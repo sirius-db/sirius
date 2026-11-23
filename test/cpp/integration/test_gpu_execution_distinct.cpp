@@ -1057,6 +1057,21 @@ TEST_CASE_METHOD(DistinctFixture,
 }
 
 TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution arg_min_null with its own ORDER BY falls back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // `w` breaks the ties on `t`: DuckDB keeps v 20 and v 50, where decoding the sort key as the
+  // whole order would keep v 10 and v 40.
+  run_ok(
+    "CREATE TABLE dist_argmin AS SELECT * FROM (VALUES (1, 5, 3, 10), (1, 5, 1, 20), "
+    "(1, 7, 0, 30), (2, 5, 9, 40), (2, 5, 2, 50)) x(k, t, w, v);");
+  run_ok("CHECKPOINT;");
+  expect_plan_fallback_matches_cpu(
+    "SELECT k, arg_min_null(v, create_sort_key(t, 'ASC NULLS LAST') ORDER BY w) FROM dist_argmin "
+    "GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution DISTINCT over a collated VARCHAR key falls back at plan time",
                  "[integration][gpu_execution][distinct]")
 {

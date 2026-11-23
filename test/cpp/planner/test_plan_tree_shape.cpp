@@ -2961,6 +2961,15 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       "create_sort_key");
   }
 
+  SECTION("an arg_min_null with its own ORDER BY is not decoded")
+  {
+    // That ORDER BY breaks ties on the sort key, which a decoded FIRST would drop.
+    require_rejected(
+      "SELECT id % 2 AS g, arg_min_null(val, create_sort_key(val, 'ASC NULLS LAST') ORDER BY id) "
+      "FROM big_left GROUP BY id % 2",
+      "create_sort_key");
+  }
+
   SECTION("an ordered LAST still falls back")
   {
     // Only FIRST's rewrite is decoded; LAST's arg_max_null leaves create_sort_key untranslatable.

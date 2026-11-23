@@ -208,11 +208,12 @@ bool is_first(duckdb::BoundAggregateExpression const& aggregate)
          sirius::aggregate_id::first;
 }
 
-// Matched by name only: create_sort_key returns BIGINT or BLOB.
-bool is_arg_min_null(duckdb::BoundAggregateExpression const& aggregate)
+// Matched by name only: create_sort_key returns BIGINT or BLOB. An arg_min_null with its own ORDER
+// BY, which breaks ties on the sort key, is not a decodable FIRST.
+bool is_unordered_arg_min_null(duckdb::BoundAggregateExpression const& aggregate)
 {
   return aggregate.Function().GetName().GetIdentifierName() == "arg_min_null" &&
-         aggregate.GetChildren().size() == 2;
+         aggregate.GetChildren().size() == 2 && !aggregate.GetOrderBys();
 }
 
 // create_sort_key(k1, 'm1', ...) with every modifier a non-NULL constant.
@@ -258,7 +259,7 @@ void inline_shared_sort_keys(duckdb::LogicalAggregate& op)
   std::map<duckdb::idx_t, std::vector<duckdb::BoundAggregateExpression*>> readers;
   for (auto& expression : op.expressions) {
     auto& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
-    if (!is_arg_min_null(aggregate)) { continue; }
+    if (!is_unordered_arg_min_null(aggregate)) { continue; }
     auto const& key = *aggregate.GetChildren()[1];
     if (key.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
     auto const index = key.Cast<duckdb::BoundReferenceExpression>().Index();
@@ -307,7 +308,7 @@ void decode_ordered_first(duckdb::ClientContext& context,
 {
   auto& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
   auto& children  = aggregate.GetChildrenMutable();
-  if (!is_arg_min_null(aggregate) || !is_decodable_sort_key(*children[1])) { return; }
+  if (!is_unordered_arg_min_null(aggregate) || !is_decodable_sort_key(*children[1])) { return; }
   auto& terms = children[1]->Cast<duckdb::BoundFunctionExpression>().GetChildrenMutable();
 
   auto order_bys = duckdb::make_uniq<duckdb::BoundOrderModifier>();
