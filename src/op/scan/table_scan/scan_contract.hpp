@@ -207,7 +207,7 @@ enum class verdict_reason : uint16_t {
   iceberg_puffin_remote_eager,
   iceberg_delete_corrupt,
   // Equality deletes the GPU path can read in principle but not in this shape.
-  iceberg_equality_plan_unproven,  // delete manifests unreadable, or they contradict the inventory
+  iceberg_equality_plan_unproven,    // applicability cannot be proven from the manifests
   iceberg_equality_key_unsupported,  // key is dropped, nested, or of an unsupported type
   iceberg_equality_budget,           // delete set above the plan-time budget
   iceberg_equality_multi_gpu,        // delete tables are built on one device only

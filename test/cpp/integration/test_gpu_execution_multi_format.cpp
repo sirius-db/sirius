@@ -1856,26 +1856,6 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
                          2);
   }
   {
-    INFO("floating-point partition values");
-    // Four data files hold ids 1..3 with v = 10 * file + id, in partitions f=-0.0, f=+0.0, f=1.5
-    // and f=NaN. id=1 is deleted in f=+0.0: DuckDB takes the two zeros for one partition, so the
-    // row goes from both files, where the spec's bit patterns keep v=11. id=2 is deleted in a NaN
-    // partition whose sign bit is set: every NaN is one partition, so v=42 goes.
-    auto path = table("iceberg_v2_eq_float_partition");
-    require_delete_files(path, 2);
-    expect_equality_rows("SELECT id, v FROM " + pinned_scan(path) + " ORDER BY v;",
-                         {{"2", "12"},
-                          {"3", "13"},
-                          {"2", "22"},
-                          {"3", "23"},
-                          {"1", "31"},
-                          {"2", "32"},
-                          {"3", "33"},
-                          {"1", "41"},
-                          {"3", "43"}},
-                         2);
-  }
-  {
     INFO("upsert within one commit");
     // The second commit writes key 2 twice. Its equality delete removes the first commit's (2, b)
     // and must NOT touch its own commit's rows; its position delete removes the superseded (2, x).
@@ -1936,6 +1916,49 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
     static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_key_unsupported);
   CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
   CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+}
+
+TEST_CASE_METHOD(
+  GPUExecutionIcebergEqRulesFixture,
+  "gpu_execution iceberg - an equality delete in a zero floating-point partition declines",
+  "[integration][gpu_execution][iceberg]")
+{
+  // Three data files hold ids 1..3 with v = 10 * file + id, in partitions f=-0.0, f=+0.0 and
+  // f=1.5. Two sibling snapshots each delete id 1: one in f=1.5, one in f=+0.0.
+  auto path       = table("iceberg_v2_eq_float_partition");
+  auto const scan = [&](int64_t sequence) {
+    return "SELECT id, v FROM iceberg_scan('" + path +
+           "', snapshot_from_id = " + std::to_string(8800000000000000 + sequence) + ") ORDER BY v;";
+  };
+  // A floating-point partition value is by itself no reason to decline.
+  expect_equality_rows(scan(2),
+                       {{"1", "11"},
+                        {"2", "12"},
+                        {"3", "13"},
+                        {"1", "21"},
+                        {"2", "22"},
+                        {"3", "23"},
+                        {"2", "32"},
+                        {"3", "33"}});
+  // DuckDB's reader at the verified extension build takes the two zeros for one partition and
+  // deletes v=11 as well, where the spec's bit patterns keep it. The rows are its answer; this
+  // path only has to hand the scan over.
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::scoped_recording_log_sink logs;
+  expect_iceberg_rows(
+    scan(3),
+    gpu_route::plan_fallback,
+    {{"2", "12"}, {"3", "13"}, {"2", "22"}, {"3", "23"}, {"1", "31"}, {"2", "32"}, {"3", "33"}});
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  auto index =
+    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_plan_unproven);
+  CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+  bool named = false;
+  for (auto const& record : logs.records())
+    if (record.message.find("floating-point partition value of zero") != std::string::npos)
+      named = true;
+  CHECK(named);
 }
 
 TEST_CASE_METHOD(
