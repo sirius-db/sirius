@@ -148,7 +148,7 @@ A pipeline is an ordered list of operators:
 | `parents` | `vector<weak_ptr<sirius_pipeline>>` | Pipelines that depend on this one finishing |
 | `tasks_created` | `atomic<size_t>` | Number of tasks created for this pipeline |
 | `tasks_completed` | `atomic<size_t>` | Number of tasks that have finished |
-| `pipeline_finished` | `atomic<bool>` | Set when all tasks are done and source is drained |
+| `pipeline_finished` | `atomic<bool>` | Set when all tasks are done, the source is drained and the operators are finalized |
 
 > **Important:** Unlike DuckDB's pipeline model where `source` and `sink` are separate from the `operators` list, Sirius finalizes pipelines at the end of `initialize_internal()` (line ~1133) by pushing the sink into `operators` and setting `source = &operators[0]`. After finalization, `operators` contains **every** operator from source to sink inclusive. `get_operators()` returns this full list, which `compute_task()` iterates over to call each operator's `execute()`.
 
