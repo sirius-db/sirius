@@ -32,7 +32,7 @@ namespace sirius::compression::detail {
 inline std::shared_ptr<cucascade::io::ioctx> spill_context(
   cucascade::memory::memory_space const& space)
 {
-  return space.get_or_init_io_context(cucascade::default_disk_io_context);
+  return cucascade::resolve_disk_io_context(space);
 }
 
 // Declare after the object, file guard and all buffer owners. Even an unexpected exception

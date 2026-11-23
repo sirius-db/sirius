@@ -270,18 +270,23 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 | `disk_id` | int | 0 | Identifier for the disk space. |
 | `capacity_bytes` | bytes | 1Ti | Capacity bound for reservations / in-flight conversions, not a quota on stored spill files. The filesystem must have enough free space. |
 | `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
+| `allow_gds` | bool | true | Whether spills may use GPUDirect Storage. When true, the space uses the shared cuFile context if `downgrade_root_dirs` is on a filesystem the cuFile driver serves through GDS, and the shared io_uring context otherwise. When false, it always uses io_uring and never opens the cuFile driver. |
 
 Raw and compressed `.hpln` spills use the DISK space's shared `cucascade::io::ioctx`.
 The default is adopted lazily on first conversion and shared process-wide through a weak
-cache. Automatic selection prefers **real GDS via cuFile**, then **io_uring**. The context
+cache. It is chosen per mount: the shared **cuFile** context when `allow_gds` is true and
+the mount's filesystem is one the cuFile driver serves through GDS (ext4/xfs on NVMe,
+GPFS, Lustre, WekaFS, BeeGFS, NFS), else the shared **io_uring** context. The check is a
+prediction: cuFile can still serve a file on such a mount in compatibility mode, which
+works but is slower than io_uring; set `allow_gds: false` to rule it out. The context
 owns its reactor teardown and its staging; see
 [DISK I/O and ownership](memory-management.md#disk-io-and-ownership).
 On a GDS host it also takes a registered GPU arena when it starts, after the GPU memory
 pools exist (see [arena memory](#scan_managercufile--local-cufile-reads-iocufileconfighpp)).
 
 The existing `disk_id`, `capacity_bytes`, and `downgrade_root_dirs` keys and spill-file
-layouts are unchanged. There are no additional DISK-backend or per-mount reactor YAML
-settings, and no backend registration is required. `sirius.executor.scan_manager.backend`,
+layouts are unchanged. Apart from `allow_gds`, there are no DISK-backend or per-mount
+reactor YAML settings, and no backend registration is required. `sirius.executor.scan_manager.backend`,
 reactor counts and cache settings configure independent scan contexts, not this spill
 default. The removed kvikIO backend is not available for reads or writes.
 

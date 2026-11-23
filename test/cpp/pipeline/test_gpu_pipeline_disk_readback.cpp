@@ -142,7 +142,12 @@ TEST_CASE("DISK->GPU round-trip conversion via converter registry", "[gpu_pipeli
   REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::DISK);
   auto const adopted_context = disk_space->get_io_context();
   REQUIRE(adopted_context != nullptr);
-  CHECK(adopted_context == cucascade::default_disk_io_context());
+  // The shared context of the mount: what another space on it adopts.
+  cucascade::memory::memory_space same_mount(cucascade::memory::disk_memory_space_config{
+    .disk_id         = 99,
+    .memory_capacity = 1ull << 30,
+    .mount_paths     = std::string{disk_space->get_disk_mount_path()}});
+  CHECK(adopted_context == cucascade::resolve_disk_io_context(same_mount));
   {
     auto ro = batch->to_read_only();
     REQUIRE(dynamic_cast<cucascade::disk_data_representation const*>(ro.get_data()) != nullptr);

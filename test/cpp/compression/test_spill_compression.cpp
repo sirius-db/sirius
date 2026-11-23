@@ -123,7 +123,7 @@ struct scoped_disk_context {
   std::shared_ptr<cucascade::io::ioctx> previous;
 
   explicit scoped_disk_context(std::shared_ptr<cucascade::io::ioctx> context)
-    : previous(env().disk->get_or_init_io_context(cucascade::default_disk_io_context))
+    : previous(cucascade::resolve_disk_io_context(*env().disk))
   {
     env().disk->set_io_context(std::move(context));
   }
@@ -728,7 +728,8 @@ TEST_CASE("spill IO: compressed disk conversion lazily adopts the shared default
   CHECK(disk->get_size_in_bytes() < ro.get_data()->get_size_in_bytes());
   auto adopted = disk_space.get_io_context();
   REQUIRE(adopted != nullptr);
-  CHECK(adopted == cucascade::default_disk_io_context());
+  // The shared context of the mount: what another space on it adopts.
+  CHECK(adopted == cucascade::resolve_disk_io_context(*env().disk));
   auto const path = disk->path();
   CHECK(fs::exists(path));
 

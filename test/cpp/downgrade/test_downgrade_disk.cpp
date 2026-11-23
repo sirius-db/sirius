@@ -219,7 +219,12 @@ TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_dis
 
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::DISK);
   REQUIRE(disk_space->get_io_context() != nullptr);
-  CHECK(disk_space->get_io_context() == cucascade::default_disk_io_context());
+  // The shared context of the mount: what another space on it adopts.
+  cucascade::memory::memory_space same_mount(cucascade::memory::disk_memory_space_config{
+    .disk_id         = 99,
+    .memory_capacity = 1ull << 30,
+    .mount_paths     = std::string{disk_space->get_disk_mount_path()}});
+  CHECK(disk_space->get_io_context() == cucascade::resolve_disk_io_context(same_mount));
   auto ro = batch->to_read_only();
   CHECK(dynamic_cast<cucascade::disk_data_representation const*>(ro.get_data()) != nullptr);
 }

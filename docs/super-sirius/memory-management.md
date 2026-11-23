@@ -73,12 +73,15 @@ memory_capacity = 1TB;          // reservation / in-flight conversion bound, not
 
 Raw spills and compressed `.hpln` spills use the same per-space
 `std::shared_ptr<cucascade::io::ioctx>`. Unless a context is supplied through the C++ API,
-`get_or_init_io_context(cucascade::default_disk_io_context)` adopts the default on first
-conversion. That default is process-shared but cached only through a weak pointer: live
+`cucascade::resolve_disk_io_context(space)` adopts a default on first conversion. That
+default is process-shared but cached only through a weak pointer: live
 spaces and in-flight conversions hold strong references, not a static owning singleton or
 a separate reactor pool per mount. An unused DISK space starts no I/O workers.
 
-Automatic selection prefers **cuFile with real GDS**, then **io_uring**; both need a usable
+The default is chosen per space from its mount: the process-shared **cuFile** context when
+the space allows GDS (`memory.disk.allow_gds`, default true) and the mount is on a
+filesystem the cuFile driver serves through GDS, else the process-shared **io_uring**
+context. A space with `allow_gds: false` never opens the cuFile driver. Both need a usable
 io_uring (the cuFile context serves host I/O through an io_uring reactor of its own), and
 the factory fails when the process cannot create a ring. cuFile compatibility
 mode alone is not real GDS. The cuCascade DISK factory supports `automatic`, `uring`, and

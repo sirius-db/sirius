@@ -284,11 +284,12 @@ struct disk_mem_config {
   int id{0};
   std::size_t capacity_bytes{1024UL << 30};  // 1TB
   std::string downgrade_root_dirs;
+  bool allow_gds{true};
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
   {
     if (downgrade_root_dirs.empty() || capacity_bytes == 0) { return; }
-    builder.set_disk_mounting_point(id, capacity_bytes, downgrade_root_dirs);
+    builder.set_disk_mounting_point(id, capacity_bytes, downgrade_root_dirs, nullptr, allow_gds);
   }
 };
 
