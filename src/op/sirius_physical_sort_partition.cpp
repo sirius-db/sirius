@@ -27,8 +27,28 @@
 
 #include <cudf/search.hpp>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <format>
+#include <numeric>
+#include <sstream>
+#include <string>
+
 namespace sirius {
 namespace op {
+
+namespace {
+double batch_cut_offset(std::uint64_t id)
+{
+  // SplitMix64 maps batch IDs to a reproducible offset with 53 bits of precision.
+  id += 0x9e3779b97f4a7c15ULL;
+  id = (id ^ (id >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  id = (id ^ (id >> 27)) * 0x94d049bb133111ebULL;
+  id ^= id >> 31;
+  return static_cast<double>(id >> 11) * 0x1.0p-53;
+}
+}  // namespace
 
 sirius_physical_sort_partition::sirius_physical_sort_partition(sirius_physical_order* order_by)
   : sirius_physical_sort_partition(order_by->types,
@@ -66,10 +86,17 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
       input.get_data_batches(), std::vector<std::size_t>(input.get_data_batches().size(), 0));
   }
 
-  auto start           = std::chrono::high_resolution_clock::now();
-  size_t num_parts     = _sample_op->get_num_partitions();
-  auto& boundaries     = _sample_op->get_partition_boundaries();
-  auto boundaries_view = boundaries.view();
+  auto start            = std::chrono::high_resolution_clock::now();
+  size_t num_parts      = _sample_op->get_num_partitions();
+  auto& boundaries      = _sample_op->get_partition_boundaries();
+  auto boundaries_view  = boundaries.view();
+  auto const& fractions = _sample_op->get_equal_key_fractions();
+  if (!fractions.empty() &&
+      boundaries.num_columns() < static_cast<cudf::size_type>(orders.size())) {
+    throw internal_exception("Sort partition cannot split equal keys with incomplete boundaries");
+  }
+  bool const split_equal_keys =
+    std::any_of(fractions.begin(), fractions.end(), [](double fraction) { return fraction > 0; });
 
   // Build cudf order vectors from BoundOrderByNode
   std::vector<int> order_key_idx;
@@ -126,6 +153,38 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
                                   stream.get()));
     CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
 
+    if (!fractions.empty() && fractions.size() != num_splits) {
+      throw internal_exception("Sort partition fraction count does not match boundaries");
+    }
+    if (split_equal_keys) {
+      auto upper_positions_col = cudf::upper_bound(batch_sort_keys,
+                                                   boundaries_view,
+                                                   column_order,
+                                                   null_precedence,
+                                                   stream,
+                                                   space->get_default_allocator());
+      std::vector<int32_t> upper_host(num_splits);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(upper_host.data(),
+                                    upper_positions_col->view().data<int32_t>(),
+                                    num_splits * sizeof(int32_t),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+      auto const offset = batch_cut_offset(batch.get_batch_id());
+      int32_t previous  = 0;
+      for (std::size_t i = 0; i < num_splits; ++i) {
+        auto const lo  = splits_host[i];
+        auto const hi  = upper_host[i];
+        auto const cut = lo + static_cast<int32_t>(
+                                std::floor(fractions[i] * static_cast<double>(hi - lo) + offset));
+        if (lo < 0 || hi < lo || cut < previous || cut > hi) {
+          throw internal_exception("Sort partition equal-key cuts are out of order");
+        }
+        splits_host[i] = cut;
+        previous       = cut;
+      }
+    }
+
     // Build slice indices: [0, split[0], split[0], split[1], ..., split[P-2], num_rows]
     std::vector<cudf::size_type> slice_indices;
     slice_indices.reserve(num_parts * 2);
@@ -177,21 +236,114 @@ void sirius_physical_sort_partition::sink(const operator_data& output, ::cuda::s
   // their indices; merge-sort skips them after the FULL barrier.
   std::call_once(_initialize_partitions, [&] {
     auto count = _sample_op ? _sample_op->get_num_partitions() : std::size_t{1};
+    {
+      std::lock_guard lock(_range_sizes_mutex);
+      _range_sizes.resize(count);
+    }
     for (auto const& next : next_port_after_sink) {
       auto* repo = next.next_operator->get_port(next.next_operator_port_name)->repo;
       if (count > repo->num_partitions()) { repo->set_num_partitions(count); }
     }
   });
   for (std::size_t i = 0; i < batches.size(); ++i) {
+    auto const rows =
+      static_cast<std::size_t>(get_cudf_table_view(batches[i]->to_read_only()).num_rows());
+    auto const bytes = batches[i]->to_read_only().get_data()->get_size_in_bytes();
     for (auto const& next : next_port_after_sink) {
       next.next_operator->push_data_batch_partitioned(
         next.next_operator_port_name, batches[i], slices.partitions[i]);
+    }
+    {
+      std::lock_guard lock(_range_sizes_mutex);
+      if (slices.partitions[i] >= _range_sizes.size()) {
+        _range_sizes.resize(slices.partitions[i] + 1);
+      }
+      auto& size = _range_sizes[slices.partitions[i]];
+      size.rows += rows;
+      size.bytes += bytes;
+      ++size.slices;
     }
   }
 }
 
 void sirius_physical_sort_partition::on_finalize_operator()
 {
+  sirius::log::log_noexcept([&] {
+    auto sizes        = get_range_sizes();
+    auto const sample = _sample_op ? _sample_op->get_range_sample_stats()
+                                   : sirius_physical_sort_sample::range_sample_stats{};
+    sizes.resize(std::max(sizes.size(), sample.num_ranges));
+    std::vector<std::size_t> rows, bytes;
+    rows.reserve(sizes.size());
+    bytes.reserve(sizes.size());
+    std::size_t empty = 0, rows_total = 0, bytes_total = 0;
+    std::ostringstream detail;
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+      auto const& size = sizes[i];
+      rows.push_back(size.rows);
+      bytes.push_back(size.bytes);
+      rows_total += size.rows;
+      bytes_total += size.bytes;
+      empty += size.rows == 0;
+      if (i != 0) { detail << ','; }
+      detail << i << ":rows=" << size.rows << ":bytes=" << size.bytes;
+    }
+    std::sort(rows.begin(), rows.end());
+    std::sort(bytes.begin(), bytes.end());
+    auto const median = [](std::vector<std::size_t> const& values) {
+      if (values.empty()) { return 0.0; }
+      if (values.size() % 2 != 0) { return static_cast<double>(values[values.size() / 2]); }
+      return static_cast<double>(values[values.size() / 2 - 1]) / 2.0 +
+             static_cast<double>(values[values.size() / 2]) / 2.0;
+    };
+    auto const rows_min        = rows.empty() ? 0 : rows.front();
+    auto const bytes_min       = bytes.empty() ? 0 : bytes.front();
+    auto const rows_max        = rows.empty() ? 0 : rows.back();
+    auto const bytes_max       = bytes.empty() ? 0 : bytes.back();
+    auto const max_over_target = sample.target_range_bytes == 0
+                                   ? 0.0
+                                   : static_cast<double>(bytes_max) / sample.target_range_bytes;
+    auto const largest_share =
+      bytes_total == 0 ? 0.0 : static_cast<double>(bytes_max) / bytes_total;
+    auto const summary = std::format(
+      "Sort ranges: ranges={} empty={} rows_total={} bytes_total={} input_batches={} "
+      "target_bytes={} "
+      "est_total_bytes={} est_source={} complete_input={} sample_batches={} sample_rows={} "
+      "sample_key_rows={} sample_stride={} "
+      "repeated_boundaries={} split_equal_keys={} split_boundaries={} "
+      "rows_min={} rows_median={} rows_max={} bytes_min={} "
+      "bytes_median={} bytes_max={} max_over_target={:.3f} largest_share={:.3f}",
+      sizes.size(),
+      empty,
+      rows_total,
+      bytes_total,
+      _sample_op ? _sample_op->get_input_batch_count() : 0,
+      sample.target_range_bytes,
+      sample.estimated_total_bytes,
+      sample.est_source,
+      sample.complete_input,
+      sample.sample_batches,
+      sample.sample_rows,
+      sample.sample_key_rows,
+      sample.sample_stride,
+      sample.repeated_boundaries ? std::to_string(*sample.repeated_boundaries) : "unavailable",
+      sample.split_equal_keys,
+      sample.split_boundaries,
+      rows_min,
+      median(rows),
+      rows_max,
+      bytes_min,
+      median(bytes),
+      bytes_max,
+      max_over_target,
+      largest_share);
+    if (sizes.size() > 1) {
+      SIRIUS_LOG_INFO("{}", summary);
+    } else {
+      SIRIUS_LOG_DEBUG("{}", summary);
+    }
+    SIRIUS_LOG_DEBUG("Sort range sizes: {}", detail.str());
+  });
   if (_sample_op) { _sample_op->clear_partition_boundaries(); }
 }
 

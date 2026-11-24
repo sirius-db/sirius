@@ -25,6 +25,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 namespace sirius::op {
 
@@ -33,6 +34,8 @@ struct sort_boundaries {
   std::size_t num_partitions = 1;
   //! num_partitions - 1 rows of the sort key columns; null for one partition.
   std::unique_ptr<cudf::table> table;
+  //! Fraction of rows equal to each boundary that precede it; empty means all zero.
+  std::vector<double> equal_key_fractions;
 };
 
 /**
@@ -47,10 +50,11 @@ class cross_rank_sort_boundaries {
   virtual ~cross_rank_sort_boundaries() = default;
 
   struct request {
-    //! This process's sample, sorted, key columns only; no columns when it had no input.
+    //! Evenly spaced key rows of this process's sorted sample; no columns with no input.
     cudf::table_view sample_keys;
     std::size_t sample_bytes = 0;
-    //! The bytes the operator samples before it asks; a smaller sample_bytes is a short input.
+    //! The bytes the operator samples before it asks, 0 for all its input; a smaller sample_bytes
+    //! is a short input.
     std::size_t target_sample_bytes = 0;
     //! Partitions this process keeps, at most.
     std::size_t num_parts = 1;
