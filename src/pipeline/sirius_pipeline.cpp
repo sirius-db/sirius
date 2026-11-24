@@ -19,7 +19,6 @@
 #include "creator/task_creator.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "log/logging.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"

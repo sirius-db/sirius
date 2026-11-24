@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/execution/physical_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 namespace sirius {
@@ -28,8 +26,6 @@ class sirius_meta_pipeline;
 }  // namespace pipeline
 
 namespace op {
-
-// class recursive_cte_state;
 
 class sirius_physical_cte : public sirius_physical_operator {
  public:
@@ -50,8 +46,6 @@ class sirius_physical_cte : public sirius_physical_operator {
   ~sirius_physical_cte() override;
 
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> cte_scans;
-
-  duckdb::shared_ptr<duckdb::ColumnDataCollection> working_table;
 
   std::size_t table_index;
   std::string ctename;

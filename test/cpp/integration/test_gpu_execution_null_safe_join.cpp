@@ -61,7 +61,7 @@ class NullSafeJoinFixture : public sirius::test::GpuExecutionFixture {
   }
 };
 
-// A join mixing plain '=' with IS NOT DISTINCT FROM (as delim joins for correlated
+// A join mixing plain '=' with IS NOT DISTINCT FROM (as the joins DuckDB makes of correlated
 // subqueries do). `b` has no NULLs, so the result is independent of null semantics;
 // this fixture guards that the mixed-key join stays on the GPU. NULL-to-NULL matching
 // on the null-safe key is covered by MixedKeyNullSafeJoinFixture below.
@@ -132,7 +132,7 @@ TEST_CASE_METHOD(MixedKeyJoinFixture,
                  "gpu_execution mixed '=' and IS NOT DISTINCT FROM join runs on GPU",
                  "[integration][gpu_execution][join][nulls]")
 {
-  // Keep null-free mixed keys on GPU; rejecting them breaks delim joins.
+  // Keep null-free mixed keys on GPU; rejecting them breaks correlated subquery joins.
   compare_gpu_vs_cpu(
     "SELECT ml.a, ml.b FROM ml JOIN mr ON ml.a = mr.a AND ml.b IS NOT DISTINCT FROM mr.b");
   compare_gpu_vs_cpu(

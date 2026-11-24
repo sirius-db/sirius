@@ -26,6 +26,7 @@
 #include <duckdb/main/settings.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 
 #include <string>
 #include <vector>
@@ -83,15 +84,6 @@ class GpuExecutionTableFunctionFixture : public sirius::test::GpuExecutionFixtur
     return collect_rows(*result);
   }
 
-  std::string query_error(std::string const& sql)
-  {
-    auto result = con->Query(sql);
-    REQUIRE(result);
-    if (!result->HasError()) { UNSCOPED_INFO("expected an error, got: " << result->ToString()); }
-    REQUIRE(result->HasError());
-    return result->GetError();
-  }
-
   bool session_optimizer_enabled() const
   {
     return duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(*con->context);
@@ -116,6 +108,28 @@ TEST_CASE_METHOD(GpuExecutionTableFunctionFixture,
 
   // The session stays usable after a rejected bind.
   REQUIRE(query_rows("SELECT 42") == rows{{"42"}});
+}
+
+// With `delim_join_as_cte` off, only a plan that keeps a delim join is left to DuckDB.
+TEST_CASE_METHOD(GpuExecutionTableFunctionFixture,
+                 "gpu_execution table function leaves a plan with a delim join to DuckDB",
+                 "[integration][gpu_execution][table_function]")
+{
+  // Correlated on an inequality, which keeps the delim join through DuckDB's optimizer.
+  auto const correlated = "SELECT count(*) FROM " + table() + " o WHERE v > (SELECT avg(v) FROM " +
+                          table() + " i WHERE i.x < o.x)";
+  auto const expected_group      = query_rows(group_query());
+  auto const expected_correlated = query_rows(correlated);
+
+  sirius::test::scoped_sirius_setting off{*con, "delim_join_as_cte", false};
+  CHECK(query_rows(gpu_execution(group_query())) == expected_group);
+  CHECK(query_rows(gpu_execution(correlated)) == expected_correlated);
+
+  // Without a CPU fallback, the error names the setting; a plan without a delim join still runs.
+  sirius::test::scoped_sirius_setting no_fallback{*con, "enable_duckdb_fallback", false};
+  CHECK(query_error(gpu_execution(correlated)).find("delim_join_as_cte = true") !=
+        std::string::npos);
+  CHECK(query_rows(gpu_execution(group_query())) == expected_group);
 }
 
 TEST_CASE_METHOD(GpuExecutionTableFunctionFixture,
