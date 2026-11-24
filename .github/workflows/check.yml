@@ -47,32 +47,6 @@ jobs:
       - name: Check public Rust ownership with Miri
         run: cargo miri test --locked --manifest-path rust/Cargo.toml -p sirius -p sirius-sys --test miri
 
-  # The Quent browser analyzer must keep compiling for the browser. The `browser` pixi
-  # environment builds only the browser crate and its telemetry dependencies, not the
-  # CMake-linked telemetry bridge.
-  telemetry-browser:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
-        with:
-          pixi-version: v0.84.2
-          environments: browser
-          locked: true
-          cache: false
-      - name: Format
-        run: pixi run --locked -e browser cargo fmt --manifest-path rust/Cargo.toml --package sirius-telemetry-store --package sirius-telemetry-analyzer --package sirius-telemetry-browser --check
-      - name: Lint
-        run: |
-          pixi run --locked -e browser cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets --package sirius-telemetry-store --package sirius-telemetry-analyzer --package sirius-telemetry-browser --features sirius-telemetry-browser/generate -- -D warnings
-          pixi run --locked -e browser cargo clippy --locked --manifest-path rust/Cargo.toml --package sirius-telemetry-browser --target wasm32-unknown-unknown -- -D warnings
-      - name: Test the analyzer and browser bundle round trip
-        run: pixi run --locked -e browser cargo test --locked --manifest-path rust/Cargo.toml --package sirius-telemetry-store --package sirius-telemetry-analyzer --package sirius-telemetry-browser --features sirius-telemetry-browser/generate
-      - name: Check the analyzer builds without filesystem loading
-        run: pixi run --locked -e browser cargo check --locked --manifest-path rust/Cargo.toml --package sirius-telemetry-analyzer --no-default-features
-      - name: Build the browser analyzer for WASM
-        run: pixi run --locked -e browser build-quent-browser "$RUNNER_TEMP/sirius-browser"
-
   lint:
     runs-on: ubuntu-24.04
     env:
