@@ -79,6 +79,12 @@ path choose_path(endpoint const& me,
       me.domain.to_string(),
       peer.domain.to_string());
   }
+  if (mnnvl == mnnvl_mode::require &&
+      (staging == host_staging::always || staging == host_staging::remote)) {
+    throw sirius::invalid_input_exception(
+      "exchange: sirius_exchange_mnnvl is require, but sirius_exchange_host_staging stages "
+      "every peer");
+  }
   bool const same_host = me.boot_id == peer.boot_id;
   if (staging == host_staging::remote) { return path::tcp_lanes; }
   // Shared memory reaches only this host.
