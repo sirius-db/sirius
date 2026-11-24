@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exchange/fabric.hpp"
+#include "sirius/exception.hpp"
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/detail/error.hpp>
@@ -103,6 +104,15 @@ class loopback_hub {
       {
         std::lock_guard lock{_hub._mutex};
         recv = _hub._recv.at(peer);
+      }
+      if (src + bytes > _send.bytes() || dst + bytes > recv->bytes() ||
+          bytes > max_write_bytes(peer)) {
+        throw sirius::invalid_input_exception(
+          "loopback: a {}-byte write from {} to {} of rank {} is out of bounds",
+          bytes,
+          src,
+          dst,
+          peer);
       }
       pending w{peer, std::move(notification), nullptr, false};
       if (_hub._opts.fail_after_writes && _posted >= *_hub._opts.fail_after_writes) {
