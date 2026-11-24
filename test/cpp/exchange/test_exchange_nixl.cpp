@@ -41,6 +41,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <memory>
 #include <random>
@@ -304,6 +305,32 @@ TEST_CASE(
   CHECK_THROWS_AS(nixl_fabric(taken, send, recv), sirius::invalid_input_exception);
   CHECK_THROWS_WITH(nixl_fabric(taken, send, recv), Catch::Matchers::ContainsSubstring("in use"));
   ::close(fd);
+}
+
+TEST_CASE("a NIXL fabric refuses a peer whose frames are another size", "[exchange][nixl]")
+{
+  // Both receive rings are 256 KiB, in 4 frames of 64 KiB and in 2 of 128 KiB, so the ring bytes
+  // agree. The first rank to take the other's hello refuses it; the other may hear nothing more
+  // and time out.
+  auto const peers   = two_free_peers();
+  auto const connect = [&](rank_t rank, std::uint32_t frames, std::size_t frame_bytes) {
+    nixl_fabric::config cfg{rank, peers};
+    cfg.connect_timeout = std::chrono::seconds{10};
+    frame_ring send(frames, frame_bytes);
+    frame_ring recv(frames, frame_bytes);
+    try {
+      nixl_fabric fab(std::move(cfg), send, recv);
+    } catch (std::exception const& e) {
+      return std::string{e.what()};
+    }
+    return std::string{};
+  };
+  auto other        = std::async(std::launch::async, connect, 0, 4, 64 * KiB);
+  auto const mine   = connect(1, 2, 128 * KiB);
+  auto const theirs = other.get();
+  CHECK_FALSE(mine.empty());
+  CHECK_FALSE(theirs.empty());
+  CHECK_THAT(mine + theirs, Catch::Matchers::ContainsSubstring("-byte frames"));
 }
 
 TEST_CASE("two ranks connect through make_nixl_exchange and exchange a batch", "[exchange][nixl]")
