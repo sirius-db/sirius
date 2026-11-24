@@ -1,0 +1,23 @@
+# Stock Paimon planning admission experiment
+
+This CPU-only diagnostic exercises caller-side admission for a private,
+immutable copy of the checked-in `append_basic` fixture at snapshot 2. It checks
+the actual manifest list references and bounded Zstandard frames before
+optionally running a reader command. The command receives the fixture path in
+`PAIMON_PROBE_TABLE`. Exit statuses 2 and 3 indicate refusal and errors in
+the diagnostic. A reader that runs supplies its own exit status.
+
+Run from this directory with Python 3.11+ and libzstd installed. The tests also
+need `fastavro` and `zstandard` for generating private fixture variants.
+
+```sh
+python3 -m unittest -v test_check.py
+python3 check.py ../warehouse/reference.db/append_basic
+```
+
+To chain a stock SDK probe after admission, add `-- /path/to/reader` after
+the fixture path. The regression tests use a sentinel to check dispatch.
+The actual native CPU run belongs to the SDK and reader pair. This
+diagnostic assumes these specific fixture schemas and a sealed view of the
+files between validation and reading. Codec workspace, physical backing and
+production SQL integration remain outside the diagnostic's evidence.
