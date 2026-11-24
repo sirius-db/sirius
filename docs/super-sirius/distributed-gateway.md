@@ -23,7 +23,8 @@ For several machines, follow the [distributed quick start](distributed-quickstar
 `pixi run build-distributed` on every machine, then `pixi run sirius-gateway`,
 `pixi run sirius-node` on each GPU machine, and `pixi run sirius-client`.
 
-**One machine.** The gateway can start its ranks itself, rank i on GPU i:
+**One machine.** The gateway can start its ranks itself, rank i on GPU i, or on entry i of its
+own `CUDA_VISIBLE_DEVICES` when that is set:
 
 ```bash
 pixi run build-distributed     # Sirius and the gateway
@@ -78,7 +79,9 @@ hosts cannot connect through.
    inside the exchanges.
 4. When every rank is done it returns rank 0's result. A statement that succeeded on every rank
    and is not a `SELECT`, `EXPLAIN` or transaction statement is appended to the DDL log: DDL, but
-   also `INSERT`, `COPY`, `SET`, `CALL`, `ATTACH`. Every entry runs again on restarted ranks.
+   also `INSERT`, `COPY`, `SET`, `CALL`, `ATTACH`. A `SELECT` whose CTE is DML or a `COPY`
+   changes state and is logged too, as is an `EXPLAIN ANALYZE` of a statement that changes
+   state. Every entry runs again on restarted ranks.
 
 The gateway holds one Quack session per rank, and every client's statements go through it:
 Sirius runs a process's distributed queries on one connection only.
@@ -106,6 +109,7 @@ rank.
 | `sirius_gateway_add_rank`, `sirius_gateway_drop_rank`, with `sirius_gateway_allow_join` on (`sirius_gateway.sh` with 0 ranks sets it) | The gateway: a node registers its rank. A client's token already runs any SQL on every rank |
 | Other `sirius_gateway_*`, `quack_*`, `sirius_rank_*` calls anywhere in a statement, and `SET` of such settings | Refused: gateway console only. A `CALL` or `SELECT` is searched as a tree, subqueries and CTEs included. Any other statement (`CREATE TABLE AS`, `INSERT`, `COPY`, a view, a macro) is searched by name: such a name before an opening parenthesis is refused, a table's or a column's too |
 | `PREPARE`, `EXECUTE` | Refused: a prepared plan keeps the query number it was planned with |
+| A batch of statements that does not parse | Refused whole, with the parser's error: none of its statements runs |
 
 ## Ranks
 
@@ -136,7 +140,8 @@ fails at once; at most a year). Meanwhile `sirius_gateway_status()` says "waitin
 registered by then, the statement fails. While no ranks run, the gateway answers the catalog
 reads a client's `ATTACH` sends from its own catalog, so attaching neither waits nor starts
 anything, and a node can attach to register its rank. A rank registered after the first
-statement restarts every rank. A start that fails is tried again by the next statement. After
+statement restarts every rank. A start that fails is tried again by the next statement; so is
+a failed `sirius_gateway_start`, with spawned ranks or with registered ones only. After
 `sirius_gateway_stop`, only `sirius_gateway_start` or `sirius_gateway_restart` starts ranks.
 
 **Restart-to-join.** A rank's exchange peers are fixed once it connects, so a rank process joins
@@ -148,7 +153,9 @@ default `SELECT joined FROM sirius_rank_info()`). A process that has never joine
 is. One that has joined is sent `sirius_gateway_rank_exit_sql` (by default
 `CALL sirius_rank_exit()`), and the gateway waits up to 10 minutes for the launcher to start a
 new one. An empty `sirius_gateway_rank_joined_sql` counts every process as joined. So a rank's
-first join uses the process that registered, and each later join restarts it.
+first join uses the process that registered, and each later join restarts it. A gateway's only
+rank connects to no peer: it reports `joined` once the gateway sets its `sirius_exchange_rank`,
+so a later join restarts it too, and the DDL log replays into an empty catalog.
 `sirius_rank_exit` is refused in a process that has not joined, so it cannot end a Sirius that
 runs alone.
 `sirius_rank_exit` replies, shuts the exchange down (freeing its port and shared-memory mirrors)
@@ -197,19 +204,20 @@ abandoned.
 
 | Function | What |
 |---|---|
-| `sirius_gateway_start(ranks, gpus :=, exchange_base_port :=, quack_base_port :=, replay_saved :=)` | Starts `ranks` spawned ranks on this host plus the registered ones. It clears the DDL log, and deletes `<state_dir>/ddl.sql` once the new ranks run. With `replay_saved := true` it keeps the log instead, and replays `ddl.sql` on the new ranks, as a restarted gateway's first start does; `sirius_gateway.sh` with N > 0 ranks uses it |
+| `sirius_gateway_start(ranks, gpus :=, exchange_base_port :=, quack_base_port :=, replay_saved :=)` | Starts `ranks` spawned ranks on this host plus the registered ones. Without `gpus`, rank i takes GPU i; Sirius ranks take entry i of the gateway's own `CUDA_VISIBLE_DEVICES` when that is set, and more ranks than entries is refused. It clears the DDL log, and deletes `<state_dir>/ddl.sql` once the new ranks run; if the start fails, the next statement's retry does not replay that file. With `replay_saved := true` it keeps the log instead, and replays `ddl.sql` on the new ranks, as a restarted gateway's first start does; `sirius_gateway.sh` with N > 0 ranks uses it |
 | `sirius_gateway_add_rank('host:port', exchange_port :=, token :=, fingerprint :=, name :=, exchange_host :=)` | Registers a rank started outside the gateway. `exchange_port` and `token` are required; `name` defaults to the address. Unless the cluster is stopped, every rank restarts at the next statement. The same rank again, with the same addresses and credentials, changes nothing; another under the same name replaces it |
 | `sirius_gateway_drop_rank(name)` | Unregisters a registered rank, likewise |
 | `sirius_gateway_restart()` | Restarts every rank and replays the DDL log |
 | `sirius_gateway_stop()` | Stops spawned ranks and disconnects registered ones |
 | `sirius_gateway_run(sql)` | Runs `sql` on every rank; what the router rewrites statements to |
 | `sirius_gateway_status()` | One row per rank: process, name, state, cluster state and its `error` (why it is stopped or failed, what it waits for, or a note while it is `ready`: a skipped saved entry, or a log it could not save), `last_error` (the rank's last failure to join, to answer, or to keep running), query numbers, queue |
-| `sirius_gateway_log()` | The DDL log |
+| `sirius_gateway_log()` | The DDL log. A statement that carries credentials shows as `-- not shown: this statement carries credentials` |
 | `sirius_gateway_route(user, sql)` | Quack's authorization callback that routes each client statement: `SET GLOBAL quack_authorization_function = 'sirius_gateway_route'` |
 | `sirius_gateway_test_signal(rank, signal)`, `sirius_gateway_test_serve(port, token, init)` | Test hooks |
 
 On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid`, its
-`boot_id`, and whether its exchange has `joined` its peers, and `sirius_rank_exit()`
+`boot_id`, and whether it has `joined` a set of ranks (its exchange connected to its peers, or
+the gateway set it up as its only rank), and `sirius_rank_exit()`
 (`src/exchange/rank_control.cpp`).
 
 | Setting | Default | What |
@@ -237,10 +245,15 @@ On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid
   replayed. `CREATE TABLE` and `INSERT` give one copy of the rows per rank. `now()` and `random()`
   evaluate on each rank. A `ROLLBACK` does not undo what ran on the ranks.
 - **A statement that calls a gateway function** runs in the client's gateway session, so it may
-  read nothing else there: a table, a file or another table function in it is refused.
+  read nothing else there: a table, a file or another table function in it is refused, and so
+  is DML or a `COPY` in one of its CTEs. The name of one of its own CTEs is not a table.
 - **SQL in a string** is not routed: `query('FROM sirius_rank_exit()')` runs its text on every
   rank. The refusal of console-only calls guards against mistakes, not against a client, whose
   token already runs any SQL on every rank.
+- **`sirius_gateway_run` runs at bind time:** on the gateway's console, a `PREPARE` or an
+  `EXPLAIN` of a `sirius_gateway_run` call runs its statement on every rank.
+- **`nextval` in a `SELECT`:** `SELECT nextval('s')` changes state but is not logged, so it is
+  not replayed: the gateway parses a statement and does not bind it, and sees a read.
 - **State across gateway restarts:** with `sirius_gateway_state_dir` set (`sirius_gateway.sh`
   sets it), the DDL log is also written to `<state_dir>/ddl.sql`, mode 600, after each statement
   that adds to it. If that write fails, the statement still succeeds, and the status `error`
@@ -256,6 +269,12 @@ On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid
   DDL entry N: ...", and the entry is dropped from `ddl.sql`. So a saved view that needs a secret
   is skipped when the secret is missing at replay: create the view again after the secret.
   Replaying the in-memory log on restarted ranks is still fail-stop.
+- **Replay into an attached database:** the log is also replayed into state outside a rank's
+  memory catalog. A database file a rank `ATTACH`es keeps what was written to it, so each
+  restart of the ranks repeats the logged writes in that file.
+- **Catalog reads with no ranks:** while no ranks run, any read of `duckdb_*()` or `pragma_*()`
+  functions only, not just those of a client's `ATTACH`, is answered from the gateway's own
+  catalog.
 - **Registered ranks** are kept in memory only: nodes register them again when `gateway.conf`
   names a new `gateway_id`, which `sirius_gateway.sh` writes at each start. A node given
   `gateway` and `gateway_token` instead of `gateway_conf` registers again only when its rank
@@ -272,7 +291,9 @@ On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid
   restart until it is dropped.
 - **A cancel during planning** (the shape all-gather ignores interrupts) can escalate to killing
   the ranks.
-- **CI:** nothing builds or tests `gateway/` automatically.
+- **CI:** nothing builds or tests `gateway/` automatically. `pixi run test-gateway` runs its SQL
+  tests on CPU ranks, and `pixi run test-scripts` the tests of the launch and answer-check
+  scripts.
 
 ## Tests
 
