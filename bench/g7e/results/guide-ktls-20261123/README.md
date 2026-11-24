@@ -25,9 +25,12 @@ measurements and Q1-only tests are excluded. Pinning setup time is excluded.
 The [versioned recipes and runner](../../guide-26b5caba/README.md) preserve the
 measured settings and process boundaries. SF100/SF300/SF1000 use the guide's
 CPU-budget preset; SF1000 adds `SET threads=24`. SF3000 and SF10000 use the
-SF10000 balanced-large-scans preset plus `SET threads=24`. Large-scale hot changes
-only eviction from idle to LRU. No retired experimental environment flags are
-set. Quent is enabled in separate effective config copies.
+SF10000 balanced-large-scans preset plus `SET threads=24`. The exact
+[SF10000 hot config](../../guide-26b5caba/configs/balanced-hot.yaml) differs from
+the [cold config](../../guide-26b5caba/configs/balanced-cold.yaml) only in eviction:
+idle becomes LRU. The saved hot YAML matches the measured config byte for byte;
+its SHA256 is recorded in the result manifest. No retired experimental
+environment flags are set. Quent is enabled in separate effective config copies.
 
 Cold uses a fresh engine and cleared OS/Sirius caches for every measurement.
 Hot uses one fresh engine per query and retains it for two consecutive
