@@ -211,3 +211,20 @@ SELECT count(*) FROM glob('{TEST_DIR}/sirius_gateway_replay/state/*');
 
 statement ok
 FROM sirius_gateway_stop();
+
+# A saved log that is cut short fails the start: no part of an entry is replayed.
+statement ok
+COPY (SELECT * FROM (VALUES ('-- entry 99'), ('CREATE VIEW')) lines(line)) TO '{TEST_DIR}/sirius_gateway_replay/state/ddl.sql' (FORMAT csv, HEADER false, QUOTE '');
+
+statement error
+FROM sirius_gateway_start(1, quack_base_port := 19965, replay_saved := true);
+----
+entry 1 is cut short
+
+statement ok
+COPY (SELECT '-- entry many' AS line) TO '{TEST_DIR}/sirius_gateway_replay/state/ddl.sql' (FORMAT csv, HEADER false, QUOTE '');
+
+statement error
+FROM sirius_gateway_start(1, quack_base_port := 19965, replay_saved := true);
+----
+bad entry line
