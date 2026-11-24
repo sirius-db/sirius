@@ -87,20 +87,24 @@ struct cluster {
   }
 };
 
-/// Rank 0's transport, and rank 1 as a bare fabric endpoint that notifies rank 0 what it likes.
+/// Rank 0's transport in a world of @p world ranks, and rank @p forger as a bare fabric endpoint
+/// that notifies rank 0 what it likes.
 struct forged_peer {
-  loopback_hub hub{2};
+  loopback_hub hub;
   frame_ring send{4, 64 * KiB};
   frame_ring recv{4, 64 * KiB};
   frame_ring peer_send{4, 64 * KiB};
   frame_ring peer_recv{4, 64 * KiB};
-  std::unique_ptr<fabric> fab  = hub.attach(0, send, recv);
-  std::unique_ptr<fabric> peer = hub.attach(1, peer_send, peer_recv);
+  std::unique_ptr<fabric> fab;
+  std::unique_ptr<fabric> peer;
   received got;
   std::unique_ptr<transport> t;
 
-  explicit forged_peer(transport::options opts = {})
-    : t(std::make_unique<transport>(*fab, send, recv, *env().gpu, env().host, recording(got), opts))
+  explicit forged_peer(transport::options opts = {}, rank_t world = 2, rank_t forger = 1)
+    : hub(world),
+      fab(hub.attach(0, send, recv)),
+      peer(hub.attach(forger, peer_send, peer_recv)),
+      t(std::make_unique<transport>(*fab, send, recv, *env().gpu, env().host, recording(got), opts))
   {
   }
   ~forged_peer() { t.reset(); }
@@ -199,12 +203,40 @@ TEST_CASE("a write past the frames a peer holds fails the receiver", "[exchange]
   f.fails_with("which it does not hold");
 }
 
+TEST_CASE("a write into another peer's receive frames fails the receiver", "[exchange][transport]")
+{
+  // Three ranks, so 2 of rank 0's 4 receive frames each: rank 1 holds 0 and 1, rank 2 holds 2
+  // and 3. Both runs are inside the ring.
+  SECTION("a run that ends in the next peer's frames")
+  {
+    forged_peer f({}, 3, 1);
+    sirius::exchange::frame_message m{1, 0, 0, 1, 2 * 64 * KiB, many_frame_header()};
+    m.frames = 2;
+    f.forge(m);
+    f.fails_with("which it does not hold");
+  }
+  SECTION("a run that starts in the previous peer's frames")
+  {
+    forged_peer f({}, 3, 2);
+    f.forge(sirius::exchange::frame_message{1, 0, 0, 1, 64 * KiB, many_frame_header()});
+    f.fails_with("which it does not hold");
+  }
+}
+
 TEST_CASE("notifications may arrive in any order", "[exchange][transport]")
 {
   // Several notifications arrive together and shuffled: frames before their header, ends
   // before the batches they count, credits late.
   cluster c(4, 3, 6, {.shuffle = true, .deliver_every = 5}, env().host);
   all_to_all(c, {1, 2}, 2, 8'000);
+}
+
+TEST_CASE("writes of several frames survive shuffled notifications", "[exchange][transport]")
+{
+  // 8 credits per peer: writes of up to 4 frames, with credits returned out of order, so a
+  // staged run is split over the runs of consecutive credits a peer has left.
+  cluster c(3, 16, 16, {.shuffle = true, .deliver_every = 5}, env().host);
+  all_to_all(c, {1, 2}, 3, 30'000);
 }
 
 TEST_CASE("a peer that returns no credits leaves send frames for the other peers",
