@@ -2885,6 +2885,10 @@ static void SetExchangeRank(ClientContext& context, SetScope scope, Value& param
     if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
       static_cast<void>(sirius_ctx->get_exchange_service(next));
     }
+  } else if (next.exchange_peers.size() == 1) {
+    // A gateway's only rank connects to no peer, but it has served that gateway: it restarts
+    // before it serves another set of ranks, so that their DDL log replays into an empty catalog.
+    sirius::exchange::note_exchange_joined();
   }
   params->exchange_rank = next.exchange_rank;
 }
