@@ -207,6 +207,43 @@ TEST_CASE("notifications may arrive in any order", "[exchange][transport]")
   all_to_all(c, {1, 2}, 2, 8'000);
 }
 
+TEST_CASE("a peer that returns no credits leaves send frames for the other peers",
+          "[exchange][transport]")
+{
+  // Rank 0's transport, and ranks 1 and 2 as bare endpoints, which never return a credit. 8
+  // credits per peer and 8 send frames; a batch is 19 frames.
+  loopback_hub hub{3};
+  frame_ring send{8, 64 * KiB};
+  frame_ring recv{16, 64 * KiB};
+  frame_ring unused{1, 64 * KiB};
+  frame_ring recv1{16, 64 * KiB};
+  frame_ring recv2{16, 64 * KiB};
+  auto fab        = hub.attach(0, send, recv);
+  auto const one  = hub.attach(1, unused, recv1);
+  auto const two  = hub.attach(2, unused, recv2);
+  auto const took = [](fabric& peer, std::uint32_t frames) {
+    std::uint32_t seen  = 0;
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (seen < frames && std::chrono::steady_clock::now() < deadline) {
+      std::vector<fabric_notification> in;
+      peer.poll(in);
+      for (auto const& n : in) {
+        seen += std::get<sirius::exchange::frame_message>(sirius::exchange::decode(n.body)).frames;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return seen;
+  };
+  received got;
+  transport t(*fab, send, recv, *env().gpu, env().host, recording(got));
+  t.send(1, 1, exchange_batch(0, 1, 1, 0, 30'000));
+  // Rank 1's credits are spent; what rank 0 stages for it from here on is never written.
+  REQUIRE(took(*one, 8) == 8);
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  t.send(1, 2, exchange_batch(0, 2, 1, 0, 30'000));
+  CHECK(took(*two, 8) == 8);
+}
+
 TEST_CASE("a receiver with no room holds the frames until room appears", "[exchange][transport]")
 {
   cluster c(2, 4, 4, loopback_hub::options{}, /*host=*/nullptr);
