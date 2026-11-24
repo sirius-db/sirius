@@ -44,7 +44,7 @@ void spawn_rank(start_options const& options,
       out << "LOAD " << KeywordHelper::WriteQuoted(options.sirius_extension) << ";\n";
     }
     if (!init_sql.empty()) { out << init_sql << ";\n"; }
-    out << "CALL quack_serve(" << KeywordHelper::WriteQuoted(r.uri)
+    out << "SELECT listen_uri FROM quack_serve(" << KeywordHelper::WriteQuoted(r.uri)
         << ", token := " << KeywordHelper::WriteQuoted(token) << ");\n";
     if (!out) { throw IOException("cannot write %s", init); }
   }
@@ -52,7 +52,7 @@ void spawn_rank(start_options const& options,
   int in[2];
   if (pipe2(in, O_CLOEXEC) != 0) { throw IOException("pipe: %s", std::strerror(errno)); }
   int const log =
-    open(log_path(options, r.index).c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    open(log_path(options, r.index).c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
   if (log < 0) {
     close(in[0]);
     close(in[1]);
