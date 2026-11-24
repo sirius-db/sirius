@@ -433,6 +433,31 @@ char const* to_string(cluster_state state)
   return "unknown";
 }
 
+std::vector<std::string> rank_setup_sql(start_options const& options,
+                                        std::string const& peers,
+                                        uint32_t index)
+{
+  std::vector<std::string> sql;
+  if (!options.sirius_extension.empty()) {
+    sql.push_back("SET enable_duckdb_fallback = false");
+    // The same on every rank: a rank refuses a peer that reaches it another way. With 'auto',
+    // ranks tell other hosts apart by boot id and reach them over TCP lanes, one frame in flight
+    // per lane.
+    sql.push_back("SET sirius_exchange_host_staging = " +
+                  KeywordHelper::WriteQuoted(options.host_staging));
+    sql.push_back("SET sirius_exchange_tcp_lanes = " + std::to_string(options.tcp_lanes));
+    sql.push_back("SET sirius_exchange_mnnvl = " + KeywordHelper::WriteQuoted(options.mnnvl));
+    sql.push_back("SET sirius_exchange_frame_bytes = " + std::to_string(options.frame_bytes));
+    sql.push_back("SET sirius_exchange_send_frames = " + std::to_string(options.send_frames));
+    sql.push_back("SET sirius_exchange_recv_frames_per_peer = " +
+                  std::to_string(options.recv_frames));
+    sql.push_back("SET sirius_exchange_peers = " + KeywordHelper::WriteQuoted(peers));
+    sql.push_back("SET sirius_exchange_rank = " + std::to_string(index));
+  }
+  if (!options.rank_init.empty()) { sql.push_back(options.rank_init); }
+  return sql;
+}
+
 void read_settings(ClientContext& context, start_options& options)
 {
   options.duckdb_binary    = setting(context, "sirius_gateway_duckdb_binary", "");
@@ -755,26 +780,10 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
     if (give_up) { throw duckdb::InterruptException(); }
 
     // Each session's setup. With Sirius, SET sirius_exchange_rank connects NIXL and waits for
-    // every peer, so the ranks run it in parallel. The exchange settings come first, the same on
-    // every rank: a rank refuses a peer that reaches it another way. With 'auto', ranks tell other
-    // hosts apart by boot id and reach them over TCP lanes, one frame in flight per lane.
+    // every peer, so the ranks run it in parallel.
     std::vector<std::vector<std::string>> setup(ranks_.size());
     for (auto& r : ranks_) {
-      auto& sql = setup[r.index];
-      if (!options_.sirius_extension.empty()) {
-        sql.push_back("SET enable_duckdb_fallback = false");
-        sql.push_back("SET sirius_exchange_host_staging = " +
-                      KeywordHelper::WriteQuoted(options_.host_staging));
-        sql.push_back("SET sirius_exchange_tcp_lanes = " + std::to_string(options_.tcp_lanes));
-        sql.push_back("SET sirius_exchange_mnnvl = " + KeywordHelper::WriteQuoted(options_.mnnvl));
-        sql.push_back("SET sirius_exchange_frame_bytes = " + std::to_string(options_.frame_bytes));
-        sql.push_back("SET sirius_exchange_send_frames = " + std::to_string(options_.send_frames));
-        sql.push_back("SET sirius_exchange_recv_frames_per_peer = " +
-                      std::to_string(options_.recv_frames));
-        sql.push_back("SET sirius_exchange_peers = " + KeywordHelper::WriteQuoted(plan.peers));
-        sql.push_back("SET sirius_exchange_rank = " + std::to_string(r.index));
-      }
-      if (!options_.rank_init.empty()) { sql.push_back(options_.rank_init); }
+      setup[r.index] = rank_setup_sql(options_, plan.peers, r.index);
     }
     auto const setup_done = fan_out(context, setup, client_policy(context));
     for (uint32_t i = 0; i < setup_done.outcomes.size(); ++i) {
