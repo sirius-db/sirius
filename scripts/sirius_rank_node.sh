@@ -9,6 +9,10 @@
 # exchange_port, listen_host, dir; arguments given here win over it. It may also set:
 #   ucx_tls, ucx_net_devices  UCX_TLS, UCX_NET_DEVICES, unless exported
 #                      (defaults: scripts/launcher_env.sh)
+#   cpus               the rank's CPUs, unless SIRIUS_NODE_CPUS is exported. auto (default): its
+#                      GPU's share of the cores next to that GPU, or the CPUs it was started
+#                      with when those are fewer than the host's (sirius_rank_cpus.py). all:
+#                      every CPU it was started with, which the host's other ranks then share
 #   priority_networks  CIDRs, e.g. 10.87.140.0/24; this host's first address in them is the listen
 #                      host, and its interface UCX_NET_DEVICES, unless those are set. Default: the
 #                      gateway's networks
@@ -96,6 +100,13 @@ flock -n 8 || {
   echo "a rank already runs from $dir" >&2
   exit 1
 }
+# Each rank gets CPUs of its own. On CPUs that ranks share, a thread of one rank that is bound to
+# one CPU can wait for minutes behind a busy thread of another rank, and the query with it.
+visible=${CUDA_VISIBLE_DEVICES:-}
+rank_cpus=$(python3 "$here/sirius_rank_cpus.py" "${SIRIUS_NODE_CPUS:-${cpus:-auto}}" "${visible%%,*}")
+rank_threads=${rank_cpus% *}
+rank_cpus=${rank_cpus#* }
+echo "cpus: $rank_threads ($rank_cpus)" >&2
 
 token=${SIRIUS_RANK_TOKEN:-}
 if [ -z "$token" ]; then
@@ -125,10 +136,15 @@ case $host in
     pin=", fingerprint := '$fingerprint'"
     ;;
 esac
+# DuckDB binds each worker thread to one CPU when it has 64 or more. pin_threads off stops that
+# for new workers only, so the pool is emptied (threads = 1) and filled again at the rank's size.
 (
   umask 077
   cat > "$dir/init.sql" <<SQL
 LOAD $(sirius_sql_quote "$build/extension/sirius/sirius.duckdb_extension");
+SET pin_threads = 'off';
+SET threads = 1;
+SET threads = $rank_threads;
 SELECT listen_uri FROM quack_serve('quack:$host:$port', $serve);
 SQL
 )
@@ -245,7 +261,7 @@ trap stop TERM INT
 backoff=1
 first=1
 while :; do
-  "$duckdb" -unsigned -init "$dir/init.sql" <> "$dir/stdin" >> "$dir/rank.log" 2>&1 &
+  taskset -c "$rank_cpus" "$duckdb" -unsigned -init "$dir/init.sql" <> "$dir/stdin" >> "$dir/rank.log" 2>&1 &
   child=$!
   # Without fd 8: only the rank may outlive this script with the directory's lock. The
   # announcer's background sleeps would hold it for up to 30 s after a stop.

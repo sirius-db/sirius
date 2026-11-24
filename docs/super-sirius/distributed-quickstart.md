@@ -60,6 +60,7 @@ sirius:
       # host: 10.87.140.52      # or on this address; wins over networks
     node:
       gpus: all                 # all, a list such as [0, 1], or slurm
+      cpus: auto                # auto: each rank on its own CPUs, next to its GPU; all: shared
       networks: 10.87.140.0/24  # each rank's listen and exchange address
       quack_port: 9500          # rank i: 9500 + i
       exchange_port: 27000      # rank i: 27000 + i
@@ -91,6 +92,7 @@ number or list, stops the scripts before they apply any of it. `gateway.min_rank
 | `gateway.host` | `SIRIUS_GATEWAY_HOST` | | The address the gateway listens on |
 | `gateway.networks` | `SIRIUS_GATEWAY_PRIORITY_NETWORKS` | | Or this host's first address in these CIDRs (`;` or `,` between them). Without either, the address of the default route's interface; with ranks spawned on this host, 127.0.0.1 |
 | `node.gpus` | `SIRIUS_NODE_GPUS` | `all` | The GPUs that get a rank: `all` (the entries of `CUDA_VISIBLE_DEVICES` when that is set), a list, or `slurm` (the GPU Slurm gave the task) |
+| `node.cpus` | `SIRIUS_NODE_CPUS` | `auto` | The CPUs of each rank. `auto`: its GPU's share of the cores next to that GPU (on a GB200 node, 36 of the 72 on the GPU's socket), or the CPUs the node script was started with when those are fewer than the host's, as under a Slurm that binds tasks to cores. `all`: every CPU the script was started with, shared by the host's ranks |
 | `node.networks` | `SIRIUS_NODE_NETWORKS` | the gateway's subnet | Each rank listens on this node's first address in these CIDRs, and UCX uses that address's interface unless `ucx.net_devices` names others |
 | `node.quack_port` | `SIRIUS_NODE_QUACK_PORT` | 9500 | First rank's Quack port |
 | `node.exchange_port` | `SIRIUS_NODE_EXCHANGE_PORT` | 27000 | First rank's exchange port |

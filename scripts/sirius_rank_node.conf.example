@@ -22,6 +22,11 @@ gateway_conf=$HOME/.sirius/gateways/default/gateway.conf
 # listen_host=10.87.140.52
 # dir=/tmp/sirius_rank_9500
 
+# The rank's CPUs; an exported SIRIUS_NODE_CPUS wins. auto: its GPU's share of the cores next to
+# that GPU, or the CPUs the script was started with when those are fewer than the host's. all:
+# every CPU the script was started with.
+# cpus=auto
+
 # UCX transports and network devices; scripts/launcher_env.sh and priority_networks set defaults.
 # ucx_tls=cuda_copy,cuda_ipc,tcp,self
 # ucx_net_devices=bond0

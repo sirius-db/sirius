@@ -22,6 +22,7 @@ KEYS = {
     ("gateway", "join_wait"): "SIRIUS_GATEWAY_JOIN_WAIT",
     ("gateway", "statement_timeout"): "SIRIUS_GATEWAY_STATEMENT_TIMEOUT",
     ("node", "gpus"): "SIRIUS_NODE_GPUS",
+    ("node", "cpus"): "SIRIUS_NODE_CPUS",
     ("node", "networks"): "SIRIUS_NODE_NETWORKS",
     ("node", "quack_port"): "SIRIUS_NODE_QUACK_PORT",
     ("node", "exchange_port"): "SIRIUS_NODE_EXCHANGE_PORT",
