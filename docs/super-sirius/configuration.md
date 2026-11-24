@@ -1015,7 +1015,7 @@ Evaluators retain their own policy values rather than reading mutable global def
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
-| `enable_dictionary_carrier` | false | Keep VARCHAR columns of a dictionary-encoded Simpatico pin as DICTIONARY32 (keys plus codes) until a grouped aggregate or another native boundary. |
+| `enable_dictionary_carrier` | false | Keep VARCHAR columns of a dictionary-encoded Simpatico pin as DICTIONARY32 (keys plus codes) until a grouped aggregate or another native boundary. A batch whose dictionary keys exceed 512 KiB carries strings instead. |
 | `parquet_footer_statistics` | true | Give DuckDB's optimizer the merged footer statistics of every file of a multi-file Parquet scan. |
 
 DuckDB reads column statistics for a scan of several Parquet files only with `union_by_name`.

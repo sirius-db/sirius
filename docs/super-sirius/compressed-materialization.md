@@ -325,7 +325,12 @@ the finished sidecars at wrap time rather than through a propagation case:
   partial batch layout deviates from the declared output — multiple grouping sets, grouping
   functions, AVG (SUM + COUNT decomposition adds a partial column), COUNT(DISTINCT) (LIST partial
   column) — keep the native boundary. So does any `FIRST`: its carried columns are copied out of
-  the chosen row rather than aggregated, which this model does not describe.
+  the chosen row rather than aggregated, which this model does not describe. A
+  [dictionary carrier](optimizations.md#dictionary-carrier) key is the exception: the partial
+  aggregate groups on its codes and emits STRING keys, so its PARTITION and MERGE_GROUP_BY never
+  see a dictionary.
+- A dictionary carrier is a hint: a batch may carry it as STRING, so any PARTITION decodes a
+  carrier key before hashing, and a carrier payload whose keys every partition would copy.
 - Distinct- and sort-side exchanges are native because their inputs are restored at the
   boundary.
 
