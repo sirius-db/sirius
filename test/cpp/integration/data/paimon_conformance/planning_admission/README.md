@@ -17,7 +17,9 @@ python3 check.py ../warehouse/reference.db/append_basic
 ```
 
 To chain a stock SDK probe after admission, add `-- /path/to/reader` after
-the fixture path. The regression tests use a sentinel to check dispatch.
+the fixture path. Configure the reader to select snapshot 2 explicitly. The
+diagnostic passes the table path and the reader owns snapshot selection. The
+regression tests use a sentinel to check dispatch.
 The actual native CPU run belongs to the SDK and reader pair. This
 diagnostic assumes these specific fixture schemas and a sealed view of the
 files between validation and reading. Codec workspace, physical backing and
