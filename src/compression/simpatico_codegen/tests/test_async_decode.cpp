@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "api/simpatico_codegen.hpp"
+#include "codegen/bridge/meld_backend.hpp"
 #include "codegen/decode/jit/renderer.hpp"
 #include "codegen/jit/kernel_cache.hpp"
 #include "decode/decode_session.hpp"
@@ -1700,6 +1701,10 @@ void test_submission_and_kernel_lifetime(rmm::device_async_resource_ref upstream
   codegen::jit::CompileOptions options;
   options.arch_cc = codegen::jit::arch_cc_for_current_device();
   auto handle     = cache.get_or_compile_plain(spec.source, spec.entry_symbol, options);
+  // The kernel the session launches, which is Meld's where SIMPATICO_CODEGEN_BACKEND says so.
+  if (simpatico::meld::decode_backend() == simpatico::meld::Backend::meld) {
+    handle = simpatico::meld::plain_decode_kernel(*shape, "int32_t").value().kernel;
+  }
   std::weak_ptr<codegen::jit::CompiledKernel const> retained = handle;
   handle.reset();
 
@@ -2298,7 +2303,9 @@ void test_temporaries_released_at_submission(rmm::device_async_resource_ref upst
   checked_resource ledger(upstream);
   current_resource_guard current(ledger);
 
-  // Each request's ledger peak and output bytes when it is decoded alone.
+  // Each request's ledger peak and output bytes when it is decoded alone. Shadow mode's second
+  // decode is a temporary of any request Meld decodes.
+  auto const shadow = simpatico::meld::decode_backend() == simpatico::meld::Backend::shadow;
   std::vector<std::size_t> solo_peak(fixtures.size());
   std::vector<std::size_t> output_bytes(fixtures.size());
   for (std::size_t i = 0; i < fixtures.size(); ++i) {
@@ -2308,10 +2315,12 @@ void test_temporaries_released_at_submission(rmm::device_async_resource_ref upst
       session.append(value_request(columns[i]));
       outputs = session.finish();
     }
-    solo_peak[i]    = ledger.observations->peak_live_bytes;
-    output_bytes[i] = ledger.observations->live_bytes;
-    expect(output_bytes[i] > 0 && (solo_peak[i] > output_bytes[i]) == fixtures[i].temporaries,
-           "temporary fixture's decode temporaries differ from what it declares");
+    solo_peak[i]           = ledger.observations->peak_live_bytes;
+    output_bytes[i]        = ledger.observations->live_bytes;
+    auto const temporaries = solo_peak[i] > output_bytes[i];
+    expect(
+      output_bytes[i] > 0 && (temporaries == fixtures[i].temporaries || (shadow && temporaries)),
+      "temporary fixture's decode temporaries differ from what it declares");
     outputs.clear();
     ledger.check();
     ledger.reset();
