@@ -1550,6 +1550,25 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
       partition->set_physical_types(hgb_ptr->get_physical_types());
     }
     partition->set_alternate_physical_types(std::move(alternate_types));
+
+    // Table aggregation (off by default): the local aggregate folds batches into one table per
+    // GPU and PARTITION drains what the tables still hold once the aggregate's pipeline ends.
+    // That drain needs PARTITION's FULL ingress, which runtime size estimation relaxes.
+    if (op_params.agg_table_enabled && !op_params.enable_runtime_size_estimation) {
+      sirius::op::table_aggregate_options table_options;
+      table_options.memory_fraction  = op_params.agg_table_memory_fraction;
+      table_options.max_budget_bytes = op_params.agg_table_budget_bytes;
+      table_options.inject_fold_oom  = op_params.test_inject_agg_table_fold_oom;
+      if (op_params.hash_partition_bytes > 0) {
+        table_options.flush_chunk_bytes = op_params.hash_partition_bytes;
+      }
+      std::string why_not;
+      if (grouped.enable_table_aggregate(table_options, &why_not)) {
+        partition->set_pending_state_source(grouped.table_aggregate());
+      } else {
+        SIRIUS_LOG_DEBUG("grouped aggregate keeps the cuDF path: {}", why_not);
+      }
+    }
     partition->children.push_back(std::move(hgb_op));
 
     // Bind merge sizing independently of the local aggregate's explicit key description.

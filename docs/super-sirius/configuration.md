@@ -121,6 +121,9 @@ sirius:
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
     enable_runtime_size_estimation: false  # project total port input from upstream ratios
+    agg_table_enabled: false         # GROUP BY over one key: one hash table per GPU across batches
+    agg_table_memory_fraction: 0.25  # share of one GPU's memory such a table may hold
+    agg_table_budget_bytes: 0        # cap in bytes on one such table (0 = no cap)
     enable_decimal_sum_stats_bound: true  # decide decimal and BIGINT SUM width from statistics at plan time
   telemetry:
     enable_quent: true
@@ -800,6 +803,9 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
+| `agg_table_enabled` | false | Fold a grouped aggregation over one fixed-width key with COUNT, SUM, MIN, MAX and AVG into one hash table per GPU that lives across batches, instead of aggregating every batch on its own. Other aggregations, and batches a table cannot take, keep the per-batch path. Ignored while `enable_runtime_size_estimation` is on. See [Table aggregation](operators.md#table-aggregation). |
+| `agg_table_memory_fraction` | 0.25 | Share of one GPU's memory space a table of `agg_table_enabled` may hold, in (0, 1]. The table cannot be spilled. |
+| `agg_table_budget_bytes` | 0 (no cap) | Cap in bytes on one such table, below the share above. |
 | `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input, or the BIGINT input of a SUM or AVG that DuckDB accumulates in HUGEINT, must be widened before aggregation, or whether a DECIMAL128 SUM input can be summed as DECIMAL64. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
@@ -1270,6 +1276,13 @@ error. See [Data Size Estimation](data-size-estimation.md) for the design.
 
 ```sql
 SET enable_runtime_size_estimation = true;   -- off by default
+```
+
+The table aggregation is set the same way; `agg_table_memory_fraction` and
+`agg_table_budget_bytes` bound each table.
+
+```sql
+SET agg_table_enabled = true;                -- off by default
 ```
 
 ### Transparent Execution

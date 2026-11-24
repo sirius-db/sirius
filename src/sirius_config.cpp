@@ -718,6 +718,13 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
       "'operator_params.avg_variable_column_bytes': must be greater than zero");
   }
   r.optional("enable_runtime_size_estimation", opt.enable_runtime_size_estimation);
+  r.optional("agg_table_enabled", opt.agg_table_enabled);
+  r.optional("agg_table_memory_fraction", opt.agg_table_memory_fraction);
+  if (!(opt.agg_table_memory_fraction > 0.0) || opt.agg_table_memory_fraction > 1.0) {
+    throw std::runtime_error("'operator_params.agg_table_memory_fraction': must be in (0, 1]");
+  }
+  // 0 is meaningful here: it leaves the budget to the share above.
+  r.optional("agg_table_budget_bytes", yaml::bytes(opt.agg_table_budget_bytes));
   r.optional("use_hw_decompression", opt.use_hw_decompression);
   r.reject_unknown();
 }

@@ -27,6 +27,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/table_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <atomic>
@@ -35,6 +36,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <string>
 #include <vector>
 
 namespace sirius {
@@ -152,6 +154,38 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
+
+  /**
+   * @brief Switches this aggregate to the table aggregation (`table_aggregate_state`), if it can
+   * use it.
+   *
+   * The table handles one key column and aggregates that decompose into COUNT, SUM, MIN and MAX;
+   * every other aggregate keeps the cuDF path and this returns false. Call it at plan time,
+   * before any task runs, and bind the returned state's end-of-input flush to this operator's
+   * consumer (`sirius_physical_partition::set_pending_state_source`): the rows a table still
+   * holds when the input ends are published by the consumer's tasks, not by this operator's.
+   *
+   * @param options Memory share and flush sizing
+   * @param why_not If not null, receives the reason for a false return
+   * @return Whether the table aggregation is now on
+   */
+  bool enable_table_aggregate(table_aggregate_options const& options,
+                              std::string* why_not = nullptr);
+
+  /// The table aggregation's state; nullptr unless `enable_table_aggregate` returned true.
+  [[nodiscard]] std::shared_ptr<table_aggregate_state> const& table_aggregate() const noexcept
+  {
+    return _table_aggregate;
+  }
+
+ protected:
+  void on_finalize_operator() override;
+
+ private:
+  std::unique_ptr<operator_data> execute_with_table(const pipelineable_operator_data& input,
+                                                    ::cuda::stream_ref stream);
+
+  std::shared_ptr<table_aggregate_state> _table_aggregate;
 };
 
 }  // namespace op

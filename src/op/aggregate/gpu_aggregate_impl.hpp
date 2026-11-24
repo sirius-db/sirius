@@ -20,6 +20,7 @@
 
 #include <cudf/aggregation.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/table/table_view.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -108,6 +109,30 @@ class gpu_aggregate_impl {
    */
   static std::shared_ptr<cucascade::data_batch> local_grouped_aggregate(
     const cucascade::read_only_data_batch& input,
+    const std::vector<int>& group_idx,
+    const std::vector<cudf::aggregation::Kind>& aggregates,
+    const std::vector<int>& aggregate_idx,
+    const std::vector<std::vector<int>>& aggregate_struct_col_indices,
+    const std::vector<int>& carried_idx,
+    ::cuda::stream_ref stream,
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info                    = {},
+    const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
+    const std::vector<bool>& aggregate_is_wide_integer_sum                   = {},
+    bool split_wide_integer_sums                                             = false,
+    cudf::size_type* num_groups                                              = nullptr,
+    bool enable_low_cardinality_groupby                                      = true);
+
+  /**
+   * @brief Perform local grouped aggregate on rows that are not a whole data batch.
+   *
+   * The table aggregation (table_aggregate_state) uses it for the rows of a batch that its table
+   * did not take. Parameters and result are those of the overload above.
+   *
+   * @param input The input rows, on the GPU of @p memory_space.
+   */
+  static std::shared_ptr<cucascade::data_batch> local_grouped_aggregate(
+    cudf::table_view const& input,
     const std::vector<int>& group_idx,
     const std::vector<cudf::aggregation::Kind>& aggregates,
     const std::vector<int>& aggregate_idx,

@@ -959,7 +959,39 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   cudf::size_type* num_groups,
   bool enable_low_cardinality_groupby)
 {
-  auto output_table = grouped_aggregate_table(get_cudf_table_view(input),
+  return local_grouped_aggregate(get_cudf_table_view(input),
+                                 group_idx,
+                                 aggregates,
+                                 aggregate_idx,
+                                 aggregate_struct_col_indices,
+                                 carried_idx,
+                                 stream,
+                                 memory_space,
+                                 telemetry_info,
+                                 aggregate_input_max_abs,
+                                 aggregate_is_wide_integer_sum,
+                                 split_wide_integer_sums,
+                                 num_groups,
+                                 enable_low_cardinality_groupby);
+}
+
+std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
+  cudf::table_view const& input,
+  const std::vector<int>& group_idx,
+  const std::vector<cudf::aggregation::Kind>& aggregates,
+  const std::vector<int>& aggregate_idx,
+  const std::vector<std::vector<int>>& aggregate_struct_col_indices,
+  const std::vector<int>& carried_idx,
+  ::cuda::stream_ref stream,
+  cucascade::memory::memory_space& memory_space,
+  const telemetry::batch_telemetry_info& telemetry_info,
+  const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs,
+  const std::vector<bool>& aggregate_is_wide_integer_sum,
+  bool split_wide_integer_sums,
+  cudf::size_type* num_groups,
+  bool enable_low_cardinality_groupby)
+{
+  auto output_table = grouped_aggregate_table(input,
                                               group_idx,
                                               aggregates,
                                               aggregate_idx,

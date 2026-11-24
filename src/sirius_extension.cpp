@@ -3281,6 +3281,39 @@ static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
   // current_setting still reported the old value.
 }
 
+static void SetAggTableEnabled(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params              = get_operator_params(context, scope);
+  params->agg_table_enabled = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config AGG_TABLE_ENABLED to {}", params->agg_table_enabled);
+}
+
+static void SetAggTableMemoryFraction(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const fraction = DoubleValue::Get(parameter);
+  if (!(fraction > 0.0) || fraction > 1.0) {
+    throw InvalidInputException("agg_table_memory_fraction must be in (0.0, 1.0], got %f",
+                                fraction);
+  }
+  auto* params                      = get_operator_params(context, scope);
+  params->agg_table_memory_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config AGG_TABLE_MEMORY_FRACTION to {}",
+                   params->agg_table_memory_fraction);
+}
+
+static void SetAggTableBudgetBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                   = get_operator_params(context, scope);
+  params->agg_table_budget_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config AGG_TABLE_BUDGET_BYTES to {}", params->agg_table_budget_bytes);
+}
+
+static void SetTestInjectAggTableFoldOom(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                           = get_operator_params(context, scope);
+  params->test_inject_agg_table_fold_oom = UBigIntValue::Get(parameter);
+}
+
 static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                           = get_operator_params(context, scope);
@@ -4071,6 +4104,37 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_runtime_size_estimation),
     SetEnableRuntimeSizeEstimation);
+
+  config.AddExtensionOption(
+    "agg_table_enabled",
+    "Fold a grouped aggregation over one fixed-width key into a hash table per GPU that lives "
+    "across batches, instead of aggregating every batch on its own. Off by default",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.agg_table_enabled),
+    SetAggTableEnabled);
+
+  config.AddExtensionOption(
+    "agg_table_memory_fraction",
+    "Share of one GPU's memory a table of agg_table_enabled may hold, in (0, 1]",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.agg_table_memory_fraction),
+    SetAggTableMemoryFraction);
+
+  config.AddExtensionOption(
+    "agg_table_budget_bytes",
+    "Cap in bytes on one table of agg_table_enabled, below agg_table_memory_fraction; 0 = no cap",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.agg_table_budget_bytes),
+    SetAggTableBudgetBytes);
+
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_agg_table_fold_oom",
+                    "the first N table folds of each grouped aggregate run out of memory after "
+                    "they were applied",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0),
+                    SetTestInjectAggTableFoldOom);
 }
 
 // Publish the transparent optimizer mask once at extension load, unioned

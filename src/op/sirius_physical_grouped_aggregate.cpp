@@ -16,7 +16,9 @@
 
 #include "op/sirius_physical_grouped_aggregate.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/common/assert.hpp"
+#include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "op/aggregate/wide_integer_sum.hpp"
@@ -170,7 +172,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_grouped_aggregate::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  if (_table_aggregate) { return execute_with_table(input, stream); }
   const auto& input_batches = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   auto const carried = carried_inputs(aggregate_slots);
@@ -216,6 +219,137 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);
+}
+
+bool sirius_physical_grouped_aggregate::enable_table_aggregate(
+  table_aggregate_options const& options, std::string* why_not)
+{
+  auto const refuse = [&](std::string reason) {
+    if (why_not != nullptr) { *why_not = std::move(reason); }
+    return false;
+  };
+  if (has_grouping_sets()) { return refuse("grouping sets"); }
+  if (group_idx.size() != 1) { return refuse("not a single key column"); }
+  if (has_count_distinct || has_stddev_samp() || has_first()) {
+    return refuse("COUNT(DISTINCT), STDDEV_SAMP or FIRST");
+  }
+  // A narrowed key or aggregate carrier has another runtime type than the declared one.
+  if (has_physical_overrides()) { return refuse("narrow carriers on the aggregate"); }
+  if (children.size() != 1) { return refuse("not exactly one input"); }
+  for (auto const& slot : aggregate_slots) {
+    if (auto const* plain = std::get_if<plain_slot>(&slot)) {
+      // A HUGEINT input is summed in DECIMAL128 with a range check at the merge.
+      if (plain->sums_hugeint_input) { return refuse("SUM over HUGEINT"); }
+    } else if (auto const* avg = std::get_if<avg_slot>(&slot)) {
+      if (avg->sums_hugeint_input) { return refuse("AVG over HUGEINT"); }
+    } else {
+      return refuse("an aggregate that is not COUNT, SUM, MIN, MAX or AVG");
+    }
+  }
+  for (auto const& struct_columns : cudf_aggregate_struct_col_indices) {
+    if (!struct_columns.empty()) { return refuse("an aggregate over several columns"); }
+  }
+
+  auto const& child      = *children[0];
+  auto const& child_cols = child.get_types();
+  auto const input_type  = [&](int column) -> std::optional<cudf::data_type> {
+    if (column < 0 || static_cast<std::size_t>(column) >= child_cols.size()) {
+      return std::nullopt;
+    }
+    auto const idx = static_cast<std::size_t>(column);
+    if (child.has_physical_overrides()) {
+      auto const& physical = child.get_physical_types();
+      return idx < physical.size() ? std::optional{physical[idx]} : std::nullopt;
+    }
+    try {
+      return sirius::require_cudf_type(child_cols[idx]);
+    } catch (std::exception const&) {
+      return std::nullopt;
+    }
+  };
+
+  table_aggregate_plan plan;
+  plan.key_column     = group_idx[0];
+  auto const key_type = input_type(group_idx[0]);
+  if (!key_type) { return refuse("key type has no cuDF carrier"); }
+  plan.key_type = *key_type;
+  for (std::size_t i = 0; i < cudf_aggregates.size(); ++i) {
+    auto const type = input_type(cudf_aggregate_idx[i]);
+    if (!type) { return refuse("aggregate input type has no cuDF carrier"); }
+    plan.aggregates.push_back(cudf_aggregates[i]);
+    plan.aggregate_columns.push_back(cudf_aggregate_idx[i]);
+    plan.aggregate_input_types.push_back(*type);
+  }
+  plan.input_max_abs       = cudf_aggregate_input_max_abs;
+  plan.is_wide_integer_sum = cudf_aggregate_is_wide_integer_sum;
+  if (child.estimated_cardinality > 0) { plan.rows_hint = child.estimated_cardinality; }
+
+  _table_aggregate = table_aggregate_state::try_create(std::move(plan), options, why_not);
+  return _table_aggregate != nullptr;
+}
+
+std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute_with_table(
+  const pipelineable_operator_data& input, ::cuda::stream_ref stream)
+{
+  const auto& input_batches = input.get_read_only_batches();
+  // A replayed task passes the same input object, so these ids name the same rows on every
+  // attempt (see pipelineable_operator_data::original_batch_ids). The table keys its
+  // exactly-once records on them.
+  auto const batch_ids = input.original_batch_ids();
+  // Without one id per batch there is nothing to key a replay on. Where late materialization
+  // restores a deferral at this operator's port, the rows a table would flush later would
+  // bypass that restore. Both keep the cuDF path.
+  bool const use_table = batch_ids.size() == input_batches.size() && port_directive().empty();
+  if (!use_table && _table_aggregate->enabled()) {
+    _table_aggregate->disable("input batches carry no stable ids, or a deferral ends here");
+  }
+  std::vector<std::shared_ptr<::cucascade::data_batch>> results;
+  auto const carried = carried_inputs(aggregate_slots);
+  for (std::size_t i = 0; i < input_batches.size(); ++i) {
+    auto const& input_batch = input_batches[i];
+    auto* space             = input_batch.get_memory_space();
+    if (!space) { continue; }
+    // The cuDF local aggregation, exactly as execute() runs it without a table.
+    table_aggregate_state::legacy_aggregate const legacy = [&](cudf::table_view const& rows) {
+      auto const last_groups     = _last_batch_groups.load(std::memory_order_relaxed);
+      bool const split_wide_sums = last_groups <= split_wide_sum_max_groups;
+      cudf::size_type num_groups = 0;
+      auto result                = gpu_aggregate_impl::local_grouped_aggregate(
+        rows,
+        group_idx,
+        cudf_aggregates,
+        cudf_aggregate_idx,
+        cudf_aggregate_struct_col_indices,
+        carried,
+        stream,
+        *space,
+        batch_telemetry(),
+        cudf_aggregate_input_max_abs,
+        cudf_aggregate_is_wide_integer_sum,
+        split_wide_sums,
+        &num_groups,
+        operator_options().enable_low_cardinality_groupby);
+      // A probe of the schema on no rows says nothing about the input's groups.
+      if (rows.num_rows() > 0) { _last_batch_groups.store(num_groups, std::memory_order_relaxed); }
+      return result;
+    };
+    auto const rows = sirius::get_cudf_table_view(input_batch);
+    if (use_table) {
+      _table_aggregate->aggregate_batch(
+        rows, batch_ids[i], stream, *space, batch_telemetry(), legacy, results);
+    } else {
+      results.push_back(legacy(rows));
+    }
+  }
+  if (use_table) { _table_aggregate->complete_batches(batch_ids); }
+  return std::make_unique<pipelineable_operator_data>(results);
+}
+
+void sirius_physical_grouped_aggregate::on_finalize_operator()
+{
+  // This pipeline has finished: no task folds any more. Tables that hold rows wait for the
+  // consumer's end-of-input flush tasks; the others are freed here, each on its own GPU.
+  if (_table_aggregate) { _table_aggregate->release_idle_tables(); }
 }
 }  // namespace op
 }  // namespace sirius
