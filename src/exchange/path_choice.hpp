@@ -29,11 +29,6 @@ namespace sirius::exchange {
 /// @throws sirius::invalid_input_exception on any other value.
 [[nodiscard]] host_staging parse_host_staging(std::string_view value);
 
-/// Whether the rings go in fabric memory, so that peers on other nodes of this NVLink domain
-/// write them over NVLink (MNNVL). automatic: where the GPU and driver allow it; require: every
-/// peer must be reached that way; off: cudaMalloc rings, as before.
-enum class mnnvl_mode { automatic, require, off };
-
 /// "auto", "require" or "off", as the sirius_exchange_mnnvl setting takes it.
 /// @throws sirius::invalid_input_exception on any other value.
 [[nodiscard]] mnnvl_mode parse_mnnvl(std::string_view value);
@@ -69,7 +64,7 @@ struct endpoint {
  * else nixl.
  *
  * @throws sirius::invalid_input_exception when @p mnnvl is require and the peer cannot be
- *         reached over the NVLink fabric.
+ *         reached over the NVLink fabric, or @p staging (always, remote) stages every peer.
  */
 [[nodiscard]] path choose_path(endpoint const& me,
                                endpoint const& peer,

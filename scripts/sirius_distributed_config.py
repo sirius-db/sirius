@@ -103,6 +103,9 @@ def main():
         if var is None:
             known = ", ".join(".".join(k) for k in KEYS)
             sys.exit(f"{path}: unknown key {name} (known: {known})")
+        # YAML 1.1 reads a bare off as False.
+        if keys == ("exchange", "mnnvl") and value is False:
+            value = "off"
         text = shell_value(value)
         if text is None:
             sys.exit(f"{path}: {name} must be a string, a number or a list of them")
