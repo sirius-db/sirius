@@ -1020,6 +1020,28 @@ bound (`scan_source_names`, `src/planner/scan_source_names.hpp`), not by
 bind, or one whose column count differs from the `LogicalGet`'s, falls back to
 `LogicalGet::names`.
 
+## Opt-in native Paimon snapshot admission
+
+`SIRIUS_ENABLE_PAIMON_SDK` builds a native Paimon reader and cursor and defaults to
+`OFF`. The component has no production SQL registration.
+
+For the numbered-snapshot controls, use unmodified
+[Paimon C++ 9520864c](https://github.com/apache/paimon-cpp/tree/9520864cb8b222a671eda24cf6c56b48231d63e5)
+with the matching GNU C++11 ABI on Linux. Build Paimon with
+`PAIMON_BUILD_SHARED=ON`, `PAIMON_ENABLE_AVRO=ON`, and `PAIMON_USE_CXX11_ABI=ON`.
+Configure Sirius with `-DSIRIUS_ENABLE_PAIMON_SDK=ON`,
+`-DPaimon_DIR=<directory containing PaimonConfig.cmake>`, and
+`-DSIRIUS_PAIMON_ARROW_INCLUDE_DIR=<Arrow 17 include root>`. The latter must
+contain `arrow/c/abi.h` and can point to the matching Arrow install used to build
+Paimon. Tests load LocalFS, Avro and Parquet shared modules from the same Paimon
+installation. The runtime loader must resolve the matching core and C++ runtimes.
+
+The optional lease covers the numbered snapshot's ordinary string allocation
+request on this SDK and ABI. The caller must provide a budget and the selected
+filesystem for its bound immutable local snapshot. Production admission also
+requires verified SDK identity and bounds for decoder scratch, retained
+manifests and plans, native batches, and detached and staged output.
+
 ## Key Files
 
 | File | Purpose |

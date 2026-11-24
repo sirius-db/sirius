@@ -22,6 +22,25 @@ set_target_properties(
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 add_dependencies(sirius_unittest sirius_extension_host)
+if(SIRIUS_ENABLE_PAIMON_SDK)
+  target_include_directories(sirius_unittest SYSTEM
+                             PRIVATE "${SIRIUS_PAIMON_ARROW_INCLUDE_DIR}")
+  target_link_libraries(sirius_unittest Paimon::paimon_shared)
+  foreach(module IN ITEMS local_file_system avro_file_format
+                          parquet_file_format)
+    if(NOT TARGET Paimon::paimon_${module}_shared)
+      message(FATAL_ERROR "Paimon native tests require shared ${module} module")
+    endif()
+    add_dependencies(sirius_unittest Paimon::paimon_${module}_shared)
+  endforeach()
+  target_compile_definitions(
+    sirius_unittest
+    PRIVATE
+      SIRIUS_PAIMON_LOCAL_MODULE="$<TARGET_FILE:Paimon::paimon_local_file_system_shared>"
+      SIRIUS_PAIMON_AVRO_MODULE="$<TARGET_FILE:Paimon::paimon_avro_file_format_shared>"
+      SIRIUS_PAIMON_PARQUET_MODULE="$<TARGET_FILE:Paimon::paimon_parquet_file_format_shared>"
+  )
+endif()
 
 # Compile the public API test separately so engine tests remain C++20.
 add_library(
