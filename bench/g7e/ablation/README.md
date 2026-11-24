@@ -3,6 +3,8 @@
 The November 23 [BUILD_PROBE-first results](results/20261123/RESULTS.md) and
 [type-narrowing-first results](results/20261123-type-first/RESULTS.md) preserve
 complete stages, partial sums and allocation failures separately.
+The [all-on except compressed pinning case](results/20261123-all-on-uncompressed/RESULTS.md)
+keeps the other four switches enabled and makes every pin explicitly uncompressed.
 
 This supports the corrected cumulative orders from the
 [GB300 study](../../gb300/ablation/RESULTS.md#corrected-build_probe-first-comparison)
@@ -23,6 +25,14 @@ type narrowing, BUILD_PROBE admission, dynamic filtering, compressed pinning,
 then fused filtering. The default is `--order build-first`. All other settings,
 pin controls and process boundaries are identical. A new output directory
 preserves the earlier order's measurements.
+
+Pass `--all-on-uncompressed` to run a single additional case: type narrowing,
+BUILD_PROBE, dynamic filtering and fused scan/filter enabled, with every host
+pin explicitly using `compression=false` (GB300 stage 7). Its effective YAML
+matches the all-on compressed stage; only the per-call pin compression policy
+differs. The fused switch remains enabled, but there is no compressed pinned
+input for fused decode to operate on. Use a new output directory. Compare only
+matching completed queries if raw pins exceed host capacity.
 
 As on GB300, each stage starts one fresh engine, clears caches at startup, and
 runs Q1–Q22 once. Each query pins only its referenced host columns, executes,
@@ -54,7 +64,7 @@ pixi run --locked python bench/g7e/ablation/run.py \
   --output /path/to/new-ablation-output
 ```
 
-`--dry-run` prints the six-stage protocol without AWS or GPU access. Real runs
+`--dry-run` prints the selected protocol without AWS or GPU access. Real runs
 belong in detached tmux. Each stage has the GB300 study's 600-second wall limit,
 including pinning. Errors and partial timings are retained, and later stages
 continue. A failed or incomplete stage never receives a full-suite sum.

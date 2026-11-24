@@ -1,0 +1,4 @@
+case,completed_queries,full_suite_sum_s,common_query_sum_s
+all_on_uncompressed,18,,40.386595
+previous_all_on_compressed,22,29.425129,23.195274
+previous_raw_fused_off,18,,40.405679

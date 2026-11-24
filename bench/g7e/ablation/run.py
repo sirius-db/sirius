@@ -67,6 +67,16 @@ def stage_config(base, stage):
     return doc
 
 
+def selected_stages(order, all_on_uncompressed=False):
+    if all_on_uncompressed:
+        stage = stage_spec(5, order)
+        stage.update(
+            stage=0, gb300_stage=7, label="all_on_uncompressed", compressed_pin=False
+        )
+        return [stage]
+    return [stage_spec(i, order) for i in range(6)]
+
+
 def coverage_table(label):
     return Path(label).parent.name if label.endswith(".parquet") else label
 
@@ -83,17 +93,23 @@ def main():
         "--order", choices=("build-first", "type-first"), default="build-first"
     )
     parser.add_argument(
+        "--all-on-uncompressed",
+        action="store_true",
+        help="Run only the all-on case with compression=false on every host pin",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Collect existing workers without repeating them",
     )
     args = parser.parse_args()
-    stages = [stage_spec(i, args.order) for i in range(6)]
+    stages = selected_stages(args.order, args.all_on_uncompressed)
     if args.dry_run:
         print(
             json.dumps(
                 dict(
                     order=args.order,
+                    all_on_uncompressed=args.all_on_uncompressed,
                     stages=stages,
                     queries=list(range(1, 23)),
                     iterations=1,
@@ -145,10 +161,9 @@ def main():
     host = args.host_input.resolve(strict=True)
     if args.resume:
         prior = json.loads((root / "preflight.json").read_text())
-        assert (
-            json.loads((root / "plan.json").read_text()).get("order", "build-first")
-            == args.order
-        )
+        prior_plan = json.loads((root / "plan.json").read_text())
+        assert prior_plan.get("all_on_uncompressed", False) == args.all_on_uncompressed
+        assert prior_plan.get("order", "build-first") == args.order
         assert (
             prior["input_hashes_verified"]
             and prior["ec2"]["instanceId"] == identity["instanceId"]
@@ -194,6 +209,7 @@ def main():
         root / "plan.json",
         dict(
             order=args.order,
+            all_on_uncompressed=args.all_on_uncompressed,
             stages=stages,
             iterations=1,
             queries=list(range(1, 23)),
@@ -388,7 +404,11 @@ def main():
         dict(
             source_commit=guide.PIN,
             scale_factor=1000,
-            protocol="corrected GB300 " + args.order,
+            protocol=(
+                "GB300 all-on except compressed pinning"
+                if args.all_on_uncompressed
+                else "corrected GB300 " + args.order
+            ),
             totals=totals,
             proofs=rows,
             complete=all(t["complete"] for t in totals),
@@ -396,7 +416,7 @@ def main():
         ),
     )
     with (root / "per-query.csv").open("w", newline="") as stream:
-        writer = csv.writer(stream)
+        writer = csv.writer(stream, lineterminator="\n")
         writer.writerow(["stage", "label", "query", "seconds", "correct"])
         writer.writerows(
             [r[k] for k in ["stage", "label", "query", "seconds", "correct"]]

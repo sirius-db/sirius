@@ -1,0 +1,73 @@
+{
+  "all_staged_file_hashes_verified": true,
+  "archive": {
+    "all_payload_hashes_verified_after_download": true,
+    "bytes": 23994131,
+    "filename": "g7e8-london-sf1k-host-ablation-all-on-uncompressed-20261123-full-results.tar.gz",
+    "files": 185,
+    "payload_bytes": 84096477,
+    "sha256": "a0e6fe0b454eb4c95902da9a75e8a3e0803549d327d3404be7778b6cd1791739"
+  },
+  "base_config_sha256": "a96d6e0715fddcd807c7b5e69fc8d0ecfcfd93c5ecf11f26a13556dad325e642",
+  "common_queries": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18
+  ],
+  "common_query_sums_s": {
+    "compressed_all_on_previous": 23.195274,
+    "raw_fused_off_previous": 40.405679,
+    "raw_fused_on_new": 40.386595
+  },
+  "compressed_pin_policy": "compression=false explicitly on every pin call; all four other switches on",
+  "config_sha256": "519d9758bd79b5aef99b019ec2b3e03aadaa1ef07b1c634c31c0f562480bc29c",
+  "dataset_manifest_sha256": "884a627553d7a3d0f5cc41bdf451b3d7353274cb2dabcf1555e5c8e17537785a",
+  "date_timezone": "America/Chicago",
+  "engine_commit": "26b5caba3e2c96290fdc63d4cf40ac42572eaab8",
+  "executed_controller_ast_matches_published": true,
+  "executed_source_sha256": {
+    "ablation/run.py": "45e58088f927476b2e0f3f962ac8af06c7181bbdd9324e46b52ff0508c1490bd",
+    "ablation/worker.py": "cc53c773bcd9f6af9ac60b968b4997632ac89ad16d50f0ebdba9732a0ce9b5af",
+    "guide-26b5caba/supervisor.py": "e42ffa05aa4b013ac5c69e273827ae4b69e0c9e7590165227a06263e2ce7422b",
+    "guide-26b5caba/worker.py": "9f7a673999444e4ea15b67a2b96e945948c39973a3ffa57d3afd57b18418810b"
+  },
+  "hardware": "g7e.8xlarge",
+  "lifecycle": "One fresh engine for the stage, one iteration Q1-Q22, host pin/unpin per query, startup cache clear only, no warmup or profile/mode override",
+  "native_library_sha256": "090f552314d37196b6c0509a261a9656034a287e03524531dd7e1af3ccc79236",
+  "prior_comparison": "../20261123-type-first/RESULTS.md",
+  "protocol": "GB300 all-on except compressed pinning",
+  "published_controller_sha256": "829ac24eeadf3880351f75589a222d8c8e3f03b053e97597334ffbaaab2dddbb",
+  "region": "eu-west-2",
+  "result_date": "2026-11-23",
+  "runner_package_sha256": "370233627848410d3b53e3f47850220037c759112b2849785fc3af06036040a6",
+  "same_region_s3": {
+    "bucket": "sae-dataproc-aws-dev-sirius-scratch-eu-west-2",
+    "region": "eu-west-2",
+    "tables_present": [
+      "region",
+      "nation",
+      "supplier",
+      "customer",
+      "part",
+      "partsupp",
+      "orders",
+      "lineitem"
+    ]
+  },
+  "stage_plan_sha256": "2c8da8be2d716d63d4a44f6635fac7054b33380b3ba09d1e4824af639d2309b9"
+}

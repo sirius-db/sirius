@@ -1,0 +1,46 @@
+{
+  "all_completed_answers_correct": true,
+  "archive_sha256": "a0e6fe0b454eb4c95902da9a75e8a3e0803549d327d3404be7778b6cd1791739",
+  "common_queries": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18
+  ],
+  "common_query_sums_s": {
+    "compressed_all_on_previous": 23.195274,
+    "raw_fused_off_previous": 40.405679,
+    "raw_fused_on_new": 40.386595
+  },
+  "compressed_chunks": 0,
+  "date_timezone": "America/Chicago",
+  "explicit_raw_pin_calls": 61,
+  "failure": {
+    "error": "_duckdb.Error: std::bad_alloc: out_of_memory: Not enough free blocks available in fixed_size_host_memory_resource. total_bytes: 1929379840, upstream_tracked_bytes: 1929379840, only 113 free blocks available from 1840 requested blocks.",
+    "phase": "host pinning",
+    "query": 19,
+    "timed_out": false
+  },
+  "fresh_processes": 1,
+  "instance_lifecycle": "retained running",
+  "no_extra_diagnostic_queries": true,
+  "quent_contexts": 1,
+  "quent_executions": 18,
+  "query_attempts": 18,
+  "result_date": "2026-11-23",
+  "validated_timed_queries": 18
+}
