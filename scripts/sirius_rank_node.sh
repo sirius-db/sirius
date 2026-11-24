@@ -18,8 +18,8 @@
 # Once the rank listens, the script writes the sirius_gateway_add_rank call that registers it to
 # <dir>/add_rank.sql. With a gateway, it runs that call itself after every start of the rank,
 # retrying until it succeeds, and again whenever gateway.conf names a new gateway_id; the gateway
-# must SET GLOBAL sirius_gateway_allow_join = true. Without one, it prints the call, for the gateway's
-# console.
+# must SET GLOBAL sirius_gateway_allow_join = true. Without one, it prints the call, for the
+# gateway's console.
 # SIRIUS_RANK_TOKEN sets the rank's token; otherwise a random one is kept in <dir>/token. On a
 # listen host other than this machine's loopback, Quack serves TLS with a key pair kept in
 # <dir>/tls, whose fingerprint the gateway pins.
