@@ -199,7 +199,6 @@ single-process plan already partitions:
 | the same, with a small build side | `broadcast` of the build side; the probe side stays where it is |
 | `NESTED_LOOP_JOIN`, each side `CONCAT → PARTITION → input` | `broadcast` of the build side; the probe side stays where it is |
 | `DENSE_COUNT_JOIN`, each side `PARTITION → input` | `hash` on the join key, both sides |
-| `LEFT/RIGHT_DELIM_JOIN` | `hash` on the delim columns, before the input fans out to the inner join and the `DISTINCT`; `hash` on the inner join's other side |
 | `MERGE_GROUP_BY → PARTITION → HASH_GROUP_BY` | `hash` on the group keys, between `PARTITION` and `HASH_GROUP_BY` |
 | the same, with `COUNT(DISTINCT)` | `hash` on the group keys, below `HASH_GROUP_BY`: partial distinct sets are LIST columns, which the wire does not carry |
 | `MERGE_AGGREGATE → UNGROUPED_AGGREGATE` | `gather` to rank 0, between them |
@@ -224,8 +223,7 @@ row matches nothing off its home rank, since every probe row with its key hashes
 A nested-loop join refuses the types that emit unmatched build rows (`RIGHT`, `OUTER`,
 `RIGHT_SEMI`, `RIGHT_ANTI`), since every rank holds the whole build.
 
-Refused with `not_implemented_exception`: a delim join whose join keys are not its delim columns,
-`COUNT(DISTINCT)` with grouping sets, `ORDER BY` on an expression, a DuckDB table (#2374), a
+Refused with `not_implemented_exception`: `COUNT(DISTINCT)` with grouping sets, `ORDER BY` on an expression, a DuckDB table (#2374), a
 `read_parquet` of one remote URI (#2377), `filename` or `file_index` of a split table, byte
 ranges carried by the plan itself, a nested column crossing an exchange (grouped `STDDEV_SAMP`
 and ungrouped `COUNT(DISTINCT)` partials), and any other operator. Only Parquet tables read through
@@ -364,8 +362,8 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 
 ## Limits
 
-- **Joins:** a nested-loop join that emits unmatched build rows, and a delim join whose join
-  keys are not its delim columns, are refused rather than run per rank.
+- **Joins:** a nested-loop join that emits unmatched build rows is refused rather than run per
+  rank.
 - **Remote files:** an S3 table needs at least as many files as there are ranks; local files
   split by byte range have no such limit (#2377).
 - **Query start:** every rank must run the same statements in the same order, which is what

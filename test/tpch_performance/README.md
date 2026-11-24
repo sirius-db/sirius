@@ -289,8 +289,8 @@ Key flags:
 - `--profile cold|lukewarm|hot` (optional) — cache state to measure; see "Profiles" above. When given it overrides `cache.mode` / `cache.eviction` in `--config`; when omitted the config is left alone.
 - `--queries 1,3,6-10` — subset selection.
 - `--pin gpu|host|none` — Sirius cache pre-load tier. Both `gpu` and `host` are supported; `host` converts the pinned table into NUMA-local pinned host memory. Any other tier throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:811-813`).
-- `--pin-compression` / `--compression-plan-dir <dir>` — pin the tables Simpatico-compressed (requires `--pin gpu|host`; plan dir defaults to the shipped `plans/tpch_sf1000`). Confirm engagement by grepping the run's logs for `compressing with plan`.
-- `--validation` — byte-compare GPU vs CPU `result.txt` after timing (with `abs_tol=1e-10` on float columns). Requires `--engine both`.
+- `--compression-plan-dir <dir>` — per-table Simpatico plan files for the pins (requires `--pin gpu|host`). The runner sets no compression state of its own: pins compress under the engine's `pin_table_compression` setting (on by default; turn it off in the `--config` YAML or with `SIRIUS_PRE_SQL`), and without this flag their plans are selected automatically. Confirm engagement by grepping the run's logs for `chunk(s) compressed`.
+- `--validation` — compare GPU vs CPU after timing. Row output compares `result.txt` exactly first, then allows `abs_tol=1e-10` on float columns. Parquet output requires matching schemas and exact row multisets; see [Parquet output](../../docs/super-sirius/parquet-output.md). Requires `--engine both`.
 - `--precmd none|nsys|gdb` — normal in-process execution, per-query Nsight Systems capture, or per-query batch-mode GDB with an automatic all-thread crash backtrace. External runners require `--engine gpu` and are incompatible with `--profile`, `--validation`, and `--duckdb-profiling`.
 - `--query-timeout N` — per-query subprocess timeout for the `nsys` and `gdb` runners (default 90s).
 - `--name <NAME>` — label appended to the benchmark subdirectory name (`tpch_<ts>_<profile>_<engine>_iter<N>_<NAME>`); the run's parameters stay in the name.
@@ -440,17 +440,17 @@ Each query runs as its own `READ ONLY` transaction. q15 is a CTE in the 3.0.1 te
 query creates a view and nothing is shared between concurrent streams.
 
 `--pin-compression` pins the tables Simpatico-compressed (either tier): the runner sets
-`pin_table_compression` and points `pin_table_input_compression_plan_dir` at
-`--compression-plan-dir`, which defaults to the explore-generated TPC-H plans shipped under
-`src/compression/simpatico_codegen/plans/tpch_sf1000` (2 of 8 tables active — `lineitem`, `orders`;
-`part`, `partsupp`, `supplier`, `customer` are present but named `*_disabled.txt` pending
-performance/correctness validation of a whole-table plan against the SF1000 repro, and `nation`/
-`region` have no plans at all — all six pin uncompressed). Compression happens at pin time, so the
-flag requires a pinned tier.
-A table whose plan is missing or does not cover the pinned columns degrades to uncompressed with
-a `[pin_table]` WARN in the log; the runner counts the `compressing with plan` INFO markers after
-pinning and aborts if nothing compressed, so a misconfigured run cannot silently measure
-uncompressed data. Refreshed rows live in the uncompressed insert delta / delete mask on top of
+`pin_table_compression`, and each table's plans are selected automatically (see
+[Compressed Pinning](../../docs/super-sirius/compressed-pinning.md)). `--compression-plan-dir`
+points `pin_table_input_compression_plan_dir` at a directory of per-table plan overrides, such as
+the explore-generated TPC-H plans under `src/compression/simpatico_codegen/plans/tpch_sf1000`.
+Compression happens at pin time, so the flag requires a pinned tier.
+A table whose plan file does not cover the pinned columns degrades to uncompressed with
+a `[pin_table]` WARN in the log; the runner counts pins with compressed chunks from the final
+compression coverage records. If none compressed, it continues only when every expected pin
+has both an automatic table-size skip record and a completed, uncompressed coverage record.
+It reports that the run uses uncompressed pins; other zero-compression outcomes still abort.
+Refreshed rows live in the uncompressed insert delta / delete mask on top of
 the compressed base, which is exactly the recurring cost the post-RF passes measure.
 
 Power@Size is a geometric mean, so one very fast query would otherwise pull it up without bound;
@@ -545,7 +545,7 @@ sqrt(Power · Throughput)`.
 - The summary reports per-query `clean`, `post-RF1`, and `post-RF2` times, plus `delta overhead`
   (post-RF1 − clean) and `mask overhead` (post-RF2 − post-RF1). Power@Size itself uses only the
   post-RF1 stream.
-- Validation (default on with fixed predicates, power run only): the post-RF1 and post-RF2 GPU
+- Validation (default on with fixed predicates): the post-RF1 and post-RF2 GPU
   rows are stashed during the timed passes, then diffed against pure DuckDB **after every pinned
   phase has finished** — in a child process that never loads the extension. It cannot share the
   benchmark process: the host pool is a growing pool allocator, so unpinning returns blocks to the
@@ -558,10 +558,21 @@ sqrt(Power · Throughput)`.
   the cost is one extra copy of the base DB and an untimed CPU pass. q2/q11/q16 touch neither
   table and are skipped. Row-count movement across RF1/RF2 is also checked. Any mismatch exits
   non-zero.
-- Concurrency caveat: the engine serializes queries across all connections on one query-lifecycle
-  lock, so the throughput run measures throughput of concurrent submission on one GPU, not
-  overlapped execution. Every result is fetched fully before the next query; an open cursor would
-  hold the lock and stall every stream.
+- Throughput validation (`--mode both` only): each throughput stream's GPU rows are stashed
+  during the run, and the same extension-free child process then builds a **knowledge base** —
+  after replaying the power run's RF1/RF2 it snapshots the Q1-Q22 CPU results at the post-power
+  baseline and after each of the N throughput RF1/RF2 commits (2N+1 in-memory snapshots, update
+  sets 2..N+1). A stream's result for a query is validated iff it matches at least one snapshot:
+  the query streams run concurrently with the refresh stream, so which committed refresh state a
+  given query observed is a scheduling accident, but it must be one of them. q2/q11/q16 are
+  skipped as refresh-invariant. `--mode throughput` alone skips this with a warning (no validated
+  power baseline to anchor snapshot 0); mismatches list the per-snapshot diffs in `metrics.json`
+  under `throughput.validation` and exit non-zero like power validation.
+  A PASS checks membership in a collected committed state; it does not establish that the
+  matched state was visible during the query's transaction or within its timing interval.
+- Concurrency: stream count controls client submission independently of the Sirius
+  `max_concurrent_queries` admission limit (default 1). Increase the engine limit to allow
+  overlapping execution. Every result is fetched fully before that stream submits its next query.
 
 ### Where this differs from duckdb-tpch-power-test
 
@@ -632,7 +643,8 @@ tables — debug only), `--pin-layout <json>` (mixed-tier pin entries; see above
 `--pin-compression/--no-pin-compression` (Simpatico-compressed pins; needs
 a pinned tier), `--compression-plan-dir <dir>`, `--vary-predicates/--no-vary-predicates`
 (per-stream qgen parameters; rejects `--validation`), `--query-dir <dir>`,
-`--validation/--no-validation` (fixed predicates only), `--staged-refresh/--no-staged-refresh`
+`--validation/--no-validation` (fixed predicates only; covers the throughput streams too in
+`--mode both`), `--staged-refresh/--no-staged-refresh`
 (pre-stage update sets as native tables, untimed; see above — spec-legal per clause 2.5.3.1),
 `--refresh-write-config/--no-refresh-write-config` (write-path settings on the refresh cursors;
 defaults to following `--staged-refresh`), `--baseline-pass/--no-baseline-pass`,
@@ -781,3 +793,14 @@ The Sirius config file (`test/cpp/integration/integration.yaml`) controls:
 - The `rewrite_parquet.py` script preserves the original schema (date32, decimal128) to avoid type mismatch issues with Sirius
 - cudf internally promotes date32 to timestamp; the rewriter casts back before writing
 - Large tables are split into multiple numbered files when exceeding the max file size limit
+
+## Exporting benchmark results to Parquet
+
+Add `--result-format parquet --parquet-compression snappy` to the Python runner or
+TPC-H shell runners/wrapper. This measures query execution plus export using
+`COPY (...) TO ... (FORMAT PARQUET, PER_THREAD_OUTPUT true)`. Each iteration writes
+a fresh directory. GPU export measurements disable CPU fallback. Readback and
+validation are outside timing; the default row-output mode is unchanged.
+
+See [Parquet output](../../docs/super-sirius/parquet-output.md) for option support,
+file ordering, validation, configuration, and failure-cleanup semantics.

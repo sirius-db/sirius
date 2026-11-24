@@ -33,6 +33,7 @@
 #include "scan_manager/insert_delta_job.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/memory_prefetcher.hpp"
+#include "scan_manager/metadata_placement.hpp"
 #include "scan_manager/mvcc_mask_cache.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
@@ -397,6 +398,14 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 [[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(
   pinned_entry const& entry, std::size_t entry_position, cudf::data_type native_type);
 
+/// Whether late materialization can restore the nulls of the pinned column at
+/// @p column_position: its gather shape carries validity through, or the pin
+/// proves the column holds none. A compressed chunk carrying no blob answers
+/// neither, so a pin with one is refused. Deferral admission asks this of every
+/// column a primary bundle or a rider defers.
+[[nodiscard]] bool pinned_column_nulls_restorable(pinned_entry const& entry,
+                                                  std::size_t column_position);
+
 /// True when every column of @p column_ids that @p entry carries still maps, in
 /// every chunk, to the pin-time native cuDF type @p returned_types declares. A
 /// column the entry lacks is skipped (coverage is checked separately) and an
@@ -668,11 +677,13 @@ class sirius_scan_manager {
   ///
   /// Re-insert semantics (keyed by @p name):
   ///   - If no entry exists for @p name, a fresh one is created.
-  ///   - If an entry has the same source and row count, new columns are merged and
-  ///     duplicate columns are dropped. Only column-major GPU entries support this
-  ///     merge; host and device-chunked entries are rejected, even when empty.
-  ///     Chunk placement must also match. Rejection preserves the published entry;
-  ///     UNPIN first to change the storage format of a same-source, same-row-count pin.
+  ///   - If a nonempty device-chunked GPU entry exists, replace it with the raw
+  ///     column-major result, including when automatic compression falls back to raw.
+  ///   - For other entries with the same source and row count, new columns are merged
+  ///     and duplicates dropped. Only column-major GPU entries support this merge;
+  ///     host entries and empty device-chunked entries are rejected. Chunk placement
+  ///     must also match. Rejection preserves the published entry; UNPIN first to
+  ///     change these incompatible storage formats.
   ///   - If the source differs, including a recreated table with the same name, the
   ///     existing entry is replaced.
   ///   - If row counts differ, the existing entry is dropped and replaced. (An
@@ -776,12 +787,17 @@ class sirius_scan_manager {
   ///                      must cover every chunk and cached column. A recorded carrier that
   ///                      contradicts an uncompressed chunk's stored type throws; a compressed
   ///                      chunk's types are unreadable here, so its cells are trusted.
-  void insert_pinned_entry_device(const std::string& name,
-                                  cache_entry_info cache_info,
-                                  std::vector<sirius::device_pin_chunk> chunks,
-                                  cucascade::memory::memory_space& memory_space,
-                                  sirius::pinned_column_storage_matrix column_storage,
-                                  pinned_entry_metadata metadata = {});
+  /// \param column_types Pin-time DuckDB column types for optional zone-map capture.
+  /// \param chunk_stats  Captured native statistics, indexed by chunk and cached column.
+  void insert_pinned_entry_device(
+    const std::string& name,
+    cache_entry_info cache_info,
+    std::vector<sirius::device_pin_chunk> chunks,
+    cucascade::memory::memory_space& memory_space,
+    sirius::pinned_column_storage_matrix column_storage,
+    pinned_entry_metadata metadata                                                   = {},
+    duckdb::vector<duckdb::LogicalType> column_types                                 = {},
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
@@ -863,16 +879,6 @@ class sirius_scan_manager {
   /// several names with different column sets, and the serve-time matcher may use any of them.
   [[nodiscard]] std::vector<std::shared_ptr<const pinned_entry>>
   find_pinned_entries_for_parquet_files(std::span<std::string const> resolved_file_paths) const;
-
-  /// Device ids of the GPUs that hold Simpatico-compressed GPU-tier chunks of any pinned
-  /// entry over the same source as @p table_info (same parquet file set or same DuckDB table
-  /// incarnation), sorted and duplicate-free. Matches on source identity alone, so it can
-  /// name the owners of a pin that ends up not serving the scan, but never misses the owners
-  /// of one that does.
-  /// Read by query admission: a compressed chunk is decoded on the GPU that holds it, so
-  /// these GPUs must stay in the query's admitted set.
-  [[nodiscard]] std::vector<int> compressed_gpu_pin_owner_devices(
-    const op::scan::ingestible_table_info& table_info) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
 
@@ -1170,6 +1176,8 @@ class sirius_scan_manager {
   /// the GPU id set fed to the round-robin scan-balancing strategy.
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
+  metadata_placement _metadata_placement;
+  std::atomic<size_t> _next_metadata_domain{0};
   exec::static_thread_pool _thread_pool;
   std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
     std::make_shared<shared_scan_budget>();

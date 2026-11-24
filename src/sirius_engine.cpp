@@ -24,7 +24,6 @@
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_cte.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"
@@ -46,7 +45,6 @@
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
-#include <string>
 
 namespace sirius {
 
@@ -63,13 +61,13 @@ void finish_scan_preparation(op::sirius_physical_operator const* plan) noexcept
   });
 }
 
-/// Narrow the fleet for this query: gpus_per_query caps it, and within that cap a non-zero
-/// admission_bytes_per_gpu narrows further by estimated scan bytes. With neither set, every
-/// active GPU is kept.
-std::vector<int> narrow_admission_gpu_ids(const op::sirius_physical_operator& plan,
-                                          std::vector<int> gpu_ids,
-                                          const sirius_config& config,
-                                          const operator_params& op_params)
+/// Select the GPU subset this query is admitted with: gpus_per_query caps the fleet, and
+/// within that cap a non-zero admission_bytes_per_gpu narrows further by estimated scan
+/// bytes. With neither set, every active GPU is used.
+std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& plan,
+                                           std::vector<int> gpu_ids,
+                                           const sirius_config& config,
+                                           const operator_params& op_params)
 {
   auto const bpg = op_params.admission_bytes_per_gpu;
 
@@ -100,58 +98,6 @@ std::vector<int> narrow_admission_gpu_ids(const op::sirius_physical_operator& pl
                   n_gpus);
   gpu_ids.resize(static_cast<size_t>(k));
   return gpu_ids;
-}
-
-/// Devices holding compressed GPU-tier pinned chunks that the plan's scans read in place.
-std::vector<int> compressed_pin_owner_devices(const op::sirius_physical_operator& plan,
-                                              const scan_manager::sirius_scan_manager& pins)
-{
-  std::vector<int> owners;
-  planner::for_each_gpu_scan(plan, [&](const op::sirius_physical_operator& node) {
-    auto const* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator const*>(&node);
-    if (scan == nullptr) { return; }
-    auto const scan_owners =
-      pins.compressed_gpu_pin_owner_devices(scan->get_ingestible().table_info());
-    owners.insert(owners.end(), scan_owners.begin(), scan_owners.end());
-  });
-  return owners;
-}
-
-std::string format_gpu_ids(const std::vector<int>& gpu_ids)
-{
-  std::string out;
-  for (auto const id : gpu_ids) {
-    if (!out.empty()) { out += ", "; }
-    out += std::to_string(id);
-  }
-  return out;
-}
-
-/// Select the GPU subset this query is admitted with: the narrowed fleet (see
-/// narrow_admission_gpu_ids), plus every GPU that holds a compressed pinned chunk the query
-/// reads. A compressed pin is decoded on the GPU that holds it, so a query narrowed away from
-/// an owner would have a scan no admitted GPU can run. The pin registry is only consulted when
-/// narrowing actually dropped a GPU.
-std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& plan,
-                                           std::vector<int> gpu_ids,
-                                           const sirius_config& config,
-                                           const operator_params& op_params,
-                                           const scan_manager::sirius_scan_manager& pins)
-{
-  auto const available = gpu_ids;
-  auto admitted        = narrow_admission_gpu_ids(plan, std::move(gpu_ids), config, op_params);
-  if (admitted.size() >= available.size()) { return admitted; }
-
-  auto const owners = compressed_pin_owner_devices(plan, pins);
-  auto widened      = planner::widen_to_pin_owners(admitted, owners, available);
-  if (widened.size() != admitted.size()) {
-    SIRIUS_LOG_INFO(
-      "[gpu_alloc] admission widened from [{}] to [{}]: the query reads compressed GPU-tier pins, "
-      "which are decoded on the GPUs that hold them",
-      format_gpu_ids(admitted),
-      format_gpu_ids(widened));
-  }
-  return widened;
 }
 
 std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_client_context(
@@ -210,7 +156,7 @@ sirius_engine::~sirius_engine()
   try {
     query_handle_.finished();
   } catch (std::exception const& e) {
-    SIRIUS_LOG_ERROR("query telemetry finish failed: {}", e.what());
+    log::log_noexcept([&] { SIRIUS_LOG_ERROR("query telemetry finish failed: {}", e.what()); });
   }
 }
 
@@ -219,6 +165,12 @@ void sirius_engine::quiesce_plan_users()
   if (plan_users_quiescent_) return;
   if (auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
     ctx->retire_query_work(query_id_, duckdb::SiriusContext::query_retirement_mode::cancelled);
+    // The handler's error callback sees only the query's first error. A finalize that failed
+    // after it may still be a fatal device error, which must mark the runtime unavailable.
+    if (query_) {
+      pipeline::report_finalize_failures(
+        query_->get_pipelines(), ctx->get_query_lifecycle_registry(), query_id_);
+    }
   }
   finish_scan_preparation(sirius_physical_plan.get());
   plan_users_quiescent_ = true;
@@ -321,17 +273,19 @@ void sirius_engine::execute()
   plan_users_quiescent_ = false;
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
   try {
-    query_ = sirius_ctx->create_query(std::move(new_scheduled),
-                                      query_id_,
-                                      completion_handler_,
-                                      telemetry::query_telemetry_info{
-                                        .telemetry_query_id = telemetry_uuid,
-                                        .worker_id          = telemetry_context_->worker_id().raw(),
-                                        .query_id           = query_id_,
-                                      },
-                                      [&client = context] { return client.IsInterrupted(); });
-    sirius_ctx->get_task_scheduler().start_query(*query_);
-    sirius_ctx->get_scan_manager().start_preparation(query_id_);
+    completion_handler_->run_startup([&] {
+      query_ = sirius_ctx->create_query(std::move(new_scheduled),
+                                        query_id_,
+                                        completion_handler_,
+                                        telemetry::query_telemetry_info{
+                                          .telemetry_query_id = telemetry_uuid,
+                                          .worker_id = telemetry_context_->worker_id().raw(),
+                                          .query_id  = query_id_,
+                                        },
+                                        [&client = context] { return client.IsInterrupted(); });
+      sirius_ctx->get_task_scheduler().start_query(*query_);
+      sirius_ctx->get_scan_manager().start_preparation(query_id_);
+    });
   } catch (...) {
     // Prepare/start failures and asynchronous failures compete for the same terminal winner.
     completion_handler_->report_error(std::current_exception());
@@ -348,18 +302,21 @@ void sirius_engine::execute()
       sirius_ctx->throw_runtime_unavailable();
     sirius_ctx->retire_query_work(query_id_,
                                   duckdb::SiriusContext::query_retirement_mode::completed);
+    // No finish transition is running past the work barrier. One that failed after success was
+    // signalled had its report dropped, so it fails the query here.
+    if (query_) { pipeline::rethrow_finalize_failure(query_->get_pipelines()); }
     finish_scan_preparation(sirius_physical_plan.get());
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {
     registry->report_failure(std::current_exception(), query_id_);
-    SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    log::log_noexcept([&] { SIRIUS_LOG_ERROR("Error executing query: {}", e.what()); });
     cancel_dynamic_filter_publications();
     // Retire asynchronous borrowers before the execution window can release repositories.
     quiesce_plan_users();
     throw;
   } catch (...) {
     registry->report_failure(std::current_exception(), query_id_);
-    SIRIUS_LOG_ERROR("Unknown error executing query");
+    log::log_noexcept([&] { SIRIUS_LOG_ERROR("Unknown error executing query"); });
     cancel_dynamic_filter_publications();
     quiesce_plan_users();
     throw;
@@ -407,16 +364,16 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   // matters: task_creator holds it, and create_query later reads it back for scan_manager.
   auto query_operator_params      = duckdb::query_operator_options(context);
   auto const full_gpu_count       = gpu_ids.size();
-  std::vector<int> active_gpu_ids = compute_admission_gpu_ids(plan,
-                                                              std::move(gpu_ids),
-                                                              sirius_ctx_ptr->get_config(),
-                                                              *query_operator_params,
-                                                              sirius_ctx_ptr->get_scan_manager());
+  std::vector<int> active_gpu_ids = compute_admission_gpu_ids(
+    plan, std::move(gpu_ids), sirius_ctx_ptr->get_config(), *query_operator_params);
   sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(query_id_, active_gpu_ids, full_gpu_count);
   try {
-    SIRIUS_LOG_INFO("[gpu_alloc] query allocated {} GPU(s): [{}]",
-                    active_gpu_ids.size(),
-                    format_gpu_ids(active_gpu_ids));
+    std::string gpu_list;
+    for (auto id : active_gpu_ids) {
+      if (!gpu_list.empty()) { gpu_list += ", "; }
+      gpu_list += std::to_string(id);
+    }
+    SIRIUS_LOG_INFO("[gpu_alloc] query allocated {} GPU(s): [{}]", active_gpu_ids.size(), gpu_list);
   } catch (...) {  // best-effort observability
   }
 

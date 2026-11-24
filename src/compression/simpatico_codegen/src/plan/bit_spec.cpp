@@ -5,6 +5,8 @@
 
 #include "codegen/plan/bit_spec.hpp"
 
+#include "codegen/plan/operator_registry.hpp"
+
 #include <cctype>
 
 namespace simpatico {
@@ -49,6 +51,7 @@ cudf::data_type parse_packed_type_token(std::string_view tok)
 
 std::string bitextract_canonical_name(std::string const& compressor)
 {
+  if (compressor == kBitpackGcdName) return "bitpack";
   auto suffix = strip_bitextract_prefix(compressor);
   if (!suffix) return compressor;
   if (*suffix == "f32" || *suffix == "f64") return compressor;

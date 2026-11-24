@@ -343,7 +343,12 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 // 15: a ZigZag output no fused op consumes is stored like Delta's and FOR's, as a Raw
 //     passthrough {data, offsets} parked on the ZigZag node, instead of as a "zigzag"
 //     buffer on the ZigZag node's own rep.
-static constexpr std::uint8_t kVersion = 15;
+//
+// 16: Bitpack carries a trailing `chunk_divisors` channel (the folded-in common
+//     divisor), decoded as chunk_min + divisor * residual. Buffers bind by name, so a
+//     v15 reader would load the channel, never apply it, and silently decode wrong
+//     values; the exact version match is what makes it reject the payload instead.
+static constexpr std::uint8_t kVersion = 16;
 
 // Per-column validity record, written right after num_rows:
 //

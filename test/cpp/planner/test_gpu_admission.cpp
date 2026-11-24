@@ -29,7 +29,6 @@ using sirius::planner::estimate_bytes_per_row;
 using sirius::planner::gpu_count_for_bytes;
 using sirius::planner::scan_estimate;
 using sirius::planner::total_scan_bytes;
-using sirius::planner::widen_to_pin_owners;
 
 namespace {
 constexpr uint64_t k_avg_var = 32;
@@ -79,47 +78,6 @@ TEST_CASE("apply_gpu_cap treats a negative cap as no cap", "[gpu_admission]")
 TEST_CASE("apply_gpu_cap on an empty fleet stays empty", "[gpu_admission]")
 {
   REQUIRE(apply_gpu_cap({}, 2).empty());
-}
-
-TEST_CASE("widen_to_pin_owners adds an owner the narrowed set dropped", "[gpu_admission]")
-{
-  const std::vector<int> all{0, 1, 2, 3};
-  const std::vector<int> owners{0, 2};
-  REQUIRE(widen_to_pin_owners({0}, owners, all) == std::vector<int>{0, 2});
-}
-
-TEST_CASE("widen_to_pin_owners leaves a set that already holds every owner unchanged",
-          "[gpu_admission]")
-{
-  const std::vector<int> all{0, 1, 2, 3};
-  const std::vector<int> owners{1, 0};
-  REQUIRE(widen_to_pin_owners({0, 1}, owners, all) == std::vector<int>{0, 1});
-  REQUIRE(widen_to_pin_owners({0, 1}, {}, all) == std::vector<int>{0, 1});
-}
-
-TEST_CASE("widen_to_pin_owners can widen back to the whole fleet", "[gpu_admission]")
-{
-  // Round-robin pin placement puts chunks on every GPU, so every GPU is an owner.
-  const std::vector<int> all{0, 1, 2, 3};
-  const std::vector<int> owners{3, 1, 2, 0, 2};
-  REQUIRE(widen_to_pin_owners({0}, owners, all) == all);
-}
-
-TEST_CASE("widen_to_pin_owners returns a sorted set without duplicates", "[gpu_admission]")
-{
-  const std::vector<int> all{2, 5, 7, 9};
-  const std::vector<int> owners{9, 5, 9, 5};
-  REQUIRE(widen_to_pin_owners({2}, owners, all) == std::vector<int>{2, 5, 9});
-}
-
-TEST_CASE("widen_to_pin_owners ignores an owner outside the fleet", "[gpu_admission]")
-{
-  // A pin cannot be on a GPU this process does not run on; stay defensive anyway.
-  const std::vector<int> all{0, 1};
-  const std::vector<int> owners{4, 1};
-  REQUIRE(widen_to_pin_owners({0}, owners, all) == std::vector<int>{0, 1});
-  const std::vector<int> stray{4};
-  REQUIRE(widen_to_pin_owners({0}, stray, all) == std::vector<int>{0});
 }
 
 TEST_CASE("estimate_bytes_per_row sums fixed-width carrier widths", "[admission_estimator]")

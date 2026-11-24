@@ -104,7 +104,8 @@ std::string codegen_kind_for_compressor(std::string const& c)
 // list → unknown kind.
 std::vector<std::string> consumed_slots(std::string const& kind)
 {
-  if (kind == "bitpack") return {"chunk_min", "chunk_count", "chunk_bits", "packed"};
+  if (kind == "bitpack")
+    return {"chunk_min", "chunk_count", "chunk_bits", "packed", "chunk_divisors"};
   if (kind == "delta") return {"delta_first"};
   if (kind == "rle") return {"rle_runs_offsets"};
   if (kind == "for") return {"references"};
@@ -595,7 +596,7 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
                                        dtype,
                                        num_rows,
                                        hollow,
-                                       row_enumeration{nullptr, sel->rows},
+                                       row_enumeration{nullptr, sel->rows, sel->diagnostics},
                                        out,
                                        frame,
                                        out_dtype);
@@ -608,7 +609,8 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
     dtype,
     num_rows,
     *sel->mask,
-    row_enumeration{by_index ? sel->survivor_indices.data<std::int32_t>() : nullptr, nullptr},
+    row_enumeration{
+      by_index ? sel->survivor_indices.data<std::int32_t>() : nullptr, nullptr, sel->diagnostics},
     out,
     frame,
     out_dtype);
@@ -1050,7 +1052,7 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
                                          region.dtype,
                                          region.num_rows,
                                          *sel->mask,
-                                         row_enumeration{},
+                                         row_enumeration{nullptr, nullptr, sel->diagnostics},
                                          chars.data<std::uint8_t>(),
                                          key_width,
                                          char_data,
@@ -1108,7 +1110,7 @@ std::unique_ptr<cudf::column> decode_str_split_selected(PlanTree const& tree,
                                             region.dtype,
                                             sel.mask->num_rows,
                                             *sel.mask,
-                                            row_enumeration{},
+                                            row_enumeration{nullptr, nullptr, sel.diagnostics},
                                             static_cast<std::int64_t*>(source_offsets.data()),
                                             lengths->mutable_view().data<std::int32_t>(),
                                             frame);
@@ -1197,8 +1199,10 @@ void validate_request(column_decode_request const& request)
   }
   validate_plan(tree->get());
   // A selection compacts the value rows, while the stored bitmask describes every row of the
-  // chunk, so the decode cannot reattach it; a caller that wants both declines the selection.
-  if (request.selection && !tree->get().validity.empty())
+  // chunk, so the decode cannot reattach it; a caller that wants both either declines the
+  // selection or opts in to compacting the stripped sidecar itself.
+  if (request.selection && !tree->get().validity.empty() &&
+      !request.selection->get().caller_reattaches_validity)
     throw unsupported_nullable_selection("decode: selection on a null-masked column unsupported");
   if (predicate && !predicate->predicate.active())
     throw std::invalid_argument("decode: empty predicate request");
@@ -1267,8 +1271,10 @@ std::unique_ptr<cudf::column> decode_request(column_decode_request const& reques
     }
   }
   // Reattach the validity the compress side detached. The walk decodes a null-free column, so this
-  // is the only place the mask re-enters; a selecting request was refused above unless all-valid.
-  attach_validity(*output, tree.validity, frame.stream(), frame.mr());
+  // is the only place the mask re-enters; a selecting request was refused above unless all-valid
+  // or the caller compacts the sidecar itself against the selection it supplied.
+  if (!selection || !selection->caller_reattaches_validity)
+    attach_validity(*output, tree.validity, frame.stream(), frame.mr());
   if (selection && (output->size() != selection->survivor_count || output->null_count() != 0)) {
     throw std::runtime_error("decode: selected output has wrong size or unsupported nulls");
   }

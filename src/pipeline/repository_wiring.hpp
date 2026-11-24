@@ -43,9 +43,8 @@ struct repository_wiring {
   std::string_view port_id;
   //! Memory barrier semantics between source and destination.
   op::MemoryBarrierType barrier_type;
-  //! Operator that emits via `add_next_port_after_sink`. For ordinary pipeline sinks
-  //! this is `source_pipeline->get_sink().get()`; for delim joins and build CONCATs it
-  //! is a sub-operator of the sink.
+  //! Operator that emits via `add_next_port_after_sink`. The converter sets it to
+  //! `source_pipeline->get_sink().get()`.
   op::sirius_physical_operator* source_op;
   //! Pipeline that produces the data.
   std::shared_ptr<sirius_pipeline> source_pipeline;
@@ -81,10 +80,8 @@ void materialize_repository_wiring(const std::vector<repository_wiring>& wirings
  * source -> operators -> sink order. Each operator is numbered on first visit, so an operator
  * appearing in several pipelines keeps one stable id. The resulting ids are `0..N-1`, no gaps.
  *
- * The pipeline set — not the plan tree — is the traversal root on purpose:
- * `sirius_physical_delim_join` owns its `join` and `distinct_root` subtrees outside `children`
- * and does not override `get_children()`, so a tree walk would miss them. Every operator that
- * executes belongs to a pipeline.
+ * The pipeline set — not the plan tree — is the traversal root on purpose: every operator that
+ * executes belongs to a pipeline, and the ids then follow scheduling order.
  *
  * @param pipelines The query's pipelines, in scheduling order.
  * @return The number of operators numbered (i.e. one past the highest id assigned).

@@ -20,6 +20,7 @@
  */
 
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
+#include "sirius_config.hpp"
 
 #include <catch.hpp>
 #include <duckdb/common/enum_util.hpp>
@@ -32,7 +33,6 @@
 #include <duckdb/planner/operator/logical_any_join.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_cteref.hpp>
-#include <duckdb/planner/operator/logical_delim_get.hpp>
 #include <duckdb/planner/operator/logical_distinct.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
@@ -85,13 +85,6 @@ duckdb::unique_ptr<duckdb::LogicalProjection> make_projection_over(
   return projection;
 }
 
-duckdb::unique_ptr<duckdb::LogicalDelimGet> make_delim_get()
-{
-  return duckdb::make_uniq<duckdb::LogicalDelimGet>(
-    duckdb::TableIndex(/*table_index=*/2),
-    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
-}
-
 duckdb::unique_ptr<duckdb::LogicalCTERef> make_cte_ref()
 {
   return duckdb::make_uniq<duckdb::LogicalCTERef>(
@@ -131,11 +124,9 @@ duckdb::unique_ptr<duckdb::LogicalComparisonJoin> make_join_over(
   return join;
 }
 
-duckdb::unique_ptr<duckdb::LogicalComparisonJoin> make_typed_join(
-  duckdb::JoinType join_type,
-  duckdb::LogicalOperatorType type = duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN)
+duckdb::unique_ptr<duckdb::LogicalComparisonJoin> make_typed_join(duckdb::JoinType join_type)
 {
-  auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type, type);
+  auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
   join->children.push_back(make_get());
   join->children.push_back(make_get());
   return join;
@@ -249,17 +240,26 @@ TEST_CASE("a semi or anti join carries join evidence", "[dynamic_filter][evidenc
     REQUIRE_FALSE(build_subtree_is_filtering(*join));
   }
 
-  SECTION("as a DELIM_JOIN")
-  {
-    REQUIRE(build_subtree_has_filtering_join(
-      *make_typed_join(join_type, duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN)));
-  }
-
   SECTION("below a projection and an inner join")
   {
     auto const outer = make_join_over(make_get(), make_projection_over(make_typed_join(join_type)));
     REQUIRE(build_subtree_has_filtering_join(*outer));
   }
+}
+
+TEST_CASE("a right-family join publishes only with filters, accumulation and a Bloom budget",
+          "[dynamic_filter][evidence]")
+{
+  sirius::operator_params params;
+  params.enable_dynamic_filter                 = true;
+  params.enable_dynamic_filter_multi_partition = true;
+  REQUIRE(params.max_dynamic_filter_bloom_bytes_per_gpu() > 0);
+  CHECK(sirius::planner::right_family_publication_enabled(params));
+
+  SECTION("dynamic filters off") { params.enable_dynamic_filter = false; }
+  SECTION("Bloom accumulation off") { params.enable_dynamic_filter_multi_partition = false; }
+  SECTION("no Bloom budget") { params.scan_task_batch_size = 0; }
+  CHECK_FALSE(sirius::planner::right_family_publication_enabled(params));
 }
 
 TEST_CASE("joins that can keep every row carry no join evidence", "[dynamic_filter][evidence]")
@@ -294,19 +294,6 @@ TEST_CASE("joins that can keep every row carry no join evidence", "[dynamic_filt
 
 TEST_CASE("opaque build leaves carry fallback evidence", "[dynamic_filter][evidence]")
 {
-  SECTION("a bare DELIM_GET") { REQUIRE(build_relation_is_opaque(*make_delim_get())); }
-
-  SECTION("a projected DELIM_GET")
-  {
-    REQUIRE(build_relation_is_opaque(*make_projection_over(make_delim_get())));
-  }
-
-  SECTION("a DELIM_GET below stacked projections")
-  {
-    REQUIRE(
-      build_relation_is_opaque(*make_projection_over(make_projection_over(make_delim_get()))));
-  }
-
   SECTION("a bare CTE_REF") { REQUIRE(build_relation_is_opaque(*make_cte_ref())); }
 
   SECTION("a projected CTE_REF")
@@ -331,11 +318,7 @@ TEST_CASE("base-table builds carry no opaque fallback evidence", "[dynamic_filte
 
 TEST_CASE("ordinary deduplication preserves opaque build evidence", "[dynamic_filter][evidence]")
 {
-  auto const cte_source = GENERATE(false, true);
-  duckdb::unique_ptr<duckdb::LogicalOperator> source =
-    cte_source ? duckdb::unique_ptr<duckdb::LogicalOperator>(make_cte_ref())
-               : duckdb::unique_ptr<duckdb::LogicalOperator>(make_delim_get());
-  auto aggregate = make_dedup_over(std::move(source));
+  auto aggregate = make_dedup_over(make_cte_ref());
 
   SECTION("implicit ordinary grouping") { REQUIRE(build_relation_is_opaque(*aggregate)); }
 
@@ -469,15 +452,6 @@ TEST_CASE("reducing operators are not opaque build roots", "[dynamic_filter][evi
   SECTION("a comparison join")
   {
     REQUIRE_FALSE(build_relation_is_opaque(*make_join_over(make_get(), make_get())));
-  }
-
-  SECTION("a DELIM_JOIN")
-  {
-    auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(
-      duckdb::JoinType::INNER, duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN);
-    join->children.push_back(make_get());
-    join->children.push_back(make_get());
-    REQUIRE_FALSE(build_relation_is_opaque(*join));
   }
 
   SECTION("an ANY_JOIN")

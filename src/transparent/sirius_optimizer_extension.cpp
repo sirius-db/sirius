@@ -19,12 +19,15 @@
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/delim_cte_proof.hpp"
+#include "planner/delim_cte_rewrites.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_delim_aggregate_reuse.hpp"
+#include "planner/sirius_plan_partial_aggregate_pushdown.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 
+#include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
@@ -67,34 +70,17 @@ bool parquet_footer_statistics_enabled(const duckdb::ClientContext& context)
   return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
 }
 
-/// The option as `query_operator_options` resolves it, without creating the session's overrides:
-/// those snapshot the global configuration, which would stop the session from seeing later
-/// changes to it.
-bool delim_aggregate_reuse_enabled(duckdb::ClientContext& context)
+/// Whether a plan optimization is on: its `operator_params` switch as `query_operator_options`
+/// resolves it, without creating the session's overrides. Those snapshot the global
+/// configuration, which would stop the session from seeing later changes to it.
+bool plan_optimization_enabled(duckdb::ClientContext& context,
+                               bool sirius::operator_params::* option)
 {
   auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->enable_delim_aggregate_reuse;
-  }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->enable_delim_aggregate_reuse;
-  }
+  if (state && state->execution_options) { return (*state->execution_options).*option; }
+  if (state && state->operator_overrides) { return (*state->operator_overrides).*option; }
   auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().enable_delim_aggregate_reuse;
-}
-
-/// The option as `query_operator_options` resolves it, without creating the session's overrides.
-bool exists_minmax_rewrite_enabled(duckdb::ClientContext& context)
-{
-  auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->enable_exists_minmax_rewrite;
-  }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->enable_exists_minmax_rewrite;
-  }
-  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().enable_exists_minmax_rewrite;
+  return runtime && runtime->get_config().get_operator_params().*option;
 }
 
 /// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving data
@@ -228,8 +214,46 @@ void preserve_parquet_bindings(duckdb::LogicalOperator const& from,
   }
 }
 
-// What Sirius needs from the plan before DuckDB optimizes it. Reads the plan and attaches scan
-// statistics; it does not restructure it.
+// The delim CTE rewrites that have to run before DuckDB orders the joins. Only for queries headed
+// to the GPU: with GPU execution off, DuckDB plans exactly what it plans without Sirius. Each
+// edit is decided and built in full before it changes the plan, with moves that cannot fail, so
+// the plan is valid whenever a rewrite throws. There is no rollback: edits made before the throw
+// stay, including an `EXISTS` already answered when the search for the next one fails.
+//
+// Returns whether the plan may have changed. A rewrite that throws counts, since it can have made
+// edits first.
+bool rewrite_delim_ctes(duckdb::OptimizerExtensionInput& input, duckdb::LogicalOperator& plan)
+{
+  auto& context = input.context;
+  bool changed  = false;
+  // First: once the keys reach a second table, the subquery no longer has the single key join the
+  // comparison of the two subqueries looks for.
+  if (plan_optimization_enabled(context, &sirius::operator_params::enable_exists_from_aggregate)) {
+    try {
+      if (sirius::planner::answer_exists_from_aggregate(context, plan) > 0) { changed = true; }
+    } catch (std::exception& e) {
+      changed = true;
+      SIRIUS_LOG_DEBUG("Stopped answering EXISTS from aggregate subqueries: {}",
+                       sirius::sanitized_message(e));
+    }
+  }
+  if (plan_optimization_enabled(context, &sirius::operator_params::enable_subquery_key_carry)) {
+    try {
+      if (sirius::planner::carry_subquery_keys_across_equalities(
+            context, input.optimizer.binder, plan) > 0) {
+        changed = true;
+      }
+    } catch (std::exception& e) {
+      changed = true;
+      SIRIUS_LOG_DEBUG("Subquery keys not carried across equalities: {}",
+                       sirius::sanitized_message(e));
+    }
+  }
+  return changed;
+}
+
+// What Sirius needs from the plan before DuckDB optimizes it: its decision on the query, scan
+// statistics, the delim CTE rewrites, and the proofs about the delim CTEs they leave.
 void prepare_for_sirius(duckdb::OptimizerExtensionInput& input, duckdb::LogicalOperator& plan)
 {
   auto& context = input.context;
@@ -238,16 +262,31 @@ void prepare_for_sirius(duckdb::OptimizerExtensionInput& input, duckdb::LogicalO
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
   // Decide before optimization can remove scans, including when GPU execution is off.
-  (void)should_use_duckdb(context, &plan, &input.optimizer.binder.GetStatementProperties());
+  auto const& properties = input.optimizer.binder.GetStatementProperties();
+  auto const declined    = should_use_duckdb(context, &plan, &properties);
   if (parquet_footer_statistics_enabled(context)) {
     auto const scans = add_parquet_footer_statistics(context, plan);
     if (scans > 0) { SIRIUS_LOG_DEBUG("Gave {} Parquet scans their footer statistics", scans); }
   }
+  bool const gpu_execution = gpu_execution_enabled(context);
+  // Only a statement that can reach the GPU is rewritten; anything else must get the plan DuckDB
+  // makes alone. That takes a statement that returns rows, and not the second planning pass of a
+  // query Sirius has already left to DuckDB. `INSERT ... SELECT` and `CREATE TABLE AS` return
+  // none, and Sirius never runs them. A `COPY` returns none either, so the Parquet export Sirius
+  // does run is planned without these rewrites.
+  bool const headed_to_gpu = declined == decline_reason::none &&
+                             !conn_state->replanning_for_cpu() && ctx->is_initialized() &&
+                             properties.return_type == duckdb::StatementReturnType::QUERY_RESULT &&
+                             gpu_execution;
+  // After the statistics, which give Parquet scans the row counts one rewrite's size guard reads;
+  // before the proofs, which describe the plan the built-in optimizers will receive. A query that
+  // Sirius turns down later is planned again without the rewrites (`mark_plan_rewritten`).
+  if (headed_to_gpu && rewrite_delim_ctes(input, plan)) { conn_state->mark_plan_rewritten(); }
   // DuckDB clears its delim-CTE restriction proof before this hook runs, and never sets it for
   // Parquet scans. Re-derive it before the built-in optimizers restructure the delim CTEs; the
   // optimizer hook keeps it only together with the plan of this same run.
   conn_state->stage_cte_reader_proofs(nullptr);
-  if (gpu_execution_enabled(context)) {
+  if (gpu_execution) {
     try {
       conn_state->stage_cte_reader_proofs(std::make_shared<sirius::planner::delim_cte_proofs const>(
         sirius::planner::collect_delim_cte_proofs(context, plan)));
@@ -272,8 +311,10 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   prepare_for_sirius(input, *plan);
   // DuckDB clears every delim CTE's filter_dependency before it calls a pre-optimize hook, because
   // it cannot vouch for what an extension does to the plan. Without it, DuckDB's CTE filter pushers
-  // skip delim CTEs, in its CPU plans too. This hook leaves the plan's shape alone, so give the
-  // dependency back, re-derived with DuckDB's own rule, for every query, GPU execution on or off.
+  // skip delim CTEs, in its CPU plans too. The rewrites above keep each delim CTE's two readers and
+  // a join-back that keeps an outer row only through that row, so give the dependency back,
+  // re-derived with DuckDB's own rule on the plan as it now is, for every query, GPU execution on
+  // or off.
   try {
     sirius::planner::restore_cte_filter_dependencies(input.context, *plan);
   } catch (std::exception& e) {
@@ -369,6 +410,8 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
   // Preserve the pre-hook's decline; optimized plans may no longer contain the scans.
   if (should_use_duckdb(context, nullptr, nullptr) != decline_reason::none) { return; }
+  // The second planning pass of a query Sirius has already left to DuckDB: nothing to capture.
+  if (conn_state->replanning_for_cpu()) { return; }
   if (!gpu_execution_enabled(context) || !ctx->is_initialized()) { return; }
 
   // Copy the optimized plan into THIS connection's per-connection state,
@@ -390,30 +433,57 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     }
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*captured, context));
-    auto copy = copy_logical_plan(*captured, context);
-    // Runs before the EXISTS rewrite, whose recorded count a failure here would otherwise discard.
-    if (delim_aggregate_reuse_enabled(context)) {
-      try {
-        sirius::planner::reuse_delim_rows_for_subquery_aggregates(
-          context, input.optimizer.binder, copy);
-      } catch (std::exception& e) {
-        SIRIUS_LOG_WARN(
-          "Transparent execution: delim aggregate reuse failed, planning without it: {}",
-          sirius::sanitized_message(e));
-        copy = copy_logical_plan(*captured, context);
+    // The subquery rewrites on @p copy; returns the subqueries the EXISTS rewrite replaced. A
+    // rewrite that fails is left out by starting over from a fresh copy. The delim reuse runs
+    // first, so its failure starts over before the EXISTS rewrite has replaced anything.
+    auto const rewrite_subqueries =
+      [&](duckdb::unique_ptr<duckdb::LogicalOperator>& copy) -> std::size_t {
+      if (plan_optimization_enabled(context,
+                                    &sirius::operator_params::enable_delim_aggregate_reuse)) {
+        try {
+          sirius::planner::reuse_delim_rows_for_subquery_aggregates(
+            context, input.optimizer.binder, copy);
+        } catch (std::exception& e) {
+          SIRIUS_LOG_WARN(
+            "Transparent execution: delim aggregate reuse failed, planning without it: {}",
+            sirius::sanitized_message(e));
+          copy = copy_logical_plan(*captured, context);
+        }
       }
-    }
-    if (exists_minmax_rewrite_enabled(context)) {
+      if (!plan_optimization_enabled(context,
+                                     &sirius::operator_params::enable_exists_minmax_rewrite)) {
+        return 0;
+      }
       try {
-        ctx->record_exists_minmax_rewrites(sirius::planner::rewrite_correlated_inequality_exists(
-          context, input.optimizer.binder, copy, gpu_memory_budget(context)));
+        return sirius::planner::rewrite_correlated_inequality_exists(
+          context, input.optimizer.binder, copy, gpu_memory_budget(context));
       } catch (std::exception& e) {
         SIRIUS_LOG_WARN(
           "Transparent execution: EXISTS MIN/MAX rewrite failed, planning without it: {}",
           sirius::sanitized_message(e));
         copy = copy_logical_plan(*captured, context);
+        return 0;
+      }
+    };
+    auto copy                     = copy_logical_plan(*captured, context);
+    auto exists_rewrites          = rewrite_subqueries(copy);
+    std::size_t pushed_aggregates = 0;
+    if (plan_optimization_enabled(context,
+                                  &sirius::operator_params::enable_partial_aggregate_below_join)) {
+      try {
+        pushed_aggregates = sirius::planner::push_partial_aggregates_below_joins(
+          context, input.optimizer.binder, copy);
+      } catch (std::exception& e) {
+        SIRIUS_LOG_WARN(
+          "Transparent execution: partial aggregate pushdown failed, planning without it: {}",
+          sirius::sanitized_message(e));
+        copy            = copy_logical_plan(*captured, context);
+        exists_rewrites = rewrite_subqueries(copy);
       }
     }
+    // Recorded once the plan is final, so the counts describe the plan that is captured.
+    ctx->record_exists_minmax_rewrites(exists_rewrites);
+    ctx->record_partial_aggregate_pushdowns(pushed_aggregates);
     conn_state->set_captured_plan(std::move(copy));
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is

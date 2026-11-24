@@ -32,6 +32,7 @@
 #include "exchange/exchange_service.hpp"
 #include "exchange/rank_control.hpp"
 #include "exec/stream_bind_catalog.hpp"
+#include "exec/thread_util.hpp"
 #include "helper/transaction_utils.hpp"
 #include "log/duckdb_sink.hpp"
 #include "log/logging.hpp"
@@ -65,8 +66,10 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <duckdb/common/allocator.hpp>
+#include <duckdb/common/string_util.hpp>
 #include <duckdb/execution/operator/helper/physical_execute.hpp>
 #include <duckdb/execution/operator/helper/physical_prepare.hpp>
+#include <duckdb/execution/operator/persistent/physical_copy_to_file.hpp>
 #include <duckdb/execution/operator/persistent/physical_insert.hpp>
 #include <duckdb/execution/operator/persistent/physical_merge_into.hpp>
 #include <duckdb/execution/operator/persistent/physical_update.hpp>
@@ -931,6 +934,8 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     throw std::runtime_error("Cannot reinitialize a context after a fatal runtime failure");
   }
 
+  // Keep rollback inside the startup affinity scope as well.
+  std::optional<cucascade::exec::thread_util::scoped_thread_affinity> startup_affinity;
   // Roll back even when initialize() is called on an existing engine object.
   struct initialization_guard {
     SiriusContext* self;
@@ -954,6 +959,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     throw std::runtime_error("SiriusContext::initialize: no GPUs discovered");
   }
   config_ = config.resolve(discovery.get_topology());
+  startup_affinity.emplace(config_.get_worker_startup_cpus());
   // The spill converters run on downgrade threads with no client context, so they
   // read process-wide settings rather than this configuration.
   sirius::compression::apply_spill_compression_config(config_.get_compression_config());
@@ -1371,7 +1377,8 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
       // made here inherit its CPU set. The transport's engine thread and NIXL's listener
       // busy-poll: pinned there, they starve the DuckDB workers pinned to that CPU, and a query
       // waits forever on a task one of those workers holds.
-      sirius::util::scoped_process_affinity const affinity;
+      cucascade::exec::thread_util::scoped_thread_affinity startup_affinity(
+        config_.get_worker_startup_cpus());
       auto exchange = sirius::exchange::make_nixl_exchange(
         params.exchange_rank, params.exchange_peers, *gpu, host, opts);
       sirius::exchange::note_exchange_joined();
@@ -1635,7 +1642,10 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     .fallbacks              = transparent_fallback_count_.load(std::memory_order_relaxed),
     .executions             = transparent_execution_count_.load(std::memory_order_relaxed),
     .runtime_fallbacks      = transparent_runtime_fallback_count_.load(std::memory_order_relaxed),
+    .fallback_replans       = transparent_fallback_replan_count_.load(std::memory_order_relaxed),
     .exists_minmax_rewrites = exists_minmax_rewrite_count_.load(std::memory_order_relaxed),
+    .partial_aggregate_pushdowns =
+      partial_aggregate_pushdown_count_.load(std::memory_order_relaxed),
     .provider_internal_skips =
       transparent_provider_internal_skip_count_.load(std::memory_order_relaxed),
     .hidden_catalog_skips = transparent_hidden_catalog_skip_count_.load(std::memory_order_relaxed),
@@ -1820,6 +1830,11 @@ void SiriusContext::record_transparent_decline(sirius::transparent::decline_reas
   }
 }
 
+void SiriusContext::record_transparent_fallback_replan() noexcept
+{
+  transparent_fallback_replan_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void SiriusContext::record_transparent_rebind_success() noexcept
 {
   transparent_rebind_success_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1843,6 +1858,11 @@ void SiriusContext::record_transparent_runtime_fallback() noexcept
 void SiriusContext::record_exists_minmax_rewrites(uint64_t count) noexcept
 {
   exists_minmax_rewrite_count_.fetch_add(count, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_partial_aggregate_pushdowns(uint64_t count) noexcept
+{
+  partial_aggregate_pushdown_count_.fetch_add(count, std::memory_order_relaxed);
 }
 
 void SiriusContext::record_transparent_certificate_incomplete() noexcept
@@ -1876,6 +1896,21 @@ void SiriusContext::record_lease_held_at_replay() noexcept
 }
 
 namespace {
+
+// COPY FROM (including IMPORT DATABASE), CSV and single-file exports are
+// DuckDB-only operations, not failed GPU attempts. Keep this eligibility gate
+// separate from the option/schema validation of a GPU multipart Parquet COPY.
+bool is_gpu_copy_candidate(PreparedStatementData const& prepared)
+{
+  if (!prepared.physical_plan) return false;
+  auto const* root = &prepared.physical_plan->Root();
+  while (root->type == PhysicalOperatorType::EXECUTE)
+    root = &root->Cast<PhysicalExecute>().plan;
+  if (root->type != PhysicalOperatorType::COPY_TO_FILE) return false;
+  auto const& copy = root->Cast<PhysicalCopyToFile>();
+  return copy.per_thread_output &&
+         StringUtil::Lower(copy.function.name.GetIdentifierName()) == "parquet";
+}
 
 // With enable_duckdb_fallback off, surface a GPU plan-generation failure as a
 // normal query error. Sanitize INTERNAL/FATAL (which would invalidate the whole
@@ -1921,16 +1956,21 @@ bool compressed_materialization_enabled(ClientContext& context)
   return sirius::operator_params{}.enable_compressed_materialization;
 }
 
-void print_cpu_fallback_banner()
+void print_cpu_fallback_banner(std::string_view reason)
 {
   const bool tty  = ::isatty(::fileno(stdout)) != 0;
   const char* red = tty ? "\033[1;31m" : "";
   const char* off = tty ? "\033[0m" : "";
+  std::string line(reason);
+  std::replace(line.begin(), line.end(), '\n', ' ');
+  std::replace(line.begin(), line.end(), '\r', ' ');
   std::fprintf(stdout,
                "%s=============================================\n"
                "Error in Sirius GPU execution, fallback to DuckDB\n"
+               "Reason: %s\n"
                "=============================================%s\n",
                red,
+               line.c_str(),
                off);
   std::fflush(stdout);
 }
@@ -1951,6 +1991,18 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
   if (is_internal_query_active(context)) { return RebindQueryInfo::DO_NOT_REBIND; }
   auto conn_state = get_sirius_connection_state(context);
+
+  // DuckDB has already built its CPU plan, from the logical plan the pre-optimize hook may have
+  // rewritten for the GPU. When Sirius then leaves such a query to DuckDB, have DuckDB plan the
+  // statement once more: `replan_for_cpu` keeps both optimizer hooks out of that pass, and DuckDB
+  // does not call this function again, so the query runs the plan DuckDB makes alone.
+  auto const leave_to_duckdb = [&]() {
+    if (!conn_state || !conn_state->plan_rewritten()) { return RebindQueryInfo::DO_NOT_REBIND; }
+    conn_state->replan_for_cpu();
+    record_transparent_fallback_replan();
+    SIRIUS_LOG_INFO("Transparent execution: planning again without the GPU rewrites");
+    return RebindQueryInfo::ATTEMPT_TO_REBIND;
+  };
 
   // If the optimizer hook captured a plan FOR THIS planning attempt, use it.
   // A generation mismatch (e.g. a leftover from Connection::ExtractPlan, which
@@ -1973,7 +2025,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     cte_reader_proofs      = conn_state->take_captured_cte_reader_proofs_if_current();
     if (sirius::transparent::should_use_duckdb(context, nullptr, &prepared.properties) !=
         sirius::transparent::decline_reason::none) {
-      return RebindQueryInfo::DO_NOT_REBIND;
+      return leave_to_duckdb();
     }
   }
   auto const candidate_source = logical_plan ? sirius::transparent::candidate_origin::copy
@@ -2001,7 +2053,18 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     statement_type =
       prepared.physical_plan->Root().Cast<PhysicalExecute>().prepared->statement_type;
   }
-  if (statement_type != StatementType::SELECT_STATEMENT) { return RebindQueryInfo::DO_NOT_REBIND; }
+  bool const sirius_runs_it =
+    statement_type == StatementType::SELECT_STATEMENT ||
+    (statement_type == StatementType::COPY_STATEMENT && is_gpu_copy_candidate(prepared));
+  if (!sirius_runs_it) {
+    // A plain EXPLAIN keeps a rewritten plan: it describes what the GPU is given and executes
+    // nothing. A statement that executes (EXPLAIN ANALYZE, DML with RETURNING, a COPY Sirius does
+    // not take) gets the plan DuckDB makes alone.
+    bool const plain_explain = statement_type == StatementType::EXPLAIN_STATEMENT &&
+                               !(prepared.physical_plan && prepared.physical_plan->Root().type ==
+                                                             PhysicalOperatorType::EXPLAIN_ANALYZE);
+    return plain_explain ? RebindQueryInfo::DO_NOT_REBIND : leave_to_duckdb();
+  }
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).
@@ -2020,7 +2083,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                               : sirius::transparent::plan_source_policy{{}, false};
 
   if (!logical_plan) {
-    if (current_query_sql.empty()) { return RebindQueryInfo::DO_NOT_REBIND; }
+    if (current_query_sql.empty()) { return leave_to_duckdb(); }
     try {
       InternalQueryGuard guard(context);  // suppress recursive optimizer hooks
       duckdb::Value churn_setting;
@@ -2042,7 +2105,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       }
       Parser parser(context);
       parser.ParseQuery(current_query_sql);
-      if (parser.statements.size() != 1) { return RebindQueryInfo::DO_NOT_REBIND; }
+      if (parser.statements.size() != 1) { return leave_to_duckdb(); }
       Planner planner(context);
       planner.CreatePlan(std::move(parser.statements[0]));
       Optimizer optimizer(*planner.binder, context);
@@ -2062,7 +2125,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}",
                       sirius::sanitized_message(e));
-      return RebindQueryInfo::DO_NOT_REBIND;
+      return leave_to_duckdb();
     } catch (NotImplementedException& e) {
       // The retained physical plan also exposes sources hidden behind views.
       sirius::transparent::require_s3_cpu_replay(
@@ -2074,7 +2137,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}",
                       sirius::sanitized_message(e));
-      return RebindQueryInfo::DO_NOT_REBIND;
+      return leave_to_duckdb();
     } catch (std::exception& e) {
       sirius::transparent::require_s3_cpu_replay(
         source_policy, current_query_sql, sirius::sanitized_message(e));
@@ -2085,11 +2148,12 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}",
                       sirius::sanitized_message(e));
-      return RebindQueryInfo::DO_NOT_REBIND;
+      return leave_to_duckdb();
     }
-    if (!logical_plan) { return RebindQueryInfo::DO_NOT_REBIND; }
+    if (!logical_plan) { return leave_to_duckdb(); }
   }
 
+  bool took_over = false;
   try {
     // Copy can rebind table functions, whose bind callbacks may acquire maintenance access.
     // Finish it before taking a planning permit so maintenance cannot wait on our own permit.
@@ -2124,7 +2188,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                            std::nullopt, conn_state->planning_generation()})
                      : std::make_unique<sirius::planner::sirius_physical_plan_generator>(context);
 
-    planner->cte_reader_proofs = cte_reader_proofs;
+    planner->cte_reader_proofs  = cte_reader_proofs;
+    planner->copy_statement_sql = current_query_sql;
     // Hand the validated plan over instead of discarding it, so the first execution can skip
     // an identical rebuild. Stamp the pinned-registry epoch the plan was built against: the
     // execution window re-checks it and rebuilds if a pin or unpin landed in between.
@@ -2182,9 +2247,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // PreparedStatementData. On a runtime GPU failure PhysicalSiriusExecution runs
     // it on a private Executor in the same transaction. It's collector-free here —
     // exactly what GetResultCollector expects at execute time.
-    auto cpu_fallback   = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
-    cpu_fallback->types = prepared.types;
-    cpu_fallback->names = prepared.names;
+    auto cpu_fallback           = make_shared_ptr<PreparedStatementData>(statement_type);
+    cpu_fallback->types         = prepared.types;
+    cpu_fallback->names         = prepared.names;
     cpu_fallback->properties    = prepared.properties;
     cpu_fallback->physical_plan = std::move(prepared.physical_plan);
 
@@ -2205,11 +2270,13 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       validated_plan_pin_epoch,
       context.transaction.ActiveTransaction().global_transaction_id,
       std::move(cte_reader_proofs),
-      validated_distributed_query);
+      validated_distributed_query,
+      conn_state && conn_state->plan_rewritten());
     new_physical_plan->SetRoot(sirius_op);
 
     // Replace the DuckDB CPU physical plan.
     prepared.physical_plan = std::move(new_physical_plan);
+    took_over              = true;
     record_transparent_rebind_success();
 
     SIRIUS_LOG_INFO("Transparent execution: physical plan replaced with GPU operator");
@@ -2228,7 +2295,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     record_transparent_fallback();
     SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}",
                     sirius::sanitized_message(e));
-    return RebindQueryInfo::DO_NOT_REBIND;
   } catch (NotImplementedException& e) {
     sirius::transparent::require_s3_cpu_replay(
       source_policy, current_query_sql, sirius::sanitized_message(e));
@@ -2252,7 +2318,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     SIRIUS_LOG_INFO("Transparent execution fallback: {}", sirius::sanitized_message(e));
   }
 
-  return RebindQueryInfo::DO_NOT_REBIND;
+  return took_over ? RebindQueryInfo::DO_NOT_REBIND : leave_to_duckdb();
 }
 
 RebindQueryInfo SiriusContext::OnRebindPreparedStatement(ClientContext& context,
@@ -2269,9 +2335,11 @@ RebindQueryInfo SiriusContext::OnRebindPreparedStatement(ClientContext& context,
   // Bind parameter values before GPU planning, including values whose types match
   // the cached CPU plan and therefore do not trigger DuckDB's own rebind.
   Value enabled;
-  if (prepared.statement_type == StatementType::SELECT_STATEMENT && !prepared.value_map.empty() &&
-      is_initialized_ && context.TryGetCurrentSetting("gpu_execution", enabled) &&
-      !enabled.IsNull() && enabled.GetValue<bool>()) {
+  if ((prepared.statement_type == StatementType::SELECT_STATEMENT ||
+       prepared.statement_type == StatementType::COPY_STATEMENT) &&
+      !prepared.value_map.empty() && is_initialized_ &&
+      context.TryGetCurrentSetting("gpu_execution", enabled) && !enabled.IsNull() &&
+      enabled.GetValue<bool>()) {
     return RebindQueryInfo::ATTEMPT_TO_REBIND;
   }
   // Only Sirius-backed statements need an extra rebind to recheck GPU eligibility
@@ -2385,7 +2453,29 @@ void install_configured_log_sink(DatabaseInstance* db)
   }
 }
 
-SiriusContextExtensionCallback::SiriusContextExtensionCallback()
+logging_load_transaction::logging_load_transaction()
+  : log_lock_(Config::logging_mutex),
+    previous_sink_(sirius::log::get_sink()),
+    previous_backend_(Config::LOG_BACKEND),
+    previous_dir_(Config::LOG_DIR),
+    previous_level_(Config::LOG_LEVEL)
+{
+}
+
+logging_load_transaction::~logging_load_transaction()
+{
+  if (committed_) { return; }
+  Config::LOG_BACKEND = std::move(previous_backend_);
+  Config::LOG_DIR     = std::move(previous_dir_);
+  Config::LOG_LEVEL   = std::move(previous_level_);
+  try {
+    if (sirius::log::get_sink() != previous_sink_) { sirius::log::set_sink(previous_sink_); }
+  } catch (...) {
+    // Flushing the discarded sink failed; the load's own error is the one to report.
+  }
+}
+
+SiriusContextExtensionCallback::SiriusContextExtensionCallback(DatabaseInstance* db)
   : disabled_(sirius_disabled_by_env())
 {
   std::lock_guard log_lock(Config::logging_mutex);
@@ -2410,11 +2500,9 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
   if (backend_env) { Config::LOG_BACKEND = backend_env; }
   if (log_dir_env) { Config::LOG_DIR = log_dir_env; }
   if (level_env) { Config::LOG_LEVEL = level_env; }
-  // Install now (no db yet) so spdlog/noop capture the logs emitted by
-  // read_config_file_if_exists() below; the duckdb backend needs a db (installed
-  // later).
+  // Install now so the sink captures the logs emitted by read_config_file_if_exists() below.
   try {
-    install_configured_log_sink(nullptr);
+    install_configured_log_sink(db);
   } catch (...) {
     Config::LOG_BACKEND = previous_log_backend;
     Config::LOG_DIR     = previous_log_dir;

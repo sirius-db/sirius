@@ -13,17 +13,21 @@
 # =============================================================================
 
 CMAKE ?= cmake
+# Build root; each configuration gets its own subdirectory. For example:
+# pixi run --manifest-path envs/nightly/pixi.toml make BUILD_DIR=build-nightly
+BUILD_DIR ?= build
+# Preserve the historical wrapper location for the default build.
+WRAPPER_BUILD_DIR ?= $(if $(filter build,$(BUILD_DIR)),sirius-duckdb/build,$(BUILD_DIR)/wrapper)
 DUCKDB_DIR ?= duckdb
 TEST_BUILD_TARGET ?= sirius_unittest
 MAIN_BUILD_TARGETS ?= sirius_library
 
 BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 
-.PHONY: all sirius-duckdb release debug reldebug relwithdebinfo debug-release \
+.PHONY: all sirius-duckdb release release-meld debug relwithdebinfo \
 	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
-	test test_release test_debug test_reldebug clean list-presets \
-	s3-test s3-test-large s3-tpch \
-	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker \
+	test test_release test_debug test_relwithdebinfo clean list-presets \
+	s3-test s3-test-large s3-test-aws \
 	slot-gate-test
 
 CMAKE_INPUTS := CMakePresets.json cmake/CMakePresets.json CMakeLists.txt $(wildcard cmake/*.cmake)
@@ -31,9 +35,10 @@ CMAKE_INPUTS := CMakePresets.json cmake/CMakePresets.json CMakeLists.txt $(wildc
 all: sirius-duckdb
 
 sirius-duckdb: release
-	$(CMAKE) --install build/release --prefix "$(CURDIR)/build/release/install" --component sirius_library
-	$(MAKE) -C sirius-duckdb release SIRIUS_DUCKDB_LINKAGE=shared \
-		SIRIUS_INSTALL_DIR="$(CURDIR)/build/release/install" \
+	$(CMAKE) --install "$(BUILD_DIR)/release" --prefix "$(abspath $(BUILD_DIR))/release/install" --component sirius_library
+	$(MAKE) -C sirius-duckdb sirius-release SIRIUS_DUCKDB_LINKAGE=shared \
+		BUILD_DIR="$(abspath $(WRAPPER_BUILD_DIR))" \
+		SIRIUS_INSTALL_DIR="$(abspath $(BUILD_DIR))/release/install" \
 		EXT_FLAGS="$(EXT_FLAGS) -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
 
 # Development tooling from the Pixi environment; set SIRIUS_CMAKE_FLAGS= without it.
@@ -41,44 +46,48 @@ SIRIUS_CMAKE_FLAGS ?= -DCMAKE_C_COMPILER_LAUNCHER=sccache \
 	-DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \
 	-DCMAKE_LINKER_TYPE=MOLD
 
-build/%/build.ninja: $(CMAKE_INPUTS)
-	$(CMAKE) --preset $* -DSIRIUS_DUCKDB_SOURCE_DIR="$(abspath $(DUCKDB_DIR))" $(SIRIUS_CMAKE_FLAGS)
+$(BUILD_DIR)/%/build.ninja: $(CMAKE_INPUTS)
+	$(CMAKE) --preset $* -B "$(BUILD_DIR)/$*" -DSIRIUS_DUCKDB_SOURCE_DIR="$(abspath $(DUCKDB_DIR))" $(SIRIUS_CMAKE_FLAGS)
 
-release: build/release/build.ninja
-	$(CMAKE) --build --preset release --target $(BUILD_TARGETS)
+release: $(BUILD_DIR)/release/build.ninja
+	$(CMAKE) --build "$(BUILD_DIR)/release" --target $(BUILD_TARGETS)
 
-debug: build/debug/build.ninja
-	$(CMAKE) --build --preset debug --target $(BUILD_TARGETS)
+# pixi run make release-meld
+release-meld: $(BUILD_DIR)/release-meld/build.ninja
+	$(CMAKE) --build "$(BUILD_DIR)/release-meld" --target $(BUILD_TARGETS)
+
+debug: $(BUILD_DIR)/debug/build.ninja
+	$(CMAKE) --build "$(BUILD_DIR)/debug" --target $(BUILD_TARGETS)
 
 reldebug: relwithdebinfo
 
 debug-release: relwithdebinfo
 
-relwithdebinfo: build/relwithdebinfo/build.ninja
-	$(CMAKE) --build --preset relwithdebinfo --target $(BUILD_TARGETS)
+relwithdebinfo: $(BUILD_DIR)/relwithdebinfo/build.ninja
+	$(CMAKE) --build "$(BUILD_DIR)/relwithdebinfo" --preset relwithdebinfo --target $(BUILD_TARGETS)
 
-clang-release: build/clang-release/build.ninja
-	$(CMAKE) --build --preset clang-release --target $(BUILD_TARGETS)
+clang-release: $(BUILD_DIR)/clang-release/build.ninja
+	$(CMAKE) --build "$(BUILD_DIR)/clang-release" --target $(BUILD_TARGETS)
 
-clang-debug: build/clang-debug/build.ninja
-	$(CMAKE) --build --preset clang-debug --target $(BUILD_TARGETS)
+clang-debug: $(BUILD_DIR)/clang-debug/build.ninja
+	$(CMAKE) --build "$(BUILD_DIR)/clang-debug" --target $(BUILD_TARGETS)
 
-clang-relwithdebinfo: build/clang-relwithdebinfo/build.ninja
-	$(CMAKE) --build --preset clang-relwithdebinfo --target $(BUILD_TARGETS)
+clang-relwithdebinfo: $(BUILD_DIR)/clang-relwithdebinfo/build.ninja
+	$(CMAKE) --build "$(BUILD_DIR)/clang-relwithdebinfo" --target $(BUILD_TARGETS)
 
 # AddressSanitizer build (RelWithDebInfo + clang). Run inside `pixi shell` (so
 # llvm-symbolizer is auto-detected on PATH) with:
 #   ASAN_OPTIONS="protect_shadow_gap=0:detect_leaks=0:halt_on_error=0:abort_on_error=1" \
 #     ./build/clang-asan/test/cpp/sirius_unittest
-clang-asan: build/clang-asan/build.ninja
-	$(CMAKE) --build --preset clang-asan --target $(BUILD_TARGETS)
+clang-asan: $(BUILD_DIR)/clang-asan/build.ninja
+	$(CMAKE) --build "$(BUILD_DIR)/clang-asan" --target $(BUILD_TARGETS)
 
 # ThreadSanitizer build (RelWithDebInfo + clang). Run inside `pixi shell` (so
 # llvm-symbolizer is auto-detected on PATH) with:
 #   TSAN_OPTIONS="suppressions=$$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7:detect_deadlocks=0" \
 #     ./build/clang-tsan/test/cpp/sirius_unittest
-clang-tsan: build/clang-tsan/build.ninja
-	$(CMAKE) --build --preset clang-tsan --target $(BUILD_TARGETS)
+clang-tsan: $(BUILD_DIR)/clang-tsan/build.ninja
+	$(CMAKE) --build "$(BUILD_DIR)/clang-tsan" --target $(BUILD_TARGETS)
 
 # The C++ unit tests run through scripts/run_unit_tests.py, as in CI. Pass options through
 # UNITTEST_ARGS, e.g. `make test UNITTEST_ARGS="--steps shards -- --order rand"`.
@@ -86,18 +95,18 @@ RUN_UNIT_TESTS = python3 scripts/run_unit_tests.py
 
 test: test_release
 
-test_release: export SIRIUS_EXTENSION_PATH ?= $(CURDIR)/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+test_release: export SIRIUS_EXTENSION_PATH ?= $(abspath $(WRAPPER_BUILD_DIR))/release/extension/sirius/sirius.duckdb_extension
 test_release: sirius-duckdb
-	$(RUN_UNIT_TESTS) --build-dir build/release $(UNITTEST_ARGS)
+	$(RUN_UNIT_TESTS) --build-dir "$(BUILD_DIR)/release" $(UNITTEST_ARGS)
 
 test_debug: debug
-	$(RUN_UNIT_TESTS) --build-dir build/debug $(UNITTEST_ARGS)
+	$(RUN_UNIT_TESTS) --build-dir "$(BUILD_DIR)/debug" $(UNITTEST_ARGS)
 
-test_reldebug: relwithdebinfo
-	$(RUN_UNIT_TESTS) --build-dir build/relwithdebinfo $(UNITTEST_ARGS)
+test_relwithdebinfo: relwithdebinfo
+	$(RUN_UNIT_TESTS) --build-dir "$(BUILD_DIR)/relwithdebinfo" $(UNITTEST_ARGS)
 
 clean:
-	rm -rf build sirius-duckdb/build
+	rm -rf "$(BUILD_DIR)" "$(WRAPPER_BUILD_DIR)"
 
 list-presets:
 	$(CMAKE) --list-presets
@@ -136,13 +145,9 @@ list-presets:
 # The S3 targets pass `--order decl`, so cases run in declaration order;
 # Catch2 3.9.0 and later would otherwise pick a random order.
 #
-# Deprecated names, kept for one round: `s3-tpch` (its suites also run in
-# s3-test and s3-test-large), `s3-test-aws-sigv4` (runs s3-test-aws, which
-# selects the same cases) and `s3-test-aws-broker` (no case carries [broker]).
-#
 # See test/cpp/integration/s3/README.md for details.
 
-S3_TEST_BIN ?= build/release/test/cpp/sirius_unittest
+S3_TEST_BIN ?= $(BUILD_DIR)/release/test/cpp/sirius_unittest
 
 # Query-lifecycle concurrency gates. Runs the hidden [slot_leak_gate] cases
 # (the worker-pressure gate needs a TPC-H lineitem parquet fixture) plus the
@@ -193,19 +198,6 @@ s3-test-large:
 	SIRIUS_TEST_S3_TPCH=1 SIRIUS_TEST_S3_GLOB_SCALE=1 $(S3_TEST_BIN) --order decl "[s3][sql][large][large-cache],[s3][integration][sql][tpch][large],[s3][large][glob-scale]"; \
 	$(S3_TEST_BIN) --order decl "[s3][sql][large][large-nocache]"
 
-# Deprecated: the tiny TPC-H suite runs in s3-test and the SF1 suite in
-# s3-test-large. Kept for one round with its old selection (uploads the SF1
-# TPC-H fixture with SIRIUS_TEST_S3_TPCH=1 and runs both suites).
-s3-tpch:
-	@echo "s3-tpch is deprecated: the TPC-H suites run in s3-test (tiny) and s3-test-large (SF1)." >&2
-	@if [ ! -x $(S3_TEST_BIN) ]; then \
-	  echo "s3-tpch: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
-	  exit 1; \
-	fi
-	@set -e; \
-	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 SIRIUS_TEST_S3_TPCH=1; \
-	$(S3_TEST_BIN) --order decl "[s3][integration][sql][tpch]"
-
 # Manual real-AWS gates. These never start the local backend and are excluded from
 # CI. Export the AWS environment yourself before invoking (regional S3 endpoint,
 # real bucket, and assume-role TEMPORARY credentials including the session
@@ -219,12 +211,3 @@ s3-test-aws:
 	@set -e; \
 	export SIRIUS_TEST_S3_STRICT=1; \
 	$(S3_TEST_BIN) --order decl "[s3][aws]"
-
-# Deprecated: selects the same cases as s3-test-aws.
-s3-test-aws-sigv4:
-	@echo "s3-test-aws-sigv4 is deprecated: use s3-test-aws, which selects the same cases." >&2
-	@$(MAKE) --no-print-directory s3-test-aws
-
-# Deprecated: no test case carries [broker], so this target runs nothing.
-s3-test-aws-broker:
-	@echo "s3-test-aws-broker is deprecated and runs nothing: no test case carries [broker]." >&2

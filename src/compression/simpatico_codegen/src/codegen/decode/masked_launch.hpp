@@ -42,6 +42,8 @@ class decode_frame;
 struct row_enumeration {
   std::int32_t const* row_indices              = nullptr;
   ::sirius::codegen::chunk_row_set const* rows = nullptr;
+  /// Query-local trace policy; independent of the enumeration geometry.
+  bool diagnostics = false;
 
   [[nodiscard]] bool by_index() const noexcept { return row_indices != nullptr; }
   [[nodiscard]] bool by_row_set() const noexcept { return rows != nullptr; }

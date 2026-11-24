@@ -76,6 +76,7 @@ add_library(
   "${EMBED_CCCL_HEADERS_OUT}"
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
+  src/bridge/first_mismatch.cu
   src/selection/selection_wave.cu
   src/selection/chunk_row_set_build.cu
   src/selection/row_id_space.cu
@@ -99,7 +100,6 @@ add_library(
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
   # Runtime: plan executor + bridge + API + rep glue
-  src/selection/decompression_pushdown_policy.cpp
   src/plan/bit_spec.cpp
   src/plan/plan_dsl.cpp
   src/plan/plan_tree.cpp
@@ -114,6 +114,7 @@ add_library(
   src/util/isoc23_compat.c
   src/bridge/fused_tree_build.cpp
   src/bridge/codegen_runtime.cpp
+  src/bridge/meld_backend.cpp
   src/simpatico_codegen.cpp
   src/api/compressed_table_io.cpp
   src/explore/compression_explorer.cpp)
@@ -190,6 +191,36 @@ if(TARGET cuCascade::cucascade_static)
                              PRIVATE SIMPATICO_USE_CUCASCADE_STREAM_POOL)
 endif()
 
+option(SIMPATICO_ENABLE_MELD "Build Meld's decoders beside the NVRTC JIT" OFF)
+set(SIMPATICO_MELD_SOURCE_DIR
+    ""
+    CACHE PATH "Meld's source tree, for SIMPATICO_ENABLE_MELD")
+if(SIMPATICO_ENABLE_MELD)
+  if(NOT EXISTS "${SIMPATICO_MELD_SOURCE_DIR}/lib/Codec/CMakeLists.txt")
+    message(
+      FATAL_ERROR
+        "SIMPATICO_ENABLE_MELD needs SIMPATICO_MELD_SOURCE_DIR to name Meld's "
+        "source tree; '${SIMPATICO_MELD_SOURCE_DIR}' is not one")
+  endif()
+  # Only Meld's codec library, which needs MLIR and nothing else of Meld.
+  block()
+  set(MELD_CODEC_ONLY ON)
+  add_subdirectory("${SIMPATICO_MELD_SOURCE_DIR}"
+                   "${CMAKE_CURRENT_BINARY_DIR}/meld" EXCLUDE_FROM_ALL)
+  endblock()
+  # Meld sets its include directories per directory, not per target.
+  get_directory_property(
+    simpatico_meld_include_dirs DIRECTORY "${SIMPATICO_MELD_SOURCE_DIR}"
+                                          INCLUDE_DIRECTORIES)
+  set_source_files_properties(
+    src/bridge/meld_backend.cpp PROPERTIES INCLUDE_DIRECTORIES
+                                           "${simpatico_meld_include_dirs}")
+  target_link_libraries(simpatico PRIVATE MeldDecoderCompiler)
+  target_compile_definitions(simpatico PRIVATE SIMPATICO_WITH_MELD)
+  message(
+    STATUS "Simpatico: Meld decode backend from ${SIMPATICO_MELD_SOURCE_DIR}")
+endif()
+
 function(add_codegen_host_test name)
   add_executable(${name} tests/${name}.cpp)
   set_target_properties(${name} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
@@ -224,6 +255,9 @@ add_codegen_host_test(test_row_id_space)
 add_codegen_host_test(test_chunk_row_set_convert)
 add_codegen_host_test(test_decompress_column_rows)
 add_codegen_host_test(test_render_signature_contract)
+if(SIMPATICO_ENABLE_MELD)
+  add_codegen_host_test(test_meld_decode)
+endif()
 
 # Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
 # the installed binary is named 'simpatico'.
@@ -258,3 +292,6 @@ add_test(NAME row_id_space COMMAND test_row_id_space)
 add_test(NAME chunk_row_set_convert COMMAND test_chunk_row_set_convert)
 add_test(NAME decompress_column_rows COMMAND test_decompress_column_rows)
 add_test(NAME render_signature_contract COMMAND test_render_signature_contract)
+if(SIMPATICO_ENABLE_MELD)
+  add_test(NAME meld_decode COMMAND test_meld_decode)
+endif()

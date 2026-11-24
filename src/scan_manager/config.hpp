@@ -19,25 +19,25 @@
 
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "exec/thread_defaults.hpp"
 #include "scan_manager/preparation_options.hpp"
 
 #include <cucascade/io/config.hpp>
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
 namespace sirius::scan_manager {
 
-/// Default uring reactor count (matches cuCascade's @c io_config::uring_n_reactors;
-/// one worker thread each);
-/// counted in the scan-manager sizing budget below.
+/// Unresolved uring fallback; hardware resolution uses 2 reactors below 32 CPU
+/// hardware threads and 4 otherwise, unless YAML explicitly sets the count.
 inline constexpr std::size_t default_uring_n_reactors = 4;
 
 /// Sirius keeps read-path chunks in cuCascade's pinned host cache for reuse,
@@ -52,14 +52,13 @@ inline constexpr std::size_t default_uring_n_reactors = 4;
   return c;
 }
 
-/// Sirius's default uring backend config: cuCascade's struct defaults with
-/// readahead off (@c n_max_concurrent_scans = 0).  cuCascade's own default is
-/// 0 as well; the explicit assignment keeps Sirius's choice independent of it.
+/// Sirius's unresolved uring backend config: cuCascade's struct defaults with
+/// @c n_max_concurrent_scans = 0.  cuCascade's own default is 0 as well; the
+/// explicit assignment keeps Sirius's choice independent of it.
 ///
-/// Local NVMe has no round trip to hide, so a readahead competes with the
-/// executor's own reads for the same device and just reorders the queue rather
-/// than adding throughput.  Set a positive value (or @c max_readahead_scans) to
-/// opt the local path in.
+/// @c sirius_config re-defaults the budget to the pipeline pool size when it
+/// resolves a configuration (@c sirius_config::derive_uring_scan_budget), so this
+/// zero is what a @c scan_manager_config built directly carries.
 /// @c n_max_concurrent_scans_explicit stays false: this is a default, not a
 /// value the config named.
 [[nodiscard]] inline cucascade::io::uring::config default_uring_config() noexcept
@@ -69,14 +68,11 @@ inline constexpr std::size_t default_uring_n_reactors = 4;
   return c;
 }
 
-/// Default scan-manager pool size: every core left after the other default pools
-/// (downgrade, task_creator, pipeline, uring reactor), never below 4.
-[[nodiscard]] inline int default_scan_manager_num_threads()
+/// Initial scan-worker default; runtime resolution also covers every eligible
+/// NUMA domain. Explicit counts retain their domain-coverage validation.
+[[nodiscard]] inline constexpr int default_scan_manager_num_threads()
 {
-  constexpr int reserved =
-    exec::default_downgrade_num_threads + creator::default_task_creator_num_threads +
-    exec::default_gpu_pipeline_num_threads + static_cast<int>(default_uring_n_reactors);
-  return std::max(4, static_cast<int>(std::thread::hardware_concurrency()) - reserved);
+  return exec::derive_thread_defaults(0, 0).scan_manager;
 }
 
 /// How the readahead decides *when* to issue the next prefetch.
@@ -238,6 +234,9 @@ struct scan_manager_config {
   preparation_config preparation;
   exec::thread_pool_config thread_pool{.num_threads        = default_scan_manager_num_threads(),
                                        .thread_name_prefix = "scan_manager"};
+  /// YAML preserves explicit values even when numerically equal to the default.
+  /// C++ callers assigning that same value should also set this flag to request a hard limit.
+  bool num_threads_explicit{false};
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::native};
 
@@ -263,12 +262,12 @@ struct scan_manager_config {
   /// interrupts and the reactors.  No effect when the reactors run unpinned.
   bool reserve_rest_reactor_cpus{true};
 
-  /// Engine-owned (not YAML): the CPU mask REST contexts are built and started
-  /// from, set to the configuring thread's affinity when the reactor CPUs are
-  /// reserved.  A routed REST context built lazily on a pool thread (whose mask
-  /// excludes the reserved CPUs) is built on a helper thread with this mask, so
-  /// it plans and pins exactly as at startup.  Empty: the caller's own mask.
-  std::vector<int> rest_placement_cpus;
+  /// Engine-owned rank CPU boundary, sampled from the main-thread affinity and cgroup
+  /// allowance at configuration resolution. Used by metadata and lazy I/O/control startup.
+  std::vector<int> startup_cpus;
+  /// Default CPU mask for lazy control/native workers, excluding reserved reactor CPUs.
+  /// Independent of the metadata pool's explicit cpu_affinity override.
+  std::vector<int> worker_startup_cpus;
 
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:
@@ -295,7 +294,7 @@ struct scan_manager_config {
 
   /// Local (uring) reactor configuration. @c use_odirect is derived from
   /// @ref cache; physical operation size is selected by the worker.  Defaults
-  /// to @ref default_uring_config (readahead off).
+  /// to @ref default_uring_config (budget 0 until @c sirius_config derives it).
   cucascade::io::uring::config uring{default_uring_config()};
 
   /// REST (S3/object-store) reactor configuration — timeouts, TLS policy,
@@ -361,9 +360,10 @@ struct scan_manager_config {
     // chunk would be dropped before its scan ever asked for it.
     if (!cache.enabled()) { return plan; }
     // A backend budget of zero is the backend opting out of readahead entirely
-    // (see default_uring_config).  Honor it even under the
-    // opportunistic strategy, which would otherwise substitute the pipeline
-    // width and run a readahead the backend asked not to have.
+    // (an explicit `n_max_concurrent_scans: 0`, or the unresolved default of
+    // default_uring_config).  Honor it even under the opportunistic strategy,
+    // which would otherwise substitute the pipeline width and run a readahead
+    // the backend asked not to have.
     if (backend_budget == 0) { return plan; }
     // Opportunistic schedules against what the executor can run, not what the
     // device can queue: one prefetch per non-scan deployment is only useful
@@ -374,6 +374,23 @@ struct scan_manager_config {
     return plan;
   }
 };
+
+// Resolve only after GPU topology and CPU restrictions determine eligible domains.
+// Preserve direct C++ overrides as well as explicitly supplied YAML values.
+inline int resolve_scan_manager_num_threads(scan_manager_config const& config, size_t domains)
+{
+  auto workers   = config.thread_pool.num_threads;
+  auto automatic = default_scan_manager_num_threads();
+  if (workers <= 0) throw std::invalid_argument("scan_manager.num_threads must be positive");
+  if (config.num_threads_explicit || workers != automatic) {
+    if (static_cast<size_t>(workers) < domains)
+      throw std::invalid_argument("scan_manager.num_threads must cover each eligible NUMA domain");
+    return workers;
+  }
+  if (domains > static_cast<size_t>(std::numeric_limits<int>::max()))
+    throw std::invalid_argument("too many scan metadata NUMA domains");
+  return std::max(workers, static_cast<int>(domains));
+}
 
 // Validate before any pool/reactor starts. Both defaults and explicit C++ overrides use this path.
 inline scan_manager_config validate_scan_manager_config(scan_manager_config config)

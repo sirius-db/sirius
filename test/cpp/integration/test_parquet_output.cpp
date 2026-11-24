@@ -1,0 +1,1384 @@
+// Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
+#include "late_mat/column_origin.hpp"
+#include "log/logging.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/sirius_physical_parquet_sink.hpp"
+#include "output/parquet_writer.hpp"
+#include "sirius/exception.hpp"
+#include "utils/gpu_execution_fixture.hpp"
+
+#include <cudf/column/column_factories.hpp>
+#include <cudf/io/parquet.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/cuda_device.hpp>
+#include <rmm/mr/callback_memory_resource.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+#include <rmm/version_config.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <absl/cleanup/cleanup.h>
+#include <catch.hpp>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <mutex>
+#include <thread>
+
+namespace {
+struct export_directory {
+  std::filesystem::path path;
+  export_directory()
+  {
+    std::string pattern =
+      (std::filesystem::temp_directory_path() / "sirius-copy-sql-XXXXXX").string();
+    if (!::mkdtemp(pattern.data())) throw std::runtime_error("mkdtemp failed");
+    path = pattern;
+  }
+  ~export_directory() { std::filesystem::remove_all(path); }
+};
+std::string quote(std::filesystem::path const& path) { return "'" + path.string() + "'"; }
+constexpr auto empty_nested_query = "SELECT ar FROM export_empty_nested";
+}  // namespace
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "DuckDB-only COPY operations do not require GPU fallback",
+                 "[parquet_export_gpu][integration][copy_cpu_routing]")
+{
+  export_directory root;
+  bool const fallback = GENERATE(false, true);
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_cpu_only(k INTEGER)");
+  run_ok("INSERT INTO export_cpu_only VALUES (1), (2), (NULL)");
+  run_ok("CHECKPOINT");
+  run_ok("COPY export_cpu_only TO " + quote(root.path / "input.parquet") + " (FORMAT PARQUET)");
+  run_ok("CREATE TABLE import_cpu_only(k INTEGER)");
+  run_ok("SET gpu_execution=true");
+  run_ok(std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"));
+  auto run_cpu = [&](std::string const& sql) {
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    run_ok(sql);
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::require_transparent_execution_delta(before, after, 0, 0, 0);
+  };
+  run_cpu("COPY import_cpu_only FROM " + quote(root.path / "input.parquet"));
+  run_cpu("PREPARE import_copy AS COPY import_cpu_only FROM " + quote(root.path / "input.parquet"));
+  run_cpu("EXECUTE import_copy");
+  run_cpu("DEALLOCATE import_copy");
+  run_cpu("COPY export_cpu_only TO " + quote(root.path / "csv") +
+          " (FORMAT CSV, PER_THREAD_OUTPUT true)");
+  run_cpu("COPY export_cpu_only TO " + quote(root.path / "single.parquet") + " (FORMAT PARQUET)");
+  run_cpu("PREPARE cpu_copy AS COPY export_cpu_only TO " + quote(root.path / "prepared.parquet") +
+          " (FORMAT PARQUET, PER_THREAD_OUTPUT false)");
+  run_cpu("EXECUTE cpu_copy");
+  run_cpu("DEALLOCATE cpu_copy");
+  run_ok("SET gpu_execution=false");
+  auto rows = con->Query("SELECT * FROM import_cpu_only");
+  REQUIRE_FALSE(rows->HasError());
+  REQUIRE(rows->RowCount() == 6);
+  REQUIRE(std::filesystem::is_regular_file(root.path / "single.parquet"));
+  REQUIRE(std::filesystem::is_regular_file(root.path / "prepared.parquet"));
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "IMPORT DATABASE runs on DuckDB with fallback disabled",
+                 "[parquet_export_gpu][integration][copy_cpu_routing]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE import_database_input AS SELECT 42::INTEGER k");
+  run_ok("EXPORT DATABASE " + quote(root.path / "database") + " (FORMAT PARQUET)");
+  run_ok("DROP TABLE import_database_input");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  run_ok("IMPORT DATABASE " + quote(root.path / "database"));
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before, after, 0, 0, 0);
+  run_ok("SET gpu_execution=false");
+  auto rows = con->Query("SELECT * FROM import_database_input");
+  REQUIRE_FALSE(rows->HasError());
+  REQUIRE(sirius::test::collect_rows(*rows) == std::vector<std::vector<std::string>>{{"42"}});
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "SQL and API prepared multipart COPY execute on the GPU",
+                 "[parquet_export_gpu][integration][copy_prepared]")
+{
+  export_directory root;
+  bool const sql_prepare = GENERATE(false, true);
+  bool const fallback    = GENERATE(false, true);
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_prepared AS SELECT i::INTEGER k FROM range(10) t(i)");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=true");
+  run_ok(std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"));
+  auto sql = "COPY (SELECT * FROM export_prepared) TO " + quote(root.path / "prepared") +
+             " (FORMAT PARQUET, PER_THREAD_OUTPUT true)";
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  if (sql_prepare) {
+    run_ok("PREPARE export_statement AS " + sql);
+    run_ok("EXECUTE export_statement");
+    run_ok("DEALLOCATE export_statement");
+  } else {
+    auto prepared = con->Prepare(sql);
+    REQUIRE_FALSE(prepared->HasError());
+    auto result = prepared->Execute();
+    if (result->HasError()) UNSCOPED_INFO(result->GetError());
+    REQUIRE_FALSE(result->HasError());
+  }
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  REQUIRE(after.executions == before.executions + 1);
+  REQUIRE(after.fallbacks == before.fallbacks);
+  REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks);
+  run_ok("SET gpu_execution=false");
+  auto metadata = con->Query("SELECT num_rows, created_by FROM parquet_file_metadata(" +
+                             quote(root.path / "prepared/*.parquet") + ")");
+  REQUIRE_FALSE(metadata->HasError());
+  REQUIRE(metadata->RowCount() > 0);
+  for (auto const& row : sirius::test::collect_rows(*metadata))
+    REQUIRE(row[1].find("cudf") != std::string::npos);
+  // A SQL EXECUTE must validate the original COPY's explicit generic options.
+  run_ok("SET gpu_execution=false");
+  run_ok("SET enable_duckdb_fallback=false");
+  run_ok("PREPARE unsupported_export AS COPY export_prepared TO " +
+         quote(root.path / "unsupported") +
+         " (FORMAT PARQUET, PER_THREAD_OUTPUT true, ROW_GROUP_SIZE 2048)");
+  run_ok("SET gpu_execution=true");
+  auto unsupported = con->Query("EXECUTE unsupported_export");
+  REQUIRE(unsupported->HasError());
+  REQUIRE(unsupported->GetError().find("row_group_size") != std::string::npos);
+  REQUIRE_FALSE(std::filesystem::exists(root.path / "unsupported"));
+  run_ok("DEALLOCATE unsupported_export");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Small-decimal COPY preserves the scan fallback policy",
+                 "[parquet_export_gpu][integration][copy_small_decimal]")
+{
+  export_directory root;
+  bool const parquet_input = GENERATE(false, true);
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_small_decimal(d DECIMAL(4,2))");
+  run_ok("INSERT INTO export_small_decimal VALUES (99.99), (-99.99), (1.23), (-4.56), (0), (NULL)");
+  run_ok("CHECKPOINT");
+  run_ok("COPY export_small_decimal TO " + quote(root.path / "cpu") +
+         " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  auto query = parquet_input
+                 ? "SELECT * FROM read_parquet(" + quote(root.path / "cpu/*.parquet") + ")"
+                 : "SELECT * FROM export_small_decimal";
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  auto sql = std::string("COPY (") + query + ") TO " + quote(root.path / "fallback") +
+             " (FORMAT PARQUET, PER_THREAD_OUTPUT true)";
+  auto before  = sirius::test::get_transparent_execution_stats(*con);
+  auto refused = con->Query(sql);
+  REQUIRE(refused->HasError());
+  REQUIRE(refused->GetError().find("DECIMAL(4,2)") != std::string::npos);
+  REQUIRE(refused->GetError().find("no native cuDF carrier") != std::string::npos);
+  REQUIRE_FALSE(std::filesystem::exists(root.path / "fallback"));
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  REQUIRE(after.executions == before.executions);
+  REQUIRE(after.fallbacks == before.fallbacks);
+  REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks);
+  run_ok("SET enable_duckdb_fallback=true");
+  before = sirius::test::get_transparent_execution_stats(*con);
+  run_ok(sql);
+  after = sirius::test::get_transparent_execution_stats(*con);
+  REQUIRE(after.executions == before.executions);
+  REQUIRE(after.fallbacks == before.fallbacks + 1);
+  REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks);
+  run_ok("SET gpu_execution=false");
+  for (auto const* prefix : {"SELECT * FROM ", "DESCRIBE SELECT * FROM "}) {
+    auto cpu =
+      con->Query(std::string(prefix) + "read_parquet(" + quote(root.path / "cpu/*.parquet") + ")");
+    auto gpu = con->Query(std::string(prefix) + "read_parquet(" +
+                          quote(root.path / "fallback/*.parquet") + ")");
+    REQUIRE_FALSE(cpu->HasError());
+    REQUIRE_FALSE(gpu->HasError());
+    REQUIRE(sirius::test::collect_rows(*cpu) == sirius::test::collect_rows(*gpu));
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "COPY preserves JSON annotations through planning fallback",
+                 "[parquet_export_gpu][integration][copy_json]")
+{
+  export_directory root;
+  bool const nested = GENERATE(false, true);
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_json(j JSON)");
+  run_ok("INSERT INTO export_json VALUES ('{\"k\":1}'), ('[1,2]'), (NULL)");
+  run_ok("CHECKPOINT");
+  auto query =
+    nested ? "SELECT struct_pack(j := j) AS s FROM export_json" : "SELECT * FROM export_json";
+  run_ok(std::string("COPY (") + query + ") TO " + quote(root.path / "cpu") +
+         " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  auto sql = std::string("COPY (") + query + ") TO " + quote(root.path / "fallback") +
+             " (FORMAT PARQUET, PER_THREAD_OUTPUT true)";
+  auto refused = con->Query(sql);
+  REQUIRE(refused->HasError());
+  REQUIRE(refused->GetError().find("JSON") != std::string::npos);
+  REQUIRE_FALSE(std::filesystem::exists(root.path / "fallback"));
+  run_ok("SET enable_duckdb_fallback=true");
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  run_ok(sql);
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  REQUIRE(after.fallbacks == before.fallbacks + 1);
+  REQUIRE(after.executions == before.executions);
+  run_ok("SET gpu_execution=false");
+  for (auto const* prefix : {"SELECT * FROM ", "DESCRIBE SELECT * FROM "}) {
+    auto cpu =
+      con->Query(std::string(prefix) + "read_parquet(" + quote(root.path / "cpu/*.parquet") + ")");
+    auto actual = con->Query(std::string(prefix) + "read_parquet(" +
+                             quote(root.path / "fallback/*.parquet") + ")");
+    REQUIRE_FALSE(cpu->HasError());
+    REQUIRE_FALSE(actual->HasError());
+    REQUIRE(sirius::test::collect_rows(*cpu) == sirius::test::collect_rows(*actual));
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet writer validates physical types before opening output",
+                 "[parquet_export_gpu][integration][copy_schema_check]")
+{
+  export_directory root;
+  auto const kind = GENERATE(0, 1, 2, 3);
+  sirius::output::parquet_field field;
+  field.name  = "value";
+  field.type  = sirius::logical_type::make(sirius::type_id::INTEGER);
+  auto column = cudf::make_empty_column(cudf::data_type{cudf::type_id::INT64});
+  if (kind == 1) {
+    field.type              = sirius::logical_type::make_decimal(9, 2);
+    field.decimal_precision = 9;
+    column = cudf::make_empty_column(cudf::data_type{cudf::type_id::DECIMAL32, -3});
+  } else if (kind == 2) {
+    auto child     = field;
+    field.type     = sirius::logical_type::make(sirius::type_id::STRUCT);
+    field.children = {child};
+    std::vector<std::unique_ptr<cudf::column>> children;
+    children.push_back(std::move(column));
+    column = cudf::make_structs_column(
+      0, std::move(children), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+  } else if (kind == 3) {
+    field.type              = sirius::logical_type::make_decimal(9, 2);
+    field.decimal_precision = 9;
+    column = cudf::make_empty_column(cudf::data_type{cudf::type_id::DECIMAL64, -2});
+  }
+  sirius::output::parquet_export_spec spec;
+  spec.fields = {field};
+  if (kind == 3) {
+    REQUIRE_NOTHROW(sirius::output::write_parquet_part(spec,
+                                                       cudf::table_view({column->view()}),
+                                                       root.path / "compatible.parquet",
+                                                       cudf::get_default_stream()));
+    REQUIRE(std::filesystem::exists(root.path / "compatible.parquet"));
+    return;
+  }
+  REQUIRE_THROWS_WITH(sirius::output::write_parquet_part(spec,
+                                                         cudf::table_view({column->view()}),
+                                                         root.path / "invalid.parquet",
+                                                         cudf::get_default_stream()),
+                      Catch::Matchers::ContainsSubstring("physical type mismatch"));
+  REQUIRE_FALSE(std::filesystem::exists(root.path / "invalid.parquet"));
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY preserves wide Parquet decimal carriers and logical precision",
+                 "[parquet_export_gpu][integration][parquet_wide_decimal]")
+{
+  export_directory root;
+  auto const source_type = GENERATE(cudf::type_id::DECIMAL64, cudf::type_id::DECIMAL128);
+  auto column =
+    cudf::make_fixed_point_column(cudf::data_type{source_type, -2}, 6, cudf::mask_state::ALL_NULL);
+  int64_t const values[] = {999999999, -999999999, 123, -456, 0, 0};
+  __int128_t wide_values[6];
+  std::copy(std::begin(values), std::end(values), std::begin(wide_values));
+  auto const* data = source_type == cudf::type_id::DECIMAL64
+                       ? static_cast<void const*>(values)
+                       : static_cast<void const*>(wide_values);
+  auto const bytes = source_type == cudf::type_id::DECIMAL64 ? sizeof(values) : sizeof(wide_values);
+  REQUIRE(cudaMemcpy(column->mutable_view().head<void>(), data, bytes, cudaMemcpyHostToDevice) ==
+          cudaSuccess);
+  cudf::bitmask_type const mask = 31;
+  REQUIRE(
+    cudaMemcpy(column->mutable_view().null_mask(), &mask, sizeof(mask), cudaMemcpyHostToDevice) ==
+    cudaSuccess);
+  column->set_null_count(1);
+  // Seed independently of the Sirius writer under test. cuDF uses the column's
+  // width for physical storage and the explicit metadata for logical precision.
+  cudf::table_view table({column->view()});
+  cudf::io::table_input_metadata metadata(table);
+  metadata.column_metadata[0].set_name("d").set_decimal_precision(9).set_nullability(true);
+  auto options = cudf::io::parquet_writer_options::builder(
+                   cudf::io::sink_info((root.path / "input.parquet").string()), table)
+                   .metadata(std::move(metadata))
+                   .build();
+  cudf::io::write_parquet(options);
+  run_ok("SET gpu_execution=false");
+  auto input_schema = con->Query("SELECT type, precision, scale FROM parquet_schema(" +
+                                 quote(root.path / "input.parquet") + ") WHERE name='d'");
+  REQUIRE_FALSE(input_schema->HasError());
+  auto const expected_physical =
+    source_type == cudf::type_id::DECIMAL64 ? "INT64" : "FIXED_LEN_BYTE_ARRAY";
+  REQUIRE(sirius::test::collect_rows(*input_schema) ==
+          std::vector<std::vector<std::string>>{{expected_physical, "9", "2"}});
+  for (bool empty : {false, true}) {
+    auto const cpu   = root.path / (empty ? "cpu_empty" : "cpu");
+    auto const gpu   = root.path / (empty ? "gpu_empty" : "gpu");
+    auto const query = "SELECT d FROM read_parquet(" + quote(root.path / "input.parquet") + ")" +
+                       (empty ? " WHERE false" : "");
+    run_ok("SET gpu_execution=false");
+    run_ok("COPY (" + query + ") TO " + quote(cpu) + " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    run_ok("SET gpu_execution=true");
+    run_ok("SET enable_duckdb_fallback=false");
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    run_ok("COPY (" + query + ") TO " + quote(gpu) + " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    auto const after = sirius::test::get_transparent_execution_stats(*con);
+    REQUIRE(after.executions == before.executions + 1);
+    REQUIRE(after.fallbacks == before.fallbacks);
+    REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks);
+    run_ok("SET gpu_execution=false");
+    for (auto const* prefix : {"SELECT * FROM ", "DESCRIBE SELECT * FROM "}) {
+      auto cpu_result =
+        con->Query(std::string(prefix) + "read_parquet(" + quote(cpu / "*.parquet") + ")");
+      auto gpu_result =
+        con->Query(std::string(prefix) + "read_parquet(" + quote(gpu / "*.parquet") + ")");
+      REQUIRE_FALSE(cpu_result->HasError());
+      REQUIRE_FALSE(gpu_result->HasError());
+      REQUIRE(sirius::test::collect_rows(*cpu_result) == sirius::test::collect_rows(*gpu_result));
+    }
+    // A nonresident scan passes the wide cuDF carrier through to COPY. Empty
+    // output uses its schema-only DECIMAL32 column; both retain SQL DECIMAL(9,2).
+    auto output_schema = con->Query("SELECT type, precision, scale FROM parquet_schema(" +
+                                    quote(gpu / "*.parquet") + ") WHERE name='d'");
+    REQUIRE_FALSE(output_schema->HasError());
+    REQUIRE(sirius::test::collect_rows(*output_schema) ==
+            std::vector<std::vector<std::string>>{{empty ? "INT32" : expected_physical, "9", "2"}});
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY exports pinned payloads restored after joins and grouping",
+                 "[parquet_export_gpu][integration][copy_pinned]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok(
+    "CREATE TABLE export_pinned AS SELECT i::BIGINT k, 'name-' || i p1, "
+    "'address-' || i p2, 'comment-' || i p3 FROM range(2000) t(i)");
+  run_ok(
+    "CREATE TABLE export_orders AS SELECT i::BIGINT k, (i%2000)::BIGINT customer "
+    "FROM range(4000) t(i)");
+  run_ok("CREATE TABLE export_lines AS SELECT (i%4000)::BIGINT order_key FROM range(8000) t(i)");
+  run_ok("CHECKPOINT");
+  auto query =
+    "SELECT p.k, p.p1, p.p2, p.p3, count(*) n FROM export_pinned p "
+    "JOIN export_orders o ON p.k=o.customer JOIN export_lines l ON o.k=l.order_key "
+    "GROUP BY p.k, p.p1, p.p2, p.p3 ORDER BY p.k";
+  run_ok(std::string("COPY (") + query + ") TO " + quote(root.path / "cpu") +
+         " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  run_ok("CALL pin_table(format='duckdb', name='export_pinned', tier='gpu')");
+  absl::Cleanup unpin = [&] { con->Query("CALL unpin_table('export_pinned')"); };
+  auto before         = sirius::test::get_transparent_execution_stats(*con);
+  auto deferrals      = sirius::late_mat::deferrals_installed();
+  run_ok(std::string("COPY (") + query + ") TO " + quote(root.path / "gpu") +
+         " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  REQUIRE(after.executions == before.executions + 1);
+  REQUIRE(after.fallbacks == before.fallbacks);
+  REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks);
+  REQUIRE(sirius::late_mat::deferrals_installed() > deferrals);
+  run_ok("SET gpu_execution=false");
+  for (auto const* prefix : {"SELECT * FROM ", "DESCRIBE SELECT * FROM "}) {
+    auto cpu =
+      con->Query(std::string(prefix) + "read_parquet(" + quote(root.path / "cpu/*.parquet") + ")");
+    auto gpu =
+      con->Query(std::string(prefix) + "read_parquet(" + quote(root.path / "gpu/*.parquet") + ")");
+    REQUIRE_FALSE(cpu->HasError());
+    REQUIRE_FALSE(gpu->HasError());
+    REQUIRE(sirius::test::collect_rows(*cpu) == sirius::test::collect_rows(*gpu));
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY exports ordered batch-sized Parquet parts",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  std::filesystem::create_directory(root.path / "ordered");
+  run_ok("SET gpu_execution=false");
+  run_ok(
+    "CREATE TABLE export_input AS SELECT i::INTEGER k, (i % 7)::INTEGER v FROM range(10000) t(i)");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  auto result = con->Query("COPY (SELECT * FROM export_input ORDER BY k DESC) TO " +
+                           quote(root.path / "ordered") +
+                           " (FORMAT PARQUET, PER_THREAD_OUTPUT true, COMPRESSION 'snappy')");
+  if (result->HasError()) UNSCOPED_INFO(result->GetError());
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 10000);
+  run_ok("SET gpu_execution=false");
+  std::vector<std::filesystem::path> parts;
+  for (auto const& entry : std::filesystem::directory_iterator(root.path / "ordered"))
+    parts.push_back(entry.path());
+  std::sort(parts.begin(), parts.end());
+  int64_t expected = 9999;
+  for (auto const& file : parts) {
+    auto rows = con->Query("SELECT k FROM read_parquet(" + quote(file) + ")");
+    REQUIRE_FALSE(rows->HasError());
+    auto metadata = con->Query("SELECT created_by FROM parquet_file_metadata(" + quote(file) + ")");
+    REQUIRE_FALSE(metadata->HasError());
+    REQUIRE(metadata->Collection().GetRows().GetValue(0, 0).ToString().find("cudf") !=
+            std::string::npos);
+    for (auto const& row : sirius::test::collect_rows(*rows, false))
+      REQUIRE(std::stoll(row[0]) == expected--);
+  }
+  REQUIRE(expected == -1);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "COPY unsupported options use the existing fallback policy",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_input AS SELECT 42::INTEGER k");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  auto sql = "COPY (SELECT * FROM export_input) TO " + quote(root.path / "unsupported") +
+             " (FORMAT PARQUET, PER_THREAD_OUTPUT true, ROW_GROUP_SIZE 2048)";
+  auto refused = con->Query(sql);
+  REQUIRE(refused->HasError());
+  REQUIRE_FALSE(std::filesystem::exists(root.path / "unsupported"));
+  run_ok("SET enable_duckdb_fallback=true");
+  run_ok(sql);
+  REQUIRE(std::filesystem::is_directory(root.path / "unsupported"));
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY creates a schema-only part for no rows",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_empty(k INTEGER, d DECIMAL(9,2))");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  run_ok("COPY (SELECT * FROM export_empty) TO " + quote(root.path / "empty") +
+         " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  run_ok("SET gpu_execution=false");
+  auto result =
+    con->Query("SELECT count(*) FROM read_parquet(" + quote(root.path / "empty/*.parquet") + ")");
+  if (result->HasError()) UNSCOPED_INFO(result->GetError());
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 0);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY round trips nullable scalars and decimal widths",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok(
+    "CREATE TABLE export_types AS SELECT i::INTEGER k, "
+    "CASE WHEN i % 3 = 0 THEN NULL ELSE (i / 10)::DECIMAL(9,2) END small_decimal, "
+    "(i / 100)::DECIMAL(18,3) medium_decimal, "
+    "CASE WHEN i % 5 = 0 THEN NULL ELSE 'value-' || i END text_value "
+    "FROM range(100) t(i)");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  run_ok(
+    "COPY (SELECT k, small_decimal::DECIMAL(9,2) small_decimal, medium_decimal, text_value FROM "
+    "export_types) TO " +
+    quote(root.path / "types") + " (FORMAT PARQUET, PER_THREAD_OUTPUT true, COMPRESSION 'zstd')");
+  run_ok("SET gpu_execution=false");
+  auto result = con->Query(
+    "SELECT count(*) FROM ((SELECT k, small_decimal::DECIMAL(9,2), medium_decimal, text_value FROM "
+    "export_types EXCEPT ALL SELECT * FROM read_parquet(" +
+    quote(root.path / "types/*.parquet") + ")) UNION ALL (SELECT * FROM read_parquet(" +
+    quote(root.path / "types/*.parquet") +
+    ") EXCEPT ALL SELECT k, small_decimal::DECIMAL(9,2), medium_decimal, text_value FROM "
+    "export_types)) differences");
+  if (result->HasError()) UNSCOPED_INFO(result->GetError());
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 0);
+  auto schema =
+    con->Query("DESCRIBE SELECT * FROM read_parquet(" + quote(root.path / "types/*.parquet") + ")");
+  REQUIRE_FALSE(schema->HasError());
+  REQUIRE(schema->Collection().GetRows().GetValue(1, 1).ToString() == "DECIMAL(9,2)");
+  REQUIRE(schema->Collection().GetRows().GetValue(1, 2).ToString() == "DECIMAL(18,3)");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY honors the installed cuDF codec capabilities",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_codecs AS SELECT i::INTEGER k FROM range(100) t(i)");
+  run_ok("CHECKPOINT");
+  run_ok("SET enable_duckdb_fallback=false");
+  for (auto const* codec : {"uncompressed", "snappy", "gzip", "brotli", "zstd", "lz4_raw"}) {
+    INFO("codec=" << codec);
+    run_ok("SET gpu_execution=true");
+    auto directory = root.path / codec;
+    auto result =
+      con->Query("COPY (SELECT * FROM export_codecs) TO " + quote(directory) +
+                 " (FORMAT PARQUET, PER_THREAD_OUTPUT true, COMPRESSION '" + codec + "')");
+    if (!sirius::output::supported_parquet_compression(sirius::output::parse_compression(codec))) {
+      REQUIRE(result->HasError());
+      REQUIRE_FALSE(std::filesystem::exists(directory));
+      continue;
+    }
+    if (result->HasError()) UNSCOPED_INFO(result->GetError());
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 100);
+    run_ok("SET gpu_execution=false");
+    auto check = con->Query("SELECT count(*), sum(k) FROM read_parquet(" +
+                            quote(directory / "*.parquet") + ")");
+    REQUIRE_FALSE(check->HasError());
+    REQUIRE(check->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 100);
+    REQUIRE(check->Collection().GetRows().GetValue(1, 0).ToString() == "4950");
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU schema-only writer preserves nested names and decimal precision",
+                 "[parquet_export_gpu][integration]")
+{
+  using namespace sirius;
+  export_directory root;
+  output::parquet_export_spec spec;
+  output::parquet_field decimal;
+  decimal.name              = "small_decimal";
+  decimal.type              = logical_type::make_decimal(4, 2);
+  decimal.decimal_precision = 4;
+  output::parquet_field nested;
+  nested.name = "nested";
+  nested.type = logical_type::make(type_id::STRUCT);
+  nested.children.push_back(decimal);
+  output::parquet_field list;
+  list.name    = "values";
+  list.type    = logical_type::make(type_id::LIST);
+  decimal.name = "element";
+  list.children.push_back(decimal);
+  spec.fields              = {nested, list};
+  auto const caller_device = rmm::get_current_cuda_device();
+  output::write_empty_parquet(spec, root.path / "nested.parquet", caller_device.value());
+  REQUIRE(rmm::get_current_cuda_device() == caller_device);
+  REQUIRE_THROWS(
+    output::write_empty_parquet(spec, root.path / "missing/nested.parquet", caller_device.value()));
+  REQUIRE(rmm::get_current_cuda_device() == caller_device);
+  run_ok("SET gpu_execution=false");
+  auto schema =
+    con->Query("DESCRIBE SELECT * FROM read_parquet(" + quote(root.path / "nested.parquet") + ")");
+  if (schema->HasError()) UNSCOPED_INFO(schema->GetError());
+  REQUIRE_FALSE(schema->HasError());
+  REQUIRE(schema->Collection().GetRows().GetValue(1, 0).ToString() ==
+          "STRUCT(small_decimal DECIMAL(4,2))");
+  REQUIRE(schema->Collection().GetRows().GetValue(1, 1).ToString() == "DECIMAL(4,2)[]");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU writer widens the small-decimal carrier without rescaling",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  sirius::output::parquet_export_spec spec;
+  sirius::output::parquet_field decimal;
+  decimal.name              = "d";
+  decimal.type              = sirius::logical_type::make_decimal(4, 2);
+  decimal.decimal_precision = 4;
+  spec.fields.push_back(decimal);
+  auto column = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT16}, 3, cudf::mask_state::UNALLOCATED);
+  int16_t const values[] = {123, -456, 0};
+  REQUIRE(cudaMemcpy(column->mutable_view().data<int16_t>(),
+                     values,
+                     sizeof(values),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  sirius::output::write_parquet_part(spec,
+                                     cudf::table_view({column->view()}),
+                                     root.path / "decimal.parquet",
+                                     cudf::get_default_stream());
+  run_ok("SET gpu_execution=false");
+  auto rows =
+    con->Query("SELECT * FROM read_parquet(" + quote(root.path / "decimal.parquet") + ")");
+  REQUIRE_FALSE(rows->HasError());
+  auto actual = sirius::test::collect_rows(*rows, false);
+  REQUIRE(actual == std::vector<std::vector<std::string>>{{"1.23"}, {"-4.56"}, {"0.00"}});
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY rejects nonempty destinations without CPU replay",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  auto target = root.path / "existing";
+  std::filesystem::create_directories(target / "nested");
+  auto original = target / "nested" / "original.txt";
+  std::ofstream(original) << "preserve";
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_input AS SELECT 42::INTEGER k");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=true");
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("COPY (SELECT * FROM export_input) TO " + quote(target) +
+                           " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  auto after  = sirius::test::get_transparent_execution_stats(*con);
+  REQUIRE(result->HasError());
+  REQUIRE(after.window_tasks_started == before.window_tasks_started);
+  REQUIRE(result->GetError().find("CPU replay disabled") != std::string::npos);
+  REQUIRE(std::filesystem::file_size(original) == 8);
+  REQUIRE(std::distance(std::filesystem::directory_iterator(target),
+                        std::filesystem::directory_iterator{}) == 1);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY overwrite and append options remain unsupported",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_input AS SELECT 42::INTEGER k");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  for (auto const* option : {"OVERWRITE", "OVERWRITE_OR_IGNORE", "APPEND"}) {
+    INFO(option);
+    auto target = root.path / option;
+    std::filesystem::create_directory(target);
+    auto original = target / "original.txt";
+    std::ofstream(original) << "preserve";
+    auto result = con->Query("COPY (SELECT * FROM export_input) TO " + quote(target) +
+                             " (FORMAT PARQUET, PER_THREAD_OUTPUT true, " + option + " true)");
+    REQUIRE(result->HasError());
+    REQUIRE(std::filesystem::file_size(original) == 8);
+    REQUIRE(std::distance(std::filesystem::directory_iterator(target),
+                          std::filesystem::directory_iterator{}) == 1);
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU Parquet timestamps retain CPU naive timestamp semantics",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("SET TimeZone='America/Los_Angeles'");
+  run_ok(
+    "CREATE TABLE export_timestamps AS SELECT "
+    "TIMESTAMP '2024-03-10 01:02:03.123456' t, "
+    "TIMESTAMP '2024-03-10 01:02:03.123'::TIMESTAMP_MS ms, "
+    "TIMESTAMP '2024-03-10 01:02:03'::TIMESTAMP_S sec, "
+    "TIMESTAMP '2024-03-10 01:02:03.123456'::TIMESTAMP_NS ns "
+    "FROM range(3)");
+  run_ok("CHECKPOINT");
+  for (bool empty : {false, true}) {
+    auto suffix = empty ? " WHERE false" : "";
+    auto query  = std::string("SELECT * FROM export_timestamps") + suffix;
+    auto cpu    = root.path / (empty ? "cpu_empty" : "cpu");
+    auto gpu    = root.path / (empty ? "gpu_empty" : "gpu");
+    run_ok("SET gpu_execution=false");
+    run_ok("COPY (" + query + ") TO " + quote(cpu) + " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    run_ok("SET gpu_execution=true");
+    run_ok("SET enable_duckdb_fallback=false");
+    run_ok("COPY (" + query + ") TO " + quote(gpu) + " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    run_ok("SET gpu_execution=false");
+    auto describe = [&](auto const& path) {
+      auto schema =
+        con->Query("DESCRIBE SELECT * FROM read_parquet(" + quote(path / "*.parquet") + ")");
+      if (schema->HasError()) UNSCOPED_INFO(schema->GetError());
+      REQUIRE_FALSE(schema->HasError());
+      return sirius::test::collect_rows(*schema);
+    };
+    REQUIRE(describe(cpu) == describe(gpu));
+    auto difference =
+      con->Query("SELECT count(*) FROM (SELECT * FROM read_parquet(" + quote(cpu / "*.parquet") +
+                 ") EXCEPT ALL SELECT * FROM read_parquet(" + quote(gpu / "*.parquet") + "))");
+    REQUIRE_FALSE(difference->HasError());
+    REQUIRE(difference->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 0);
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU empty tuple export retains recursive CPU field names and precision",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_empty_tuple(k INTEGER)");
+  run_ok("CHECKPOINT");
+  auto query =
+    "SELECT row(k, k::DECIMAL(9,2), row(k, TIMESTAMP '2024-01-02 03:04:05')) AS r FROM "
+    "export_empty_tuple";
+  run_ok(std::string("COPY (") + query + ") TO " + quote(root.path / "cpu_tuple") +
+         " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  run_ok(std::string("COPY (") + query + ") TO " + quote(root.path / "gpu_tuple") +
+         " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  run_ok("SET gpu_execution=false");
+  auto cpu = con->Query("DESCRIBE SELECT * FROM read_parquet(" +
+                        quote(root.path / "cpu_tuple/*.parquet") + ")");
+  auto gpu = con->Query("DESCRIBE SELECT * FROM read_parquet(" +
+                        quote(root.path / "gpu_tuple/*.parquet") + ")");
+  REQUIRE_FALSE(cpu->HasError());
+  REQUIRE_FALSE(gpu->HasError());
+  REQUIRE(sirius::test::collect_rows(*cpu) == sirius::test::collect_rows(*gpu));
+}
+
+namespace {
+class interrupted_copy_log_gate final : public sirius::log::sink {
+ public:
+  void set_level(sirius::log::level) override {}
+  bool should_log(sirius::log::level) const override { return true; }
+  bool flush() override { return true; }
+  void log(sirius::log::level,
+           std::source_location const& location,
+           std::string_view message) override
+  {
+    std::unique_lock lock(mutex);
+    if (!blocked && message.find("COPY_TO_FILE") != std::string_view::npos &&
+        message.find("executing on") != std::string_view::npos) {
+      blocked = true;
+      condition.notify_all();
+      condition.wait_for(lock, std::chrono::seconds(15), [&] { return released; });
+    }
+    if (std::string_view(location.file_name()).ends_with("sirius_engine.cpp") &&
+        message.starts_with("Error executing query:")) {
+      diagnostic = true;
+      condition.notify_all();
+      throw std::bad_alloc();
+    }
+  }
+  bool wait_for(bool interrupted_copy_log_gate::* flag)
+  {
+    std::unique_lock lock(mutex);
+    return condition.wait_for(lock, std::chrono::seconds(5), [&] { return this->*flag; });
+  }
+  void release()
+  {
+    std::lock_guard lock(mutex);
+    released = true;
+    condition.notify_all();
+  }
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool blocked    = false;
+  bool diagnostic = false;
+  bool released   = false;
+};
+struct restore_export_test_logger {
+  std::shared_ptr<sirius::log::sink> previous = sirius::log::get_sink();
+  ~restore_export_test_logger() { sirius::log::set_sink(previous); }
+};
+}  // namespace
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Cancelled COPY retains interrupt classification even when error logging throws",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_cancel_input AS SELECT i::INTEGER k FROM range(100) t(i)");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=true");
+  auto gate = std::make_shared<interrupted_copy_log_gate>();
+  duckdb::unique_ptr<duckdb::QueryResult> result;
+  bool blocked = false, diagnostic = false;
+  {
+    restore_export_test_logger restore;
+    sirius::log::set_sink(gate, sirius::log::level::trace);
+    std::thread query([&] {
+      result =
+        con->Query("COPY (SELECT * FROM export_cancel_input) TO " + quote(root.path / "cancelled") +
+                   " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    });
+    blocked = gate->wait_for(&interrupted_copy_log_gate::blocked);
+    if (blocked) {
+      con->Interrupt();
+      diagnostic = gate->wait_for(&interrupted_copy_log_gate::diagnostic);
+    }
+    gate->release();
+    query.join();
+  }
+  REQUIRE(blocked);
+  REQUIRE(diagnostic);
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  REQUIRE(result->GetErrorType() == duckdb::ExceptionType::INTERRUPT);
+  REQUIRE_FALSE(std::filesystem::exists(root.path / "cancelled"));
+  auto next = con->Query("SELECT count(*) FROM export_cancel_input");
+  REQUIRE_FALSE(next->HasError());
+  REQUIRE(next->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 100);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet export preserves repeated CTE occurrences through UNION ALL",
+                 "[parquet_export_gpu][integration][parquet_cte_multiplicity]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_cte_repeat(k VARCHAR, n INTEGER)");
+  run_ok("INSERT INTO export_cte_repeat VALUES ('42',42),('42',42),('7',7)");
+  run_ok("CHECKPOINT");
+  unsigned sequence = 0;
+  auto check_export = [&](std::string const& sql) {
+    auto target = root.path / ("cte_" + std::to_string(sequence++));
+    run_ok("SET gpu_execution=false");
+    auto cpu = con->Query(sql);
+    REQUIRE_FALSE(cpu->HasError());
+    auto expected = sirius::test::collect_rows(*cpu);
+    run_ok("SET gpu_execution=true");
+    run_ok("SET enable_duckdb_fallback=false");
+    auto copied = con->Query("COPY (" + sql + ") TO " + quote(target) +
+                             " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    if (copied->HasError()) UNSCOPED_INFO(copied->GetError());
+    REQUIRE_FALSE(copied->HasError());
+    REQUIRE(copied->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() ==
+            static_cast<int64_t>(expected.size()));
+    run_ok("SET gpu_execution=false");
+    auto actual = con->Query("SELECT * FROM read_parquet(" + quote(target / "*.parquet") + ")");
+    REQUIRE_FALSE(actual->HasError());
+    REQUIRE(sirius::test::collect_rows(*actual) == expected);
+  };
+  for (bool compressed : {true, false}) {
+    run_ok(std::string("SET enable_compressed_materialization=") + (compressed ? "true" : "false"));
+    for (auto const* column : {"k", "n"}) {
+      for (unsigned arms : {2U, 3U}) {
+        std::string sql = std::string("WITH c AS MATERIALIZED (SELECT ") + column +
+                          " FROM export_cte_repeat) SELECT * FROM c";
+        for (unsigned arm = 1; arm < arms; ++arm)
+          sql += " UNION ALL SELECT * FROM c";
+        check_export(sql);
+      }
+    }
+  }
+  run_ok("SET sirius_test_gpu_task_retry_backoff_ms=0");
+  run_ok("SET sirius_test_inject_gpu_task_oom=2");
+  check_export("SELECT k FROM export_cte_repeat");
+  run_ok("SET sirius_test_inject_gpu_task_oom=0");
+  check_export(
+    "WITH a AS MATERIALIZED (SELECT k FROM export_cte_repeat), "
+    "b AS MATERIALIZED (SELECT * FROM a UNION ALL SELECT * FROM a) "
+    "SELECT * FROM b UNION ALL SELECT * FROM b");
+  check_export(
+    "WITH c AS MATERIALIZED (SELECT k FROM export_cte_repeat) "
+    "SELECT * FROM c UNION ALL SELECT * FROM c ORDER BY k DESC");
+  check_export(
+    "WITH c AS MATERIALIZED (SELECT k FROM export_cte_repeat WHERE false) "
+    "SELECT * FROM c UNION ALL SELECT * FROM c");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU Parquet seconds preserve infinity and NULL like CPU COPY",
+                 "[parquet_export_gpu][integration][parquet_timestamp_seconds]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_seconds(t TIMESTAMP_S)");
+  unsigned sequence = 0;
+  for (auto const* value : {"'infinity'",
+                            "'-infinity'",
+                            "NULL",
+                            "'1970-01-01 00:00:00'",
+                            "'1969-12-31 23:59:59'",
+                            "'2024-03-10 01:02:03'"}) {
+    INFO(value);
+    auto cpu = root.path / ("cpu_" + std::to_string(sequence));
+    auto gpu = root.path / ("gpu_" + std::to_string(sequence++));
+    run_ok("SET gpu_execution=false");
+    run_ok("DELETE FROM export_seconds");
+    run_ok(std::string("INSERT INTO export_seconds VALUES (") + value + "::TIMESTAMP_S)");
+    run_ok("CHECKPOINT");
+    run_ok("COPY (SELECT t FROM export_seconds) TO " + quote(cpu) +
+           " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    run_ok("SET gpu_execution=true");
+    run_ok("SET enable_duckdb_fallback=false");
+    auto copied = con->Query("COPY (SELECT t FROM export_seconds) TO " + quote(gpu) +
+                             " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    if (copied->HasError()) UNSCOPED_INFO(copied->GetError());
+    REQUIRE_FALSE(copied->HasError());
+    REQUIRE(copied->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 1);
+    run_ok("SET gpu_execution=false");
+    auto read = [&](auto const& path) {
+      auto rows = con->Query("SELECT t::VARCHAR, isinf(t), t IS NULL FROM read_parquet(" +
+                             quote(path / "*.parquet") + ")");
+      REQUIRE_FALSE(rows->HasError());
+      return sirius::test::collect_rows(*rows);
+    };
+    REQUIRE(read(gpu) == read(cpu));
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU Parquet seconds normalization recurses into structs lists and arrays",
+                 "[parquet_export_gpu][integration][parquet_timestamp_seconds]")
+{
+  using namespace sirius;
+  export_directory root;
+  auto seconds = [] {
+    auto column = cudf::make_timestamp_column(
+      cudf::data_type{cudf::type_id::TIMESTAMP_SECONDS}, 4, cudf::mask_state::ALL_NULL);
+    int64_t const values[]        = {std::numeric_limits<int64_t>::max(),
+                                     -std::numeric_limits<int64_t>::max(),
+                                     123,
+                                     std::numeric_limits<int64_t>::min()};
+    cudf::bitmask_type const mask = 7;
+    REQUIRE(cudaMemcpy(column->mutable_view().data<int64_t>(),
+                       values,
+                       sizeof(values),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE(
+      cudaMemcpy(column->mutable_view().null_mask(), &mask, sizeof(mask), cudaMemcpyHostToDevice) ==
+      cudaSuccess);
+    column->set_null_count(1);
+    return column;
+  };
+  auto list = [&] {
+    auto offsets = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT32}, 5, cudf::mask_state::UNALLOCATED);
+    int32_t const values[] = {0, 1, 2, 3, 4};
+    REQUIRE(cudaMemcpy(offsets->mutable_view().data<int32_t>(),
+                       values,
+                       sizeof(values),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    return cudf::make_lists_column(4,
+                                   std::move(offsets),
+                                   seconds(),
+                                   0,
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+  };
+  output::parquet_field scalar;
+  scalar.name = "t";
+  scalar.type = logical_type::make(type_id::TIMESTAMP_SEC);
+  auto child  = scalar;
+  child.name  = "v";
+  output::parquet_field structure;
+  structure.name     = "st";
+  structure.type     = logical_type::make(type_id::STRUCT);
+  structure.children = {child};
+  output::parquet_field list_field;
+  list_field.name     = "li";
+  list_field.type     = logical_type::make(type_id::LIST);
+  list_field.children = {child};
+  auto array_field    = list_field;
+  array_field.name    = "ar";
+  array_field.type    = logical_type::make_array(scalar.type, 1);
+  output::parquet_export_spec spec;
+  spec.fields = {scalar, structure, list_field, array_field};
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.push_back(seconds());
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(seconds());
+  columns.push_back(cudf::make_structs_column(
+    4, std::move(children), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED)));
+  columns.push_back(list());
+  columns.push_back(list());
+  cudf::table table(std::move(columns));
+  output::write_parquet_part(
+    spec, table.view(), root.path / "nested.parquet", cudf::get_default_stream());
+  run_ok("SET gpu_execution=false");
+  auto rows = con->Query(
+    "SELECT t::VARCHAR, isinf(t), st.v::VARCHAR, li[1]::VARCHAR, "
+    "ar[1]::VARCHAR, t IS NULL FROM read_parquet(" +
+    quote(root.path / "nested.parquet") + ")");
+  REQUIRE_FALSE(rows->HasError());
+  auto actual = sirius::test::collect_rows(*rows, false);
+  REQUIRE(actual == std::vector<std::vector<std::string>>{
+                      {"infinity", "true", "infinity", "infinity", "infinity", "false"},
+                      {"-infinity", "true", "-infinity", "-infinity", "-infinity", "false"},
+                      {"1970-01-01 00:02:03",
+                       "false",
+                       "1970-01-01 00:02:03",
+                       "1970-01-01 00:02:03",
+                       "1970-01-01 00:02:03",
+                       "false"},
+                      {"NULL", "NULL", "NULL", "NULL", "NULL", "true"}});
+  output::write_empty_parquet(
+    spec, root.path / "empty.parquet", rmm::get_current_cuda_device().value());
+  auto empty =
+    con->Query("SELECT count(*) FROM read_parquet(" + quote(root.path / "empty.parquet") + ")");
+  REQUIRE_FALSE(empty->HasError());
+  REQUIRE(empty->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 0);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU Parquet seconds rejects finite conversion overflow before creating a file",
+                 "[parquet_export_gpu][integration][parquet_timestamp_seconds]")
+{
+  export_directory root;
+  auto column = cudf::make_timestamp_column(
+    cudf::data_type{cudf::type_id::TIMESTAMP_SECONDS}, 1, cudf::mask_state::UNALLOCATED);
+  sirius::output::parquet_export_spec spec;
+  sirius::output::parquet_field field;
+  field.name = "t";
+  field.type = sirius::logical_type::make(sirius::type_id::TIMESTAMP_SEC);
+  spec.fields.push_back(field);
+  for (auto ticks : {std::numeric_limits<int64_t>::max() / 1000000 + 1,
+                     std::numeric_limits<int64_t>::min() / 1000000 - 1}) {
+    REQUIRE(cudaMemcpy(column->mutable_view().data<int64_t>(),
+                       &ticks,
+                       sizeof(ticks),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE_THROWS_AS(sirius::output::write_parquet_part(spec,
+                                                         cudf::table_view({column->view()}),
+                                                         root.path / "overflow.parquet",
+                                                         cudf::get_default_stream()),
+                      sirius::invalid_input_exception);
+    REQUIRE_FALSE(std::filesystem::exists(root.path / "overflow.parquet"));
+  }
+}
+
+// External access cannot be re-enabled with SQL. Omit [integration] so this fixture
+// owns a private database for every generated scenario instead of borrowing one.
+TEST_CASE("GPU COPY validates directory permissions before creating parts",
+          "[parquet_export_gpu][isolated_context][parquet_authorization]")
+{
+  sirius::util::env_guard const enabled("SIRIUS_DISABLE", std::nullopt);
+  sirius::test::GpuExecutionFixture fixture;
+  auto& con   = fixture.con;
+  auto run_ok = [&](std::string const& sql) { fixture.run_ok(sql); };
+  REQUIRE(sirius::test::get_registered_sirius_context(*con) != nullptr);
+  export_directory root;
+  auto const mode     = GENERATE(0, 1, 2, 3, 4);
+  auto const fallback = GENERATE(false, true);
+  auto const existing = GENERATE(false, true);
+  INFO("authorization mode=" << mode << " fallback=" << fallback << " existing=" << existing);
+  auto gpu = root.path / "output";
+  auto cpu = root.path / "cpu_output";
+  if (existing) {
+    std::filesystem::create_directory(gpu);
+    std::filesystem::create_directory(cpu);
+  }
+  run_ok("SET gpu_execution=false");
+  // Load Parquet before disabling external access, as a configured application would.
+  run_ok("SELECT count(*) FROM duckdb_functions() WHERE function_name='parquet_schema'");
+  if (mode == 0) {  // Exact destination entries do not authorize generated parts.
+    run_ok("SET allowed_paths = [" + quote(gpu) + ", " + quote(cpu) + "]");
+  } else if (mode == 1) {  // Wildcards in allowed_paths are literal strings.
+    run_ok("SET allowed_paths = [" + quote(gpu / "*") + ", " + quote(cpu / "*") + "]");
+  } else if (mode == 2) {  // Directory prefixes plus exact destination access.
+    run_ok("SET allowed_paths = [" + quote(gpu) + ", " + quote(cpu) + "]");
+    run_ok("SET allowed_directories = [" + quote(gpu) + ", " + quote(cpu) + "]");
+  } else if (mode == 3) {  // A parent prefix covers both destination and parts.
+    run_ok("SET allowed_directories = [" + quote(root.path) + "]");
+  } else {  // A similarly named sibling must not match a directory prefix.
+    run_ok("SET allowed_paths = [" + quote(gpu) + ", " + quote(cpu) + "]");
+    run_ok("SET allowed_directories = [" + quote(root.path / "out") + "]");
+  }
+  run_ok(std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"));
+  run_ok("SET enable_external_access=false");
+  run_ok("SET gpu_execution=true");
+  auto const sql = [](auto const& path) {
+    return "COPY (SELECT 42::INTEGER k) TO " + quote(path) +
+           " (FORMAT PARQUET, PER_THREAD_OUTPUT true)";
+  };
+  auto exported        = con->Query(sql(gpu));
+  bool const permitted = mode == 2 || mode == 3;
+  if (permitted && exported->HasError()) UNSCOPED_INFO(exported->GetError());
+  REQUIRE(exported->HasError() == !permitted);
+  if (!permitted) {
+    // CPU planning fallback may create an authorized directory before its
+    // generated-file check fails. GPU refusal itself must have no side effects.
+    if (!fallback) REQUIRE(std::filesystem::exists(gpu) == existing);
+    if (std::filesystem::exists(gpu)) REQUIRE(std::filesystem::is_empty(gpu));
+  }
+  run_ok("SET gpu_execution=false");
+  auto baseline = con->Query(sql(cpu));
+  REQUIRE(baseline->HasError() == !permitted);
+  if (!permitted && std::filesystem::exists(cpu)) REQUIRE(std::filesystem::is_empty(cpu));
+  if (permitted) {
+    auto metadata =
+      con->Query("SELECT created_by FROM parquet_file_metadata(" + quote(gpu / "*.parquet") + ")");
+    REQUIRE_FALSE(metadata->HasError());
+    REQUIRE(metadata->Collection().GetRows().GetValue(0, 0).ToString().find("cudf") !=
+            std::string::npos);
+    auto rows = con->Query("SELECT k FROM read_parquet(" + quote(gpu / "*.parquet") + ")");
+    REQUIRE_FALSE(rows->HasError());
+    REQUIRE(rows->Collection().GetRows().GetValue(0, 0).ToString() == "42");
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU grouped decimal SUM exports storage fitting its declared precision",
+                 "[parquet_export_gpu][integration][parquet_decimal_storage]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_decimal_sum(k INTEGER, d DECIMAL(9,2))");
+  run_ok("INSERT INTO export_decimal_sum VALUES (1,1.00),(1,2.00),(2,NULL),(3,-4.50)");
+  run_ok("CHECKPOINT");
+  auto expected = con->Query("SELECT k, SUM(d) AS s FROM export_decimal_sum GROUP BY k");
+  REQUIRE_FALSE(expected->HasError());
+  auto expected_rows = sirius::test::collect_rows(*expected);
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  run_ok("COPY (SELECT k, SUM(d) AS s FROM export_decimal_sum GROUP BY k) TO " +
+         quote(root.path / "sum") + " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  run_ok("SET gpu_execution=false");
+  auto rows = con->Query("SELECT * FROM read_parquet(" + quote(root.path / "sum/*.parquet") + ")");
+  REQUIRE_FALSE(rows->HasError());
+  REQUIRE(sirius::test::collect_rows(*rows) == expected_rows);
+  auto schema = con->Query("SELECT type, type_length, precision, scale FROM parquet_schema(" +
+                           quote(root.path / "sum/*.parquet") + ") WHERE name='s'");
+  REQUIRE_FALSE(schema->HasError());
+  REQUIRE(sirius::test::collect_rows(*schema) ==
+          std::vector<std::vector<std::string>>{{"FIXED_LEN_BYTE_ARRAY", "16", "38", "2"}});
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU Parquet widens nested decimal storage and preserves scale and NULL",
+                 "[parquet_export_gpu][integration][parquet_decimal_storage]")
+{
+  using namespace sirius;
+  export_directory root;
+  // Exercise both widening steps independently of aggregate carrier choices.
+  auto const precision = GENERATE(18, 38);
+  auto const source    = precision == 18 ? cudf::type_id::DECIMAL32 : cudf::type_id::DECIMAL64;
+  auto decimal         = [&] {
+    auto column =
+      cudf::make_fixed_point_column(cudf::data_type{source, -2}, 3, cudf::mask_state::ALL_NULL);
+    int32_t const small[] = {300, -750, 999};
+    int64_t const large[] = {300, -750, 999};
+    auto const* data =
+      precision == 18 ? static_cast<void const*>(small) : static_cast<void const*>(large);
+    auto const bytes = precision == 18 ? sizeof(small) : sizeof(large);
+    REQUIRE(cudaMemcpy(column->mutable_view().head<void>(), data, bytes, cudaMemcpyHostToDevice) ==
+            cudaSuccess);
+    cudf::bitmask_type const mask = 3;
+    REQUIRE(
+      cudaMemcpy(column->mutable_view().null_mask(), &mask, sizeof(mask), cudaMemcpyHostToDevice) ==
+      cudaSuccess);
+    column->set_null_count(1);
+    return column;
+  };
+  auto list = [&] {
+    auto offsets = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT32}, 4, cudf::mask_state::UNALLOCATED);
+    int32_t const values[] = {0, 1, 2, 3};
+    REQUIRE(cudaMemcpy(offsets->mutable_view().data<int32_t>(),
+                       values,
+                       sizeof(values),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    return cudf::make_lists_column(3,
+                                   std::move(offsets),
+                                   decimal(),
+                                   0,
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+  };
+  output::parquet_field scalar;
+  scalar.name              = "d";
+  scalar.type              = logical_type::make_decimal(precision, 2);
+  scalar.decimal_precision = precision;
+  auto child               = scalar;
+  child.name               = "v";
+  output::parquet_field structure;
+  structure.name     = "st";
+  structure.type     = logical_type::make(type_id::STRUCT);
+  structure.children = {child};
+  output::parquet_field list_field;
+  list_field.name     = "li";
+  list_field.type     = logical_type::make(type_id::LIST);
+  list_field.children = {child};
+  auto array_field    = list_field;
+  array_field.name    = "ar";
+  array_field.type    = logical_type::make_array(scalar.type, 1);
+  output::parquet_export_spec spec;
+  spec.fields = {scalar, structure, list_field, array_field};
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.push_back(decimal());
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(decimal());
+  columns.push_back(cudf::make_structs_column(
+    3, std::move(children), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED)));
+  columns.push_back(list());
+  columns.push_back(list());
+  cudf::table table(std::move(columns));
+  output::write_parquet_part(
+    spec, table.view(), root.path / "nested.parquet", cudf::get_default_stream());
+  run_ok("SET gpu_execution=false");
+  auto rows = con->Query("SELECT d, st.v, li[1], ar[1] FROM read_parquet(" +
+                         quote(root.path / "nested.parquet") + ")");
+  REQUIRE_FALSE(rows->HasError());
+  REQUIRE(sirius::test::collect_rows(*rows, false) ==
+          std::vector<std::vector<std::string>>{{"3.00", "3.00", "3.00", "3.00"},
+                                                {"-7.50", "-7.50", "-7.50", "-7.50"},
+                                                {"NULL", "NULL", "NULL", "NULL"}});
+  auto schema = con->Query("SELECT type, type_length, precision, scale FROM parquet_schema(" +
+                           quote(root.path / "nested.parquet") + ") WHERE precision IS NOT NULL");
+  REQUIRE_FALSE(schema->HasError());
+  auto fields = sirius::test::collect_rows(*schema);
+  REQUIRE(fields.size() == 4);
+  for (auto const& field : fields) {
+    REQUIRE(field[0] == (precision == 18 ? "INT64" : "FIXED_LEN_BYTE_ARRAY"));
+    if (precision == 38) REQUIRE(field[1] == "16");
+    REQUIRE(field[2] == std::to_string(precision));
+    REQUIRE(field[3] == "2");
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY finalizes an empty nested schema on a configured device",
+                 "[parquet_export_gpu][integration][parquet_empty_device]")
+{
+  export_directory root;
+  auto const caller_device = rmm::get_current_cuda_device();
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_empty_nested(ar INTEGER[1])");
+  run_ok("CHECKPOINT");
+  auto copy = [&](auto const& path) {
+    return "COPY (" + std::string(empty_nested_query) + ") TO " + quote(path) +
+           " (FORMAT PARQUET, PER_THREAD_OUTPUT true)";
+  };
+  run_ok(copy(root.path / "cpu"));
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  auto exported = con->Query(copy(root.path / "gpu"));
+  if (exported->HasError()) UNSCOPED_INFO(exported->GetError());
+  REQUIRE_FALSE(exported->HasError());
+  REQUIRE(exported->Collection().GetRows().GetValue(0, 0).ToString() == "0");
+  REQUIRE(rmm::get_current_cuda_device() == caller_device);
+  run_ok("SET gpu_execution=false");
+  auto read_schema = [&](auto const& path) {
+    auto schema =
+      con->Query("DESCRIBE SELECT * FROM read_parquet(" + quote(path / "*.parquet") + ")");
+    REQUIRE_FALSE(schema->HasError());
+    return sirius::test::collect_rows(*schema);
+  };
+  REQUIRE(read_schema(root.path / "gpu") == read_schema(root.path / "cpu"));
+  auto metadata = con->Query("SELECT num_rows, created_by FROM parquet_file_metadata(" +
+                             quote(root.path / "gpu/*.parquet") + ")");
+  REQUIRE_FALSE(metadata->HasError());
+  REQUIRE(metadata->Collection().GetRows().GetValue(0, 0).ToString() == "0");
+  REQUIRE(metadata->Collection().GetRows().GetValue(1, 0).ToString().find("cudf") !=
+          std::string::npos);
+}
+
+TEST_CASE("Empty nested COPY avoids an excluded ambient GPU and restores the caller device",
+          "[parquet_export_gpu][multi_gpu][isolated_context][parquet_empty_device]")
+{
+  if (!sirius::test::has_gpus(2)) SKIP("Requires two visible GPUs for subset [1]");
+  rmm::cuda_set_device_raii const caller_guard{rmm::cuda_device_id{0}};
+  export_directory root;
+  auto config_path = root.path / "gpu1.yaml";
+  {
+    std::ofstream config(config_path);
+    config << R"(sirius:
+  topology:
+    gpu_ids: [1]
+  memory:
+    gpu:
+      usage_limit_fraction: 0.2
+    host:
+      capacity_bytes: 32000000000
+      initial_number_pools: 2
+      pool_size: 128
+      block_size: 1048576
+)";
+  }
+  auto db = sirius::test::open_sirius_db((root.path / "subset.db").c_str(), config_path);
+  duckdb::Connection con(*db);
+  auto run_ok = [&](std::string const& sql) {
+    auto result = con.Query(sql);
+    if (result->HasError()) UNSCOPED_INFO(result->GetError());
+    REQUIRE_FALSE(result->HasError());
+  };
+  auto runtime = sirius::test::get_registered_sirius_context(con);
+  auto spaces =
+    runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(spaces.size() == 1);
+  REQUIRE(spaces.front()->get_device_id() == 1);
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_empty_nested(ar INTEGER[1])");
+  run_ok("CHECKPOINT");
+  REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{0});
+
+  // Install only after runtime initialization, which may probe every visible GPU.
+  // Any RMM allocation on excluded GPU0 during export is a regression.
+  std::atomic<std::size_t> excluded_allocations{0};
+  rmm::mr::callback_memory_resource reject_excluded
+  {
+#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 12)
+    [](::cuda::stream_ref, std::size_t, std::size_t, void* arg) -> void* {
+#else
+    [](std::size_t, ::cuda::stream_ref, void* arg) -> void* {
+#endif
+      ++*static_cast<std::atomic<std::size_t>*>(arg);
+      throw std::logic_error("Empty export allocated on excluded GPU0");
+    },
+#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 12)
+      [](::cuda::stream_ref, void*, std::size_t, std::size_t, void*) {},
+#else
+      [](void*, std::size_t, ::cuda::stream_ref, void*) {},
+#endif
+      &excluded_allocations
+  };
+  auto previous =
+    rmm::mr::set_per_device_resource(rmm::cuda_device_id{0},
+                                     ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+                                       rmm::device_async_resource_ref{reject_excluded}});
+  absl::Cleanup restore_resource = [&] {
+    rmm::mr::set_per_device_resource(rmm::cuda_device_id{0}, std::move(previous));
+  };
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  auto exported = con.Query("COPY (" + std::string(empty_nested_query) + ") TO " +
+                            quote(root.path / "out") + " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  if (exported->HasError()) UNSCOPED_INFO(exported->GetError());
+  REQUIRE_FALSE(exported->HasError());
+  REQUIRE(exported->Collection().GetRows().GetValue(0, 0).ToString() == "0");
+  REQUIRE(excluded_allocations.load() == 0);
+  REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{0});
+  run_ok("SET gpu_execution=false");
+  auto schema =
+    con.Query("DESCRIBE SELECT * FROM read_parquet(" + quote(root.path / "out/*.parquet") + ")");
+  REQUIRE_FALSE(schema->HasError());
+  REQUIRE(schema->RowCount() == 1);
+
+  sirius::output::parquet_field element;
+  element.name = "element";
+  element.type = sirius::logical_type::make(sirius::type_id::INTEGER);
+  sirius::output::parquet_field list;
+  list.name     = "li";
+  list.type     = sirius::logical_type::make(sirius::type_id::LIST);
+  list.children = {element};
+  sirius::output::parquet_export_spec spec;
+  spec.fields = {list};
+  REQUIRE_THROWS(sirius::output::write_empty_parquet(spec, root.path / "missing/part.parquet", 1));
+  REQUIRE(excluded_allocations.load() == 0);
+  REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{0});
+}
+
+TEST_CASE("Parquet execute requires delivery metadata before creating output",
+          "[parquet_export_gpu][delivery_metadata]")
+{
+  export_directory root;
+  sirius::output::parquet_export_spec spec;
+  spec.directory = root.path / "missing-metadata";
+  sirius::op::sirius_physical_parquet_sink sink({}, std::move(spec));
+  sirius::op::pipelineable_operator_data input;
+  REQUIRE_THROWS_AS(sink.execute(input, cudf::get_default_stream()), sirius::internal_exception);
+  REQUIRE_FALSE(std::filesystem::exists(root.path / "missing-metadata"));
+}

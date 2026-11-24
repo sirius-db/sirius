@@ -28,6 +28,19 @@ else()
   message(FATAL_ERROR "SIRIUS_DUCKDB_LINKAGE must be static or shared")
 endif()
 
+# DuckDB's C++ ABI differs between revisions, and the metadata footer DuckDB
+# checks on load only names the tree this extension is configured in.
+if(COMMAND sirius_require_duckdb_revision)
+  sirius_require_duckdb_revision(
+    "${sirius_DUCKDB_REVISION}" "${DuckDB_SOURCE_DIR}"
+    "${SIRIUS_DUCKDB_LINKAGE}")
+elseif(SIRIUS_DUCKDB_LINKAGE STREQUAL "static")
+  message(
+    FATAL_ERROR
+      "Cannot verify that Sirius and this extension use one DuckDB revision: the Sirius package predates the check"
+  )
+endif()
+
 set(EXTENSION_SOURCES src/sirius/sirius_extension.cpp)
 
 # DuckDB's linker options are directory-wide; this backend uses BFD. Keep the
@@ -63,10 +76,11 @@ if(SIRIUS_DUCKDB_LINKAGE STREQUAL "static")
   set_target_properties(
     ${extension_name}_loadable_extension
     PROPERTIES LINK_LIBRARIES "${sirius_link_libraries}" SKIP_BUILD_RPATH ON)
+  # Strip at link time: DuckDB appends its metadata footer after linking.
   target_link_options(
     ${extension_name}_loadable_extension PRIVATE
     "LINKER:--version-script=${CMAKE_CURRENT_BINARY_DIR}/exports.map"
-    -static-libgcc -static-libstdc++)
+    "LINKER:--strip-all" -static-libgcc -static-libstdc++)
   set_property(
     TARGET ${extension_name}_loadable_extension
     APPEND

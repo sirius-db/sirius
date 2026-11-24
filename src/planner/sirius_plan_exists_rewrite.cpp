@@ -15,12 +15,10 @@
  */
 
 #include "cudf/cudf_utils.hpp"
-#include "duckdb/catalog/catalog.hpp"
-#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
-#include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -31,19 +29,21 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "duckdb/planner/operator/logical_delim_get.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb_table_identity.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
+#include "planner/aggregate_binding.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_flat_tree.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
@@ -52,6 +52,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace sirius::planner {
@@ -83,31 +84,20 @@ ColumnBinding binding_of(Expression const& expression)
   return expression.Cast<duckdb::BoundColumnRefExpression>().Binding();
 }
 
-bool contains_delim_get(LogicalOperator const& op)
-{
-  if (op.type == LogicalOperatorType::LOGICAL_DELIM_GET) { return true; }
-  return std::ranges::any_of(op.children,
-                             [](auto const& child) { return contains_delim_get(*child); });
-}
-
 /// The pieces of a correlated `EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)` as DuckDB
 /// decorrelated it. Either comparison may also be its null-safe form (`IS [NOT] DISTINCT FROM`).
 struct exists_match {
-  LogicalOperator* replaced           = nullptr;  ///< The node being replaced
-  duckdb::LogicalComparisonJoin* join = nullptr;  ///< The join of the outer rows and T
+  duckdb::LogicalComparisonJoin* join = nullptr;  ///< The join of the outer rows and T, replaced
   std::size_t outer_child             = 0;        ///< Index of the outer rows among its children
   bool negated                        = false;    ///< NOT EXISTS
-  unique_ptr<LogicalOperator>* t      = nullptr;  ///< Owning slot of T, the subquery rows
   ColumnBinding t_key;                            ///< Column of T equal to the key
   ColumnBinding t_value;                          ///< Column of T compared with `<>`
   ColumnBinding outer_key;
   ColumnBinding outer_value;
   LogicalType key_type;
   LogicalType value_type;
-  bool key_null_safe   = false;       ///< `IS NOT DISTINCT FROM` rather than `=`
-  bool value_null_safe = false;       ///< `IS DISTINCT FROM` rather than `<>`
-  bool plain           = false;       ///< A plain SEMI or ANTI join rather than a delim join
-  std::optional<ColumnBinding> mark;  ///< The mark a replaced FILTER(mark) consumed
+  bool key_null_safe   = false;  ///< `IS NOT DISTINCT FROM` rather than `=`
+  bool value_null_safe = false;  ///< `IS DISTINCT FROM` rather than `<>`
 };
 
 enum class correlation { key, value, other };
@@ -158,118 +148,10 @@ bool has_supported_types(exists_match const& match)
          cudf::is_timestamp(*value_cudf) || cudf::is_duration(*value_cudf);
 }
 
-bool has_arbitrary_condition(duckdb::LogicalComparisonJoin const& join)
-{
-  return join.conditions.empty() || std::ranges::any_of(join.conditions, [](auto const& condition) {
-           return !condition.IsComparison();
-         });
-}
-
-/// Recognise the subquery side of @p delim, whose outer rows are child @p outer_idx: T joined to
-/// the DELIM_GET on one key and one value comparison (`t.k = delim.k`, `t.x <> delim.x`). Every
-/// check is structural; anything unexpected declines and leaves DuckDB's plan alone.
-std::optional<exists_match> match_delim_subquery(duckdb::LogicalComparisonJoin& delim,
-                                                 std::size_t outer_idx)
-{
-  if (has_arbitrary_condition(delim)) { return std::nullopt; }
-
-  // Any number of projections may sit above the join, as long as the columns the delim join
-  // reads are plain columns below them.
-  auto* sub = delim.children[1 - outer_idx].get();
-  std::vector<duckdb::LogicalProjection const*> projections;  // outermost first
-  while (sub->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-    projections.push_back(&sub->Cast<duckdb::LogicalProjection>());
-    sub = sub->children[0].get();
-  }
-  if (sub->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN || sub->children.size() != 2) {
-    return std::nullopt;
-  }
-  auto& inner = sub->Cast<duckdb::LogicalComparisonJoin>();
-  if (inner.join_type != duckdb::JoinType::INNER || has_arbitrary_condition(inner)) {
-    return std::nullopt;
-  }
-  std::size_t d_child = 2;
-  for (std::size_t c = 0; c < 2; ++c) {
-    if (inner.children[c]->type == LogicalOperatorType::LOGICAL_DELIM_GET) { d_child = c; }
-  }
-  if (d_child == 2 || contains_delim_get(*inner.children[1 - d_child])) { return std::nullopt; }
-  auto const& delim_get = inner.children[d_child]->Cast<duckdb::LogicalDelimGet>();
-  auto const width      = delim_get.chunk_types.size();
-  if (width != delim.duplicate_eliminated_columns.size() || width != delim.conditions.size()) {
-    return std::nullopt;
-  }
-
-  // Exactly one key and one value comparison, each between plain columns.
-  exists_match match;
-  match.join        = &delim;
-  match.outer_child = outer_idx;
-  match.t           = &inner.children[1 - d_child];
-  std::optional<std::size_t> key_d, value_d;  // the delim scan's columns they compare with
-  for (auto const& condition : inner.conditions) {
-    if (!is_column(condition.GetLHS()) || !is_column(condition.GetRHS())) { return std::nullopt; }
-    auto const& t_side = d_child == 1 ? condition.GetLHS() : condition.GetRHS();
-    auto const& d_side = d_child == 1 ? condition.GetRHS() : condition.GetLHS();
-    auto const d       = binding_of(d_side);
-    if (!(d.table_index == delim_get.table_index) ||
-        d_side.GetReturnType() != t_side.GetReturnType()) {
-      return std::nullopt;
-    }
-    auto const kind = classify(condition.GetComparisonType(), match);
-    if (kind == correlation::key && !key_d) {
-      key_d          = d.column_index;
-      match.t_key    = binding_of(t_side);
-      match.key_type = t_side.GetReturnType();
-    } else if (kind == correlation::value && !value_d) {
-      value_d          = d.column_index;
-      match.t_value    = binding_of(t_side);
-      match.value_type = t_side.GetReturnType();
-    } else {
-      return std::nullopt;
-    }
-  }
-  if (!key_d || !value_d || *key_d == *value_d || !has_supported_types(match)) {
-    return std::nullopt;
-  }
-
-  // The delim join must equate each outer correlated column with the subquery's echo of the
-  // matching delim column, null-safely, and nothing else. The echo is either the delim scan's own
-  // column or T's key, which equals the delim key under the join's equality.
-  std::vector<std::optional<ColumnBinding>> outer_for(width);
-  for (auto const& condition : delim.conditions) {
-    auto const& outer_side = outer_idx == 0 ? condition.GetLHS() : condition.GetRHS();
-    auto const& sub_side   = outer_idx == 0 ? condition.GetRHS() : condition.GetLHS();
-    if (condition.GetComparisonType() != ExpressionType::COMPARE_NOT_DISTINCT_FROM ||
-        !is_column(outer_side) || !is_column(sub_side)) {
-      return std::nullopt;
-    }
-    auto const origin = see_through(projections, binding_of(sub_side));
-    if (!origin) { return std::nullopt; }
-    std::size_t d = 0;
-    if (origin->table_index == delim_get.table_index) {
-      d = origin->column_index;
-    } else if (*origin == match.t_key) {
-      d = *key_d;
-    } else {
-      return std::nullopt;
-    }
-    if (d >= width || outer_for[d]) { return std::nullopt; }
-    outer_for[d] = binding_of(outer_side);
-  }
-  // DuckDB builds the distinct set from the duplicate-eliminated columns in this order.
-  for (std::size_t d = 0; d < width; ++d) {
-    auto const& dup = *delim.duplicate_eliminated_columns[d];
-    if (!outer_for[d] || !is_column(dup) || !(binding_of(dup) == *outer_for[d])) {
-      return std::nullopt;
-    }
-  }
-  match.outer_key   = *outer_for[*key_d];
-  match.outer_value = *outer_for[*value_d];
-  return match;
-}
-
-/// A plain SEMI or ANTI join of the outer rows and T on exactly one key and one value
-/// comparison, as DuckDB leaves EXISTS once it removes the delim join, or as a client writes it.
-std::optional<exists_match> match_plain_exists(LogicalOperator& node)
+/// A SEMI or ANTI join of the outer rows and T on exactly one key and one value comparison, as
+/// DuckDB's optimizer leaves a decorrelated EXISTS, or as a client writes it. Every check is
+/// structural; anything unexpected declines and leaves DuckDB's plan alone.
+std::optional<exists_match> match_exists(LogicalOperator& node)
 {
   using duckdb::JoinType;
   if (node.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN || node.children.size() != 2) {
@@ -279,16 +161,15 @@ std::optional<exists_match> match_plain_exists(LogicalOperator& node)
   auto const type = join.join_type;
   if ((type != JoinType::SEMI && type != JoinType::ANTI && type != JoinType::RIGHT_SEMI &&
        type != JoinType::RIGHT_ANTI) ||
-      has_arbitrary_condition(join) || join.conditions.size() != 2) {
+      join.conditions.size() != 2 ||
+      !std::ranges::all_of(join.conditions,
+                           [](auto const& condition) { return condition.IsComparison(); })) {
     return std::nullopt;
   }
   exists_match match;
-  match.replaced    = &node;
   match.join        = &join;
-  match.plain       = true;
   match.outer_child = type == JoinType::SEMI || type == JoinType::ANTI ? 0 : 1;
   match.negated     = type == JoinType::ANTI || type == JoinType::RIGHT_ANTI;
-  match.t           = &join.children[1 - match.outer_child];
   bool has_key = false, has_value = false;
   for (auto const& condition : join.conditions) {
     auto const& outer_side = match.outer_child == 0 ? condition.GetLHS() : condition.GetRHS();
@@ -316,68 +197,12 @@ std::optional<exists_match> match_plain_exists(LogicalOperator& node)
   return match;
 }
 
-/// A SEMI or ANTI join (plain or DELIM) emitting the outer rows that have (or lack) a match, or
-/// `FILTER([NOT] mark)` over a MARK DELIM_JOIN. The delim join's correlation conditions are
-/// null-safe, so the mark is never NULL and the filter keeps exactly the rows a SEMI (or ANTI)
-/// join would. A mark that anything but that filter reads declines.
-std::optional<exists_match> match_exists(LogicalOperator& node,
-                                         duckdb::column_binding_map_t<std::size_t> const& reads)
-{
-  using duckdb::JoinType;
-  if (auto plain = match_plain_exists(node)) { return plain; }
-  if (node.type == LogicalOperatorType::LOGICAL_DELIM_JOIN && node.children.size() == 2) {
-    auto& delim      = node.Cast<duckdb::LogicalComparisonJoin>();
-    bool const semi  = delim.join_type == JoinType::SEMI || delim.join_type == JoinType::RIGHT_SEMI;
-    bool const anti  = delim.join_type == JoinType::ANTI || delim.join_type == JoinType::RIGHT_ANTI;
-    auto const outer = delim.delim_flipped ? std::size_t{1} : std::size_t{0};
-    bool const emits_lh = delim.join_type == JoinType::SEMI || delim.join_type == JoinType::ANTI;
-    if ((!semi && !anti) || emits_lh != (outer == 0)) { return std::nullopt; }
-    auto match = match_delim_subquery(delim, outer);
-    if (!match) { return std::nullopt; }
-    match->replaced = &delim;
-    match->negated  = anti;
-    return match;
-  }
-
-  if (node.type != LogicalOperatorType::LOGICAL_FILTER || node.expressions.size() != 1 ||
-      node.children.size() != 1 ||
-      node.children[0]->type != LogicalOperatorType::LOGICAL_DELIM_JOIN) {
-    return std::nullopt;
-  }
-  auto& delim = node.children[0]->Cast<duckdb::LogicalComparisonJoin>();
-  if (delim.join_type != JoinType::MARK || delim.delim_flipped || delim.children.size() != 2) {
-    return std::nullopt;
-  }
-  Expression const* predicate = node.expressions[0].get();
-  bool negated                = false;
-  if (predicate->GetExpressionType() == ExpressionType::OPERATOR_NOT) {
-    auto const& operands = predicate->Cast<duckdb::BoundOperatorExpression>().GetChildren();
-    if (operands.size() != 1) { return std::nullopt; }
-    predicate = operands[0].get();
-    negated   = true;
-  }
-  ColumnBinding const mark(delim.mark_index, ProjectionIndex(0));
-  auto const read = reads.find(mark);
-  if (!is_column(*predicate) || !(binding_of(*predicate) == mark) || read == reads.end() ||
-      read->second != 1) {
-    return std::nullopt;
-  }
-  auto match = match_delim_subquery(delim, 0);
-  if (!match) { return std::nullopt; }
-  match->replaced = &node;
-  match->negated  = negated;
-  match->mark     = mark;
-  return match;
-}
-
-/// Positions in @p outer's output of every column @p replaced emits, dropping a trailing @p mark.
-/// Null when it emits anything else.
+/// Positions in @p outer's output of every column @p replaced emits. Null when it emits anything
+/// else.
 std::optional<duckdb::vector<ProjectionIndex>> output_map(LogicalOperator& replaced,
-                                                          LogicalOperator& outer,
-                                                          std::optional<ColumnBinding> mark)
+                                                          LogicalOperator& outer)
 {
-  auto output = replaced.GetColumnBindings();
-  if (mark && !output.empty() && output.back() == *mark) { output.pop_back(); }
+  auto const output    = replaced.GetColumnBindings();
   auto const available = outer.GetColumnBindings();
   duckdb::vector<ProjectionIndex> map;
   for (auto const& binding : output) {
@@ -386,22 +211,6 @@ std::optional<duckdb::vector<ProjectionIndex>> output_map(LogicalOperator& repla
     map.emplace_back(static_cast<duckdb::idx_t>(found - available.begin()));
   }
   return map;
-}
-
-unique_ptr<duckdb::BoundAggregateExpression> bind_extremum(duckdb::ClientContext& context,
-                                                           char const* name,
-                                                           LogicalType const& type,
-                                                           unique_ptr<Expression> argument,
-                                                           unique_ptr<Expression> filter = nullptr)
-{
-  auto& entry =
-    duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::AggregateFunctionCatalogEntry>(
-      context, DEFAULT_SCHEMA, name);
-  auto function = entry.functions.GetFunctionByArguments(context, {type});
-  duckdb::vector<unique_ptr<Expression>> children;
-  children.push_back(std::move(argument));
-  duckdb::FunctionBinder binder(context);
-  return binder.BindAggregateFunction(std::move(function), std::move(children), std::move(filter));
 }
 
 /// One subquery answered by the shared aggregate.
@@ -433,48 +242,94 @@ unique_ptr<Expression> compare(ExpressionType type,
   return duckdb::BoundComparisonExpression::Create(type, std::move(a), std::move(b));
 }
 
+/// A read of the CTE @p cte_index, which holds the rows of @p outer.
+unique_ptr<duckdb::LogicalCTERef> read_rows(duckdb::TableIndex scan_index,
+                                            duckdb::TableIndex cte_index,
+                                            LogicalOperator const& outer)
+{
+  duckdb::vector<duckdb::Identifier> names;
+  for (std::size_t i = 0; i < outer.types.size(); ++i) {
+    names.emplace_back("__sirius_exists_rows_" + std::to_string(i));
+  }
+  auto scan = duckdb::make_uniq<duckdb::LogicalCTERef>(scan_index, cte_index, outer.types, names);
+  scan->SetEstimatedCardinality(outer.estimated_cardinality);
+  return scan;
+}
+
+/// The replacement of the matched nodes, and the bindings it gives the outer rows' columns.
+struct rewritten {
+  unique_ptr<LogicalOperator> node;
+  LogicalOperator* outer = nullptr;  ///< The outer rows, now the CTE's definition
+  duckdb::vector<ColumnBinding> outer_columns;
+  duckdb::vector<ColumnBinding> read_columns;  ///< The same columns, read from the CTE
+};
+
 /// Replace the matched nodes with the shape DuckDB itself produces for a correlated scalar
-/// aggregate:
+/// aggregate under `delim_join_as_cte`:
 ///
-///   FILTER  EXISTS:     mn <> outer.x OR mx <> outer.x
-///           NOT EXISTS: (that) IS NULL OR NOT (that)
-///    └─ LEFT DELIM_JOIN on outer.k IS NOT DISTINCT FROM a.k
-///        ├─ outer rows
-///        └─ a = AGGREGATE(GROUP BY k: MIN(x), MAX(x) per subquery) ← INNER JOIN(T, DELIM_GET(k))
+///   CTE rows = outer rows
+///    └─ FILTER  EXISTS:     mn <> rows.x OR mx <> rows.x
+///               NOT EXISTS: (that) IS NULL OR NOT (that)
+///        └─ LEFT JOIN on rows.k IS NOT DISTINCT FROM a.k
+///            ├─ CTE_SCAN rows
+///            └─ a = AGGREGATE(GROUP BY k: MIN(x), MAX(x) per subquery)
+///                 ← SEMI JOIN(T, AGGREGATE(GROUP BY k) ← CTE_SCAN rows) on t.k = k
 ///
 /// `EXISTS ... t.x <> outer.x` holds exactly when MIN or MAX of `t.x` over the key differs from
 /// `outer.x`, with NULL comparisons never counting as different; NOT EXISTS keeps the rest,
 /// including rows with no group. For `IS DISTINCT FROM`, the aggregate also records whether a NULL
 /// `t.x` was seen: a NULL `outer.x` differs from any non-NULL `t.x`, and a non-NULL one from a
 /// NULL `t.x` or from MIN or MAX. A subquery's own filters move into its aggregates as FILTERs.
-/// The filter's projection map restores exactly the columns the replaced node emitted.
-unique_ptr<LogicalOperator> build(duckdb::ClientContext& context,
-                                  duckdb::Binder& binder,
-                                  unique_ptr<LogicalOperator> outer,
-                                  ColumnBinding outer_key,
-                                  unique_ptr<LogicalOperator> t,
-                                  ColumnBinding t_key,
-                                  LogicalType const& key_type,
-                                  bool key_null_safe,
-                                  std::vector<subquery> subqueries,
-                                  duckdb::vector<ProjectionIndex> output,
-                                  duckdb::idx_t output_estimate)
+/// The filter's projection map emits the outer columns the replaced node emitted, read from the
+/// CTE.
+rewritten build(duckdb::ClientContext& context,
+                duckdb::Binder& binder,
+                unique_ptr<LogicalOperator> outer,
+                ColumnBinding outer_key,
+                unique_ptr<LogicalOperator> t,
+                ColumnBinding t_key,
+                LogicalType const& key_type,
+                bool key_null_safe,
+                std::vector<subquery> subqueries,
+                duckdb::vector<ProjectionIndex> output,
+                duckdb::idx_t output_estimate)
 {
+  outer->ResolveOperatorTypes();
   auto const outer_estimate = outer->estimated_cardinality;
+  auto const cte_index      = binder.GenerateTableIndex();
+  auto const rows_index     = binder.GenerateTableIndex();
+  auto const keys_index     = binder.GenerateTableIndex();
 
-  auto delim_get = duckdb::make_uniq<duckdb::LogicalDelimGet>(
-    binder.GenerateTableIndex(), duckdb::vector<LogicalType>{key_type});
-  delim_get->SetEstimatedCardinality(outer_estimate);
-  ColumnBinding const distinct_key(delim_get->table_index, ProjectionIndex(0));
+  rewritten result;
+  result.outer         = outer.get();
+  result.outer_columns = outer->GetColumnBindings();
+  duckdb::column_binding_map_t<ProjectionIndex> position;
+  for (std::size_t i = 0; i < result.outer_columns.size(); ++i) {
+    position.emplace(result.outer_columns[i], ProjectionIndex(i));
+    result.read_columns.emplace_back(rows_index, ProjectionIndex(i));
+  }
+  auto const rows_column = [&](ColumnBinding outer_column) {
+    return ColumnBinding(rows_index, position.at(outer_column));
+  };
 
-  auto joined = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
+  auto const distinct_index = binder.GenerateTableIndex();
+  auto distinct             = duckdb::make_uniq<duckdb::LogicalAggregate>(
+    distinct_index, binder.GenerateTableIndex(), duckdb::vector<unique_ptr<Expression>>{});
+  distinct->groups.push_back(column(key_type, ColumnBinding(keys_index, position.at(outer_key))));
+  distinct->grouping_sets.push_back(duckdb::GroupingSet{ProjectionIndex(0)});
+  distinct->group_stats.resize(1);
+  distinct->distinct_validity = duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES;
+  distinct->SetEstimatedCardinality(outer_estimate);
+  distinct->children.push_back(read_rows(keys_index, cte_index, *outer));
+
+  auto joined = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::SEMI);
   joined->conditions.emplace_back(
     column(key_type, t_key),
-    column(key_type, distinct_key),
+    column(key_type, ColumnBinding(distinct_index, ProjectionIndex(0))),
     key_null_safe ? ExpressionType::COMPARE_NOT_DISTINCT_FROM : ExpressionType::COMPARE_EQUAL);
   joined->SetEstimatedCardinality(t->estimated_cardinality);
   joined->children.push_back(std::move(t));
-  joined->children.push_back(std::move(delim_get));
+  joined->children.push_back(std::move(distinct));
 
   // MIN, MAX and, for a null-safe value, MAX(a NULL value was seen) per subquery.
   duckdb::vector<unique_ptr<Expression>> aggregates;
@@ -491,13 +346,14 @@ unique_ptr<LogicalOperator> build(duckdb::ClientContext& context,
              unary(ExpressionType::OPERATOR_IS_NULL, sub.value->Copy())),
         duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(1)),
         duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(0)));
-      aggregates.push_back(bind_extremum(context, "max", LogicalType::INTEGER, std::move(seen)));
+      aggregates.push_back(
+        bind_builtin_aggregate(context, "max", LogicalType::INTEGER, std::move(seen)));
     }
     // As FILTERs, MIN and MAX share one filtered input column in the physical plan.
-    aggregates.push_back(bind_extremum(
+    aggregates.push_back(bind_builtin_aggregate(
       context, "min", type, sub.value->Copy(), sub.predicate ? sub.predicate->Copy() : nullptr));
     aggregates.push_back(
-      bind_extremum(context, "max", type, std::move(sub.value), std::move(sub.predicate)));
+      bind_builtin_aggregate(context, "max", type, std::move(sub.value), std::move(sub.predicate)));
   }
   auto const group_index     = binder.GenerateTableIndex();
   auto const aggregate_index = binder.GenerateTableIndex();
@@ -510,14 +366,12 @@ unique_ptr<LogicalOperator> build(duckdb::ClientContext& context,
   grouped->SetEstimatedCardinality(outer_estimate);
   grouped->children.push_back(std::move(joined));
 
-  auto left = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(
-    duckdb::JoinType::LEFT, LogicalOperatorType::LOGICAL_DELIM_JOIN);
-  left->conditions.emplace_back(column(key_type, outer_key),
+  auto left = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::LEFT);
+  left->conditions.emplace_back(column(key_type, rows_column(outer_key)),
                                 column(key_type, ColumnBinding(group_index, ProjectionIndex(0))),
                                 ExpressionType::COMPARE_NOT_DISTINCT_FROM);
-  left->duplicate_eliminated_columns.push_back(column(key_type, outer_key));
   left->SetEstimatedCardinality(outer_estimate);
-  left->children.push_back(std::move(outer));
+  left->children.push_back(read_rows(rows_index, cte_index, *outer));
   left->children.push_back(std::move(grouped));
 
   unique_ptr<Expression> predicate;
@@ -526,7 +380,7 @@ unique_ptr<LogicalOperator> build(duckdb::ClientContext& context,
     auto const aggregate = [&](std::size_t offset, LogicalType const& type) {
       return column(type, ColumnBinding(aggregate_index, ProjectionIndex(first[i] + offset)));
     };
-    auto const outer_x  = [&] { return column(types[i], sub.outer_value); };
+    auto const outer_x  = [&] { return column(types[i], rows_column(sub.outer_value)); };
     auto const extremum = sub.value_null_safe ? std::size_t{1} : std::size_t{0};
     auto const differs  = [&](std::size_t offset) {
       return compare(ExpressionType::COMPARE_NOTEQUAL, aggregate(offset, types[i]), outer_x());
@@ -557,15 +411,27 @@ unique_ptr<LogicalOperator> build(duckdb::ClientContext& context,
   filter->projection_map = std::move(output);
   filter->SetEstimatedCardinality(output_estimate);
   filter->children.push_back(std::move(left));
-  return filter;
+
+  auto const column_count = outer->types.size();
+  auto cte                = duckdb::make_uniq<duckdb::LogicalMaterializedCTE>(
+    duckdb::Identifier("__sirius_exists_rows_" + std::to_string(cte_index.index)),
+    cte_index,
+    column_count,
+    std::move(outer),
+    std::move(filter),
+    duckdb::CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
+  cte->SetEstimatedCardinality(output_estimate);
+  result.node = std::move(cte);
+  result.node->ResolveOperatorTypes();
+  return result;
 }
 
 // ---------------------------------------------------------------------------------------------
 // Merging sibling subqueries
 //
 // `EXISTS (... l2.k = l1.k AND l2.x <> l1.x) AND NOT EXISTS (... l3.k = l1.k AND l3.x <> l1.x AND
-// <p>)` become two nested delim joins, each with a scan of the same table. When the scans read the
-// same source, one scan serves both: each subquery's own filter turns into a CASE inside its
+// <p>)` become two nested SEMI/ANTI joins, each with a scan of the same table. When the scans read
+// the same source, one scan serves both: each subquery's own filter turns into a CASE inside its
 // MIN/MAX, so a single aggregate keyed by the shared correlation key answers every subquery.
 // ---------------------------------------------------------------------------------------------
 
@@ -632,30 +498,6 @@ std::optional<peeled_scan> peel_scan(unique_ptr<LogicalOperator>& root)
     scan.predicates.push_back(entry.Filter().ToExpression(*tested));
   }
   return scan;
-}
-
-/// Whether two scans read the same view of the same source. This is the identity the transparent
-/// execution path itself compares between plans (`capture_bound_read_view`), which a table
-/// function's own bind-data equality does not reliably provide (parquet's does not, even for a
-/// scan against itself). Reads of the same files can still select different rows, such as two
-/// Iceberg snapshots with different deletes, so their selector evidence must match too.
-bool same_source(duckdb::ClientContext& context,
-                 duckdb::LogicalGet const& a,
-                 duckdb::LogicalGet const& b)
-{
-  if (a.function.GetName() != b.function.GetName() || a.returned_types != b.returned_types ||
-      a.names != b.names) {
-    return false;
-  }
-  try {
-    auto const view_a = sirius::op::scan::capture_bound_read_view(a, context);
-    auto const view_b = sirius::op::scan::capture_bound_read_view(b, context);
-    return view_a.identity && view_b.identity &&
-           view_a.identity->fingerprint == view_b.identity->fingerprint &&
-           sirius::op::scan::same_selector(view_a, view_b);
-  } catch (std::exception const&) {
-    return false;
-  }
 }
 
 /// The slot of @p get that outputs base column @p base, reading it if the scan does not already.
@@ -733,18 +575,18 @@ unique_ptr<Expression> move_onto(unique_ptr<Expression> expression,
 }
 
 /// Rewrite a chain of two or more matched joins (innermost first) over the same scan, one level
-/// nested in the next through its outer rows. Returns null, consuming nothing, when the subqueries
-/// cannot share one scan, or when they are plain joins over a table pinned in GPU memory that are
-/// estimated to fit in @p gpu_memory_budget bytes (0: unknown).
-unique_ptr<LogicalOperator> rewrite_merged(duckdb::ClientContext& context,
-                                           duckdb::Binder& binder,
-                                           std::vector<exists_match>& chain,
-                                           std::uint64_t gpu_memory_budget)
+/// nested in the next through its outer rows. Returns no node, consuming nothing, when the
+/// subqueries cannot share one scan, or when their table is pinned in GPU memory and their joins
+/// are estimated to fit in @p gpu_memory_budget bytes (0: unknown).
+rewritten rewrite_merged(duckdb::ClientContext& context,
+                         duckdb::Binder& binder,
+                         std::vector<exists_match>& chain,
+                         std::uint64_t gpu_memory_budget)
 {
   std::vector<peeled_scan> scans;
   for (auto& match : chain) {
-    auto scan = peel_scan(*match.t);
-    if (!scan) { return nullptr; }
+    auto scan = peel_scan(match.join->children[1 - match.outer_child]);
+    if (!scan) { return {}; }
     scans.push_back(std::move(*scan));
   }
 
@@ -754,19 +596,22 @@ unique_ptr<LogicalOperator> rewrite_merged(duckdb::ClientContext& context,
   for (std::size_t i = 0; i < chain.size(); ++i) {
     auto const key   = see_through(scans[i].projections, chain[i].t_key);
     auto const value = see_through(scans[i].projections, chain[i].t_value);
-    if (!key || !value) { return nullptr; }
+    if (!key || !value) { return {}; }
     t_keys.push_back(*key);
     t_values.push_back(*value);
   }
   auto& innermost = chain.front();
   auto& outer     = innermost.join->children[innermost.outer_child];
   auto& shared    = *scans.front().get;
-  if (!reads_only(*column(innermost.key_type, t_keys[0]), shared)) { return nullptr; }
+  if (!reads_only(*column(innermost.key_type, t_keys[0]), shared)) { return {}; }
   auto const key_base    = *base_column(shared, t_keys[0].column_index);
   auto const outer_names = outer->GetColumnBindings();
+  if (std::find(outer_names.begin(), outer_names.end(), innermost.outer_key) == outer_names.end()) {
+    return {};
+  }
   for (std::size_t i = 0; i < chain.size(); ++i) {
     auto const& get = *scans[i].get;
-    if (!same_source(context, shared, get) || chain[i].key_type != innermost.key_type ||
+    if (!flat::same_source(context, shared, get) || chain[i].key_type != innermost.key_type ||
         !(chain[i].outer_key == innermost.outer_key) ||
         !reads_only(*column(chain[i].key_type, t_keys[i]), get) ||
         base_column(get, t_keys[i].column_index) != key_base ||
@@ -775,14 +620,13 @@ unique_ptr<LogicalOperator> rewrite_merged(duckdb::ClientContext& context,
           outer_names.end() ||
         !std::ranges::all_of(scans[i].predicates,
                              [&](auto const& predicate) { return reads_only(*predicate, get); })) {
-      return nullptr;
+      return {};
     }
   }
-  auto output = output_map(*chain.back().replaced, *outer, chain.back().mark);
-  if (!output) { return nullptr; }
-  if (gpu_memory_budget > 0 &&
-      std::ranges::all_of(chain, [](auto const& match) { return match.plain; })) {
-    // Plain joins each scan their subquery's table and hash its rows. That beats the merged
+  auto output = output_map(*chain.back().join, *outer);
+  if (!output) { return {}; }
+  if (gpu_memory_budget > 0) {
+    // The joins each scan their subquery's table and hash its rows. That beats the merged
     // aggregate only when those scans are cheap, from a pin in GPU memory, and the rows fit
     // without spilling. The base-table row count is used because estimates of the subqueries'
     // filters can be far too low.
@@ -805,7 +649,7 @@ unique_ptr<LogicalOperator> rewrite_merged(duckdb::ClientContext& context,
       pinned ? "pinned" : "not pinned",
       join_bytes,
       gpu_memory_budget);
-    if (!merge) { return nullptr; }
+    if (!merge) { return {}; }
   }
 
   // ---- Nothing below declines: consume the original nodes. ----
@@ -846,57 +690,47 @@ unique_ptr<LogicalOperator> rewrite_merged(duckdb::ClientContext& context,
                key_null_safe,
                std::move(subqueries),
                std::move(*output),
-               chain.back().replaced->estimated_cardinality);
+               chain.back().join->estimated_cardinality);
 }
 
 /// The longest chain of matched joins directly nested through their outer child, innermost
 /// first.
-std::vector<exists_match> match_chain(LogicalOperator& node,
-                                      duckdb::column_binding_map_t<std::size_t> const& reads)
+std::vector<exists_match> match_chain(LogicalOperator& node)
 {
   std::vector<exists_match> outermost_first;
   auto* current = &node;
-  while (auto match = match_exists(*current, reads)) {
+  while (auto match = match_exists(*current)) {
     outermost_first.push_back(*match);
     current = match->join->children[match->outer_child].get();
   }
   return {outermost_first.rbegin(), outermost_first.rend()};
 }
 
-void count_reads(LogicalOperator& op, duckdb::column_binding_map_t<std::size_t>& reads)
-{
-  duckdb::LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression>* expression) {
-    duckdb::ExpressionIterator::VisitExpressionClass(
-      **expression, ExpressionClass::BOUND_COLUMN_REF, [&](Expression const& leaf) {
-        ++reads[binding_of(leaf)];
-      });
-  });
-  for (auto& child : op.children) {
-    count_reads(*child, reads);
-  }
-}
-
 void rewrite_tree(duckdb::ClientContext& context,
                   duckdb::Binder& binder,
+                  unique_ptr<LogicalOperator>& root,
                   unique_ptr<LogicalOperator>& slot,
-                  duckdb::column_binding_map_t<std::size_t> const& reads,
                   std::uint64_t gpu_memory_budget,
                   std::size_t& rewrites)
 {
   // Only sibling subqueries are rewritten: a lone one trades its join for a GROUP BY over the
   // same rows, which is rarely faster.
-  if (auto chain = match_chain(*slot, reads); chain.size() >= 2) {
-    if (auto merged = rewrite_merged(context, binder, chain, gpu_memory_budget)) {
-      slot = std::move(merged);
+  if (auto chain = match_chain(*slot); chain.size() >= 2) {
+    if (auto merged = rewrite_merged(context, binder, chain, gpu_memory_budget); merged.node) {
+      slot = std::move(merged.node);
       rewrites += chain.size();
-      // The merged node's outer rows may hold further subqueries.
-      rewrite_tree(
-        context, binder, slot->children[0]->children[0], reads, gpu_memory_budget, rewrites);
+      // Everything above that read the outer rows' columns reads them from the CTE.
+      duckdb::ColumnBindingReplacer replacer;
+      replacer.AddReplacements(merged.outer_columns, merged.read_columns);
+      replacer.stop_operator = merged.outer;
+      replacer.VisitOperator(*root);
+      // The outer rows, now the CTE's definition, may hold further subqueries.
+      rewrite_tree(context, binder, root, slot->children[0], gpu_memory_budget, rewrites);
       return;
     }
   }
   for (auto& child : slot->children) {
-    rewrite_tree(context, binder, child, reads, gpu_memory_budget, rewrites);
+    rewrite_tree(context, binder, root, child, gpu_memory_budget, rewrites);
   }
 }
 
@@ -907,10 +741,8 @@ std::size_t rewrite_correlated_inequality_exists(duckdb::ClientContext& context,
                                                  duckdb::unique_ptr<duckdb::LogicalOperator>& plan,
                                                  std::uint64_t gpu_memory_budget)
 {
-  duckdb::column_binding_map_t<std::size_t> reads;
-  count_reads(*plan, reads);
   std::size_t rewrites = 0;
-  rewrite_tree(context, binder, plan, reads, gpu_memory_budget, rewrites);
+  rewrite_tree(context, binder, plan, plan, gpu_memory_budget, rewrites);
   if (rewrites > 0) {
     SIRIUS_LOG_INFO(
       "[sirius_plan_exists_rewrite] Rewrote {} EXISTS/NOT EXISTS on a key and a value inequality "

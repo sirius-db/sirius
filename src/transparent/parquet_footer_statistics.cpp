@@ -437,6 +437,18 @@ std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
   return statistics_of_all(context, files, options).size();
 }
 
+std::size_t parquet_files_row_count(duckdb::ClientContext& context,
+                                    std::vector<std::string> const& paths)
+{
+  duckdb::ParquetOptions const options(context);
+  std::vector<duckdb::OpenFileInfo> const files(paths.begin(), paths.end());
+  std::size_t rows = 0;
+  for (auto const& file : statistics_of_all(context, files, options)) {
+    rows += file->num_rows;
+  }
+  return rows;
+}
+
 std::size_t detail::merged_statistics_cache_size()
 {
   std::lock_guard guard(merge_mutex);

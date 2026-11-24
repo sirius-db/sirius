@@ -161,3 +161,83 @@ TEST_CASE_METHOD(TimestampExtractionFixture,
     check_extraction("SELECT id, " + extraction + " FROM timestamps WHERE " + predicate);
   }
 }
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "timestamp precision casts match DuckDB",
+                 "[integration][gpu_execution][timestamp_cast]")
+{
+  struct precision {
+    std::string type;
+    std::string unit;
+  };
+  std::vector<precision> const precisions = {
+    {"TIMESTAMP_S", "S"}, {"TIMESTAMP_MS", "MS"}, {"TIMESTAMP", "US"}, {"TIMESTAMP_NS", "NS"}};
+  auto const source   = static_cast<size_t>(GENERATE(0, 1, 2, 3));
+  auto const strategy = GENERATE("materialize", "ast_interpret", "ast_jit");
+  auto const& type    = precisions[source].type;
+  auto const& unit    = precisions[source].unit;
+  CAPTURE(type, strategy);
+  run_ok("SET gpu_execution = false");
+  run_ok(std::string("SET expression_evaluator_strategy = '") + strategy + "'");
+  run_ok("CREATE TABLE timestamps (id BIGINT, t " + type + ")");
+
+  // Every finite value fits TIMESTAMP_NS, which spans 1677-09-21 to 2262-04-11. The
+  // sub-microsecond digits include ties for the rounding cast from nanoseconds.
+  std::vector<std::string> const values = {
+    "1970-01-01 00:00:00",
+    "1970-01-01 00:00:00.000000001",
+    "1970-01-01 00:00:00.000001500",
+    "1969-12-31 23:59:59.999999999",
+    "1969-12-31 23:59:59.999999500",
+    "2024-03-10 01:02:03.123456789",
+    "1700-01-01 12:34:56.789",
+    "2200-12-31 23:59:59.999999",
+    "infinity",
+    "-infinity",
+  };
+  for (size_t i = 0; i < values.size(); ++i) {
+    run_ok("INSERT INTO timestamps VALUES (" + std::to_string(i) + ", '" + values[i] + "')");
+  }
+  run_ok("INSERT INTO timestamps VALUES (" + std::to_string(values.size()) + ", NULL)");
+  auto const widens_to_nanoseconds = type != "TIMESTAMP_NS";
+  if (widens_to_nanoseconds) {
+    // Ids 1 and 2 are finite but lie outside TIMESTAMP_NS's range.
+    run_ok("CREATE TABLE far (id BIGINT, t " + type + ")");
+    run_ok(
+      "INSERT INTO far VALUES (0, '2024-03-10 01:02:03'), (1, '2300-01-01 00:00:00'), "
+      "(2, '1600-01-01 00:00:00'), (3, 'infinity')");
+  }
+  run_ok("CHECKPOINT");
+
+  // Every finer precision, and the rounding cast from nanoseconds to microseconds.
+  std::vector<std::string> targets;
+  for (size_t finer = source + 1; finer < precisions.size(); ++finer) {
+    targets.push_back(precisions[finer].type);
+  }
+  if (!widens_to_nanoseconds) { targets.push_back("TIMESTAMP"); }
+  for (auto const& target : targets) {
+    compare_gpu_vs_cpu("SELECT id, CAST(t AS " + target + ") FROM timestamps");
+    compare_gpu_vs_cpu("SELECT id, TRY_CAST(t AS " + target + ") FROM timestamps");
+  }
+  if (!widens_to_nanoseconds) { return; }
+
+  run_ok("SET gpu_execution = false");
+  std::string const overflowing = "SELECT id, CAST(t AS TIMESTAMP_NS) FROM far";
+  auto cpu                      = con->Query(overflowing);
+  REQUIRE(cpu);
+  REQUIRE(cpu->HasError());
+  CHECK(cpu->GetError().find("Conversion Error") != std::string::npos);
+
+  run_ok("SET gpu_execution = true");
+  run_ok("SET enable_duckdb_fallback = false");
+  auto gpu = con->Query(overflowing);
+  REQUIRE(gpu);
+  REQUIRE(gpu->HasError());
+  INFO(gpu->GetError());
+  CHECK(gpu->GetError().find("Could not convert Timestamp(" + unit + ") to Timestamp(NS)") !=
+        std::string::npos);
+
+  // TRY_CAST returns NULL for those rows: the GPU raises and DuckDB answers.
+  run_ok("SET enable_duckdb_fallback = true");
+  expect_runtime_fallback_matches_cpu("SELECT id, TRY_CAST(t AS TIMESTAMP_NS) FROM far");
+}

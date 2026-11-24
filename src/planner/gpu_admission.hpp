@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
-#include <span>
 #include <vector>
 
 namespace sirius::op {
@@ -38,8 +37,8 @@ namespace sirius::planner {
  * @brief Visit every GPU_SCAN operator reachable from @p node.
  *
  * Mirrors sirius_physical_plan_generator::set_parent_ops, the canonical full-tree descent.
- * RESULT_COLLECTOR holds its child in `plan` and DELIM JOIN holds `join`/`distinct_root`,
- * both outside `children[]`; missing either under-counts scans and admits too few GPUs.
+ * RESULT_COLLECTOR holds its child in `plan`, outside `children[]`; missing it under-counts
+ * scans and admits too few GPUs.
  * Allocates nothing, so cleanup paths that must not fail can use it.
  */
 void for_each_gpu_scan(const op::sirius_physical_operator& node,
@@ -64,34 +63,6 @@ inline std::vector<int> apply_gpu_cap(std::vector<int> gpu_ids, int cap)
     gpu_ids.resize(static_cast<std::size_t>(cap));
   }
   return gpu_ids;
-}
-
-/**
- * @brief Add to an admitted GPU set the GPUs that hold data the query must read in place.
- *
- * @p owners are the devices holding Simpatico-compressed GPU-tier pinned chunks that the
- * query's scans read. Such a chunk is decoded on the GPU that holds it — compressed pins
- * have no relocation step — so narrowing a query away from an owner would leave the chunk
- * with no admitted GPU able to decode it. This overrides both `topology.gpus_per_query` and
- * `admission_bytes_per_gpu`: running on more GPUs than asked is preferred to failing the scan.
- *
- * Owners outside @p available (GPUs this process does not run on) are ignored. The result is
- * sorted and duplicate-free whenever it differs from @p admitted, and is @p admitted unchanged
- * when no owner is missing.
- */
-inline std::vector<int> widen_to_pin_owners(std::vector<int> admitted,
-                                            std::span<const int> owners,
-                                            std::span<const int> available)
-{
-  bool widened = false;
-  for (int const owner : owners) {
-    if (std::find(available.begin(), available.end(), owner) == available.end()) { continue; }
-    if (std::find(admitted.begin(), admitted.end(), owner) != admitted.end()) { continue; }
-    admitted.push_back(owner);
-    widened = true;
-  }
-  if (widened) { std::sort(admitted.begin(), admitted.end()); }
-  return admitted;
 }
 
 /**

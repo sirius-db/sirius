@@ -33,7 +33,17 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
+# The upstream release target hardcodes build/release. Keep its flags and
+# prerequisites, but allow the parent Sirius build to select an isolated root.
+CMAKE ?= cmake
+BUILD_DIR ?= build
+.PHONY: sirius-release
+sirius-release: ${EXTENSION_CONFIG_STEP}
+	$(CMAKE) $(GENERATOR) $(BUILD_FLAGS) $(EXT_RELEASE_FLAGS) $(VCPKG_MANIFEST_FLAGS) \
+		-DCMAKE_BUILD_TYPE=Release -S $(DUCKDB_SRCDIR) -B "$(BUILD_DIR)/release"
+	$(CMAKE) --build "$(BUILD_DIR)/release" --config Release
+
 .PHONY: configure_sirius_submodules
 configure_ci: configure_sirius_submodules
 configure_sirius_submodules:
-	git -C '$(PROJ_DIR)..' submodule update --init --recursive -- duckdb cucascade substrait
+	git -C '$(PROJ_DIR)..' submodule update --init --recursive -- cucascade substrait

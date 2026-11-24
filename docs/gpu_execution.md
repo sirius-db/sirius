@@ -45,6 +45,15 @@ GROUP BY l_returnflag, l_linestatus
 ORDER BY l_returnflag, l_linestatus');
 ```
 
+`gpu_execution` takes exactly one SQL statement; an empty string or several statements raise an
+error. Named parameters:
+
+- `enable_optimizer` (default `true`; `NULL` means the default): plan the query with DuckDB's
+  optimizer before Sirius takes it. `false` hands Sirius the unoptimized plan, for example to
+  test operators the optimizer would rewrite away. The session's own optimizer setting is left
+  unchanged.
+- `query_label`: names this query in telemetry, as `sirius_set_query_label` does.
+
 ### Transparent Execution
 
 When `gpu_execution` is enabled (the default after loading the extension), all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no `CALL gpu_execution('...')` wrapper needed:
@@ -78,7 +87,9 @@ To re-enable:
 SET gpu_execution = true;
 ```
 
-**How it works:** Two optimizer extensions are registered at extension load time. A pre-optimizer hook disables DuckDB optimizers incompatible with Sirius (such as `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, and `LATE_MATERIALIZATION`). A post-optimizer hook captures the optimized logical plan and attempts GPU plan generation via `sirius_physical_plan_generator`. If plan generation succeeds, a `PhysicalSiriusExecution` node replaces the DuckDB physical plan and the query runs on GPU; if plan generation throws, the original DuckDB CPU plan runs unchanged.
+Sirius plans a correlated subquery only in the form DuckDB's default `delim_join_as_cte = true` gives it, a CTE. With `false`, which DuckDB has deprecated, a correlated subquery that DuckDB cannot flatten stays a delim join, and Sirius has no operators for one. A query whose plan has a delim join is left to the CPU like any other plan Sirius cannot run, on the transparent path and in `gpu_execution(...)`: Sirius logs a warning that names the setting, and with `enable_duckdb_fallback = false` the query fails with that message. Every other query runs on the GPU under either value.
+
+**How it works:** Sirius registers two optimizer hooks at extension load time, and disables the DuckDB optimizers it cannot plan after (such as `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, and `LATE_MATERIALIZATION`). The pre-optimizer hook decides whether the statement stays on DuckDB and, for a query headed to the GPU, rewrites correlated subqueries before DuckDB orders the joins (see [Optimizations](super-sirius/optimizations.md#subquery-keys-carried-across-an-equality)). The post-optimizer hook captures the optimized logical plan, and GPU plan generation runs on it via `sirius_physical_plan_generator`. If plan generation succeeds, a `PhysicalSiriusExecution` node replaces the DuckDB physical plan and the query runs on GPU; if it throws, DuckDB's CPU plan runs. When the pre-optimizer hook had rewritten the query, DuckDB first plans the statement again without the rewrite, so the CPU runs the plan DuckDB makes alone.
 
 ## Generating Test Datasets
 

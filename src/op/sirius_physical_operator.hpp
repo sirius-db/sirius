@@ -48,6 +48,7 @@
 namespace sirius {
 
 class like_multiliteral_cache;
+struct operator_params;
 
 namespace telemetry {
 struct batch_telemetry_info;
@@ -55,7 +56,6 @@ struct batch_telemetry_info;
 
 namespace op {
 class sirius_physical_operator;
-class sirius_physical_delim_join;
 }  // namespace op
 
 namespace pipeline {
@@ -116,11 +116,19 @@ enum class operator_data_type : uint8_t {
   INPUT_FREE,
 };
 
+// Describes the task delivering this input, independently of physical batch IDs.
+// The executor stamps the actual input before each execute() call. A writer's
+// accounting is query-local, so the original task ID needs no query ID here.
+struct delivery_metadata {
+  std::uint64_t original_task_id = 0;
+  std::uint32_t retry_count      = 0;
+};
+
 /**
  * @brief Generic base class for operator input/output data.
  *
- * This is an intentionally minimal base class with no opinion on what the
- * data should be. Derived classes define the concrete data representation.
+ * Derived classes define the concrete data representation. Optional delivery
+ * metadata describes the task invocation independently of that representation.
  */
 class operator_data {
  public:
@@ -131,6 +139,12 @@ class operator_data {
   operator_data& operator=(const operator_data&) = default;
   operator_data(operator_data&&)                 = default;
   operator_data& operator=(operator_data&&)      = default;
+
+  [[nodiscard]] delivery_metadata const* delivery() const noexcept
+  {
+    return _delivery ? &*_delivery : nullptr;
+  }
+  void set_delivery(delivery_metadata metadata) noexcept { _delivery = metadata; }
 
   /**
    * @brief Identify the concrete subclass at runtime.
@@ -234,6 +248,9 @@ class operator_data {
   [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
 
  private:
+  // Optional while constructing an input; overwritten for each task invocation,
+  // including after row-preserving materialization or a downstream task boundary.
+  std::optional<delivery_metadata> _delivery;
   /// Producer-assigned device preference; nullopt until set_preferred_device_id.
   std::optional<int> _preferred_device_id;
 };
@@ -537,7 +554,7 @@ class sirius_physical_operator {
   virtual ~sirius_physical_operator() {}
 
   //! The physical operator type. Default-initialized to INVALID for the test-only default
-  //! ctor — type-dispatch sites (e.g. the wiring materializer's delim-join routing) read it
+  //! ctor — type-dispatch sites (e.g. the pipeline converter's CTE fan-out check) read it
   //! on default-constructed operators, so it must not be indeterminate.
   SiriusPhysicalOperatorType type = SiriusPhysicalOperatorType::INVALID;
   //! The set of children of the operator (operators that feed data _into_ the current operator)
@@ -588,6 +605,7 @@ class sirius_physical_operator {
 
   /// The owning pipeline supplies query policy; standalone operators use fixed defaults.
   [[nodiscard]] expression_query_policy expression_policy() const noexcept;
+  [[nodiscard]] const sirius::operator_params& operator_options() const noexcept;
 
   [[nodiscard]] bool like_swar_fastpath_enabled() const noexcept;
 
@@ -656,8 +674,8 @@ class sirius_physical_operator {
   [[nodiscard]] telemetry::batch_telemetry_info batch_telemetry() const;
 
   //! The late-materialization half this operator carries, if any. Both are empty on every
-  //! operator unless `SIRIUS_EXP_LATE_MAT` is on AND the pair installed; they are written once,
-  //! at query prepare, before any task runs, and only read from then on.
+  //! operator unless `enable_late_materialization` is on AND the pair installed; they are written
+  //! once, at query prepare, before any task runs, and only read from then on.
   //!
   //! A scan carries the producing half (stop emitting these positions' values) and its port
   //! carries the consuming half (put them back). Stamped only by
@@ -675,19 +693,6 @@ class sirius_physical_operator {
   //! This operator's parent in the physical plan tree, or nullptr at the root. Stamped by
   //! `sirius_physical_plan_generator::set_parent_ops` after plan generation completes.
   [[nodiscard]] sirius_physical_operator* get_parent_op() const noexcept { return _parent_op; }
-
-  //! Non-owning pointer to the DELIM_JOIN that owns this operator's execution (nullptr if
-  //! none). Set on the distinct chain top by `wrap_delim_distinct`; the tree-based wiring
-  //! uses it to route the merge-top into each delim_scan's consumer pipeline.
-  [[nodiscard]] sirius_physical_delim_join* owning_delim_join() const noexcept
-  {
-    return _owning_delim_join;
-  }
-  //! Set by `wrap_delim_distinct` at plan-gen time; not intended to be mutated post-plan-gen.
-  void set_owning_delim_join(sirius_physical_delim_join* delim) noexcept
-  {
-    _owning_delim_join = delim;
-  }
 
   virtual bool equals(const sirius_physical_operator& other) const { return false; }
 
@@ -772,18 +777,16 @@ class sirius_physical_operator {
   // Sink interface
   virtual void sink(const operator_data& input_data, ::cuda::stream_ref stream);
 
-  //! An operator is a pipeline sink iff its tree parent is a PARTITION, BUILD_FILTER,
-  //! RIGHT_DELIM_JOIN, or DENSE_COUNT_JOIN — computed from `_parent_op` from the final tree. Those
-  //! parents consume a child's output through a repository, so the child terminates its own
-  //! pipeline. Unconditional sinks (e.g. HGB, ORDER_BY, MERGE ops, CONCAT, PARTITION,
-  //! DENSE_COUNT_JOIN) override to `true`; SORT_SAMPLE and the `delim.join` of a RIGHT_DELIM_JOIN
-  //! override to `false`.
+  //! An operator is a pipeline sink iff its tree parent is a PARTITION, BUILD_FILTER, or
+  //! DENSE_COUNT_JOIN — computed from `_parent_op` from the final tree. Those parents consume a
+  //! child's output through a repository, so the child terminates its own pipeline. Unconditional
+  //! sinks (e.g. HGB, ORDER_BY, MERGE ops, CONCAT, PARTITION, DENSE_COUNT_JOIN) override to
+  //! `true`; SORT_SAMPLE overrides to `false`.
   virtual bool is_sink() const
   {
     return _parent_op != nullptr &&
            (_parent_op->type == SiriusPhysicalOperatorType::PARTITION ||
             _parent_op->type == SiriusPhysicalOperatorType::BUILD_FILTER ||
-            _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ||
             _parent_op->type == SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
   }
 
@@ -971,8 +974,6 @@ class sirius_physical_operator {
   //! The parent of this operator in the plan tree; nullptr at the root or before linking.
   //! Set only by the plan generator via the private `set_parent_op()` (friend access).
   sirius_physical_operator* _parent_op = nullptr;
-  //! The DELIM_JOIN that logically owns this operator, or nullptr. See `owning_delim_join()`.
-  sirius_physical_delim_join* _owning_delim_join = nullptr;
 
  private:
   //! Optional physical cuDF carrier schema for this operator's output. SQL semantics always use

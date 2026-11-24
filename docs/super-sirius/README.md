@@ -21,6 +21,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Query Lifecycle](query-lifecycle.md) | Per-query submission guards, work leases, spill borrows and retirement barriers |
 | [Execution Flow](execution-flow.md) | End-to-end query trace with file:line references |
 | [Physical Plan Generation](physical-plan-generation.md) | Logical-to-physical mapping, pipeline construction, splitting rules |
+| [Parquet Output](parquet-output.md) | COPY directory export, parallel writing, ordering, and failure cleanup |
 | [Operators](operators.md) | All physical operators: interface, GPU implementation, cuDF APIs |
 | [Expression Evaluator](expression-executor.md) | `expression_evaluator`, Sirius AST hierarchy, GPU expression translator, cuDF AST |
 | [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling, per-task-device contract under SCHED-RR |
@@ -42,7 +43,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Distributed Gateway](distributed-gateway.md) | One SQL endpoint over Quack for every rank: routing, query numbers, the DDL log, spawned and registered ranks, fail-stop and the cancel ladder |
 | [Distributed Execution](distributed-sirius.md) | One query across processes and GPUs: `EXCHANGE_SINK`/`EXCHANGE_SOURCE`, the NIXL transport with per-peer credits, the plan rewrite, Bloom filters merged across ranks, and running TPC-H Q12 on 4 GPUs |
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, ready-device scheduling, cross-GPU transfers, downgrade, concurrency invariants |
-| [Late Materialization](late-materialization.md) | Carrying a pin-order rowid instead of wide column values — the scan/port pair, group-by-rowid rides, riders, the pin-time uniqueness proof, and the `SIRIUS_EXP_LATE_MAT_*` gates |
+| [Late Materialization](late-materialization.md) | Carrying a pin-order rowid instead of wide column values — the scan/port pair, group-by-rowid rides, riders, the pin-time uniqueness proof, the `enable_late_materialization` setting, and deferral thresholds |
 | [Dynamic Filters](dynamic-filters.md) | Ordered hash-build publication, zone-map/IN-list/Bloom consumers, multi-GPU replicas, join-edge (SIP) endpoint placement, and the refinement design that remains future work |
 | [Debugging](debugging.md) | Practical guide to debugging crashes and races — building/running with ASan & TSan, the `tsan.supp` file, and capturing/inspecting core dumps with gdb |
 

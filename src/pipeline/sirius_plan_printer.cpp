@@ -342,7 +342,10 @@ std::shared_ptr<sirius_pipeline> sirius_plan_printer::find_root_pipeline() const
 {
   for (auto& p : pipelines_) {
     auto sink = p->get_sink();
-    if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) { return p; }
+    if (sink && (sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||
+                 sink->type == op::SiriusPhysicalOperatorType::COPY_TO_FILE)) {
+      return p;
+    }
   }
   // Fallback: last pipeline
   if (!pipelines_.empty()) { return pipelines_.back(); }

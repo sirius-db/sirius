@@ -19,6 +19,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "sirius_config.hpp"
 
 namespace sirius::planner {
 namespace {
@@ -64,7 +65,6 @@ bool build_subtree_is_filtering(duckdb::LogicalOperator const& op)
 bool build_relation_is_opaque(duckdb::LogicalOperator const& op)
 {
   switch (op.type) {
-    case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
     case duckdb::LogicalOperatorType::LOGICAL_CTE_REF: return true;
     case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
       // Computed groups are valid: the filter uses actual build output, not input-key lineage.
@@ -79,8 +79,7 @@ bool build_relation_is_opaque(duckdb::LogicalOperator const& op)
 
 bool build_subtree_has_filtering_join(duckdb::LogicalOperator const& op)
 {
-  if (op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-      op.type == duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
     switch (op.Cast<duckdb::LogicalComparisonJoin>().join_type) {
       case duckdb::JoinType::SEMI:
       case duckdb::JoinType::ANTI:
@@ -93,6 +92,12 @@ bool build_subtree_has_filtering_join(duckdb::LogicalOperator const& op)
     if (child && build_subtree_has_filtering_join(*child)) { return true; }
   }
   return false;
+}
+
+bool right_family_publication_enabled(sirius::operator_params const& params)
+{
+  return params.enable_dynamic_filter && params.enable_dynamic_filter_multi_partition &&
+         params.max_dynamic_filter_bloom_bytes_per_gpu() > 0;
 }
 
 }  // namespace sirius::planner

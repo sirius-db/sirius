@@ -5,7 +5,9 @@ here until it can move to `sirius-db/sirius-duckdb`. Its Makefile uses DuckDB's
 normal extension build infrastructure.
 
 Use matching DuckDB revisions and compatible C++ toolchains for Sirius and the
-wrapper. The engine and wrapper gitlinks record the supported revision.
+wrapper. The engine and wrapper gitlinks record the supported revision. The
+wrapper refuses a Sirius package built from another DuckDB commit; static builds
+compile Sirius against the wrapper's checkout, `sirius-duckdb/duckdb`.
 
 ## Shared development build
 
@@ -52,7 +54,7 @@ Hosts that statically link their C++ runtime must export its exception-handling
 symbols. The supplied DuckDB build enables this with `EXPORT_DYNAMIC_SYMBOLS=ON`.
 
 ```sh
-git submodule update --init duckdb substrait cucascade sirius-duckdb/vcpkg sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
+git submodule update --init substrait cucascade sirius-duckdb/vcpkg sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run -e vcpkg make -C sirius-duckdb release \
   SIRIUS_DUCKDB_LINKAGE=static \
   VCPKG_TOOLCHAIN_PATH="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake"
@@ -70,7 +72,7 @@ The static port hashes source contents and filenames, including the engine's
 submodules and untracked, nonignored source files, so source edits invalidate
 Sirius's package without invalidating third-party dependency caches.
 Distribution CI uses the same port, with
-`configure_ci` initializing the engine's submodules.
+`configure_ci` initializing the engine's other submodules.
 
 For shared builds, first build/install Sirius with the root Makefile or CMake,
 then pass its prefix as `SIRIUS_INSTALL_DIR` (or use CMake's normal package search
@@ -152,7 +154,13 @@ Use separate extension directories when testing both layouts.
 
 `LOAD sirius` reuses an installed backend; it does not update it or require its
 Sirius version to match the loader. Updating only the loader can therefore leave
-an older backend installed. The loader only selects and loads the backend; it
+an older backend installed. When `autoinstall_known_extensions` is enabled and the
+backend came from an HTTP repository, the first `LOAD sirius` in a database asks that
+repository whether it publishes a different build, using the ETag recorded at install
+time and without downloading it. If so, it prints a notice to stderr suggesting
+`UPDATE EXTENSIONS`. The check never fails `LOAD`. It uses two-second network
+timeouts, but a stalled DNS lookup or a server that answers very slowly can delay
+`LOAD` further. The loader only selects and loads the backend; it
 does not link against the engine API.
 
 Run `UPDATE EXTENSIONS;` to update the installed loader and backend(s) from their
