@@ -1724,9 +1724,12 @@ bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_b
     // Every probe row must see its partition's whole build to get one mark; MARK may run
     // hash-partitioned STANDARD, like SEMI.
     case duckdb::JoinType::MARK: return is_build;
-    case duckdb::JoinType::RIGHT:
     case duckdb::JoinType::RIGHT_SEMI:
-    case duckdb::JoinType::RIGHT_ANTI: return !is_build;
+    case duckdb::JoinType::RIGHT_ANTI:
+      // A kept-build join folds its build into one hash table per partition and streams the probe.
+      if (hash_join.kept_build_streaming()) { return is_build; }
+      return !is_build;
+    case duckdb::JoinType::RIGHT: return !is_build;
     case duckdb::JoinType::OUTER: return true;
     case duckdb::JoinType::INNER: return false;
     default:
@@ -1864,7 +1867,8 @@ void bind_wrapped_join(sirius::op::sirius_physical_operator& join_op, bool probe
 
 //! Wrap both children of a HASH_JOIN / NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
 //! chain (probe = children[0], build = children[1]) and bind the two inputs. The inner join of a
-//! RIGHT_DELIM_JOIN is sized from its build side even when it is right-family.
+//! RIGHT_DELIM_JOIN, and a kept-build RIGHT_SEMI/RIGHT_ANTI, are sized from their build side even
+//! though they are right-family.
 void wrap_join(sirius::op::sirius_physical_operator& join_op,
                const sirius::operator_params& op_params,
                duckdb::SiriusContext* compressed_materialization_observer)
@@ -1877,7 +1881,8 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
   bool probe_drives = false;
   if (join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
     auto const& hash_join = join_op.Cast<sirius::op::sirius_physical_hash_join>();
-    probe_drives          = hash_join.is_right_family() && !hash_join.is_delim_join_inner();
+    probe_drives          = hash_join.is_right_family() && !hash_join.is_delim_join_inner() &&
+                   !hash_join.kept_build_streaming();
   }
   bind_wrapped_join(join_op, probe_drives);
 }
@@ -2765,10 +2770,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       plan = create_plan(op.Cast<duckdb::LogicalTopN>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_COPY_TO_FILE: {
-      // Only the discard format runs on the GPU; every real file format stays on DuckDB.
+      // The discard format writes nothing and ends the query in a discard sink; every other
+      // format goes to the Parquet export, which refuses what it cannot write.
       auto& copy = op.Cast<duckdb::LogicalCopyToFile>();
-      if (!(copy.function.name == sirius::op::kDiscardCopyFormat) || !copy.bind_data ||
-          op.children.size() != 1 || op.types.size() != 1 ||
+      if (!(copy.function.name == sirius::op::kDiscardCopyFormat)) {
+        plan = create_plan(copy);
+        break;
+      }
+      if (!copy.bind_data || op.children.size() != 1 || op.types.size() != 1 ||
           op.types[0].id() != duckdb::LogicalTypeId::BIGINT) {
         throw duckdb::NotImplementedException("Copy to file not supported");
       }

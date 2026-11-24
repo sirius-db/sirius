@@ -398,6 +398,14 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 [[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(
   pinned_entry const& entry, std::size_t entry_position, cudf::data_type native_type);
 
+/// Whether late materialization can restore the nulls of the pinned column at
+/// @p column_position: its gather shape carries validity through, or the pin
+/// proves the column holds none. A compressed chunk carrying no blob answers
+/// neither, so a pin with one is refused. Deferral admission asks this of every
+/// column a primary bundle or a rider defers.
+[[nodiscard]] bool pinned_column_nulls_restorable(pinned_entry const& entry,
+                                                  std::size_t column_position);
+
 /// True when every column of @p column_ids that @p entry carries still maps, in
 /// every chunk, to the pin-time native cuDF type @p returned_types declares. A
 /// column the entry lacks is skipped (coverage is checked separately) and an
@@ -871,16 +879,6 @@ class sirius_scan_manager {
   /// several names with different column sets, and the serve-time matcher may use any of them.
   [[nodiscard]] std::vector<std::shared_ptr<const pinned_entry>>
   find_pinned_entries_for_parquet_files(std::span<std::string const> resolved_file_paths) const;
-
-  /// Device ids of the GPUs that hold Simpatico-compressed GPU-tier chunks of any pinned
-  /// entry over the same source as @p table_info (same parquet file set or same DuckDB table
-  /// incarnation), sorted and duplicate-free. Matches on source identity alone, so it can
-  /// name the owners of a pin that ends up not serving the scan, but never misses the owners
-  /// of one that does.
-  /// Read by query admission: a compressed chunk is decoded on the GPU that holds it, so
-  /// these GPUs must stay in the query's admitted set.
-  [[nodiscard]] std::vector<int> compressed_gpu_pin_owner_devices(
-    const op::scan::ingestible_table_info& table_info) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
 

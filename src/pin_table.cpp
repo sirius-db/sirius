@@ -596,6 +596,30 @@ void log_pin_compression_coverage(std::string_view log_tag,
                   suffix);
 }
 
+/// Whether a pin with automatic plans is too small to compress, judged by extrapolating its
+/// first chunk @p tbl to compression.table_rows.
+bool pin_below_min_size(cudf::table const& tbl,
+                        compression_pin_config const& compression,
+                        std::string_view table_name)
+{
+  if (!compression.plan_dsl.empty() || compression.min_pin_bytes == 0 ||
+      compression.table_rows == 0 || tbl.num_rows() == 0) {
+    return false;
+  }
+  auto const pin_bytes = static_cast<double>(tbl.alloc_size()) / tbl.num_rows() *
+                         static_cast<double>(compression.table_rows);
+  bool const below = pin_bytes < static_cast<double>(compression.min_pin_bytes);
+  SIRIUS_LOG_INFO(
+    "[pin_table] '{}': about {:.0f} bytes uncompressed, {} the {} bytes automatic "
+    "compression needs{}",
+    table_name,
+    pin_bytes,
+    below ? "below" : "at least",
+    compression.min_pin_bytes,
+    below ? "; pinning uncompressed" : "");
+  return below;
+}
+
 /// Shared compress step for the host and device pin drivers: compress @p tbl per
 /// @p compression on @p stream, and when the batch qualifies (compression on and
 /// >= the size threshold) AND the compressed footprint saves enough (<=
@@ -629,7 +653,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
   if (plan.empty()) {
     bool all_stored = true;
     for (auto const& column : tbl.view()) {
-      auto column_plan = sirius::compression::default_spill_plan(column, stream);
+      auto column_plan = sirius::compression::default_pin_plan(column, stream);
       all_stored       = all_stored && column_plan == "input -> identity\n";
       if (!plan.empty()) { plan += "---\n"; }
       plan += column_plan;
@@ -742,6 +766,7 @@ host_pin_result materialize_pin_to_host(
   auto& registry = converter_registry::get();
   host_pin_result out;
   bool compression_failed = false;
+  std::optional<bool> too_small;
 
   // Group by the actual destination, including the caller's fallback mapping for
   // GPUs without a matching NUMA host space. No topology or GPU-id arithmetic here.
@@ -770,7 +795,10 @@ host_pin_result materialize_pin_to_host(
       out.column_storage.emplace_back(std::move(column_storage));
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
 
-      if (compression.enabled && !compression_failed && tbl) {
+      if (compression.enabled && tbl && !too_small) {
+        too_small = pin_below_min_size(*tbl, compression, ingestible.table_info().display_name());
+      }
+      if (compression.enabled && !compression_failed && !too_small.value_or(false) && tbl) {
         try {
           compressed_this_chunk = compress_and_stage_batch(
             *tbl,
@@ -876,6 +904,7 @@ device_pin_result materialize_all_batches_compressed(
 {
   device_pin_result out;
   bool compression_failed = false;
+  std::optional<bool> too_small;
 
   out.unique_verdicts = materialize_pin_batches(
     ingestible,
@@ -895,7 +924,10 @@ device_pin_result materialize_all_batches_compressed(
 
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
 
-      if (compression.enabled && !compression_failed && tbl) {
+      if (compression.enabled && tbl && !too_small) {
+        too_small = pin_below_min_size(*tbl, compression, ingestible.table_info().display_name());
+      }
+      if (compression.enabled && !compression_failed && !too_small.value_or(false) && tbl) {
         try {
           compress_and_stage_batch(
             *tbl,
@@ -1006,6 +1038,21 @@ device_pin_result materialize_all_batches_compressed(
                 column_sizes = std::move(sizes);
               }
               stream.sync();
+
+              // Keep the header and the place of each payload buffer, so a query admitted
+              // without this GPU can copy the buffers it reads to its own GPU and decode
+              // there. The reader asks for a buffer by its header offset; empty buffers are
+              // never fetched.
+              blob->slices.reserve(blob->offsets.size());
+              for (std::size_t k = 0; k < blob->offsets.size(); ++k) {
+                auto const& b = buffers[slot_src[k]];
+                if (b.size_bytes == 0) { continue; }
+                blob->slices.push_back(sirius::compressed_payload_slice{
+                  b.offset,
+                  static_cast<std::byte const*>(blob->payload.data()) + blob->offsets[k],
+                  b.size_bytes});
+              }
+              blob->header = std::move(header);
 
               compressed_chunk = std::make_shared<sirius::compressed_device_representation>(
                 *src_space,

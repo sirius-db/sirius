@@ -242,15 +242,17 @@ available for reads or writes.
 Simpatico compression is enabled by default when `pin_table` caches input tables on
 the host or GPU. Use `CALL pin_table(..., compression => false)` to opt out for a specific
 pin, or `SET pin_table_compression = false` for the session default. Matching table plans
-in `input_plan_dir` override automatic selection; without one, each chunk uses the same
-type/sample-based plan selection as spill compression, after carrier narrowing. The
-size and actual compressed-footprint gates below still apply.
+in `input_plan_dir` override automatic selection; without one, a large enough table has each
+chunk's plans chosen from type and sample after carrier narrowing, favoring plans a filtered
+scan can decode in place (see [Compressed Pinning](compressed-pinning.md)). The size and actual
+compressed-footprint gates below still apply.
 
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
 | `enable_pin_table_compression` | `pin_table_compression` | bool | true | Default for `pin_table` calls that omit the `compression` argument. |
 | `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
 | `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
+| `min_table_device_fraction` | `pin_table_compression_min_table_device_fraction` | finite double >= 0 | 0.05 | Select plans automatically for a GPU-tier pin only when its uncompressed size (first chunk's bytes per row times the table's rows) is at least this fraction of the memory of the GPUs it pins to; store a smaller one uncompressed. Host pins and explicit table plans are not gated. `0` disables the gate. |
 | `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Optional directory of per-table Simpatico plan overrides. An empty path or no readable, nonempty matching file selects plans automatically. A selected plan that does not cover the pinned columns leaves the pin raw. |
 
 The YAML loader and DuckDB `SET` surface reject negative, NaN, and infinite
@@ -1018,8 +1020,6 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
 | `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input, or the BIGINT input of a SUM or AVG that DuckDB accumulates in HUGEINT, must be widened before aggregation, or whether a DECIMAL128 SUM input can be summed as DECIMAL64. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
 
-**Note:** admission includes every GPU that holds a Simpatico-compressed chunk of a GPU-tier pin matching a source scanned by the query, even when `topology.gpus_per_query` or `admission_bytes_per_gpu` would admit fewer. Owner discovery matches source identity before pin binding, so it can include owners of a pin that ultimately does not serve the scan. For example, a compressed pin containing only `k` across two GPUs still widens a query selecting unpinned `v` from the same parquet source, even with `topology.gpus_per_query: 1`. A compressed chunk is decoded on the GPU that holds it, so narrowing the query away from that GPU would leave the chunk with nowhere to be decoded; the engine logs `[gpu_alloc] admission widened ...` when this applies. Uncompressed GPU-tier pins and host-tier pins are copied to the admitted GPUs and do not widen the set.
-
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
 `max_build_probe_resident_bytes` is connection-local: `SET` and `RESET` affect only the
@@ -1549,6 +1549,7 @@ retention gates.
 | `pin_table_input_compression_plan_dir` | (empty) | Optional directory of per-table Simpatico plan overrides (`<table_name>.<ext>`, multi-column plan DSL). If no readable, nonempty matching file is found, plans are selected automatically; a selected plan that does not cover the pinned columns leaves the pin raw. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
 | `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). Spill compression uses `spill_max_compressed_fraction` instead. |
+| `pin_table_compression_min_table_device_fraction` | 0.05 | Select plans automatically for a GPU-tier pin only when its uncompressed size is at least this fraction of its GPUs' memory; store a smaller one uncompressed; host pins are not gated; `0` disables. |
 | `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time and use those facts as join-key proofs (single-pass distinct hash join) and as late materialization's proof for a group-by-rowid ride. Affects pins and plans made after it is set. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values retained across all columns for the pin-time exact uniqueness check; `0` uses 10% of the GPU memory space capacity. |
 
@@ -1589,7 +1590,7 @@ The specialized path applies only to eligible batches and otherwise uses cuDF's 
 | `enable_fused_scan_filter` | true | Fuse eligible row filters into compressed scan decoding; retain the ordinary decode and residual filter when ineligible. |
 | `fused_scan_diagnostics` | false | Promote fused-scan decision traces to INFO and enable decoder diagnostics on stderr. |
 | `fused_scan_max_selectivity` | 0.35 | Maximum surviving-row fraction for ordinary compaction. |
-| `fused_scan_full_route_max_selectivity` | 0.10 | Maximum surviving-row fraction when decoding full-width outputs. |
+| `fused_scan_full_route_max_selectivity` | 0.10 | Maximum surviving-row fraction when decoding full-width outputs. A batch that also has a dictionary output uses `fused_scan_max_selectivity` instead, if larger. |
 | `fused_scan_index_walk_max_selectivity` | 0.15 | Maximum surviving-row fraction for the survivor-index walk. |
 | `fused_scan_max_membership_sources` | 1 | Maximum join-filter probes carried by one decode; nonnegative integer. Zero disables these probes. |
 
@@ -1645,7 +1646,7 @@ SET enable_runtime_size_estimation = true;   -- off by default
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus explicit `CALL gpu_execution(...)`. Set to `false` to surface Sirius errors instead of falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates plan-time fallback (unsupported operator/type) and runtime fallback for transparent SELECT, plus explicit `CALL gpu_execution(...)`. Unsupported COPY options can fall back during planning; transparent [Parquet COPY](parquet-output.md#failure-and-cleanup) never replays runtime failures because files may already be visible. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 

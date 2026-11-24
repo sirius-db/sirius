@@ -340,7 +340,7 @@ std::vector<std::size_t> all_columns(compressed_table const& table)
 //   Dynamically, once the survivor count is known — both regimes report
 //           declined_unselective, so the caller can remember it for the scan:
 //           - any `full` output: proceed iff survivors/rows <= TIERB_MAX_SEL
-//             (0.10);
+//             (0.10), or <= MAX_SEL (0.35) when a dict_codes output is present;
 //           - otherwise: give compaction up above MAX_SEL (0.35), unless a
 //             dict_codes output is present (that gather wins at every
 //             selectivity).
@@ -755,6 +755,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     //  * `full` outputs present: proceed only at sel <= the full-route threshold
     //    (default 0.10) — a full decode plus gather costs about the unfiltered
     //    path, so only a near-empty survivor set pays for the compacted batch.
+    //    A dict_codes output raises that to the 0.35 write-skip threshold: its
+    //    survivor-count-independent savings outweigh the full columns' gather,
+    //    which giving up would not avoid either, since the scan's filter then
+    //    gathers the plain batch (TPC-H q12 at SF1000, 15% surviving, a full
+    //    l_orderkey beside a dictionary l_shipmode: 0.49 s -> 0.20 s).
     //  * no `full`: the 0.35 write-skip threshold (the mask walk costs about
     //    the plain decode at sel .5) covering bitpack_mask / delta_mask AND
     //    str_split (whose char-gather savings are dictionary-like in shape but
@@ -774,14 +779,15 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       any_full |= routes[i] == sc::decode_route::full;
     }
     double const sel_frac = static_cast<double>(sel.survivor_count) / static_cast<double>(num_rows);
-    bool const give_up    = any_full
-                              ? sel_frac > request.fused_scan.full_route_max_selectivity
-                              : (sel_frac > request.fused_scan.max_selectivity && !any_dict_gather);
+    bool const full_threshold_binds =
+      any_full && (!any_dict_gather || request.fused_scan.full_route_max_selectivity >=
+                                         request.fused_scan.max_selectivity);
+    double const threshold = full_threshold_binds ? request.fused_scan.full_route_max_selectivity
+                                                  : request.fused_scan.max_selectivity;
+    bool const give_up     = sel_frac > threshold && (any_full || !any_dict_gather);
     if (give_up) {
-      double const threshold = any_full ? request.fused_scan.full_route_max_selectivity
-                                        : request.fused_scan.max_selectivity;
-      char const* setting_name =
-        any_full ? "fused_scan_full_route_max_selectivity" : "fused_scan_max_selectivity";
+      char const* setting_name = full_threshold_binds ? "fused_scan_full_route_max_selectivity"
+                                                      : "fused_scan_max_selectivity";
       if (request.fused_scan.diagnostics) {
         std::fprintf(stderr,
                      "simpatico: filtered decode gave compaction up: sel=%.4f > %.4f (%s, "
@@ -1093,12 +1099,36 @@ std::unique_ptr<cudf::column> decode_complete_column(PlanTree const& plan,
 
 }  // namespace
 
+validity_sidecar const* column_validity(const compressed_table& table, std::size_t column_index)
+{
+  auto const* tree = column_plan(table, column_index, nullptr, "column_validity");
+  return tree == nullptr ? nullptr : &tree->validity;
+}
+
+std::optional<std::int64_t> column_null_count(const compressed_table& table,
+                                              std::size_t column_index)
+{
+  auto const* v = column_validity(table, column_index);
+  if (v == nullptr) { return std::nullopt; }
+  switch (v->kind) {
+    case validity_kind::all_valid: return std::int64_t{0};
+    case validity_kind::all_null:
+    case validity_kind::mask:
+      // A negative count is a record the writer never produces; reading it as
+      // "no nulls" would admit a column on a corrupted header.
+      if (v->null_count < 0) { return std::nullopt; }
+      return v->null_count;
+  }
+  return std::nullopt;
+}
+
 std::unique_ptr<cudf::column> decompress_column_rows(const compressed_table& table,
                                                      std::size_t column_index,
                                                      sirius::codegen::chunk_row_set const& rows,
                                                      ::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr,
-                                                     std::string* error_out)
+                                                     std::string* error_out,
+                                                     validity_sidecar const** stripped_validity)
 {
   auto const* tree = column_plan(table, column_index, error_out, "decompress_column_rows");
   if (tree == nullptr) { return nullptr; }
@@ -1117,12 +1147,15 @@ std::unique_ptr<cudf::column> decompress_column_rows(const compressed_table& tab
   }
 
   decode_selection sel;
-  sel.rows           = &rows;
-  sel.survivor_count = rows.num_survivors;
-  sel.route          = sirius::codegen::decode_route::bitpack_mask;
+  sel.rows                       = &rows;
+  sel.survivor_count             = rows.num_survivors;
+  sel.route                      = sirius::codegen::decode_route::bitpack_mask;
+  sel.caller_reattaches_validity = stripped_validity != nullptr;
 
-  return decode_complete_column(
-    *tree, table.columns[column_index].dtype, stream, mr, &sel, error_out);
+  auto col =
+    decode_complete_column(*tree, table.columns[column_index].dtype, stream, mr, &sel, error_out);
+  if (col && stripped_validity != nullptr) { *stripped_validity = &tree->validity; }
+  return col;
 }
 
 std::unique_ptr<cudf::column> decompress_column_compacted(
@@ -1131,7 +1164,8 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   sirius::codegen::selection_mask const& mask,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
-  std::string* error_out)
+  std::string* error_out,
+  validity_sidecar const** stripped_validity)
 {
   auto const* tree = column_plan(table, column_index, error_out, "decompress_column_compacted");
   if (tree == nullptr) { return nullptr; }
@@ -1148,12 +1182,15 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   }
 
   decode_selection sel;
-  sel.mask           = &mask;
-  sel.survivor_count = mask.survivor_count;
-  sel.route          = route;
+  sel.mask                       = &mask;
+  sel.survivor_count             = mask.survivor_count;
+  sel.route                      = route;
+  sel.caller_reattaches_validity = stripped_validity != nullptr;
 
-  return decode_complete_column(
-    *tree, table.columns[column_index].dtype, stream, mr, &sel, error_out);
+  auto col =
+    decode_complete_column(*tree, table.columns[column_index].dtype, stream, mr, &sel, error_out);
+  if (col && stripped_validity != nullptr) { *stripped_validity = &tree->validity; }
+  return col;
 }
 
 std::unique_ptr<cudf::column> decompress_column_full(const compressed_table& table,

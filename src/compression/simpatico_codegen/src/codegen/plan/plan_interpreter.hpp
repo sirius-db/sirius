@@ -168,6 +168,12 @@ struct decode_selection {
   /// stored type, saving the caller's separate widening cast. Ignored unless it is a same-family,
   /// same-scale widening of the decoded type.
   std::optional<cudf::data_type> output_type;
+  /// The caller compacts the column's stripped validity itself, against this
+  /// same selection. Off by default, which refuses a nullable column outright:
+  /// the stored bitmask spans the whole chunk and a compacted output does not,
+  /// so anything that returns one against the other silently misaligns validity
+  /// with values.
+  bool caller_reattaches_validity = false;
 
   [[nodiscard]] bool active() const noexcept
   {

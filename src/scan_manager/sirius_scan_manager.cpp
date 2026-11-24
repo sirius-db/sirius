@@ -41,6 +41,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
+#include "scan_manager/late_mat_resolver.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 #include "sirius_config.hpp"
@@ -55,6 +56,7 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
@@ -689,6 +691,22 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
            : late_mat::kRowidType;
 }
 
+/// Nulls one compressed chunk records for a column, or nullopt when the chunk
+/// cannot say.
+///
+/// Compression strips a column's validity into a sidecar the .hpln header
+/// carries, so the count is a header read and no decode happens here. A chunk
+/// carrying no blob at all is a legitimate shape (serving paths that need only
+/// a row count never load one), and it answers nothing.
+[[nodiscard]] std::optional<std::size_t> compressed_chunk_null_count(
+  sirius::compressed_device_representation const& compressed, std::size_t column_position)
+{
+  if (!compressed.has_table()) { return std::nullopt; }
+  auto const count = simpatico::column_null_count(compressed.table(), column_position);
+  if (!count.has_value()) { return std::nullopt; }
+  return static_cast<std::size_t>(*count);
+}
+
 /// Nulls in one pinned column across every chunk, or nullopt when the storage
 /// cannot say without decompressing — which reads as "assume the worst".
 [[nodiscard]] std::optional<std::size_t> pinned_column_null_count(pinned_entry const& entry,
@@ -698,8 +716,14 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   std::size_t nulls = 0;
   if (!entry.device_chunks.empty()) {
     for (auto const& chunk : entry.device_chunks) {
-      if (chunk.compressed || column_position >= chunk.columns.size() ||
-          !chunk.columns[column_position]) {
+      if (chunk.compressed) {
+        auto const compressed_nulls =
+          compressed_chunk_null_count(*chunk.compressed, column_position);
+        if (!compressed_nulls.has_value()) { return std::nullopt; }
+        nulls += *compressed_nulls;
+        continue;
+      }
+      if (column_position >= chunk.columns.size() || !chunk.columns[column_position]) {
         return std::nullopt;
       }
       nulls += static_cast<std::size_t>(chunk.columns[column_position]->null_count());
@@ -716,9 +740,16 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   return nulls;
 }
 
-/// Whether this column's pin is uncompressed — every such gather shape (single-batch,
-/// multi-batch fixed-width, multi-batch variable-width) propagates validity. Must agree with
-/// resolve_pinned_column's own check.
+/// Whether materialization can carry this column's validity through.
+///
+/// Every uncompressed gather shape (single-batch, multi-batch fixed-width,
+/// multi-batch variable-width) propagates validity. A compressed chunk does too,
+/// provided its blob is loaded and records the column's validity sidecar: a full
+/// decode reattaches the mask, and the two compacting routes gather it by the
+/// same rows they selected the values by (materialize.cpp's
+/// attach_selected_validity). A chunk carrying no blob answers nothing and is
+/// unsafe, which is also where resolve_pinned_column refuses — the two checks
+/// must agree.
 [[nodiscard]] bool pinned_column_nulls_are_safe(pinned_entry const& entry,
                                                 std::size_t column_position)
 {
@@ -726,8 +757,10 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   if (!entry.device_chunks.empty()) {
     return std::all_of(
       entry.device_chunks.begin(), entry.device_chunks.end(), [&](auto const& chunk) {
-        return !chunk.compressed && column_position < chunk.columns.size() &&
-               chunk.columns[column_position] != nullptr;
+        if (chunk.compressed) {
+          return compressed_chunk_null_count(*chunk.compressed, column_position).has_value();
+        }
+        return column_position < chunk.columns.size() && chunk.columns[column_position] != nullptr;
       });
   }
   if (column_position >= entry.cache_info.names.size()) { return false; }
@@ -735,6 +768,17 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   return it != entry.data_batches_by_column.end() &&
          std::all_of(
            it->second.begin(), it->second.end(), [](auto const& col) { return col != nullptr; });
+}
+
+/// Whether the port will find every deferred origin, asked of the same resolver
+/// materialize_at_port reads them through. Admission must not accept a shape that
+/// resolver refuses — a column whose chunks were narrowed to different carriers is
+/// one — because by the port the scan has already given the values up.
+[[nodiscard]] bool deferred_origins_resolve(std::span<late_mat::column_origin const> origins)
+{
+  if (origins.empty() || !resolve_pinned_layout(origins.front())) { return false; }
+  return std::ranges::all_of(
+    origins, [](auto const& origin) { return resolve_pinned_column(origin).has_value(); });
 }
 
 /// Whether every chunk of a GPU-tier pin records the memory space it lives in,
@@ -924,16 +968,14 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   }
   if (scan_op.get_ingestible().has_row_filter()) {
     // A filtered batch is no longer the chunk's rows in order, so the rowid has
-    // to come from the survivor positions the filter produced. That only works
-    // where the filter runs where we can see it — post-serve, over a whole
-    // served chunk. A COMPRESSED chunk is filtered inside the fused decode
-    // instead, and those survivors never reach the scan's output path, so a
-    // pin with any compressed chunk is refused rather than guessed at.
-    if (has_compressed_chunk) {
-      return decline(
-        "the scan restricts rows and its pin is compressed, so the surviving rows are decided "
-        "inside the decode");
-    }
+    // to come from the survivor positions the filter produced. A COMPRESSED
+    // chunk may be restricted twice — inside the fused decode and again by
+    // whatever conjuncts the decode could not carry — and both stages report
+    // their survivors: the decode through pushdown_outcome::survivor_rows,
+    // requested per split by late_mat_wants_survivors, and the residual through
+    // post_filter_and_project. The scan composes them
+    // (sirius_gpu_scan_operator's compose_survivors) and throws rather than
+    // guess if a compaction arrives unaccounted for.
     if (!entry.host_chunks.empty()) {
       return decline("the scan restricts rows and its pin is host-tier");
     }
@@ -1075,9 +1117,7 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   // pinned_column_nulls_are_safe).
   for (auto const position : planned.positions) {
     if (position >= selected_columns.size()) { continue; }  // caught again, and reported, below
-    if (pinned_column_nulls_are_safe(entry, selected_columns[position])) { continue; }
-    auto const nulls = pinned_column_null_count(entry, selected_columns[position]);
-    if (!nulls.has_value() || *nulls != 0) {
+    if (!pinned_column_nulls_restorable(entry, selected_columns[position])) {
       return decline(
         "a deferred column's pinned values may contain nulls, which materialization cannot "
         "restore");
@@ -1099,6 +1139,11 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
     origin.column_pos = static_cast<std::uint32_t>(selected_columns[position]);
     origin.generation = entry.late_mat_handle->generation();
     origins.push_back(std::move(origin));
+  }
+  if (!deferred_origins_resolve(origins)) {
+    return decline(
+      "a deferred column would not resolve at the port (its chunks disagree on the carrier, or "
+      "one carries no readable blob)");
   }
 
   // The port sees the batch its INPUT produced, not the scan's output: a join
@@ -1288,16 +1333,10 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
     }
 
     // Same gap and exemption as the primary bundle's install, above.
-    bool rider_null_free = true;
-    for (auto const position : planned.positions) {
-      if (position >= candidate.columns.size()) { continue; }  // caught again below
-      if (pinned_column_nulls_are_safe(entry, candidate.columns[position])) { continue; }
-      auto const nulls = pinned_column_null_count(entry, candidate.columns[position]);
-      if (!nulls.has_value() || *nulls != 0) {
-        rider_null_free = false;
-        break;
-      }
-    }
+    bool const rider_null_free = std::ranges::all_of(planned.positions, [&](std::size_t position) {
+      return position >= candidate.columns.size() ||  // caught again below
+             pinned_column_nulls_restorable(entry, candidate.columns[position]);
+    });
     if (!rider_null_free) {
       decline(
         "a deferred column's pinned values may contain nulls, which materialization cannot "
@@ -1320,6 +1359,12 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
     }
     if (origins.empty()) {
       decline("a deferred output position has no served column");
+      continue;
+    }
+    if (!deferred_origins_resolve(origins)) {
+      decline(
+        "a deferred column would not resolve at the port (its chunks disagree on the carrier, or "
+        "one carries no readable blob)");
       continue;
     }
 
@@ -1355,6 +1400,13 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
 }
 
 }  // namespace
+
+bool pinned_column_nulls_restorable(pinned_entry const& entry, std::size_t column_position)
+{
+  if (pinned_column_nulls_are_safe(entry, column_position)) { return true; }
+  auto const nulls = pinned_column_null_count(entry, column_position);
+  return nulls.has_value() && *nulls == 0;
+}
 
 sirius_scan_manager::sirius_scan_manager(
   sirius::exec::query_lifecycle_registry& lifecycle,
@@ -3863,49 +3915,6 @@ sirius_scan_manager::find_pinned_entries_for_parquet_files(
     if (entry->cache_info.matches_parquet_files(resolved_file_paths)) { matches.push_back(entry); }
   }
   return matches;
-}
-
-std::vector<int> sirius_scan_manager::compressed_gpu_pin_owner_devices(
-  const op::scan::ingestible_table_info& table_info) const
-{
-  // Snapshot owners, then match outside the lock: the parquet matcher canonicalizes paths.
-  std::vector<std::shared_ptr<const pinned_entry>> snapshot;
-  {
-    std::lock_guard pin_lk{_pinned_entries_mutex};
-    snapshot.reserve(_pinned_entries.size());
-    for (auto const& [name, entry] : _pinned_entries) {
-      if (entry->tier == cucascade::memory::Tier::GPU && !entry->device_chunks.empty()) {
-        snapshot.push_back(entry);
-      }
-    }
-  }
-
-  // The same identity calls as cache_entry_info::can_serve_with_columns, without its column
-  // and visibility gates, so every entry try_match_cached_entry can pick is matched here.
-  auto const same_source = [&table_info](cache_entry_info const& cached) {
-    if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&table_info)) {
-      return cached.matches_parquet_files(p->resolved_file_paths);
-    }
-    if (auto const* d =
-          dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&table_info)) {
-      return cached.matches_duckdb_table(
-        d->catalog_name, d->schema_name, d->table_name, d->table_identity);
-    }
-    return false;
-  };
-
-  std::vector<int> owners;
-  for (auto const& entry : snapshot) {
-    if (!same_source(entry->cache_info)) { continue; }
-    for (auto const& chunk : entry->device_chunks) {
-      if (chunk.compressed) {
-        owners.push_back(chunk.compressed->get_memory_space().get_device_id());
-      }
-    }
-  }
-  std::ranges::sort(owners);
-  owners.erase(std::unique(owners.begin(), owners.end()), owners.end());
-  return owners;
 }
 
 void validate_column_storage_shape(pinned_column_storage_matrix const& matrix,

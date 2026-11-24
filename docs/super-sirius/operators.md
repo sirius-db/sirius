@@ -18,13 +18,18 @@ During task execution:
 1. `compute_task()` iterates over **every** operator in `operators`, calling `execute()` on each
 2. `publish_output()` then calls `sink()` on the last operator to push results to downstream ports
 
+The executor stamps optional `delivery_metadata` onto the actual input before each `execute()`
+call. It contains the original task ID and retry count, without a query ID. COPY uses that
+identity within its query-local session to distinguish retries from separate CTE/UNION
+deliveries of the same physical batch. See [Parquet output](parquet-output.md).
+
 An operator's position in a pipeline is determined by `sirius_engine::initialize_internal()`. Many blocking operators appear as both the source (first) of one pipeline and the sink (last) of another — they accumulate data as a sink, then emit results as a source. See the [Operator Summary Table](#operator-summary-table) for the full per-operator breakdown.
 
 ### Key Methods
 
 | Method | Purpose |
 |--------|---------|
-| `execute(input_data, stream)` | Called on **every** operator during `compute_task()` |
+| `execute(input_data, stream)` | Called on **every** operator during `compute_task()`; task delivery metadata is available through `input_data.delivery()` |
 | `sink(output_data, stream)` | Called on the **last** operator after `compute_task()` to push results downstream |
 | `is_source()` | Whether this operator can produce data (has scan state or owns accumulated data) |
 | `is_sink()` | Whether this operator has a `sink()` implementation for pushing data to downstream ports — true for unconditional sinks, or when the tree parent is a sink parent (PARTITION, RIGHT_DELIM_JOIN, DENSE_COUNT_JOIN) |
@@ -313,7 +318,7 @@ Three execution modes:
 | `BUILD_PROBE` | Up to one partition per GPU; per-GPU estimated hash-table bytes (measured build rows × 16 B) under `max_build_hash_table_bytes` AND per-GPU decoded folded build payload under `max_build_probe_resident_bytes`, build foldable to one batch | `cudf::hash_join`, `cudf::distinct_hash_join`, or `cudf::filtered_join` — built once per partition, probed many times |
 | `MIXED_JOIN` | Equality plus either inequality conditions or a null-safe `IS NOT DISTINCT FROM` key (mixed with a plain `=`), on disjoint columns | `cudf::mixed_join()` with cuDF AST |
 
-Partition count, broadcast, and BUILD_PROBE are decided together by the free function `compute_hash_join_partition_strategy()` (member wrapper: `get_partition_strategy()`), which returns a single `partition_strategy {num_partitions, broadcast, build_probe, placement}`; `placement` names the GPU each partition runs on (see [multi-GPU architecture](multi-gpu-architecture.md#partition-device-pin-for-cuco-backed-operators)). BUILD_PROBE is selected when `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU — this reduces to the historical single-partition rule when `num_gpus == 1`), the per-GPU estimated hash table fits `max_build_hash_table_bytes`, the decoded build payload fits `max_build_probe_resident_bytes`, all build rows are measured and the full row count fits `cudf::size_type`, and the build folds to a single batch, and the join is not RIGHT-family (`RIGHT`, `RIGHT_SEMI`, `RIGHT_ANTI`), `MIXED_JOIN`, or full `OUTER`. INNER, LEFT, MARK, SEMI, and ANTI joins are eligible (SEMI/ANTI/MARK build a persistent `cudf::filtered_join` on the right and stream left probe batches); MARK follows the SEMI rule (see [MARK joins](#mark-joins) for how its global NULL rule survives partitioning). Full outer is excluded because BUILD_PROBE streams probe batches and calls `full_join` per batch, which would re-emit unmatched build rows on every batch (and, under broadcast/partitioning, on every GPU) with no global accumulation — full outer joins use the STANDARD path. For a broadcast join the **full** replicated build rows and decoded bytes are charged against the two budgets (each GPU builds the entire table); a hash-partitioned build charges rounded-up per-partition averages.
+Partition count, broadcast, and BUILD_PROBE are decided together by the free function `compute_hash_join_partition_strategy()` (member wrapper: `get_partition_strategy()`), which returns a single `partition_strategy {num_partitions, broadcast, build_probe, placement}`; `placement` names the GPU each partition runs on (see [multi-GPU architecture](multi-gpu-architecture.md#partition-device-pin-for-cuco-backed-operators)). BUILD_PROBE is selected when `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU — this reduces to the historical single-partition rule when `num_gpus == 1`), the per-GPU estimated hash table fits `max_build_hash_table_bytes`, the decoded build payload fits `max_build_probe_resident_bytes`, all build rows are measured and the full row count fits `cudf::size_type`, and the build folds to a single batch, and the join is not RIGHT-family (`RIGHT`, `RIGHT_SEMI`, `RIGHT_ANTI`), `MIXED_JOIN`, or full `OUTER` (kept-build RIGHT_SEMI/RIGHT_ANTI joins, below, take their own BUILD_PROBE rule). INNER, LEFT, MARK, SEMI, and ANTI joins are eligible (SEMI/ANTI/MARK build a persistent `cudf::filtered_join` on the right and stream left probe batches); MARK follows the SEMI rule (see [MARK joins](#mark-joins) for how its global NULL rule survives partitioning). Full outer is excluded because BUILD_PROBE streams probe batches and calls `full_join` per batch, which would re-emit unmatched build rows on every batch (and, under broadcast/partitioning, on every GPU) with no global accumulation — full outer joins use the STANDARD path. For a broadcast join the **full** replicated build rows and decoded bytes are charged against the two budgets (each GPU builds the entire table); a hash-partitioned build charges rounded-up per-partition averages.
 
 By execution time every equality-condition side is a plain column reference: a complex equality-key expression is materialized into a real column by a planner-inserted projection below the join (`materialize_expression_join_keys()`), because PARTITION — the first key consumer — hashes by column index and cannot evaluate expressions. Inequality sides stay inline as the mixed-join AST predicate.
 
@@ -347,8 +352,8 @@ The following table summarizes, per join type, what concat folds, which side str
 | MARK | build → 1 | probe (pairs wait for the whole build) | ✅ | ✅ | ✅ (small build) | STANDARD, BUILD_PROBE |
 | OUTER (FULL) | both → 1 | neither (stays 1×1) | ✅ degenerate | ✅ natural count | ❌ | STANDARD, MIXED_JOIN† |
 | RIGHT | probe → 1 | build | ✅ | ✅ (probe-driven) | ❌ | STANDARD, MIXED_JOIN† |
-| RIGHT_SEMI | probe → 1 | build | ✅ | ✅ | ❌ | STANDARD, MIXED_JOIN† |
-| RIGHT_ANTI | probe → 1 | build | ✅ | ✅ | ❌ | STANDARD, MIXED_JOIN† |
+| RIGHT_SEMI | probe → 1 (kept build: build → 1) | build (kept build: probe) | ✅ | ✅ | ✅ (kept build only) | STANDARD, MIXED_JOIN†, BUILD_PROBE (kept build) |
+| RIGHT_ANTI | probe → 1 (kept build: build → 1) | build (kept build: probe) | ✅ | ✅ | ✅ (kept build only) | STANDARD, MIXED_JOIN†, BUILD_PROBE (kept build) |
 | SINGLE | — | — | — | — | — | unsupported (throws) |
 
 † MIXED_JOIN applies to any of these types when the join carries equality conditions **plus** either an inequality condition or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=` (the null-safe key is routed to the AST predicate as `NULL_EQUAL`, since cuDF's single `null_equality` flag can't give `=` and null-safe keys opposite semantics). MARK is never routed to MIXED_JOIN: MARK + inequality is rejected at construction, and a MARK + null-safe key stays a `UNEQUAL` hash key (a known null-safe limitation). "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. Join wrapping chooses the initial `concat_all` flag from the join type; partition / broadcast / mode eligibility remains in `compute_hash_join_partition_strategy`. Runtime partition negotiation strengthens the build CONCAT requirement before publishing input.
@@ -371,6 +376,8 @@ Uniqueness is detected by walking the DuckDB logical plan:
 
 Only PRIMARY KEY is considered (not plain UNIQUE) due to NULL handling semantics with `null_equality::UNEQUAL`. For a parquet scan of a pinned table, a column proven distinct at pin time (no nulls, no repeats) also counts, unless `pin_table_prove_unique_keys` is off; see [Pin-Proven Unique Join Keys](optimizations.md#pin-proven-unique-join-keys). IS NOT DISTINCT FROM joins are excluded since they require `null_equality::EQUAL`.
 
+**Kept-build RIGHT_SEMI / RIGHT_ANTI.** DuckDB flips SEMI/ANTI to RIGHT_SEMI/RIGHT_ANTI when the kept (output) side is the smaller one, and the default plan then concat-folds the large probe side whole per partition and hashes it. When the kept side's estimated rows × `estimate_bytes_per_row` fit under `max_build_probe_resident_bytes` × the GPU count, `set_kept_build_streaming(true)` inverts that for non-delim joins (the kept rows stay resident until the probe finishes and cannot spill, so a larger kept side keeps the probe-driven plan): the kept side (`children[1]`) is concat-folded and sizes the partitioning, and the probe PARTITION gets a PARTIAL barrier so probe batches stream. The partition strategy is always BUILD_PROBE without broadcast (replicas would hold partial match flags), with up to one slot per GPU, or the natural count when the folded build exceeds `max_build_hash_table_bytes` / `max_build_probe_resident_bytes` (all slots stay resident until the probe finishes). Each slot keeps its prepared kept keys and a per-row `uint8` matched-flag vector. Without a residual, each probe task hashes its probe batch into a `cudf::filtered_join` and `semi_join`s the kept keys against it, the same work the probe-driven path does once over the folded probe. With a residual (for example Q21's `l_suppkey <> outer.l_suppkey`), the slot also builds a `cudf::hash_join` on the kept keys, and each probe task sizes its equality pairs with `inner_join_size`. Up to 8 pairs per probe row (and 2^28 in total), it runs `inner_join` and filters the pairs with `cudf::filter_join_indices` over the mixed join's AST. Beyond that, where duplicate keys would multiply the pairs, it runs `cudf::mixed_left_semi_join` with the kept rows on the left and the AST's table sides swapped, which never materializes pairs. Either way the task scatters `1` into the flags of matched kept rows and emits an empty batch; the scatter is idempotent, so OOM retries are safe. After the probe pipeline finishes and the slot's in-flight probe count reaches zero, one emit task per slot (`EMIT_SCHEDULED`) applies the flags (RIGHT_SEMI) or their negation (RIGHT_ANTI) with `cudf::apply_boolean_mask`. A never-probed slot emits all of its rows for RIGHT_ANTI and is reclaimed for RIGHT_SEMI; a slot that received no build batch keeps nothing and drops its probe batches. `all_ports_empty()` stays false until every slot has issued its emit task, and the last probe task re-schedules the join, since nothing else polls it after its inputs close. An empty kept side resolves to STANDARD and emits an empty batch. Delim joins and kept sides over budget keep the probe-driven path, and the build-side Bloom filter stage is unchanged.
+
 Build/probe state machine for BUILD_PROBE mode (one instance per partition slot, driven by `build_probe_action`):
 ```mermaid
 stateDiagram-v2
@@ -379,7 +386,12 @@ stateDiagram-v2
     SCHEDULING --> SCHEDULED
     SCHEDULED --> BUILT
     BUILT --> DESTROYED
+    BUILT --> EMIT_SCHEDULED
+    NOT_BUILT --> EMIT_SCHEDULED
+    EMIT_SCHEDULED --> DESTROYED
 ```
+
+`EMIT_SCHEDULED` is used only by kept-build RIGHT_SEMI/RIGHT_ANTI joins (`select_kept_build_action`).
 
 When `get_next_task_hint()` is called after the operator is already finished, it returns `std::nullopt` (no new tasks needed).
 
@@ -391,6 +403,7 @@ Key members:
 - `key_casts` — type alignment info for hash key matching
 - `unique_build_keys` / `unique_probe_keys` — cardinality hints (used to select distinct vs standard hash join)
 - `mark_join_build_switch_ratio` — threshold for adaptively building a STANDARD MARK join on the smaller (left) side
+- `_kept_build_streaming` — RIGHT_SEMI/RIGHT_ANTI built on the kept side with a streamed probe (see kept-build above); per slot, `kept_matched` holds the match flags and `probes_in_flight` counts unfinished probe tasks
 
 Supported join types: INNER, LEFT, RIGHT, OUTER, MARK via `cudf::inner_join()`, `cudf::left_join()`, `cudf::full_outer_join()`, `cudf::filtered_join`, and `cudf::mark_join`.
 
@@ -1050,7 +1063,7 @@ and decisions belong to concrete consumers. Indexed batch publication is inherit
 ### `sirius_physical_result_collector` / `sirius_physical_materialized_collector` — `RESULT_COLLECTOR`
 **File:** `src/op/sirius_physical_result_collector.hpp`
 
-Final sink that materializes query results into a `ColumnDataCollection`. The GPU executor checks for this operator type to determine query completion.
+Final sink that materializes query results into a `ColumnDataCollection`. The GPU executor uses `is_query_terminal()` to recognize result collection, streaming output, and Parquet COPY completion.
 
 The materialized collector builds local collections in parallel. For positioned input, it combines
 them by ascending position in `get_result()`, independently of task completion order.
@@ -1095,7 +1108,7 @@ Returns an empty result set for queries with contradicted filters.
 
 ## Operator Summary Table
 
-After pipeline finalization, `source` and `sink` are just aliases for the first and last operator in the `operators` list. All operators have `execute()` called during `compute_task()`; only the last operator additionally has `sink()` called via `publish_output()`.
+After pipeline finalization, `source` and `sink` are just aliases for the first and last operator in the `operators` list. All operators enter through `execute()` during `compute_task()` with delivery metadata on their input; only the last operator additionally has `sink()` called via `publish_output()`.
 
 | Operator | Category | GPU Method |
 |----------|----------|-----------|

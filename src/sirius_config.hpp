@@ -24,6 +24,7 @@
 #include "expression_evaluator/query_policy.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/config.hpp"
+#include "output/parquet_spec.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/cudf/disk_io_context.hpp>
@@ -614,6 +615,14 @@ struct compression_config {
   //  Default 0.75 (that coincides with a 1.33x compression ratio).
   double max_compressed_fraction{0.75};
 
+  /// Select plans automatically for a GPU-tier pin only when its uncompressed size (the first
+  /// chunk's bytes per row times the table's rows) is at least this fraction of the memory of
+  /// the GPUs it pins to. A smaller pin is stored uncompressed: it frees little GPU memory and
+  /// its scans still pay for decoding. Host pins are not gated, as fewer bytes always shorten
+  /// their host-to-device copies. Explicit table plans are not gated either. Finite and
+  /// non-negative; 0 disables the gate.
+  double min_table_device_fraction{0.05};
+
   /// Directory containing per-table Simpatico plan files for input-table
   /// compression.  Each file is named "<table_name>.<ext>" (any extension);
   /// its contents are the multi-column plan DSL (columns separated by "---"
@@ -817,10 +826,14 @@ struct sirius_config {
     return _compression_config;
   }
 
-  /// Initial GPU admission cap per query. 0 = use all active GPUs (default).
-  /// Initially limits admission to the first @c gpus_per_query entries of the sorted
-  /// active-GPU list. Admission can then add GPUs holding compressed GPU-tier pins
-  /// that match a scanned source, even if those pins ultimately do not serve the scan.
+  output::parquet_compression parquet_output_compression() const noexcept
+  {
+    return _parquet_output_compression;
+  }
+
+  /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
+  /// Limits each query to the first @c gpus_per_query entries of the sorted
+  /// active-GPU list; the rest are left available for future concurrent queries.
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
  private:
@@ -871,6 +884,7 @@ struct sirius_config {
   compression_config _compression_config;
   /// CPUs the REST reactors will pin to, reserved from the thread pools (empty: none).
   std::vector<int> _rest_reactor_cpus;
+  output::parquet_compression _parquet_output_compression{output::parquet_compression::snappy};
 };
 
 /// Checks that @p directory can take spill files: it is a directory (created if it is missing)
@@ -889,6 +903,7 @@ class parsed_sirius_config {
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
+  [[nodiscard]] output::parquet_compression parquet_output_compression() const noexcept;
   /// The scan-manager settings as parsed (backend selection, REST tuning, cache). Lets an
   /// embedder check backend-dependent options before the engine is brought up.
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;

@@ -150,6 +150,10 @@ constexpr char const* kStringSplitPlan =
   "str_split.chars -> ans\n"
   "str_split.offsets -> delta -> differences\n"
   "str_split.offsets.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+constexpr char const* kStringSplitRawCharsPlan =
+  "input -> str_split -> offsets, chars\n"
+  "str_split.offsets -> delta -> differences\n"
+  "str_split.offsets.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 constexpr char const* kStoredPlan = "input -> identity\n";
 
 /// Rows a string column needs before a dictionary can pay for its key table.
@@ -167,15 +171,24 @@ constexpr cudf::size_type kIntegerSampleRows = 64 * 1024;
 constexpr std::size_t kBitpackChunk = 1024;
 /// A delta plan replaces plain bitpack only when it is estimated this much smaller.
 constexpr double kMinDeltaSaving = 0.9;
+/// A pinned column takes delta -> rle -> bitpack over the best plan a filtered scan can decode
+/// in place only when rle saves at least this fraction of the column's uncompressed size more.
+/// rle decodes in full on every scan, so a gain that is large as a ratio but small in bytes (a
+/// sorted key whose differences already pack to almost nothing) does not pay for it.
+constexpr double kMinPinRleSavingOfColumn = 0.25;
+
+enum class plan_use { spill, pin };
 
 /// Rows of a column sampled to choose its plan: the whole column up to @p cap rows, and for a
 /// longer one 1/64 of it, between cap / 16 and cap. The sample is read back to the host (or
 /// counted on the device) once per column of every spilled batch, so for a batch of a few
 /// megabytes a full-size sample costs more than the encode it chooses a plan for; a batch of
-/// 4 million rows or more is sampled at @p cap as before.
-cudf::size_type plan_sample_rows(cudf::size_type rows, cudf::size_type cap)
+/// 4 million rows or more is sampled at @p cap as before. A pinned column is encoded once and
+/// always sampled at @p cap.
+cudf::size_type plan_sample_rows(cudf::size_type rows, cudf::size_type cap, plan_use use)
 {
   if (rows <= cap) { return rows; }
+  if (use == plan_use::pin) { return cap; }
   return std::clamp(rows / 64, cap / 16, cap);
 }
 
@@ -217,7 +230,7 @@ class bitpack_size_estimate {
 };
 
 /// Whether @p column is integer-valued (an integer, a decimal up to 64 bits, a date or a
-/// time) and so chooses its plan with integer_spill_plan().
+/// time) and so chooses its plan with integer_plan().
 bool samples_as_integer(cudf::column_view const& column)
 {
   auto const type = column.type();
@@ -226,10 +239,10 @@ bool samples_as_integer(cudf::column_view const& column)
   return integer_valued && cudf::size_of(type) <= sizeof(std::int64_t) && column.size() > 0;
 }
 
-/// Bytes of the prefix of @p column that integer_spill_plan() estimates on.
-std::size_t integer_sample_bytes(cudf::column_view const& column)
+/// Bytes of the prefix of @p column that integer_plan() estimates on.
+std::size_t integer_sample_bytes(cudf::column_view const& column, plan_use use)
 {
-  return static_cast<std::size_t>(plan_sample_rows(column.size(), kIntegerSampleRows)) *
+  return static_cast<std::size_t>(plan_sample_rows(column.size(), kIntegerSampleRows, use)) *
          cudf::size_of(column.type());
 }
 
@@ -239,7 +252,9 @@ std::size_t integer_sample_bytes(cudf::column_view const& column)
 /// Sorted keys, which often reach a spill still in order, pack far smaller as differences,
 /// and runs of equal keys smaller still as runs. The sample is bounded (kIntegerSampleRows),
 /// so estimating it on the host costs little next to the GPU encode that follows.
-std::string integer_spill_plan(cudf::column_view const& column, std::span<std::uint8_t const> raw)
+std::string integer_plan(cudf::column_view const& column,
+                         std::span<std::uint8_t const> raw,
+                         plan_use use)
 {
   auto const width = cudf::size_of(column.type());
   auto const rows  = raw.size() / width;
@@ -281,6 +296,13 @@ std::string integer_spill_plan(cudf::column_view const& column, std::span<std::u
   auto const bitpack = values.finish();
   auto const delta   = deltas.finish();
   auto const rle     = run_lengths.finish() + run_values.finish();
+  if (use == plan_use::pin) {
+    bool const take_delta = delta < kMinDeltaSaving * bitpack;
+    auto const filterable = take_delta ? delta : bitpack;
+    auto const sample     = static_cast<double>(rows * width);
+    if (filterable - rle >= kMinPinRleSavingOfColumn * sample) { return kDeltaRleBitpackPlan; }
+    return take_delta ? kDeltaBitpackPlan : kBitpackPlan;
+  }
   if (rle < kMinDeltaSaving * std::min(bitpack, delta)) { return kDeltaRleBitpackPlan; }
   if (delta < kMinDeltaSaving * bitpack) { return kDeltaBitpackPlan; }
   return kBitpackPlan;
@@ -303,23 +325,26 @@ char const* unsampled_spill_plan(cudf::column_view const& column)
 }
 
 /// The plan of a string column of at least kMinDictionaryRows rows.
-std::string string_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
+std::string string_plan(cudf::column_view const& column, ::cuda::stream_ref stream, plan_use use)
 {
   // A prefix is a cheap and, for batches built from scans and joins, representative
   // sample; a wrong guess costs ratio, never correctness.
-  auto const sample_rows = plan_sample_rows(column.size(), kDictionarySampleRows);
+  auto const sample_rows = plan_sample_rows(column.size(), kDictionarySampleRows, use);
   auto const sample      = cudf::slice(column, {0, sample_rows}, stream).front();
   auto const distinct    = cudf::distinct_count(
     sample, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
   return static_cast<double>(distinct) <= kMaxDictionaryDistinctFraction * sample_rows
            ? kDictionaryPlan
-           : kStringSplitPlan;
+         : use == plan_use::pin ? kStringSplitRawCharsPlan
+                                : kStringSplitPlan;
 }
 
 /// One plan per column of @p view, sampling every column whose type and size do not settle
 /// it. The integer samples of all columns are read back together, with one wait for
 /// @p stream.
-std::vector<std::string> sample_spill_plans(cudf::table_view const& view, ::cuda::stream_ref stream)
+std::vector<std::string> sample_plans(cudf::table_view const& view,
+                                      ::cuda::stream_ref stream,
+                                      plan_use use)
 {
   std::vector<std::string> plans(static_cast<std::size_t>(view.num_columns()));
   std::vector<std::vector<std::uint8_t>> samples(plans.size());
@@ -329,7 +354,7 @@ std::vector<std::string> sample_spill_plans(cudf::table_view const& view, ::cuda
     if (auto const* plan = unsampled_spill_plan(column)) {
       plans[i] = plan;
     } else if (samples_as_integer(column)) {
-      samples[i].resize(integer_sample_bytes(column));
+      samples[i].resize(integer_sample_bytes(column, use));
       reads.push_back({samples[i].data(),
                        column.head<std::uint8_t>() + column.offset() * cudf::size_of(column.type()),
                        samples[i].size()});
@@ -339,8 +364,8 @@ std::vector<std::string> sample_spill_plans(cudf::table_view const& view, ::cuda
   for (std::size_t i = 0; i < plans.size(); ++i) {
     if (!plans[i].empty()) { continue; }
     auto const& column = view.column(static_cast<cudf::size_type>(i));
-    plans[i]           = samples_as_integer(column) ? integer_spill_plan(column, samples[i])
-                                                    : string_spill_plan(column, stream);
+    plans[i]           = samples_as_integer(column) ? integer_plan(column, samples[i], use)
+                                                    : string_plan(column, stream, use);
   }
   return plans;
 }
@@ -387,7 +412,7 @@ batch_plans choose_spill_plans(cudf::table_view const& view,
     }
   }
   if (!out.reused) {
-    out.plans = sample_spill_plans(view, stream);
+    out.plans = sample_plans(view, stream, plan_use::spill);
     return out;
   }
   for (std::size_t i = 0; i < out.plans.size(); ++i) {
@@ -421,7 +446,12 @@ void forget_spill_plans(std::string const& key)
 
 std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
 {
-  return sample_spill_plans(cudf::table_view{{column}}, stream).front();
+  return sample_plans(cudf::table_view{{column}}, stream, plan_use::spill).front();
+}
+
+std::string default_pin_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
+{
+  return sample_plans(cudf::table_view{{column}}, stream, plan_use::pin).front();
 }
 
 namespace {

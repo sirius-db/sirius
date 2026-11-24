@@ -102,6 +102,12 @@ TEST_CASE("NUMA facade synchronous allocation waits for pending DMA before host 
   rmm::device_buffer device{bytes, ::cuda::stream_ref{producer.value()}};
   auto* original = f.slab_mr.allocate_sync(bytes);
   std::memset(original, 0x43, bytes);
+  // Hold the unused slabs of the block `original` was carved from: a ready slab is preferred
+  // over a pending one, so the request below must have no other slab to take.
+  std::vector<void*> held;
+  for (std::size_t i = 1; i < test_fixture::block_size / bytes; ++i) {
+    held.push_back(f.slab_mr.allocate_sync(bytes));
+  }
   pending_stream_work gate{producer};
   CUCASCADE_CUDA_TRY(
     ::cudaMemcpyAsync(device.data(), original, bytes, cudaMemcpyHostToDevice, producer.value()));
@@ -122,4 +128,7 @@ TEST_CASE("NUMA facade synchronous allocation waits for pending DMA before host 
   REQUIRE(std::all_of(
     copied.begin(), copied.end(), [](std::byte value) { return value == std::byte{0x43}; }));
   f.slab_mr.deallocate_sync(reused, bytes);
+  for (auto* slab : held) {
+    f.slab_mr.deallocate_sync(slab, bytes);
+  }
 }

@@ -332,6 +332,8 @@ TEST_CASE("bench RLE int64 pareto_runs (skewed distribution) 128Mi rows",
   for (uint32_t i = 0; i < N_SEGS; ++i) {
     auto seg_bytes = make_pareto_runs<int64_t>(SEG_ROWS, /*seed=*/i + 1, /*x_min=*/400.0);
     bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
+    // `seg_bytes` is freed at the end of this iteration; the copy must land first.
+    stream.synchronize();
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
