@@ -339,7 +339,7 @@ graph LR
 ```
 
 1. **Pipeline 1**: Current pipeline keeps ORDER_BY as sink (local sort per batch)
-2. **Pipeline 2**: SORT_SAMPLE and SORT_PARTITION run back-to-back in the same `gpu_pipeline_task`. `PIPELINE` barrier from Pipeline 1 — batches arrive as produced; SORT_SAMPLE overrides `get_next_task_hint()` to wait for N samples before computing boundaries; SORT_PARTITION reads boundaries directly from SORT_SAMPLE via `_sample_op`
+2. **Pipeline 2**: SORT_SAMPLE and SORT_PARTITION run back-to-back in the same `gpu_pipeline_task`. `PIPELINE` barrier from Pipeline 1 — batches arrive as produced; SORT_SAMPLE overrides `get_next_task_hint()` to wait for all the input (or `sort_sample_bytes` of it) before computing boundaries from the key rows ORDER_BY handed over; SORT_PARTITION reads boundaries directly from SORT_SAMPLE via `_sample_op`
 3. **Pipeline 3**: MERGE_SORT. `FULL` barrier — must wait for all partitions. Downstream pipelines that previously used ORDER_BY as source are updated to use MERGE_SORT
 
 ### HASH_GROUP_BY

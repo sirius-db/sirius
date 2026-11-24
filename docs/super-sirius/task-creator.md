@@ -180,9 +180,9 @@ there is no separate repository completion protocol.
 
 | Method | Behavior |
 |--------|----------|
-| `get_next_task_hint()` | If boundaries computed: base class. Otherwise: waits for N sample batches OR source finished. |
-| `get_next_task_input_data()` | Base class (after boundary computation) |
-| Why custom | Two-phase: cannot compute boundaries until N samples are collected |
+| `get_next_task_hint()` | If boundaries computed: base class. Otherwise: waits for the source to finish, or for a nonzero `sort_sample_bytes` of input. |
+| `get_next_task_input_data()` | One batch for the boundary task; base class after boundary computation |
+| Why custom | Two-phase: cannot compute boundaries until the input, or enough of it, was sampled |
 
 ### MERGE_SORT
 
@@ -213,7 +213,7 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 | NESTED_LOOP_JOIN | Incremental pair / pending-slice readiness | Batch pairs, cross-product slices, empty-side tasks | Single-partition streaming with whole-side CONCAT rules |
 | PARTITION | Resolves the bound input policy, then checks port readiness | Resolves once before claiming | Shared exchange layout |
 | CONCAT | Byte-threshold check | Accumulate until threshold | Batching + blocking mode |
-| SORT_SAMPLE | Wait for N batches | Base class | Two-phase sampling |
+| SORT_SAMPLE | Wait for all input or `sort_sample_bytes` | One batch for the boundary task | Two-phase sampling |
 | MERGE_SORT | Base class | Drain all from one partition | Per-partition merge |
 | GROUPED_AGGREGATE_MERGE | Base class | Drain all from one partition | Per-partition merge |
 | MERGE_AGGREGATE | Claim one task after upstream completion | Drain all partials or create input-free descriptor | Final SQL row even with zero input batches |

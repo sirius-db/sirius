@@ -170,7 +170,9 @@ arrived. It is used three ways:
 - **`SORT_SAMPLE` in distributed mode.** Each rank shares up to 1024 evenly spaced rows of its
   sorted sample, and every rank merges them all in rank order. From the same global sample each
   rank derives the same world − 1 range boundaries for the exchange after it, and its own
-  `SORT_PARTITION` boundaries from inside its range. A rank with no input still runs its boundary
+  `SORT_PARTITION` boundaries from inside its range. A rank's say is scaled by how much of
+  `sort_sample_bytes` its sample reached, so a distributed sort left at the default (0, all input)
+  takes one scan batch instead. A rank with no input still runs its boundary
   task (`runs_without_input()`), since the others wait for it. `distribute_plan()` sets a
   `sample_all_gather_boundaries` on the plan's `SORT_SAMPLE` (`set_cross_rank_boundaries()`),
   which the operator asks for its boundaries instead of cutting its own sample. It cannot be set

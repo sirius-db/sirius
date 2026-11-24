@@ -625,14 +625,23 @@ neither half of.
 ### `sirius_physical_sort_sample` — `SORT_SAMPLE`
 **File:** `src/op/sirius_physical_sort_sample.hpp`
 
-Samples input batches to compute P-1 partition boundary rows for range partitioning. Sampling is byte-based: it accumulates batches until `sort_sample_bytes` worth of input is available, rather than a fixed batch count.
+Computes P-1 partition boundary rows for range partitioning from key rows of every sorted batch.
+ORDER_BY hands each batch it sorts to `add_sorted_batch()` before the batch reaches the input
+port. `sort_key_sample` (`src/op/sort_key_sample.hpp`) keeps evenly spaced key rows of each batch
+in host memory: one stride for all batches, a power of two that doubles until at most about 1M
+rows are kept. A retried ORDER_BY task hands its batch over again under the same id, which
+replaces its earlier rows.
+
+`sort_sample_bytes` is the input to see before the boundaries are chosen. The default, 0, waits
+for all of it. Input that ends before a nonzero value is reached is used whole. A distributed
+sort left at 0 takes one scan batch, because ranks weight their samples by this budget.
 
 Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE → SCHEDULED → DONE`.
-- `get_next_task_hint()` waits in `NOT_DONE` until enough sample bytes are available (or the upstream finishes), then signals READY; it returns `std::nullopt` while `SCHEDULED` so at most one boundary task is in flight.
-- `get_next_task_input_data()` (overridden) claims the accumulated sample batches and moves the state to `SCHEDULED`, handing them to `execute()` as a single multi-batch input.
-- `execute()` gathers regularly spaced key rows from each pre-sorted sample batch, merges those keys, computes boundaries, and moves to `DONE`. Range sizing uses measured input when upstream is finished, otherwise the runtime byte estimate when available, then the planner estimate. It also caps expected rows per range at half cuDF's column limit. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
+- `get_next_task_hint()` waits in `NOT_DONE` until the upstream pipeline finishes, or until a nonzero `sort_sample_bytes` of input was handed over and a batch waits, then signals READY; it returns `std::nullopt` while `SCHEDULED` so at most one boundary task is in flight.
+- `get_next_task_input_data()` (overridden) claims one waiting batch for the boundary task and moves the state to `SCHEDULED`.
+- `execute()` copies the kept key rows to its GPU, merges them, computes boundaries, and moves to `DONE`. Range sizing uses measured input when upstream is finished, otherwise the runtime byte estimate when available, then the planner estimate. It also caps expected rows per range at half cuDF's column limit. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED`, the key rows stay, and the rescheduled task retries with the same input, preventing a duplicate boundary task.
 - Once `DONE`, the operator falls back to default scheduling and passes through remaining batches unchanged.
-- Counting repeated boundaries is best-effort: a GPU allocation failure records `repeated_boundaries=unavailable` and retains the completed boundaries, without retrying the distributed exchange.
+- Counting repeated boundaries is best-effort: a GPU allocation failure or a retryable CUDA launch error records `repeated_boundaries=unavailable` and keeps the completed boundaries. The task is not retried for it, because the distributed hook rejects a second run and the query would fail. Any other error propagates.
 
 ### `sirius_physical_sort_partition` — `SORT_PARTITION`
 **File:** `src/op/sirius_physical_sort_partition.hpp`
