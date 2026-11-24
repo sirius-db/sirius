@@ -129,6 +129,14 @@ make -C "$PIXI_PROJECT_ROOT" &&
 make -C "$PIXI_PROJECT_ROOT/gateway" release
 """
 
+[tasks.test-gateway]
+description = "Run the gateway's SQL tests on CPU ranks; needs the gateway build."
+cmd = 'cd "$PIXI_PROJECT_ROOT/gateway" && ./build/release/test/unittest "test/*"'
+
+[tasks.test-scripts]
+description = "Run the unit tests of the launch and answer-check scripts."
+cmd = 'python -m unittest discover -s "$PIXI_PROJECT_ROOT/test/scripts" -p "test_*.py" -v'
+
 [tasks.sirius-gateway]
 description = "Start the distributed gateway (scripts/sirius_gateway.sh; --help for options)."
 cmd = '"$PIXI_PROJECT_ROOT/scripts/sirius_gateway.sh"'

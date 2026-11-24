@@ -31,12 +31,14 @@ KEYS = {
 
 
 def config_path():
-    for candidate in (
-        os.environ.get("SIRIUS_CONFIG_FILE"),
-        "sirius.yaml",
-        "~/.sirius/sirius.yaml",
-    ):
-        if candidate and Path(candidate).expanduser().is_file():
+    # Sirius takes a set SIRIUS_CONFIG_FILE as the only candidate, and fails if it is missing.
+    explicit = os.environ.get("SIRIUS_CONFIG_FILE")
+    if explicit is not None:
+        if not Path(explicit).is_file():
+            sys.exit(f"SIRIUS_CONFIG_FILE points to non-existent file: {explicit}")
+        return Path(explicit)
+    for candidate in ("sirius.yaml", "~/.sirius/sirius.yaml"):
+        if Path(candidate).expanduser().is_file():
             return Path(candidate).expanduser()
     return None
 
