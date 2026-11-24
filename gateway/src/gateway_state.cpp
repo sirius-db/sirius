@@ -137,7 +137,7 @@ bool holds_credentials(std::string const& sql)
 
 /// The DDL log file: `<sirius_gateway_state_dir>/ddl.sql`, or empty when that is not set.
 /// Each entry follows a line "-- entry <bytes>", so multi-line statements read back exactly, and
-/// ends with ";", so the file also runs as a script.
+/// ends with ";".
 std::filesystem::path ddl_file(ClientContext& context)
 {
   auto const dir = setting(context, "sirius_gateway_state_dir", "");
@@ -148,14 +148,14 @@ constexpr std::string_view entry_mark = "-- entry ";
 
 /// Replaces @p file with @p log, less the entries that carry credentials: written to a new
 /// file, mode 600, then renamed, so a crash leaves the old log or the new one.
-void save_ddl_log(std::filesystem::path const& file, std::vector<std::string> const& log)
+void save_ddl_log(std::filesystem::path const& file, std::vector<log_entry> const& log)
 {
   std::string text =
     "-- The sirius_gateway DDL log, replayed on every start of the ranks. Statements with "
     "credentials are not saved.\n";
   for (auto const& entry : log) {
-    if (holds_credentials(entry)) { continue; }
-    text += std::string{entry_mark} + std::to_string(entry.size()) + "\n" + entry + ";\n";
+    if (entry.secret) { continue; }
+    text += std::string{entry_mark} + std::to_string(entry.sql.size()) + "\n" + entry.sql + ";\n";
   }
   if (std::filesystem::create_directories(file.parent_path())) {
     std::filesystem::permissions(file.parent_path(), std::filesystem::perms::owner_all);
@@ -178,11 +178,13 @@ void save_ddl_log(std::filesystem::path const& file, std::vector<std::string> co
   }
 }
 
-std::vector<std::string> load_ddl_log(std::filesystem::path const& file)
+std::vector<log_entry> load_ddl_log(std::filesystem::path const& file)
 {
   std::ifstream in(file, std::ios::binary);
+  if (!in) { throw IOException("cannot read %s: %s", file.string(), std::strerror(errno)); }
   std::string const text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-  std::vector<std::string> log;
+  if (in.bad()) { throw IOException("cannot read %s", file.string()); }
+  std::vector<log_entry> log;
   for (std::size_t at = 0; at < text.size();) {
     auto const end = std::min(text.find('\n', at), text.size());
     std::string_view const line{text.data() + at, end - at};
@@ -197,7 +199,7 @@ std::vector<std::string> load_ddl_log(std::filesystem::path const& file)
     if (at + bytes + 2 > text.size() || text.compare(at + bytes, 2, ";\n") != 0) {
       throw IOException("%s: entry %d is cut short", file.string(), log.size() + 1);
     }
-    log.push_back(text.substr(at, bytes));
+    log.push_back({text.substr(at, bytes), false});
     at += bytes + 2;
   }
   return log;
@@ -205,7 +207,7 @@ std::vector<std::string> load_ddl_log(std::filesystem::path const& file)
 
 /// Saves @p log to @p file, if set. Its statements already ran on every rank, so a failure to
 /// save is reported, not thrown: returns the error, also written to the gateway's stderr.
-std::string try_save_ddl_log(std::filesystem::path const& file, std::vector<std::string> const& log)
+std::string try_save_ddl_log(std::filesystem::path const& file, std::vector<log_entry> const& log)
 {
   if (file.empty()) { return {}; }
   try {
@@ -478,10 +480,15 @@ class gateway_state::turn {
 void gateway_state::start(ClientContext& context, start_options options, bool replay_saved)
 {
   turn t{*this, context};
+  // A start that is refused changes neither the start policy nor the options.
+  static_cast<void>(plan_ranks(options));
   {
     std::lock_guard lock{state_mutex_};
     auto_start_ = false;
-    if (replay_saved) { options_ = options; }
+    if (replay_saved) {
+      options_             = options;
+      saved_log_discarded_ = false;  // an earlier fresh start that failed left the file there
+    }
   }
   ranks_cv_.notify_all();
   // A launch script restarts a gateway whose spawned ranks died with it: the saved log is the
@@ -491,8 +498,6 @@ void gateway_state::start(ClientContext& context, start_options options, bool re
     return;
   }
   start_locked(context, std::move(options), /*discard_log=*/true);
-  // Only once the new ranks run: a start that fails keeps the saved log.
-  if (auto const file = ddl_file(context); !file.empty()) { std::filesystem::remove(file); }
 }
 
 void gateway_state::stop(ClientContext& context)
@@ -551,10 +556,8 @@ void gateway_state::wait_for_ranks(ClientContext& context, std::string const& sq
   }
 }
 
-void gateway_state::start_locked(ClientContext& context, start_options options, bool discard_log)
+gateway_state::rank_plan gateway_state::plan_ranks(start_options const& options)
 {
-  // Everything up to stop_locked() only checks and prepares: a start that is refused there
-  // leaves the running ranks, the state and the DDL log as they were.
   std::vector<rank_spec> registered;
   {
     std::lock_guard lock{state_mutex_};
@@ -576,15 +579,23 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
     throw InvalidInputException(
       "SET sirius_gateway_duckdb_binary to the DuckDB that runs each rank");
   }
-  std::filesystem::create_directories(options.log_dir);
+  if (options.ranks > 0 &&
+      (options.quack_base_port == 0 || options.exchange_base_port == 0 ||
+       std::max(options.quack_base_port, options.exchange_base_port) + uint64_t{options.ranks} - 1 >
+         65535)) {
+    throw InvalidInputException("the base ports of %d ranks must stay within 1 to 65535",
+                                options.ranks);
+  }
 
-  auto const token = random_token();
-  std::vector<rank> ranks(options.ranks + registered.size());
+  rank_plan plan;
+  plan.token  = random_token();
+  auto& ranks = plan.ranks;
+  ranks.resize(options.ranks + registered.size());
   for (uint32_t i = 0; i < options.ranks; ++i) {
     auto& r         = ranks[i];
     r.index         = i;
     r.name          = "rank_" + std::to_string(i);
-    r.token         = token;
+    r.token         = plan.token;
     r.gpu           = options.gpus.empty() ? std::to_string(i) : options.gpus[i];
     r.host          = "127.0.0.1";
     r.quack_host    = r.host;
@@ -625,11 +636,19 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
         r.host);
     }
   }
-  std::string peers;
   for (auto& r : ranks) {
     r.catalog = "sirius_rank_" + std::to_string(r.index);
-    peers += (r.index ? "," : "") + r.host + ":" + std::to_string(r.exchange_port);
+    plan.peers += (r.index ? "," : "") + r.host + ":" + std::to_string(r.exchange_port);
   }
+  return plan;
+}
+
+void gateway_state::start_locked(ClientContext& context, start_options options, bool discard_log)
+{
+  // Up to stop_locked() this only checks and prepares: a start that is refused there leaves the
+  // running ranks, the state and the DDL log as they were.
+  auto plan = plan_ranks(options);
+  std::filesystem::create_directories(options.log_dir);
   stop_locked();
   {
     std::lock_guard lock{state_mutex_};
@@ -637,16 +656,17 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
     reason_.clear();
     if (discard_log) {
       ddl_log_.clear();
-      saved_log_pending_ = false;
+      saved_log_pending_   = false;
+      saved_log_discarded_ = true;
     }
   }
   try {
     {
       std::lock_guard lock{state_mutex_};
-      ranks_   = std::move(ranks);
+      ranks_   = std::move(plan.ranks);
       options_ = options;
       for (auto& r : ranks_) {
-        if (!r.registered) { spawn_rank(options_, token, r); }
+        if (!r.registered) { spawn_rank(options_, plan.token, r); }
       }
     }
     ranks_cv_.notify_all();
@@ -695,7 +715,7 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
       if (!options_.sirius_extension.empty()) {
         sql.push_back("SET enable_duckdb_fallback = false");
         if (several_hosts) { sql.push_back("SET sirius_exchange_host_staging = 'never'"); }
-        sql.push_back("SET sirius_exchange_peers = " + KeywordHelper::WriteQuoted(peers));
+        sql.push_back("SET sirius_exchange_peers = " + KeywordHelper::WriteQuoted(plan.peers));
         sql.push_back("SET sirius_exchange_rank = " + std::to_string(r.index));
       }
       if (!options_.rank_init.empty()) { sql.push_back(options_.rank_init); }
@@ -719,6 +739,17 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
     reason_ = duckdb::ErrorData(e).RawMessage();
     throw;
   }
+  // Only once the new ranks run: a start that fails keeps the saved log on disk, for a gateway
+  // that restarts, but this gateway does not load it again.
+  bool discarded = false;
+  {
+    std::lock_guard lock{state_mutex_};
+    discarded            = saved_log_discarded_;
+    saved_log_discarded_ = false;
+  }
+  if (auto const file = ddl_file(context); discarded && !file.empty()) {
+    std::filesystem::remove(file);
+  }
 }
 
 void gateway_state::connect_rank(rank& r,
@@ -738,6 +769,7 @@ void gateway_state::connect_rank(rank& r,
   }
   attach += ")";
   auto const deadline = steady_clock::now() + patience;
+  std::string exit_error;
   for (;;) {
     {
       std::lock_guard lock{state_mutex_};
@@ -762,7 +794,10 @@ void gateway_state::connect_rank(rank& r,
         result = std::move(boot);
       } else {
         auto chunk = boot->Fetch();
-        id         = chunk && chunk->size() > 0 ? chunk->GetValue(0, 0).ToString() : "";
+        if (!chunk || chunk->size() == 0) {
+          throw IOException("rank %s: %s returned no row", r.name, options.boot_id_sql);
+        }
+        id = chunk->GetValue(0, 0).ToString();
         std::lock_guard lock{state_mutex_};
         auto* spec = find_registered(r.name);
         if (spec && spec->boot_id == id) {
@@ -783,7 +818,12 @@ void gateway_state::connect_rank(rank& r,
           }
         }
       }
-      if (!retiring.empty()) { channel->Query(options.exit_sql); }
+      if (!retiring.empty()) {
+        // An exit that worked drops the connection, so it reports an error too: this one is
+        // only shown if the process is still there at the deadline.
+        auto const exited = channel->Query(options.exit_sql);
+        exit_error        = exited->HasError() ? ": " + exited->GetError() : std::string{};
+      }
     }
     if (!result->HasError() && retiring.empty()) {
       auto id =
@@ -798,10 +838,11 @@ void gateway_state::connect_rank(rank& r,
       channel.reset();
       admin.Query("DETACH DATABASE IF EXISTS " + r.catalog);
       if (!retiring.empty()) {
-        throw IOException("rank %d (%s) still runs the process the gateway asked to exit (%s)",
+        throw IOException("rank %d (%s) still runs the process the gateway asked to exit (%s)%s",
                           r.index,
                           r.name,
-                          retiring);
+                          retiring,
+                          exit_error);
       }
       throw IOException(
         "rank %d (%s) did not answer at %s: %s", r.index, r.name, r.uri, result->GetError());
@@ -852,8 +893,11 @@ void gateway_state::add_rank(ClientContext& context, rank_spec spec)
   if (boot->HasError()) {
     throw IOException("rank %s: %s: %s", spec.name, options.boot_id_sql, boot->GetError());
   }
-  auto chunk   = boot->Fetch();
-  spec.boot_id = chunk && chunk->size() > 0 ? chunk->GetValue(0, 0).ToString() : "";
+  auto chunk = boot->Fetch();
+  if (!chunk || chunk->size() == 0) {
+    throw IOException("rank %s: %s returned no row", spec.name, options.boot_id_sql);
+  }
+  spec.boot_id = chunk->GetValue(0, 0).ToString();
 
   {
     std::lock_guard lock{state_mutex_};
@@ -895,6 +939,13 @@ void gateway_state::stop_locked()
   for (auto& r : ranks_) {
     r.channel.reset();
     admin.Query("DETACH DATABASE IF EXISTS " + r.catalog);
+    // Every spawned rank is told to end before the first is waited for.
+    if (!r.registered && r.stdin_fd >= 0) {
+      close(r.stdin_fd);
+      r.stdin_fd = -1;
+    }
+  }
+  for (auto& r : ranks_) {
     end_rank(r);
   }
   ranks_.clear();
@@ -902,28 +953,30 @@ void gateway_state::stop_locked()
 
 void gateway_state::recover_locked(ClientContext& context)
 {
-  std::vector<std::string> log;
+  std::vector<log_entry> log;
   bool from_file = false;
+  bool discarded = false;
   {
     std::lock_guard lock{state_mutex_};
     log = ddl_log_;
     // Still the saved log if an earlier attempt to replay it did not finish.
     from_file = saved_log_pending_;
+    discarded = saved_log_discarded_;
   }
   // A gateway that restarted has an empty log: its ranks replay the one it saved.
   auto const file = ddl_file(context);
-  if (log.empty() && !file.empty() && std::filesystem::exists(file)) {
+  if (log.empty() && !discarded && !file.empty() && std::filesystem::exists(file)) {
     log = load_ddl_log(file);
     std::lock_guard lock{state_mutex_};
     ddl_log_           = log;
     saved_log_pending_ = from_file = true;
   }
   start_locked(context, options_);
-  std::vector<std::string> kept;
+  std::vector<log_entry> kept;
   std::string skipped;
   for (std::size_t i = 0; i < log.size(); ++i) {
     try {
-      run_locked(context, log[i], true);
+      run_locked(context, log[i].sql, true);
       kept.push_back(log[i]);
     } catch (std::exception& e) {
       auto const error = duckdb::ErrorData(e).RawMessage();
@@ -940,7 +993,7 @@ void gateway_state::recover_locked(ClientContext& context)
         continue;
       }
       state_  = cluster_state::failed;
-      reason_ = "replaying \"" + log[i] + "\" failed: " + error;
+      reason_ = "replaying \"" + log[i].sql + "\" failed: " + error;
       throw IOException(reason_);
     }
   }
@@ -1000,12 +1053,13 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
   }
   if (ranks_.empty() && !replay) { auto_start_locked(context); }
   if (ranks_.empty() && !replay) {
-    // A recovery that failed leaves no ranks. Spawned ranks are started again here, as
-    // auto_start_locked does for registered ones; a cluster that was stopped stays stopped.
+    // A recovery that failed leaves no ranks. They are started again here, also the registered
+    // ones of an explicit sirius_gateway_start, which auto_start_locked leaves alone; a cluster
+    // that was stopped stays stopped.
     bool retry = false;
     {
       std::lock_guard lock{state_mutex_};
-      retry = state_ == cluster_state::failed && options_.ranks > 0;
+      retry = state_ == cluster_state::failed && (options_.ranks > 0 || !registered_.empty());
     }
     if (retry) { recover_locked(context); }
   }
@@ -1016,8 +1070,9 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
                           "or register ranks with sirius_gateway_add_rank"
                         : reason_);
   }
-  // A registered rank has no process here: one that died since the last statement is found by
-  // its port, so that the ranks restart before this statement rather than fail it.
+  // A registered rank has no process here: one whose port takes no connection is found before
+  // the statement. One that its launcher already restarted on that port is not: the statement
+  // fails on the old session, and the next one restarts the ranks.
   bool ready = false;
   {
     std::lock_guard lock{state_mutex_};
@@ -1158,20 +1213,23 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
     // A read changes nothing, and every rank has retired the query: the ranks keep serving.
     throw IOException("%sthe ranks disagree (%s)", prefix, failed_ranks);
   }
-  std::vector<std::string> log;
+  bool const logged = !replay && changes_state(sql);
+  bool const secret = logged && holds_credentials(sql);
+  auto const file   = ddl_file(context);
+  std::vector<log_entry> log;
   {
     std::lock_guard lock{state_mutex_};
     if (state_ == cluster_state::failed) { throw IOException(reason_); }
-    if (!replay && changes_state(sql)) {
-      ddl_log_.push_back(sql);
-      log = ddl_log_;
+    if (logged) {
+      ddl_log_.push_back({sql, secret});
+      if (!file.empty()) { log = ddl_log_; }
     }
   }
-  if (!log.empty()) {
+  if (logged) {
     // The statement took effect on every rank, so it succeeds even if the log cannot be saved.
     // The error (or, once saved, none) replaces an earlier note of a skipped entry or a save
     // that failed.
-    auto const save_error = try_save_ddl_log(ddl_file(context), log);
+    auto const save_error = try_save_ddl_log(file, log);
     std::lock_guard lock{state_mutex_};
     if (state_ == cluster_state::ready) { reason_ = save_error; }
   }
@@ -1388,7 +1446,7 @@ uint64_t gateway_state::waiting()
   return queue_.size();
 }
 
-std::vector<std::string> gateway_state::ddl_log()
+std::vector<log_entry> gateway_state::ddl_log()
 {
   std::lock_guard lock{state_mutex_};
   return ddl_log_;
