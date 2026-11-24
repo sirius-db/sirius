@@ -326,6 +326,63 @@ SELECT count(*) > 0 FROM sirius_gateway_log();
 ----
 true
 
+# Nor the options that the next recovery starts the ranks with.
+statement error
+FROM sirius_gateway_start(2, gpus := '0', quack_base_port := 19500, replay_saved := true);
+----
+gpus lists 1 GPUs for 2 ranks
+
+query T
+SELECT state FROM sirius_gateway_test_signal(1, 9) WHERE rank = 1;
+----
+exited
+
+query I
+FROM sirius_gateway_run('FROM v');
+----
+42
+
+# Ports are checked before anything stops.
+statement error
+FROM sirius_gateway_start(2, quack_base_port := 70000);
+----
+quack_base_port must be a port, 1 to 65535
+
+statement error
+FROM sirius_gateway_start(2, exchange_base_port := NULL);
+----
+exchange_base_port must be a port, 1 to 65535
+
+statement error
+FROM sirius_gateway_start(2, quack_base_port := 65535);
+----
+the base ports of 2 ranks must stay within 1 to 65535
+
+statement error
+FROM sirius_gateway_add_rank('127.0.0.1:95oo', exchange_port := 27000, token := 't');
+----
+is not host:port
+
+statement error
+FROM sirius_gateway_add_rank('127.0.0.1:70000', exchange_port := 27000, token := 't');
+----
+is not host:port
+
+statement error
+FROM sirius_gateway_add_rank('127.0.0.1:9500', exchange_port := 70000, token := 't');
+----
+exchange_port must be a port, 1 to 65535
+
+statement error
+FROM sirius_gateway_add_rank('127.0.0.1:9500', exchange_port := 27000, token := NULL);
+----
+token cannot be NULL
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up' AND cluster = 'ready';
+----
+2
+
 query I
 SELECT state FROM sirius_gateway_stop();
 ----
