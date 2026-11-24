@@ -280,6 +280,13 @@ class gateway_state {
 /// Fills @p options from the `sirius_gateway_*` settings of @p context.
 void read_settings(duckdb::ClientContext& context, start_options& options);
 
+/// The SQL rank @p index's session runs to join the exchange of @p peers ("host:port" of every
+/// rank, by rank): with Sirius, the exchange settings, then the peers, then the rank, which
+/// connects; last, options.rank_init.
+std::vector<std::string> rank_setup_sql(start_options const& options,
+                                        std::string const& peers,
+                                        uint32_t index);
+
 /// Rank process lifecycle; `rank_supervisor.cpp`.
 /// Runs the DuckDB binary on this host; @p init_sql runs before the rank serves Quack.
 void spawn_rank(start_options const& options,

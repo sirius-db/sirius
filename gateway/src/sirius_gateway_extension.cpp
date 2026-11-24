@@ -326,6 +326,26 @@ unique_ptr<FunctionData> test_signal_bind(ClientContext&,
   return status_rows(gateway_of(input), types, names);
 }
 
+/// Test hook: sirius_gateway_test_rank_setup(peers, rank) returns the session setup SQL that
+/// sirius_gateway_start would give that rank under the current settings. Starts nothing.
+unique_ptr<FunctionData> test_rank_setup_bind(ClientContext& context,
+                                              TableFunctionBindInput& input,
+                                              vector<LogicalType>& types,
+                                              vector<Identifier>& names)
+{
+  sirius_gateway::start_options options;
+  sirius_gateway::read_settings(context, options);
+  names          = {"step", "sql"};
+  types          = {LogicalType::UBIGINT, LogicalType::VARCHAR};
+  auto data      = make_uniq<rows_data>();
+  auto const sql = sirius_gateway::rank_setup_sql(
+    options, input.inputs[0].ToString(), input.inputs[1].GetValue<uint32_t>());
+  for (idx_t i = 0; i < sql.size(); ++i) {
+    data->rows.push_back({Value::UBIGINT(i + 1), Value(sql[i])});
+  }
+  return std::move(data);
+}
+
 unique_ptr<FunctionData> log_bind(ClientContext&,
                                   TableFunctionBindInput& input,
                                   vector<LogicalType>& types,
@@ -433,6 +453,10 @@ void LoadInternal(ExtensionLoader& loader)
                               {LogicalType::INTEGER, LogicalType::INTEGER},
                               scan_rows,
                               test_signal_bind));
+  loader.RegisterFunction(add("sirius_gateway_test_rank_setup",
+                              {LogicalType::VARCHAR, LogicalType::INTEGER},
+                              scan_rows,
+                              test_rank_setup_bind));
   loader.RegisterFunction(add("sirius_gateway_run", {LogicalType::VARCHAR}, scan_run, run_bind));
 
   // The Quack callback that routes each client statement:

@@ -61,6 +61,58 @@ SELECT current_setting('sirius_gateway_exchange_host_staging'),
 ----
 auto	0	auto	8388608	16	8
 
+# What a Sirius rank's session is given: the exchange settings as they are set here, before the
+# peers and the rank, which connects; then sirius_gateway_rank_init. Several hosts force nothing.
+statement ok
+SET GLOBAL sirius_gateway_sirius_extension = '/nowhere/sirius.duckdb_extension';
+
+statement ok
+SET GLOBAL sirius_gateway_exchange_mnnvl = 'off';
+
+statement ok
+SET GLOBAL sirius_gateway_exchange_tcp_lanes = 4;
+
+statement ok
+SET GLOBAL sirius_gateway_exchange_frame_bytes = 1048576;
+
+statement ok
+SET GLOBAL sirius_gateway_rank_init = 'SET threads = 2';
+
+query IT
+FROM sirius_gateway_test_rank_setup('10.0.0.1:27000,10.0.0.2:27001', 1);
+----
+1	SET enable_duckdb_fallback = false
+2	SET sirius_exchange_host_staging = 'auto'
+3	SET sirius_exchange_tcp_lanes = 4
+4	SET sirius_exchange_mnnvl = 'off'
+5	SET sirius_exchange_frame_bytes = 1048576
+6	SET sirius_exchange_send_frames = 16
+7	SET sirius_exchange_recv_frames_per_peer = 8
+8	SET sirius_exchange_peers = '10.0.0.1:27000,10.0.0.2:27001'
+9	SET sirius_exchange_rank = 1
+10	SET threads = 2
+
+statement ok
+RESET GLOBAL sirius_gateway_rank_init;
+
+statement ok
+RESET GLOBAL sirius_gateway_exchange_frame_bytes;
+
+statement ok
+RESET GLOBAL sirius_gateway_exchange_tcp_lanes;
+
+statement ok
+RESET GLOBAL sirius_gateway_exchange_mnnvl;
+
+# CPU ranks again: the tests below start plain DuckDB.
+statement ok
+RESET GLOBAL sirius_gateway_sirius_extension;
+
+query I
+SELECT count(*) FROM sirius_gateway_test_rank_setup('10.0.0.1:27000,10.0.0.2:27001', 1);
+----
+0
+
 # With no ranks, a statement waits sirius_gateway_join_wait seconds for some to register.
 statement ok
 SET GLOBAL sirius_gateway_join_wait = 0;

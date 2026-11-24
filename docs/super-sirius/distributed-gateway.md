@@ -215,7 +215,7 @@ abandoned.
 | `sirius_gateway_status()` | One row per rank: process, name, state, cluster state and its `error` (why it is stopped or failed, what it waits for, or a note while it is `ready`: a skipped saved entry, or a log it could not save), `last_error` (the rank's last failure to join, to answer, or to keep running), query numbers, queue |
 | `sirius_gateway_log()` | The DDL log. A statement that carries credentials shows as `-- not shown: this statement carries credentials` |
 | `sirius_gateway_route(user, sql)` | Quack's authorization callback that routes each client statement: `SET GLOBAL quack_authorization_function = 'sirius_gateway_route'` |
-| `sirius_gateway_test_signal(rank, signal)`, `sirius_gateway_test_serve(port, token, init)` | Test hooks |
+| `sirius_gateway_test_signal(rank, signal)`, `sirius_gateway_test_serve(port, token, init)`, `sirius_gateway_test_rank_setup(peers, rank)` | Test hooks |
 
 On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid`, its
 `boot_id`, and whether it has `joined` a set of ranks (its exchange connected to its peers, or
