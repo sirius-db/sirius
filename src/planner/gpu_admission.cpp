@@ -28,10 +28,17 @@
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/node_statistics.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
-#include <parquet_reader.hpp>
 
 #include <algorithm>
 #include <exception>
+
+// <linux/fs.h> defines BLOCK_SIZE as a macro and reaches this file through the result collector
+// (sirius_context.hpp -> scan manager -> liburing). DuckDB's parquet_crypto.hpp, which
+// parquet_reader.hpp includes, declares a constant of that name; hide the macro around it.
+#pragma push_macro("BLOCK_SIZE")
+#undef BLOCK_SIZE
+#include <parquet_reader.hpp>
+#pragma pop_macro("BLOCK_SIZE")
 
 namespace sirius::planner {
 
