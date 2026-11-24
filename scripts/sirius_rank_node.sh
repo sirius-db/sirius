@@ -124,7 +124,7 @@ esac
   umask 077
   cat > "$dir/init.sql" <<SQL
 LOAD '$build/extension/sirius/sirius.duckdb_extension';
-CALL quack_serve('quack:$host:$port', $serve);
+SELECT listen_uri FROM quack_serve('quack:$host:$port', $serve);
 SQL
 )
 add_rank="CALL sirius_gateway_add_rank('$host:$port', exchange_port := $exchange_port, token := '$token'$pin);"
