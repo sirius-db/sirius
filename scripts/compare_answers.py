@@ -4,7 +4,7 @@
 The run is the output of a DuckDB shell in `.mode csv` with `.timer on`, where each query follows
 a marker statement `SELECT 'Q<n> run <k>' AS marker;` (see
 docs/super-sirius/distributed-experiments-no-slurm.md). Rows compare in any order; numbers match
-within 1e-6 relative, or within the rounding of the one printed with fewer decimals (at most
+within 1e-12 relative, or within the rounding of the one printed with fewer decimals (at most
 0.01). A query the reference has and the run does not counts as a failure. A text diff does not
 work: float digits and the order of equal rows differ between engines.
 
@@ -23,10 +23,10 @@ Prints one table row per run, with the query's seconds, and exits 1 if any run d
 import argparse
 import csv
 import io
+import math
 import os
 import re
 import sys
-from collections import Counter
 
 
 def parse_client(path):
@@ -92,7 +92,9 @@ def cells_match(a, b):
     x, y = number(a), number(b)
     if x is None or y is None:
         return False
-    if abs(x - y) <= 1e-6 * max(abs(x), abs(y)):
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return x == y
+    if abs(x - y) <= 1e-12 * max(abs(x), abs(y)):
         return True
     # One engine rounds where the other prints more digits (a DECIMAL against a DOUBLE): they
     # may differ by half a unit of the last place of the shorter one. A fixed 0.01 would also
@@ -114,28 +116,40 @@ def exact_cells(row):
 
 def differing_rows(got, ref):
     """Multiset difference with the numeric tolerance: (only in got, only in ref)."""
-    left = Counter(tuple(row) for row in ref)
-    unmatched = []
-    for row in got:
-        key = tuple(row)
-        if left.get(key, 0) > 0:
-            left[key] -= 1
-        else:
-            unmatched.append(row)
-    buckets = {}
-    for key, count in left.items():
-        for _ in range(count):
-            buckets.setdefault(exact_cells(key), []).append(list(key))
-    only_got = []
-    for row in unmatched:
-        candidates = buckets.get(exact_cells(row), [])
-        for i, candidate in enumerate(candidates):
-            if rows_match(row, candidate):
-                del candidates[i]
-                break
-        else:
-            only_got.append(row)
-    return only_got, [row for bucket in buckets.values() for row in bucket]
+    groups = {}
+    for side, rows in enumerate((got, ref)):
+        for row in rows:
+            groups.setdefault(exact_cells(row), ([], []))[side].append(row)
+    only_got, only_ref = [], []
+    for rows, candidates in groups.values():
+        partner, owner = [None] * len(rows), [None] * len(candidates)
+        same = {}
+        for j, candidate in enumerate(candidates):
+            same.setdefault(tuple(candidate), []).append(j)
+        for i, row in enumerate(rows):
+            if same.get(tuple(row)):
+                partner[i] = same[tuple(row)].pop()
+                owner[partner[i]] = i
+        # Augmenting paths for the rest: the first candidate within tolerance, or an identical
+        # one, can be the only partner of another row.
+        for start in [i for i, j in enumerate(partner) if j is None]:
+            parents, queue, free = {}, [start], None
+            while queue and free is None:
+                i = queue.pop()
+                for j, candidate in enumerate(candidates):
+                    if j in parents or not rows_match(rows[i], candidate):
+                        continue
+                    parents[j] = i
+                    if owner[j] is None:
+                        free = j
+                        break
+                    queue.append(owner[j])
+            while free is not None:
+                i = parents[free]
+                partner[i], owner[free], free = free, i, partner[i]
+        only_got += [row for i, row in enumerate(rows) if partner[i] is None]
+        only_ref += [row for j, row in enumerate(candidates) if owner[j] is None]
+    return only_got, only_ref
 
 
 def is_tie(run, ref_rows, only_got, only_ref, columns):
@@ -181,7 +195,7 @@ def main():
         run = runs[(query, k)]
         if reference is not None:
             ref = reference.get((query, 1))
-            ref_rows = None if ref is None or ref["error"] else ref["rows"]
+            ref_rows = None if ref is None or ref["error"] or ref["time"] is None else ref["rows"]
         else:
             path = os.path.join(args.ref_dir, args.ref_pattern.format(n=query))
             ref_rows = parse_csv_file(path) if os.path.isfile(path) else None
@@ -227,9 +241,8 @@ def main():
         print(
             f"| Q{query} | {k} | {run['time']} | {len(run['rows'])} | {len(ref_rows)} | {verdict} |"
         )
-    ran = {query for query, _ in runs}
     if reference is not None:
-        expected = {query for query, _ in reference}
+        missing = sorted(set(reference) - set(runs))
     else:
         name = re.compile(
             re.sub(r"\\\{n[^}]*\\\}", r"(\\d+)", re.escape(args.ref_pattern))
@@ -239,9 +252,10 @@ def main():
             for match in map(name.fullmatch, os.listdir(args.ref_dir))
             if match
         }
-    # A client that stopped early leaves no marker for the queries it never reached.
-    for query in sorted(expected - ran):
-        print(f"| Q{query} | - | - | - | - | NOT RUN |")
+        missing = [(query, "-") for query in sorted(expected - {query for query, _ in runs})]
+    # A client that stopped early leaves no marker for the runs it never reached.
+    for query, k in missing:
+        print(f"| Q{query} | {k} | - | - | - | NOT RUN |")
         bad += 1
     if notes:
         print()
