@@ -1,0 +1,19 @@
+{
+  "all22_group_cache_clears": true,
+  "all22_group_ktls_verified": true,
+  "all44_correct": true,
+  "archive_sha256": "374147753385492d460ad0d1816dee1a2fbf9a11eaf0987b4e15b69114faa143",
+  "best_complete_iteration_sum_s": 2048.194464,
+  "instance_lifecycle": "retained running",
+  "iteration_sums_s": [
+    2048.194464,
+    2121.381237
+  ],
+  "only_eviction_changed": true,
+  "prior_cold_sum_s": 1906.310348,
+  "processes": 22,
+  "quent_contexts": 22,
+  "quent_query_executions": 44,
+  "same_process_per_query_pair": true,
+  "sum_both_iterations_s": 4169.575701
+}

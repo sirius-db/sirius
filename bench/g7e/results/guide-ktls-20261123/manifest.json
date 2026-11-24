@@ -10,6 +10,14 @@
       "files": 1660,
       "sha256": "da9be9d5b5550e26ad4c531dbd5c06849e42a6655d02db7b5e024d6040dadf18"
     },
+    "g7e8-london-sf10k-hot-guide-two-iterations-20261123": {
+      "all_payload_hashes_verified": true,
+      "bytes": 431539131,
+      "filename": "g7e8-london-sf10k-hot-guide-two-iterations-20261123-complete-results.tar.gz",
+      "files": 955,
+      "payload_bytes": 2152688736,
+      "sha256": "374147753385492d460ad0d1816dee1a2fbf9a11eaf0987b4e15b69114faa143"
+    },
     "g7e8-london-sf1k-guide-ktls-two-iterations-20261123": {
       "bytes": 41770393,
       "files": 1642,
@@ -26,10 +34,12 @@
       "sha256": "eddf374fef4cfa58c7dcbe93568e5ae11bcf20120e3fa79ecd7de8c75e023de1"
     }
   },
+  "date_timezone": "America/Chicago",
   "engine_commit": "26b5caba3e2c96290fdc63d4cf40ac42572eaab8",
   "generator_commit": "8e9a6ef307d74c2b60ad02ff287920f53193e26e",
   "hardware": "g7e.8xlarge",
   "region": "eu-west-2",
+  "result_date": "2026-11-23",
   "selected": [
     {
       "config_sha256": "63b69623ff3a115bf3c58d1f6c05f7489d6fbb822a2fd94b24412ba3beff6f19",
@@ -174,7 +184,37 @@
       "source_summary_sha256": "d7bbb4ce5f5cb57a573acae20d37eb4d6f989fa43285770cb2e8223cbe8392f0",
       "sql_threads": 24,
       "sum_s": 1906.310348
+    },
+    {
+      "config_sha256": "b0954b1d2670fcefda8d92c7fc9293a443e10335d17dbe71c2abd63f27a87247",
+      "configuration": "../../guide-26b5caba/configs/balanced-hot.yaml",
+      "correct_queries": 22,
+      "iteration": 1,
+      "profile": "hot",
+      "scale_factor": 10000,
+      "source_archive": "g7e8-london-sf10k-hot-guide-two-iterations-20261123",
+      "source_summary_sha256": "c8862902cf095c9c0dc37e7913293a745b3005a158912ee697870943c30d7d69",
+      "sql_threads": 24,
+      "sum_s": 2048.194464
     }
   ],
-  "selection": "best complete CPU-validated iteration; no mixed query minima"
+  "selection": "best complete CPU-validated iteration; no mixed query minima",
+  "sf10000_hot": {
+    "collector_fix": "Add missing import json; retain Q1 and continue Q2-Q22 without repeating measurements",
+    "collector_fix_commit": "e58e21f76526a645709c9ac4b8597d9156b02a2e",
+    "fresh_processes": 22,
+    "iteration_sums_s": [
+      2048.194464,
+      2121.381237
+    ],
+    "original_runner_commit": "b1578254e7a6af572cb70c5d3cc5df0ae4545969",
+    "published_summary": "sf10000-hot/summary.json",
+    "published_summary_sha256": "501851d8ac93e3b72658bbaa013db48a0a2ec81058c8d3440ee01804f0ecd121",
+    "quent_contexts": 22,
+    "quent_query_executions": 44,
+    "result_directory": "sf10000-hot",
+    "sum_both_iterations_s": 4169.575701,
+    "validated_measurements": 44
+  },
+  "validated_timings": 550
 }

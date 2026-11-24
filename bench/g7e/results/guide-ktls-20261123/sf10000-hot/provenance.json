@@ -1,0 +1,68 @@
+{
+  "all44_cpu_gpu_validated": true,
+  "collector_fix_commit": "e58e21f76526a645709c9ac4b8597d9156b02a2e",
+  "config_sha256": "b0954b1d2670fcefda8d92c7fc9293a443e10335d17dbe71c2abd63f27a87247",
+  "cpu_validation_requested": true,
+  "dataset": {
+    "bucket": "sae-dataproc-aws-dev-sirius-scratch-eu-west-2",
+    "region": "eu-west-2",
+    "tables_present": [
+      "region",
+      "nation",
+      "supplier",
+      "customer",
+      "part",
+      "partsupp",
+      "orders",
+      "lineitem"
+    ]
+  },
+  "date_timezone": "America/Chicago",
+  "ec2": {
+    "architecture": "x86_64",
+    "availabilityZone": "eu-west-2c",
+    "imageId": "ami-00bc0738b6bbe095c",
+    "instanceType": "g7e.8xlarge",
+    "region": "eu-west-2"
+  },
+  "extension_sha256": "eea7762bb66da60e2c817e6817667211ffbfa32ac780e48fe96e4e48e20df48b",
+  "manifest_sha256": "18eeeaf6bf3611bb89087c70aeaf3157a94b85cced29a328de7b75685bae9412",
+  "native_library_sha256": "090f552314d37196b6c0509a261a9656034a287e03524531dd7e1af3ccc79236",
+  "no_repeated_measurements": true,
+  "result_date": "2026-11-23",
+  "runner_sha256": {
+    "collect.py": "11172fffa4c0f867b747c00fd0a0ebcab447d6b9e8716bda5007a76bf3ac274f",
+    "ktls_guard.py": "c3354e8171e82ac6ee4d94a70068eb05eb1d5df0584c9ed99dd1b2e6dc3d2a95",
+    "replay.py": "a742f039a5ee5fbfad7f0e40d16465a9e80405f9b73332a62e75966fba78a2ec",
+    "supervisor.py": "77a37e7a9f3d63f5427c24f84b93bc4e0ed1a0a05992a5887170c055639c613c",
+    "test_reproduction.py": "2a88d99dd18f35a8263f446346be8700d9adf3ef4b888be05988defacd4ea013",
+    "validation.py": "18326f0387b4b25f083d86be5d0db5c153c4d38e99fa1a559f24c43be06f0a9a",
+    "worker.py": "9f7a673999444e4ea15b67a2b96e945948c39973a3ffa57d3afd57b18418810b"
+  },
+  "source_collections": [
+    "Q1: original runner output",
+    "Q2-Q22: runner with collector import fix"
+  ],
+  "source_commit": "26b5caba3e2c96290fdc63d4cf40ac42572eaab8",
+  "storage": {
+    "disk_spill_enabled": true,
+    "mounts": [
+      {
+        "allow_ebs": false,
+        "devices": [
+          {
+            "model": "Amazon EC2 NVMe Instance Storage",
+            "name": "/dev/nvme1n1",
+            "type": "disk"
+          }
+        ],
+        "free_bytes": 1489966247936,
+        "mount": {
+          "source": "/dev/nvme1n1",
+          "target": "/mnt/datasets"
+        },
+        "path": "/mnt/datasets/spill"
+      }
+    ]
+  }
+}

@@ -1,0 +1,1052 @@
+{
+  "best_complete_iteration_sum_s": 2048.194464,
+  "complete": true,
+  "cpu_validated": true,
+  "errors": [],
+  "expected_measurements": 44,
+  "expected_queries": 22,
+  "iteration_totals": [
+    {
+      "available_sum_s": 2048.194464,
+      "expected_queries": 22,
+      "iteration": 1,
+      "queries": 22,
+      "sum_s": 2048.194464
+    },
+    {
+      "available_sum_s": 2121.381237,
+      "expected_queries": 22,
+      "iteration": 2,
+      "queries": 22,
+      "sum_s": 2121.381237
+    }
+  ],
+  "per_query": [
+    {
+      "best_s": 51.266979,
+      "iterations_s": [
+        54.247188,
+        51.266979
+      ],
+      "query": 1
+    },
+    {
+      "best_s": 2.838755,
+      "iterations_s": [
+        9.010875,
+        2.838755
+      ],
+      "query": 2
+    },
+    {
+      "best_s": 51.473853,
+      "iterations_s": [
+        54.485164,
+        51.473853
+      ],
+      "query": 3
+    },
+    {
+      "best_s": 27.864788,
+      "iterations_s": [
+        31.253008,
+        27.864788
+      ],
+      "query": 4
+    },
+    {
+      "best_s": 61.169822,
+      "iterations_s": [
+        65.964032,
+        61.169822
+      ],
+      "query": 5
+    },
+    {
+      "best_s": 39.279955,
+      "iterations_s": [
+        41.813648,
+        39.279955
+      ],
+      "query": 6
+    },
+    {
+      "best_s": 68.965018,
+      "iterations_s": [
+        74.546903,
+        68.965018
+      ],
+      "query": 7
+    },
+    {
+      "best_s": 80.776301,
+      "iterations_s": [
+        85.126698,
+        80.776301
+      ],
+      "query": 8
+    },
+    {
+      "best_s": 384.164505,
+      "iterations_s": [
+        384.164505,
+        514.383794
+      ],
+      "query": 9
+    },
+    {
+      "best_s": 57.084196,
+      "iterations_s": [
+        61.543216,
+        57.084196
+      ],
+      "query": 10
+    },
+    {
+      "best_s": 6.964223,
+      "iterations_s": [
+        11.514724,
+        6.964223
+      ],
+      "query": 11
+    },
+    {
+      "best_s": 42.236254,
+      "iterations_s": [
+        45.447462,
+        42.236254
+      ],
+      "query": 12
+    },
+    {
+      "best_s": 237.546371,
+      "iterations_s": [
+        237.546371,
+        240.396359
+      ],
+      "query": 13
+    },
+    {
+      "best_s": 55.158236,
+      "iterations_s": [
+        59.034356,
+        55.158236
+      ],
+      "query": 14
+    },
+    {
+      "best_s": 50.835015,
+      "iterations_s": [
+        56.312375,
+        50.835015
+      ],
+      "query": 15
+    },
+    {
+      "best_s": 4.619971,
+      "iterations_s": [
+        9.051917,
+        4.619971
+      ],
+      "query": 16
+    },
+    {
+      "best_s": 45.956015,
+      "iterations_s": [
+        49.828077,
+        45.956015
+      ],
+      "query": 17
+    },
+    {
+      "best_s": 465.718205,
+      "iterations_s": [
+        465.718205,
+        489.411291
+      ],
+      "query": 18
+    },
+    {
+      "best_s": 68.545627,
+      "iterations_s": [
+        70.965453,
+        68.545627
+      ],
+      "query": 19
+    },
+    {
+      "best_s": 62.947777,
+      "iterations_s": [
+        66.924964,
+        62.947777
+      ],
+      "query": 20
+    },
+    {
+      "best_s": 93.922398,
+      "iterations_s": [
+        100.128608,
+        93.922398
+      ],
+      "query": 21
+    },
+    {
+      "best_s": 5.28461,
+      "iterations_s": [
+        13.566715,
+        5.28461
+      ],
+      "query": 22
+    }
+  ],
+  "proofs": [
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run/worker001/runs/sf10000/hot/q01/benchmark/tpch_20261124_012030_grouped_gpu_iter2/iterations/iteration1/sirius/q1/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483238744512688,
+        "query_end_ns": 1795483292993870167
+      },
+      "iteration": 1,
+      "pid": 3765748,
+      "query": 1,
+      "seconds": 54.247188
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run/worker001/runs/sf10000/hot/q01/benchmark/tpch_20261124_012030_grouped_gpu_iter2/iterations/iteration2/sirius/q1/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483293005368149,
+        "query_end_ns": 1795483344274860005
+      },
+      "iteration": 2,
+      "pid": 3765748,
+      "query": 1,
+      "seconds": 51.266979
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker001/runs/sf10000/hot/q02/benchmark/tpch_20261124_012351_grouped_gpu_iter2/iterations/iteration1/sirius/q2/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483439041283765,
+        "query_end_ns": 1795483448056211865
+      },
+      "iteration": 1,
+      "pid": 3838035,
+      "query": 2,
+      "seconds": 9.010875
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker001/runs/sf10000/hot/q02/benchmark/tpch_20261124_012351_grouped_gpu_iter2/iterations/iteration2/sirius/q2/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483448066557559,
+        "query_end_ns": 1795483450906933372
+      },
+      "iteration": 2,
+      "pid": 3838035,
+      "query": 2,
+      "seconds": 2.838755
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "correct ordered answer including legal LIMIT-boundary ties",
+        "expanded_cpu_rows": 14,
+        "rows": 10
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker002/runs/sf10000/hot/q03/benchmark/tpch_20261124_012417_grouped_gpu_iter2/iterations/iteration1/sirius/q3/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483464682090010,
+        "query_end_ns": 1795483519170742510
+      },
+      "iteration": 1,
+      "pid": 3842516,
+      "query": 3,
+      "seconds": 54.485164
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "correct ordered answer including legal LIMIT-boundary ties",
+        "expanded_cpu_rows": 14,
+        "rows": 10
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker002/runs/sf10000/hot/q03/benchmark/tpch_20261124_012417_grouped_gpu_iter2/iterations/iteration2/sirius/q3/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483519180199329,
+        "query_end_ns": 1795483570656736038
+      },
+      "iteration": 2,
+      "pid": 3842516,
+      "query": 3,
+      "seconds": 51.473853
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker003/runs/sf10000/hot/q04/benchmark/tpch_20261124_012617_grouped_gpu_iter2/iterations/iteration1/sirius/q4/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483584801330908,
+        "query_end_ns": 1795483616056985404
+      },
+      "iteration": 1,
+      "pid": 3915900,
+      "query": 4,
+      "seconds": 31.253008
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker003/runs/sf10000/hot/q04/benchmark/tpch_20261124_012617_grouped_gpu_iter2/iterations/iteration2/sirius/q4/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483616065231237,
+        "query_end_ns": 1795483643932724533
+      },
+      "iteration": 2,
+      "pid": 3915900,
+      "query": 4,
+      "seconds": 27.864788
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker004/runs/sf10000/hot/q05/benchmark/tpch_20261124_012730_grouped_gpu_iter2/iterations/iteration1/sirius/q5/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483657937029865,
+        "query_end_ns": 1795483723903782724
+      },
+      "iteration": 1,
+      "pid": 3956637,
+      "query": 5,
+      "seconds": 65.964032
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker004/runs/sf10000/hot/q05/benchmark/tpch_20261124_012730_grouped_gpu_iter2/iterations/iteration2/sirius/q5/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483723912664904,
+        "query_end_ns": 1795483785086191379
+      },
+      "iteration": 2,
+      "pid": 3956637,
+      "query": 5,
+      "seconds": 61.169822
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker005/runs/sf10000/hot/q06/benchmark/tpch_20261124_012951_grouped_gpu_iter2/iterations/iteration1/sirius/q6/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483799165066615,
+        "query_end_ns": 1795483840981919347
+      },
+      "iteration": 1,
+      "pid": 4049028,
+      "query": 6,
+      "seconds": 41.813648
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker005/runs/sf10000/hot/q06/benchmark/tpch_20261124_012951_grouped_gpu_iter2/iterations/iteration2/sirius/q6/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483840993337817,
+        "query_end_ns": 1795483880274781708
+      },
+      "iteration": 2,
+      "pid": 4049028,
+      "query": 6,
+      "seconds": 39.279955
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker006/runs/sf10000/hot/q07/benchmark/tpch_20261124_013126_grouped_gpu_iter2/iterations/iteration1/sirius/q7/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483894522176006,
+        "query_end_ns": 1795483969073126166
+      },
+      "iteration": 1,
+      "pid": 4110748,
+      "query": 7,
+      "seconds": 74.546903
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker006/runs/sf10000/hot/q07/benchmark/tpch_20261124_013126_grouped_gpu_iter2/iterations/iteration2/sirius/q7/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795483969082252731,
+        "query_end_ns": 1795484038050915198
+      },
+      "iteration": 2,
+      "pid": 4110748,
+      "query": 7,
+      "seconds": 68.965018
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker007/runs/sf10000/hot/q08/benchmark/tpch_20261124_013404_grouped_gpu_iter2/iterations/iteration1/sirius/q8/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795484052179282496,
+        "query_end_ns": 1795484137309180701
+      },
+      "iteration": 1,
+      "pid": 23008,
+      "query": 8,
+      "seconds": 85.126698
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker007/runs/sf10000/hot/q08/benchmark/tpch_20261124_013404_grouped_gpu_iter2/iterations/iteration2/sirius/q8/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795484137320651134,
+        "query_end_ns": 1795484218101263850
+      },
+      "iteration": 2,
+      "pid": 23008,
+      "query": 8,
+      "seconds": 80.776301
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker008/runs/sf10000/hot/q09/benchmark/tpch_20261124_013704_grouped_gpu_iter2/iterations/iteration1/sirius/q9/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795484232269720773,
+        "query_end_ns": 1795484616443016417
+      },
+      "iteration": 1,
+      "pid": 155751,
+      "query": 9,
+      "seconds": 384.164505
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker008/runs/sf10000/hot/q09/benchmark/tpch_20261124_013704_grouped_gpu_iter2/iterations/iteration2/sirius/q9/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795484616474793887,
+        "query_end_ns": 1795485130865861415
+      },
+      "iteration": 2,
+      "pid": 155751,
+      "query": 9,
+      "seconds": 514.383794
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker009/runs/sf10000/hot/q10/benchmark/tpch_20261124_015217_grouped_gpu_iter2/iterations/iteration1/sirius/q10/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795485145424732424,
+        "query_end_ns": 1795485206975096008
+      },
+      "iteration": 1,
+      "pid": 294639,
+      "query": 10,
+      "seconds": 61.543216
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker009/runs/sf10000/hot/q10/benchmark/tpch_20261124_015217_grouped_gpu_iter2/iterations/iteration2/sirius/q10/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795485206985613809,
+        "query_end_ns": 1795485264073683033
+      },
+      "iteration": 2,
+      "pid": 294639,
+      "query": 10,
+      "seconds": 57.084196
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "matches pinned harness tolerance (float abs=1e-10, other values exact)",
+        "rows": 9365098
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker010/runs/sf10000/hot/q11/benchmark/tpch_20261124_015430_grouped_gpu_iter2/iterations/iteration1/sirius/q11/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795485278257779588,
+        "query_end_ns": 1795485301407736003
+      },
+      "iteration": 1,
+      "pid": 376956,
+      "query": 11,
+      "seconds": 11.514724
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "matches pinned harness tolerance (float abs=1e-10, other values exact)",
+        "rows": 9365098
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker010/runs/sf10000/hot/q11/benchmark/tpch_20261124_015430_grouped_gpu_iter2/iterations/iteration2/sirius/q11/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795485304830395017,
+        "query_end_ns": 1795485322266755292
+      },
+      "iteration": 2,
+      "pid": 376956,
+      "query": 11,
+      "seconds": 6.964223
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker011/runs/sf10000/hot/q12/benchmark/tpch_20261124_015535_grouped_gpu_iter2/iterations/iteration1/sirius/q12/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795485343542413359,
+        "query_end_ns": 1795485388994141352
+      },
+      "iteration": 1,
+      "pid": 381991,
+      "query": 12,
+      "seconds": 45.447462
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker011/runs/sf10000/hot/q12/benchmark/tpch_20261124_015535_grouped_gpu_iter2/iterations/iteration2/sirius/q12/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795485389002535673,
+        "query_end_ns": 1795485431241032686
+      },
+      "iteration": 2,
+      "pid": 381991,
+      "query": 12,
+      "seconds": 42.236254
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker012/runs/sf10000/hot/q13/benchmark/tpch_20261124_015717_grouped_gpu_iter2/iterations/iteration1/sirius/q13/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795485445311838728,
+        "query_end_ns": 1795485682863052567
+      },
+      "iteration": 1,
+      "pid": 440275,
+      "query": 13,
+      "seconds": 237.546371
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker012/runs/sf10000/hot/q13/benchmark/tpch_20261124_015717_grouped_gpu_iter2/iterations/iteration2/sirius/q13/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795485682898201385,
+        "query_end_ns": 1795485923297238109
+      },
+      "iteration": 2,
+      "pid": 440275,
+      "query": 13,
+      "seconds": 240.396359
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker013/runs/sf10000/hot/q14/benchmark/tpch_20261124_020529_grouped_gpu_iter2/iterations/iteration1/sirius/q14/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795485937526084510,
+        "query_end_ns": 1795485996563198504
+      },
+      "iteration": 1,
+      "pid": 497821,
+      "query": 14,
+      "seconds": 59.034356
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker013/runs/sf10000/hot/q14/benchmark/tpch_20261124_020529_grouped_gpu_iter2/iterations/iteration2/sirius/q14/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795485996571927056,
+        "query_end_ns": 1795486051732777201
+      },
+      "iteration": 2,
+      "pid": 497821,
+      "query": 14,
+      "seconds": 55.158236
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker014/runs/sf10000/hot/q15/benchmark/tpch_20261124_020738_grouped_gpu_iter2/iterations/iteration1/sirius/q15/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795486065914826045,
+        "query_end_ns": 1795486122228745792
+      },
+      "iteration": 1,
+      "pid": 593010,
+      "query": 15,
+      "seconds": 56.312375
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker014/runs/sf10000/hot/q15/benchmark/tpch_20261124_020738_grouped_gpu_iter2/iterations/iteration2/sirius/q15/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795486122234026908,
+        "query_end_ns": 1795486173070958094
+      },
+      "iteration": 2,
+      "pid": 593010,
+      "query": 15,
+      "seconds": 50.835015
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker015/runs/sf10000/hot/q16/benchmark/tpch_20261124_020939_grouped_gpu_iter2/iterations/iteration1/sirius/q16/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795486187305622104,
+        "query_end_ns": 1795486196383224093
+      },
+      "iteration": 1,
+      "pid": 684836,
+      "query": 16,
+      "seconds": 9.051917
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker015/runs/sf10000/hot/q16/benchmark/tpch_20261124_020939_grouped_gpu_iter2/iterations/iteration2/sirius/q16/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795486196405359402,
+        "query_end_ns": 1795486201039453403
+      },
+      "iteration": 2,
+      "pid": 684836,
+      "query": 16,
+      "seconds": 4.619971
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker016/runs/sf10000/hot/q17/benchmark/tpch_20261124_021007_grouped_gpu_iter2/iterations/iteration1/sirius/q17/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795486215007666353,
+        "query_end_ns": 1795486264837966662
+      },
+      "iteration": 1,
+      "pid": 687082,
+      "query": 17,
+      "seconds": 49.828077
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker016/runs/sf10000/hot/q17/benchmark/tpch_20261124_021007_grouped_gpu_iter2/iterations/iteration2/sirius/q17/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795486264842371627,
+        "query_end_ns": 1795486310801566915
+      },
+      "iteration": 2,
+      "pid": 687082,
+      "query": 17,
+      "seconds": 45.956015
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "correct ordered answer including legal LIMIT-boundary ties",
+        "expanded_cpu_rows": 105,
+        "rows": 100
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker017/runs/sf10000/hot/q18/benchmark/tpch_20261124_021157_grouped_gpu_iter2/iterations/iteration1/sirius/q18/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795486325084022192,
+        "query_end_ns": 1795486790811845086
+      },
+      "iteration": 1,
+      "pid": 773039,
+      "query": 18,
+      "seconds": 465.718205
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "correct ordered answer including legal LIMIT-boundary ties",
+        "expanded_cpu_rows": 105,
+        "rows": 100
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker017/runs/sf10000/hot/q18/benchmark/tpch_20261124_021157_grouped_gpu_iter2/iterations/iteration2/sirius/q18/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795486790844282294,
+        "query_end_ns": 1795487280262430577
+      },
+      "iteration": 2,
+      "pid": 773039,
+      "query": 18,
+      "seconds": 489.411291
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker018/runs/sf10000/hot/q19/benchmark/tpch_20261124_022806_grouped_gpu_iter2/iterations/iteration1/sirius/q19/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795487294580748185,
+        "query_end_ns": 1795487365548253111
+      },
+      "iteration": 1,
+      "pid": 825342,
+      "query": 19,
+      "seconds": 70.965453
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker018/runs/sf10000/hot/q19/benchmark/tpch_20261124_022806_grouped_gpu_iter2/iterations/iteration2/sirius/q19/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795487365557965733,
+        "query_end_ns": 1795487434106717102
+      },
+      "iteration": 2,
+      "pid": 825342,
+      "query": 19,
+      "seconds": 68.545627
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker019/runs/sf10000/hot/q20/benchmark/tpch_20261124_023040_grouped_gpu_iter2/iterations/iteration1/sirius/q20/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795487448393282791,
+        "query_end_ns": 1795487515496220931
+      },
+      "iteration": 1,
+      "pid": 919405,
+      "query": 20,
+      "seconds": 66.924964
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker019/runs/sf10000/hot/q20/benchmark/tpch_20261124_023040_grouped_gpu_iter2/iterations/iteration2/sirius/q20/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795487515636591600,
+        "query_end_ns": 1795487578749995519
+      },
+      "iteration": 2,
+      "pid": 919405,
+      "query": 20,
+      "seconds": 62.947777
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker020/runs/sf10000/hot/q21/benchmark/tpch_20261124_023305_grouped_gpu_iter2/iterations/iteration1/sirius/q21/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795487593073935413,
+        "query_end_ns": 1795487693207029163
+      },
+      "iteration": 1,
+      "pid": 1034997,
+      "query": 21,
+      "seconds": 100.128608
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker020/runs/sf10000/hot/q21/benchmark/tpch_20261124_023305_grouped_gpu_iter2/iterations/iteration2/sirius/q21/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795487693215363044,
+        "query_end_ns": 1795487787142857169
+      },
+      "iteration": 2,
+      "pid": 1034997,
+      "query": 21,
+      "seconds": 93.922398
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker021/runs/sf10000/hot/q22/benchmark/tpch_20261124_023633_grouped_gpu_iter2/iterations/iteration1/sirius/q22/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795487801377831717,
+        "query_end_ns": 1795487814946105620
+      },
+      "iteration": 1,
+      "pid": 1175758,
+      "query": 22,
+      "seconds": 13.566715
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf10k-hot-guide-two-iterations-20261123/run-q02-q22/worker021/runs/sf10000/hot/q22/benchmark/tpch_20261124_023633_grouped_gpu_iter2/iterations/iteration2/sirius/q22/result.txt",
+      "config_and_quent": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795487814955183657,
+        "query_end_ns": 1795487820241247492
+      },
+      "iteration": 2,
+      "pid": 1175758,
+      "query": 22,
+      "seconds": 5.28461
+    }
+  ],
+  "queries_with_timings": 22,
+  "successful_measurements": 44
+}

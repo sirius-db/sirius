@@ -197,7 +197,7 @@ class Recipes(unittest.TestCase):
         manifest = json.loads((snapshot / "manifest.json").read_text())
         with (snapshot / "per-query.csv").open() as stream:
             rows = list(csv.DictReader(stream))
-        self.assertEqual(len(rows), 506)
+        self.assertEqual(len(rows), 550)
         for cell in manifest["selected"]:
             selected = [
                 r
