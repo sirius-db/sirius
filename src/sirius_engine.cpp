@@ -166,6 +166,12 @@ void sirius_engine::quiesce_plan_users()
   if (plan_users_quiescent_) return;
   if (auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
     ctx->retire_query_work(query_id_, duckdb::SiriusContext::query_retirement_mode::cancelled);
+    // The handler's error callback sees only the query's first error. A finalize that failed
+    // after it may still be a fatal device error, which must mark the runtime unavailable.
+    if (query_) {
+      pipeline::report_finalize_failures(
+        query_->get_pipelines(), ctx->get_query_lifecycle_registry(), query_id_);
+    }
   }
   finish_scan_preparation(sirius_physical_plan.get());
   plan_users_quiescent_ = true;
@@ -268,17 +274,19 @@ void sirius_engine::execute()
   plan_users_quiescent_ = false;
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
   try {
-    query_ = sirius_ctx->create_query(std::move(new_scheduled),
-                                      query_id_,
-                                      completion_handler_,
-                                      telemetry::query_telemetry_info{
-                                        .telemetry_query_id = telemetry_uuid,
-                                        .worker_id          = telemetry_context_->worker_id().raw(),
-                                        .query_id           = query_id_,
-                                      },
-                                      [&client = context] { return client.IsInterrupted(); });
-    sirius_ctx->get_task_scheduler().start_query(*query_);
-    sirius_ctx->get_scan_manager().start_preparation(query_id_);
+    completion_handler_->run_startup([&] {
+      query_ = sirius_ctx->create_query(std::move(new_scheduled),
+                                        query_id_,
+                                        completion_handler_,
+                                        telemetry::query_telemetry_info{
+                                          .telemetry_query_id = telemetry_uuid,
+                                          .worker_id = telemetry_context_->worker_id().raw(),
+                                          .query_id  = query_id_,
+                                        },
+                                        [&client = context] { return client.IsInterrupted(); });
+      sirius_ctx->get_task_scheduler().start_query(*query_);
+      sirius_ctx->get_scan_manager().start_preparation(query_id_);
+    });
   } catch (...) {
     // Prepare/start failures and asynchronous failures compete for the same terminal winner.
     completion_handler_->report_error(std::current_exception());
@@ -295,6 +303,9 @@ void sirius_engine::execute()
       sirius_ctx->throw_runtime_unavailable();
     sirius_ctx->retire_query_work(query_id_,
                                   duckdb::SiriusContext::query_retirement_mode::completed);
+    // No finish transition is running past the work barrier. One that failed after success was
+    // signalled had its report dropped, so it fails the query here.
+    if (query_) { pipeline::rethrow_finalize_failure(query_->get_pipelines()); }
     finish_scan_preparation(sirius_physical_plan.get());
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {

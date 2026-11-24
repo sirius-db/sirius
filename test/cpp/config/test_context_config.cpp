@@ -16,8 +16,10 @@
 
 #include "catch.hpp"
 #include "exec/thread_defaults.hpp"
+#include "exec/thread_util.hpp"
 #include "sirius_config.hpp"
 
+#include <cucascade/memory/cpu_constraints.hpp>
 #include <sirius/context/config_builder.hpp>
 #include <unistd.h>
 #include <yaml-cpp/yaml.h>  // IWYU pragma: keep
@@ -737,4 +739,67 @@ TEST_CASE("disk spill I/O settings are read per disk space", "[context_config][c
     CHECK_THROWS(load("{reactors: -1}"));
     CHECK_THROWS(load("{threads: 4}"));
   }
+}
+
+TEST_CASE("resolved startup CPUs preserve the rank boundary across pinned callers",
+          "[context_config][startup_affinity]")
+{
+  auto baseline = cucascade::memory::discover_cpu_constraints().allowed_cpus;
+  auto parsed   = sirius::parsed_sirius_config::from_node(YAML::Load(R"(sirius:
+  space:
+    gpu: [{device_id: 0, memory_capacity: 512MiB}]
+  executor:
+    scan_manager: {reserve_rest_reactor_cpus: false}
+)"));
+  std::optional<sirius::sirius_config> resolved;
+  std::vector<int> caller_after;
+  std::exception_ptr error;
+  std::thread worker([&] {
+    try {
+      sirius::exec::thread_util::scoped_thread_affinity pin(std::vector<int>{baseline.front()});
+      resolved = parsed.resolve(
+        {}, [](std::string_view) { return std::optional<cucascade::memory::nic_topology>{}; });
+      caller_after = sirius::exec::thread_util::get_current_thread_affinity();
+    } catch (...) {
+      error = std::current_exception();
+    }
+  });
+  worker.join();
+  if (error) std::rethrow_exception(error);
+  REQUIRE(resolved.has_value());
+  CHECK(resolved->get_startup_cpus() == baseline);
+  CHECK(resolved->get_worker_startup_cpus() == baseline);
+  CHECK(resolved->get_scan_manager_config().worker_startup_cpus == baseline);
+  CHECK(resolved->get_scan_manager_config().startup_cpus == baseline);
+  CHECK(resolved->get_scan_manager_config().thread_pool.cpu_affinity_list == baseline);
+  CHECK(resolved->get_gpu_pipeline_executor_config().cpu_affinity_list == baseline);
+  CHECK(resolved->get_task_creator_config().thread_pool.cpu_affinity_list == baseline);
+  CHECK(resolved->get_downgrade_executor_config().thread_pool.cpu_affinity_list == baseline);
+  CHECK(caller_after == std::vector<int>{baseline.front()});
+}
+
+TEST_CASE("explicit pool CPUs may narrow but never expand the startup boundary",
+          "[context_config][startup_affinity]")
+{
+  auto cpus   = cucascade::memory::discover_cpu_constraints().allowed_cpus;
+  int outside = 0;
+  while (outside < CPU_SETSIZE && std::find(cpus.begin(), cpus.end(), outside) != cpus.end())
+    ++outside;
+  if (outside == CPU_SETSIZE) SKIP("requires a CPU id outside the startup boundary");
+  YAML::Node root = YAML::Load(
+    "sirius: {space: {gpu: [{device_id: 0, memory_capacity: 512MiB}]}, executor: {scan_manager: "
+    "{reserve_rest_reactor_cpus: false}}}");
+  auto mask = root["sirius"]["executor"]["scan_manager"]["cpu_affinity"];
+  mask.push_back(cpus.front());
+  mask.push_back(outside);
+  auto probe    = [](std::string_view) { return std::optional<cucascade::memory::nic_topology>{}; };
+  auto resolved = sirius::parsed_sirius_config::from_node(root).resolve({}, probe);
+  CHECK(resolved.get_startup_cpus() == cpus);
+  CHECK(resolved.get_scan_manager_config().worker_startup_cpus == cpus);
+  CHECK(resolved.get_scan_manager_config().thread_pool.cpu_affinity_list ==
+        std::vector<int>{cpus.front()});
+  root["sirius"]["executor"]["scan_manager"]["cpu_affinity"] = YAML::Node(YAML::NodeType::Sequence);
+  root["sirius"]["executor"]["scan_manager"]["cpu_affinity"].push_back(outside);
+  CHECK_THROWS_WITH(sirius::parsed_sirius_config::from_node(root).resolve({}, probe),
+                    Catch::Matchers::ContainsSubstring("rank boundary"));
 }

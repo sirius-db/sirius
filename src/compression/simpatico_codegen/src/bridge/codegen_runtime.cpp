@@ -712,10 +712,12 @@ void append_tree_shape(std::string& key, jit::FusedTree const& node)
 
 // The rendered decode kernel for a tree shape, rendered once per process. The source is invariant
 // in the row count (chunk_id comes from blockIdx.x), so it is rendered for one chunk.
-std::shared_ptr<cdj::DecodeKernelSpec const> rendered_decode_spec(jit::FusedTree const& tree,
-                                                                  char const* cxx_dtype,
-                                                                  cdj::DecodeShape shape,
-                                                                  char const* out_dtype)
+std::shared_ptr<cdj::DecodeKernelSpec const> rendered_decode_spec(
+  jit::FusedTree const& tree,
+  char const* cxx_dtype,
+  cdj::DecodeShape shape,
+  char const* out_dtype,
+  std::vector<std::int32_t> const& undivided)
 {
   std::string key;
   append_tree_shape(key, tree);
@@ -727,6 +729,11 @@ std::shared_ptr<cdj::DecodeKernelSpec const> rendered_decode_spec(jit::FusedTree
   key += std::to_string(static_cast<int>(shape.consumer));
   key += '|';
   if (out_dtype != nullptr) key += out_dtype;
+  key += '|';
+  for (auto id : undivided) {
+    key += std::to_string(id);
+    key += ',';
+  }
 
   static std::mutex mu;
   static std::unordered_map<std::string, std::shared_ptr<cdj::DecodeKernelSpec const>> specs;
@@ -735,7 +742,7 @@ std::shared_ptr<cdj::DecodeKernelSpec const> rendered_decode_spec(jit::FusedTree
     if (auto it = specs.find(key); it != specs.end()) return it->second;
   }
   auto spec = std::make_shared<cdj::DecodeKernelSpec const>(
-    cdj::render(tree, cxx_dtype, 1, shape, out_dtype != nullptr ? out_dtype : ""));
+    cdj::render(tree, cxx_dtype, 1, shape, out_dtype != nullptr ? out_dtype : "", undivided));
   std::lock_guard<std::mutex> lock(mu);
   return specs.emplace(std::move(key), std::move(spec)).first->second;
 }
@@ -754,7 +761,16 @@ void launch_rendered_decode(jit::FusedTree const& tree,
 {
   auto const num_chunks =
     static_cast<std::int32_t>(std::max<std::int64_t>(1, (num_rows + kChunkSize - 1) / kChunkSize));
-  auto const spec_ptr = rendered_decode_spec(tree, cxx_dtype, va.shape, va.out_dtype);
+  // Bitpack nodes whose chunk_divisors channel is empty render the plain affine reader.
+  std::vector<std::int32_t> undivided;
+  for (auto const& [key, buffer] : persisted) {
+    constexpr std::string_view kDivisors = ".chunk_divisors";
+    if (buffer.length == 0 && key.size() > kDivisors.size() && key.ends_with(kDivisors)) {
+      undivided.push_back(std::stoi(key.substr(0, key.size() - kDivisors.size())));
+    }
+  }
+  std::sort(undivided.begin(), undivided.end());
+  auto const spec_ptr = rendered_decode_spec(tree, cxx_dtype, va.shape, va.out_dtype, undivided);
   auto const& spec    = *spec_ptr;
   std::vector<CUdeviceptr> pointers;
   pointers.reserve(spec.buffers.size());
@@ -769,9 +785,9 @@ void launch_rendered_decode(jit::FusedTree const& tree,
     }
     auto const& field       = buffer.field;
     bool const is_offset    = field == "rle_runs_offsets" || field == "bp_offsets";
-    bool const is_per_chunk = field == "chunk_min" || field == "chunk_bits" ||
-                              field == "chunk_count" || field == "references" ||
-                              field == "offsets" || is_offset;
+    bool const is_per_chunk = field == "chunk_min" || field == "chunk_divisors" ||
+                              field == "chunk_bits" || field == "chunk_count" ||
+                              field == "references" || field == "offsets" || is_offset;
     auto const required = static_cast<std::size_t>(num_chunks) + (is_offset ? 1u : 0u);
     if (is_per_chunk && found->second.length < required) {
       throw std::invalid_argument("simpatico decode: metadata buffer '" + key + "' has " +
@@ -1234,6 +1250,7 @@ bool measurable(const simpatico::CodegenHead& head,
   auto const nc = static_cast<std::size_t>(num_chunks);
   for (auto const& buffer : spec.buffers) {
     if (buffer.field == "packed" || buffer.field == "lw_shards" || buffer.field == "data") continue;
+    if (buffer.field == "chunk_divisors" && buffer.length == 0) continue;  // plain bitpack
     bool const offsets = buffer.field == "rle_runs_offsets" || buffer.field == "offsets";
     if (buffer.length != (offsets ? nc + 1 : nc)) return false;
   }
@@ -1377,13 +1394,15 @@ struct pending_fused_encode {
     // Per Bitpack node: its exact output, sized from its live-word count.
     struct packed_output {
       std::size_t live_bytes{0};
+      bool has_divisors{false};
       rmm::device_buffer offsets;
       rmm::device_buffer dense;
     };
     std::map<std::int32_t, packed_output> outputs;
     for (std::size_t i = 0; i < measure.buffers.size(); ++i) {
       if (measure.buffers[i].field != "lw_shards") continue;
-      auto& out = outputs[measure.buffers[i].node_id];
+      auto& out        = outputs[measure.buffers[i].node_id];
+      out.has_divisors = shards[i][cc::kBitpackDivisorFlagWord] != 0;
       for (std::size_t sh = 0; sh < cc::kBitpackLiveWordShards; ++sh)
         out.live_bytes +=
           static_cast<std::size_t>(shards[i][sh * cc::kBitpackLiveWordShardStride]) *
@@ -1509,6 +1528,18 @@ struct pending_fused_encode {
               std::move(out.dense),
               cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
               0));
+          // A plain bitpack publishes no divisors. Its measured buffer stays in `bufs`, which
+          // the pack launch, possibly still queued, was handed.
+          rep->buffers.emplace_back(
+            "chunk_divisors",
+            out.has_divisors
+              ? meta(find_buffer_idx(measure.buffers, node_id, "chunk_divisors"), min_type, nc)
+              : std::make_unique<cudf::column>(
+                  min_type,
+                  0,
+                  rmm::device_buffer(0, stream, mr),
+                  cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+                  0));
           rep->word_offsets = std::move(out.offsets);
           builder->leaves.emplace(origin.plan_node, std::move(rep));
           break;
@@ -1736,6 +1767,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
       switch (node.op) {
         case cc::OpKind::Bitpack: {
           const auto i_min  = find_buffer_idx(spec.buffers, node_id, "chunk_min");
+          const auto i_divs = find_buffer_idx(spec.buffers, node_id, "chunk_divisors");
           const auto i_cnt  = find_buffer_idx(spec.buffers, node_id, "chunk_count");
           const auto i_bits = find_buffer_idx(spec.buffers, node_id, "chunk_bits");
           const auto i_pkd  = find_buffer_idx(spec.buffers, node_id, "packed");
@@ -1758,6 +1790,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                "cpp encode: lw_shards DtoH failed (nid=%d)",
                                node_id);
           cudaStreamSynchronize(stream.get());
+          bool const has_divisors        = lw_shards[cc::kBitpackDivisorFlagWord] != 0;
           std::int64_t live_packed_bytes = 0;
           for (std::size_t s = 0; s < cc::kBitpackLiveWordShards; ++s)
             live_packed_bytes +=
@@ -1799,6 +1832,13 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             bp_elem_type,
             static_cast<cudf::size_type>(num_chunks),
             std::move(bufs[i_min]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          if (!has_divisors) { bufs[i_divs] = rmm::device_buffer(0, stream, mr); }
+          auto divs_col = std::make_unique<cudf::column>(
+            bp_elem_type,
+            static_cast<cudf::size_type>(has_divisors ? num_chunks : 0),
+            std::move(bufs[i_divs]),
             cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
             0);
           auto cnt_col = std::make_unique<cudf::column>(
@@ -1851,6 +1891,8 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           rep->buffers.emplace_back("chunk_bits", std::move(bits_col));
           rep->buffers.emplace_back("packed", std::move(pkd_col));
           rep->word_offsets = std::move(word_offsets);
+          // Trailing, so a reader that knows only the first four still binds them.
+          rep->buffers.emplace_back("chunk_divisors", std::move(divs_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
           break;
         }

@@ -18,6 +18,7 @@
 
 #include "exec/config.hpp"
 #include "exec/thread_defaults.hpp"
+#include "exec/thread_util.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/merge/merge_config.hpp"
@@ -31,6 +32,7 @@
 #include <cucascade/io/tls/config.hpp>
 #include <cucascade/io/uring/config.hpp>
 #include <cucascade/memory/config.hpp>
+#include <cucascade/memory/cpu_constraints.hpp>
 #include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <unistd.h>
@@ -693,6 +695,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
       "'sirius.executor.scan_manager.object_store': no longer YAML-loadable; use "
       "CREATE SECRET (TYPE SIRIUS_S3, ...) or sirius_config::set_object_store_config()");
   }
+  opt.num_threads_explicit = r.has_value("num_threads");
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   std::optional<std::string> backend;
@@ -1602,10 +1605,16 @@ sirius_config parsed_sirius_config::resolve(
 try {
   auto settings         = impl_->settings;
   settings._hw_topology = hw_topology;
-  const auto& topo      = impl_->topo;
-  const auto& gpu_cfg   = impl_->gpu_cfg;
-  const auto& host_cfg  = impl_->host_cfg;
-  const auto& disk_cfg  = impl_->disk_cfg;
+  auto constraints      = cucascade::memory::discover_cpu_constraints();
+  if (!constraints.diagnostic.empty()) SIRIUS_LOG_WARN("CPU placement: {}", constraints.diagnostic);
+  SIRIUS_LOG_INFO("CPU startup boundary: process={} allowed={}",
+                  cucascade::memory::format_cpu_list(constraints.process_cpus),
+                  cucascade::memory::format_cpu_list(constraints.allowed_cpus));
+  settings._scan_manager_config.startup_cpus = std::move(constraints.allowed_cpus);
+  const auto& topo                           = impl_->topo;
+  const auto& gpu_cfg                        = impl_->gpu_cfg;
+  const auto& host_cfg                       = impl_->host_cfg;
+  const auto& disk_cfg                       = impl_->disk_cfg;
   if (settings._memory_space_configs.empty()) {
     cucascade::memory::reservation_manager_configurator builder;
     if (std::holds_alternative<size_t>(topo.num_gpus_or_gpu_ids)) {
@@ -1743,6 +1752,7 @@ void sirius_config::finalize_derived_config()
   derive_rest_scan_budget();
   derive_uring_scan_budget();
   reserve_rest_reactor_cpus();
+  _scan_manager_config.worker_startup_cpus = get_worker_startup_cpus();
 }
 
 std::vector<int> reserve_cpus_for_rest_reactors(
@@ -1796,6 +1806,15 @@ std::vector<int> reserve_cpus_for_rest_reactors(
   return reactor_cpus;
 }
 
+std::vector<int> sirius_config::get_worker_startup_cpus() const
+{
+  auto cpus = get_startup_cpus();
+  std::erase_if(cpus, [&](int cpu) {
+    return std::binary_search(_rest_reactor_cpus.begin(), _rest_reactor_cpus.end(), cpu);
+  });
+  return cpus.empty() ? get_startup_cpus() : cpus;
+}
+
 void sirius_config::reserve_rest_reactor_cpus()
 {
   // Pinned REST reactors share their CPUs with the NIC's interrupt handling (they are pinned to
@@ -1806,12 +1825,25 @@ void sirius_config::reserve_rest_reactor_cpus()
                                              &_scan_manager_config.thread_pool,
                                              &_task_creator_config.thread_pool,
                                              &_downgrade_executor_config.thread_pool};
-  auto allowed       = cucascade::exec::thread_util::get_current_thread_affinity();
+  if (_scan_manager_config.startup_cpus.empty())
+    _scan_manager_config.startup_cpus = cucascade::memory::discover_cpu_constraints().allowed_cpus;
+  auto const& allowed = _scan_manager_config.startup_cpus;
+  // Explicit pool affinity may narrow the rank boundary, never expand it.
+  for (auto* pool : pools) {
+    auto cpus = pool->cpu_affinity_list.empty()
+                  ? allowed
+                  : cucascade::memory::intersect_cpu_affinity(pool->cpu_affinity_list, allowed);
+    if (cpus.empty())
+      throw configuration_input_error("thread pool affinity has no CPUs within the rank boundary");
+    pool->cpu_affinity_list = std::move(cpus);
+  }
+  if (!_scan_manager_config.reserve_rest_reactor_cpus) {
+    _rest_reactor_cpus.clear();
+    return;
+  }
+  exec::thread_util::scoped_thread_affinity affinity(allowed);
   _rest_reactor_cpus = reserve_cpus_for_rest_reactors(
     _scan_manager_config, cucascade::io::rest::planned_reactor_cpus, allowed, pools);
-  // A REST context built later on a restricted pool thread must plan from this mask, not its own.
-  _scan_manager_config.rest_placement_cpus =
-    _rest_reactor_cpus.empty() ? std::vector<int>{} : std::move(allowed);
 }
 
 void sirius_config::derive_rest_scan_budget()

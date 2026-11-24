@@ -745,7 +745,7 @@ TEST_CASE("reserve_rest_reactor_cpus keeps the thread pools off the planned reac
                              "        pin_to_irq_cpus: false\n");
   CHECK(unpinned.get_rest_reactor_cpus().empty());
   for (auto const& affinity : pool_affinities(unpinned)) {
-    CHECK(affinity.empty());
+    CHECK(affinity == unpinned.get_startup_cpus());
   }
 
   // The switch off: nothing reserved even where the reactors would pin.
@@ -767,11 +767,11 @@ TEST_CASE("reserve_rest_reactor_cpus keeps the thread pools off the planned reac
   });
   if (planned.empty() || !room) {
     CHECK(on.get_rest_reactor_cpus().empty());
-    CHECK(on.get_scan_manager_config().rest_placement_cpus.empty());
+    CHECK(on.get_scan_manager_config().startup_cpus == on.get_startup_cpus());
   } else {
     CHECK(on.get_rest_reactor_cpus() == planned);
     // REST contexts built later, from restricted pool threads, plan from the configuring mask.
-    CHECK(on.get_scan_manager_config().rest_placement_cpus == allowed);
+    CHECK(on.get_scan_manager_config().startup_cpus == on.get_startup_cpus());
     for (auto const& affinity : pool_affinities(on)) {
       CHECK_FALSE(affinity.empty());
       for (int const cpu : planned) {
@@ -1885,4 +1885,28 @@ TEST_CASE("Native runtime YAML rejects insufficient reader capacity",
                    scan_manager_yaml(std::string("      preparation:\n        ") + fields + "\n"));
   CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
                   sirius::configuration_input_error);
+}
+
+TEST_CASE("metadata worker YAML records explicit counts even when equal to default",
+          "[config][metadata_worker_defaults]")
+{
+  auto mode           = GENERATE(0, 1, 2);  // Omitted, null, or explicitly equal to the default.
+  bool explicit_count = mode == 2;
+  auto initial        = sirius::scan_manager::default_scan_manager_num_threads();
+  auto body           = explicit_count ? "      num_threads: " + std::to_string(initial) + "\n"
+                        : mode == 1    ? "      num_threads: null\n"
+                                       : "      backend: sirius\n";
+  scoped_yaml yaml("sirius_metadata_worker_defaults.yaml", scan_manager_yaml(body));
+  auto parsed        = sirius::parsed_sirius_config::from_file(yaml.path());
+  auto const& config = parsed.get_scan_manager_config();
+  CHECK(config.num_threads_explicit == explicit_count);
+  CHECK(config.thread_pool.num_threads == initial);
+  auto more_domains = static_cast<size_t>(initial) + 1;
+  if (explicit_count) {
+    CHECK_THROWS_AS(sirius::scan_manager::resolve_scan_manager_num_threads(config, more_domains),
+                    std::invalid_argument);
+  } else {
+    CHECK(sirius::scan_manager::resolve_scan_manager_num_threads(config, more_domains) ==
+          initial + 1);
+  }
 }

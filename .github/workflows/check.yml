@@ -60,6 +60,9 @@ jobs:
         run: |
           [[ "$(git rev-parse HEAD:duckdb)" == "$(git rev-parse HEAD:sirius-duckdb/duckdb)" ]]
 
+      - name: Test the DuckDB revision check
+        run: cmake -P test/cmake/duckdb_revision/test.cmake
+
       - name: Test thread sweep harness
         run: |
           set -o pipefail

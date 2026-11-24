@@ -353,6 +353,52 @@ class Walker {
 
 struct SimpaticoMin { template <class T> __device__ __forceinline__ T operator()(const T& a, const T& b) const { return a < b ? a : b; } };
 struct SimpaticoMax { template <class T> __device__ __forceinline__ T operator()(const T& a, const T& b) const { return a > b ? a : b; } };
+// The largest e with 5^e dividing every non-zero magnitude seen, for a chunk already known to
+// hold only multiples of 5 (so e >= 1). A magnitude m is a multiple of odd p iff
+// m * p^-1 (mod 2^64) times p does not overflow. e < 0 until the first non-zero magnitude.
+struct SimpaticoPow5 {
+    int e = -1;
+    unsigned long long p = 5ULL, inv = 0xCCCCCCCCCCCCCCCDULL;  // 5^e and its inverse mod 2^64
+    __device__ __forceinline__ void add(unsigned long long m) {
+        constexpr unsigned long long kInv5 = 0xCCCCCCCCCCCCCCCDULL;
+        if (m == 0ULL) return;
+        if (e < 0) {
+            e = 1;
+            while (e < 27 && __umul64hi(m * (inv * kInv5), p * 5ULL) == 0ULL) { inv *= kInv5; p *= 5ULL; ++e; }
+        } else {
+            while (e > 1 && __umul64hi(m * inv, p) != 0ULL) { inv *= 5ULL; p /= 5ULL; --e; }
+        }
+    }
+};
+// Warp-wide min / AND; the __reduce_*_sync intrinsics need sm_80, so older GPUs shuffle.
+__device__ __forceinline__ int simpatico_warp_min(int v) {
+#if __CUDA_ARCH__ >= 800
+    return __reduce_min_sync(0xFFFFFFFFu, v);
+#else
+    for (int o = 16; o > 0; o >>= 1) v = min(v, __shfl_xor_sync(0xFFFFFFFFu, v, o));
+    return v;
+#endif
+}
+__device__ __forceinline__ unsigned int simpatico_warp_and(unsigned int v) {
+#if __CUDA_ARCH__ >= 800
+    return __reduce_and_sync(0xFFFFFFFFu, v);
+#else
+    for (int o = 16; o > 0; o >>= 1) v &= __shfl_xor_sync(0xFFFFFFFFu, v, o);
+    return v;
+#endif
+}
+// A chunk residual divided by its folded-in divisor: no division for the no-op divisor 1, and
+// a 32-bit one when both operands fit.
+template <class U, class T>
+__device__ __forceinline__ U simpatico_bp_div(U d, T div) {
+    if (div == static_cast<T>(1)) return d;
+    if constexpr (sizeof(U) <= 8) {
+        if (static_cast<unsigned long long>(d) <= 0xFFFFFFFFull &&
+            static_cast<unsigned long long>(static_cast<U>(div)) <= 0xFFFFFFFFull)
+            return static_cast<U>(static_cast<unsigned int>(d) / static_cast<unsigned int>(div));
+    }
+    return d / static_cast<U>(div);
+}
 
 using ::cuda::std::int8_t;
 using ::cuda::std::int16_t;
@@ -1012,6 +1058,9 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   const std::string bits_v  = "bits_" + idstr;
   // The chunk range and the pack accumulator must be as wide as the element:
   // at 16 bytes a uint64_t would silently truncate the high half.
+  const std::string sh_div   = "sh_bpdiv_" + idstr;
+  const std::string v_div    = "bp_div_" + idstr;
+  const std::string p_divs   = "chunk_divisors_" + idstr;
   const std::string bp_utype = unsigned_counterpart(op_dt->elem_size);
   const std::string bp_width_fn =
     (op_dt->elem_size == 16) ? "simpatico_bit_width_u128" : "simpatico_bit_width_u64";
@@ -1028,8 +1077,12 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   add_param("uint32_t*", p_lws);
   const bool measure      = mode_ == EncodeRenderMode::measure;
   const bool pack         = mode_ == EncodeRenderMode::pack;
+  const bool gcd          = node.bitpack_gcd;
   const std::string p_off = "bp_offsets_" + idstr;
   if (pack) { add_param("const int32_t*", p_off); }
+  // Trailing: `chunk_divisors` is appended after every pre-existing channel so a
+  // plan or payload that knows only the original four stays valid.
+  add_param(in.elem_type + "*", p_divs);
 
   const std::size_t stride_words =
     static_cast<std::size_t>(::codegen::kChunkSize) * op_dt->elem_size / sizeof(std::uint32_t);
@@ -1052,6 +1105,8 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   // pack: the dense word offset of each chunk, an input the caller scans from the measure
   // pass's chunk_bits x chunk_count.
   if (pack) { add_buffer(id, "bp_offsets", sizeof(std::int32_t), nc + 1, /*no_pre_zero=*/true); }
+  // Trailing, matching the param order above; empty unless the divisor is detected.
+  add_buffer(id, "chunk_divisors", op_dt->elem_size, gcd ? nc : 0);
   // Note: no per-chunk live_words buffer — live_packed_bytes is derived
   // from lw_shards (DtoH only 2 KB instead of num_chunks×4 B).
   // compact_in_place() reconstructs per-chunk offsets from chunk_bits+chunk_count.
@@ -1081,15 +1136,32 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
         << "        if (" << bp_len << " <= 0) {\n"
         << (pack ? std::string{}
                  : "            if (tid == 0) { " + p_min + "[chunk_id] = " + in.elem_type +
-                     "{0}; " + p_cnt + "[chunk_id] = 0; " + p_bits + "[chunk_id] = 1; }\n")
+                     "{0}; " + p_cnt + "[chunk_id] = 0; " + p_bits + "[chunk_id] = 1; " +
+                     (gcd ? p_divs + "[chunk_id] = " + in.elem_type + "{1}; " : "") + "}\n")
         << "            break;\n"
         << "        }\n";
+  // Block-wide min and max of _lmin / _lmax into sh_min_b / sh_max_b, and cmin.
+  const auto emit_range_reduce = [&] {
+    body_ << "        typedef cub::BlockReduce<" << in.elem_type << ", 128> BR_" << idstr << ";\n"
+          << "        __shared__ typename BR_" << idstr << "::TempStorage br_ts_" << idstr << ";\n"
+          << "        __shared__ " << in.elem_type << " " << sh_min << "_b;\n"
+          << "        __shared__ " << in.elem_type << " " << sh_max << "_b;\n"
+          << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
+          << ").Reduce(_lmin, SimpaticoMin()); if (tid == 0) " << sh_min << "_b = _m; }\n"
+          << "        __syncthreads();\n"
+          << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
+          << ").Reduce(_lmax, SimpaticoMax()); if (tid == 0) " << sh_max << "_b = _m; }\n"
+          << "        __syncthreads();\n"
+          << "        const " << in.elem_type << " " << cmin << " = " << sh_min << "_b;\n";
+  };
   if (pack) {
     // The measure pass already reduced this chunk; read its range back.
     body_ << "        const " << in.elem_type << " " << cmin << " = " << p_min << "[chunk_id];\n"
           << "        const int32_t " << bits_v << " = static_cast<int32_t>(" << p_bits
-          << "[chunk_id]);\n";
-  } else {
+          << "[chunk_id]);\n"
+          << "        const " << in.elem_type << " " << v_div << " = "
+          << (gcd ? p_divs + "[chunk_id]" : in.elem_type + "{1}") << ";\n";
+  } else if (!gcd) {
     body_
       // Pass 1: combined min+max in a single grid-stride loop.
       << "        " << in.elem_type << " _lmin = " << emax << ";\n"
@@ -1099,32 +1171,165 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
       << "            " << in.elem_type << " _vi = (" << at_lane(in.read_expr, "i") << ");\n"
       << "            if (_vi < _lmin) _lmin = _vi;\n"
       << "            if (_vi > _lmax) _lmax = _vi;\n"
-      << "        }\n"
-      << "        typedef cub::BlockReduce<" << in.elem_type << ", 128> BR_" << idstr << ";\n"
-      << "        __shared__ typename BR_" << idstr << "::TempStorage br_ts_" << idstr << ";\n"
-      << "        __shared__ " << in.elem_type << " " << sh_min << "_b;\n"
-      << "        __shared__ " << in.elem_type << " " << sh_max << "_b;\n"
-      << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
-      << ").Reduce(_lmin, SimpaticoMin()); if (tid == 0) " << sh_min << "_b = _m; }\n"
-      << "        __syncthreads();\n"
-      << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
-      << ").Reduce(_lmax, SimpaticoMax()); if (tid == 0) " << sh_max << "_b = _m; }\n"
-      << "        __syncthreads();\n"
-      << "        const " << in.elem_type << " " << cmin << " = " << sh_min << "_b;\n"
-      << "        const " << bp_utype << " " << max_r << " = static_cast<" << bp_utype << ">("
-      << sh_max << "_b) - static_cast<" << bp_utype << ">(" << cmin << ");\n"
-      << "        const int32_t " << bits_v << " = " << bp_width_fn << "("
-      << "static_cast<" << bp_utype << ">(" << max_r << "));\n"
-      << "        if (tid == 0) {\n"
-      << "            " << p_min << "[chunk_id] = " << cmin << ";\n"
-      << "            " << p_cnt << "[chunk_id] = " << bp_len << ";\n"
-      << "            " << p_bits << "[chunk_id] = static_cast<uint8_t>(" << bits_v << ");\n"
-      << "            const uint32_t _pw = static_cast<uint32_t>((static_cast<int32_t>(" << bp_len
-      << ") * " << bits_v << " + 31) / 32);\n"
-      << "            atomicAdd(" << p_lws << " + (static_cast<uint32_t>(chunk_id) & "
-      << (::codegen::kBitpackLiveWordShards - 1) << "u) * "
-      << ::codegen::kBitpackLiveWordShardStride << "u, _pw);\n"
       << "        }\n";
+    emit_range_reduce();
+    body_ << "        const " << in.elem_type << " " << v_div << " = " << in.elem_type << "{1};\n";
+  } else {
+    // A multiple-of-5 test is m * 5^-1 (mod 2^w) <= (2^w - 1) / 5; while the powers below
+    // divide, each multiply is the exact quotient, so a chain tests the next power.
+    const bool narrow5      = op_dt->elem_size <= 4;
+    const std::string u5    = narrow5 ? "unsigned int" : "unsigned long long";
+    const std::string inv5  = narrow5 ? "0xCCCCCCCDu" : "0xCCCCCCCCCCCCCCCDULL";
+    const std::string lim5  = narrow5 ? "0x33333333u" : "0x3333333333333333ULL";
+    const std::string fits5 = op_dt->elem_size == 16 ? "(_dr >> 64) == 0 && " : "";
+    const auto residual     = [&](const std::string& at) {
+      return "static_cast<" + bp_utype + ">(static_cast<" + bp_utype + ">(" +
+             at_lane(in.read_expr, at) + ") - static_cast<" + bp_utype + ">(" + cmin + "))";
+    };
+    // Folds the powers of 5 dividing every residual into _f, in 32 or 64 bits.
+    const auto chain5 = [&](bool wide, const std::string& indent) {
+      const std::string t   = wide ? "unsigned long long" : "unsigned int";
+      const std::string inv = wide ? "0xCCCCCCCCCCCCCCCDULL" : "0xCCCCCCCDu";
+      const std::string lim = wide ? "0x3333333333333333ULL" : "0x33333333u";
+      std::string out       = indent + "for (int32_t i = tid; i < " + bp_len + "; i += 128) {\n" +
+                        indent + "    " + t + " _r = static_cast<" + t + ">(" + residual("i") +
+                        ");\n" + indent + "    unsigned int _g = 0u;\n";
+      for (int k = 0; k < 4; ++k) {
+        out += indent + "    _r *= " + inv + "; _g |= (_r <= " + lim + ") ? " +
+               std::to_string(1 << k) + "u : 0u;\n";
+      }
+      return out + indent + "    _f &= _g;\n" + indent + "}\n";
+    };
+    body_
+      // Pass 1: combined min+max in a single grid-stride loop.
+      << "        " << in.elem_type << " _lmin = " << emax << ";\n"
+      << "        " << in.elem_type << " _lmax = static_cast<" << in.elem_type << ">("
+      << op_dt->min_literal
+      << ");\n"
+      // Bitpack folds in a per-chunk divisor 2^e2 * 5^e5 of every residual v - min --
+      // decimal scales, powers of two, products such as 1000, and any of these over an
+      // offset -- where a general GCD would cost a Euclid per element. A divisor of every
+      // v - min is exactly a divisor of every v - v0, for the chunk's first value v0, so this
+      // pass screens before the minimum is known. e2 costs an OR: v ^ v0 and v - v0 share
+      // their trailing zeros. For 5, one sample per thread screens the
+      // chunk, and only a chunk whose samples all pass verifies every residual.
+      << "        const " << in.elem_type << " _v0 = (" << at_lane(in.read_expr, "0") << ");\n"
+      << "        unsigned long long _or_" << idstr << " = 0ULL;\n"
+      << "        bool _s5_" << idstr
+      << " = true;\n"
+      // Per-warp slots, read after the reduces' barrier: no reset races the warps' writes.
+      << "        __shared__ int " << sh_div << "_tzw[4], " << sh_div << "_ok5w[4], " << sh_div
+      << "_e5;\n"
+      << "        __shared__ unsigned int " << sh_div << "_f;\n"
+      << "        if (tid == 0) { " << sh_div << "_e5 = 127; " << sh_div << "_f = 15u; }\n"
+      << "        if (tid < " << bp_len << ") {\n"
+      << "            const " << in.elem_type << " _vs = (" << at_lane(in.read_expr, "tid")
+      << ");\n"
+      << "            const " << bp_utype << " _dr = _vs < _v0\n"
+      << "                ? static_cast<" << bp_utype << ">(static_cast<" << bp_utype
+      << ">(_v0) - static_cast<" << bp_utype << ">(_vs))\n"
+      << "                : static_cast<" << bp_utype << ">(static_cast<" << bp_utype
+      << ">(_vs) - static_cast<" << bp_utype << ">(_v0));\n"
+      << "            _s5_" << idstr << " = " << fits5 << "static_cast<" << u5 << ">(_dr) * "
+      << inv5 << " <= " << lim5 << ";\n"
+      << "        }\n"
+      << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
+      << "            " << in.elem_type << " _vi = (" << at_lane(in.read_expr, "i") << ");\n"
+      << "            if (_vi < _lmin) _lmin = _vi;\n"
+      << "            if (_vi > _lmax) _lmax = _vi;\n"
+      << "            _or_" << idstr << " |= static_cast<unsigned long long>(static_cast<"
+      << bp_utype << ">(_vi) ^ static_cast<" << bp_utype << ">(_v0));\n"
+      << "        }\n"
+      << "        {\n"
+      << "            const int _tz = simpatico_warp_min(_or_" << idstr
+      << " != 0ULL ? __ffsll(static_cast<long long>(_or_" << idstr << ")) - 1 : 127);\n"
+      << "            const bool _a5 = __all_sync(0xFFFFFFFFu, _s5_" << idstr << ");\n"
+      << "            if ((tid & 31) == 0) { " << sh_div << "_tzw[tid >> 5] = _tz; " << sh_div
+      << "_ok5w[tid >> 5] = _a5 ? 1 : 0; }\n"
+      << "        }\n";
+    emit_range_reduce();
+    body_
+      // The reduces above are the barrier, so every thread derives the same divisor. A
+      // constant chunk keeps the sentinel and divisor 1.
+      << "        const int _btz = min(min(" << sh_div << "_tzw[0], " << sh_div << "_tzw[1]), min("
+      << sh_div << "_tzw[2], " << sh_div << "_tzw[3]));\n"
+      << "        const bool _bok5 = (" << sh_div << "_ok5w[0] & " << sh_div << "_ok5w[1] & "
+      << sh_div << "_ok5w[2] & " << sh_div << "_ok5w[3]) != 0;\n"
+      << "        " << in.elem_type << " " << v_div << " = " << in.elem_type << "{1};\n"
+      << "        if (_btz != 127) {\n"
+      << "            int _e5 = 0;\n"
+      << "            if (_bok5) {\n"
+      // A residual is at most the chunk's range, so the chain runs in 32 bits whenever the
+      // range fits, whatever the lane width. Bit k of _f: 5^(k+1) divides every residual.
+      << "                const " << bp_utype << " _rng = static_cast<" << bp_utype << ">("
+      << sh_max << "_b) - static_cast<" << bp_utype << ">(" << cmin << ");\n"
+      << "                (void)_rng;\n"
+      << "                unsigned int _f = 15u;\n";
+    if (op_dt->elem_size <= 4) {
+      body_ << chain5(false, "                ");
+    } else {
+      body_ << "                if ((_rng >> 32) == 0) {\n"
+            << chain5(false, "                    ")
+            << (op_dt->elem_size == 16 ? "                } else if ((_rng >> 64) == 0) {\n"
+                                       : "                } else {\n")
+            << chain5(true, "                    ")
+            << (op_dt->elem_size == 16 ? "                } else {\n"
+                                         "                    _f = 0u;\n"
+                                       : "")
+            << "                }\n";
+    }
+    body_ << "                const unsigned int _fw = simpatico_warp_and(_f);\n"
+          << "                if ((tid & 31) == 0) atomicAnd(&" << sh_div << "_f, _fw);\n"
+          << "                __syncthreads();\n"
+          // The exponent is the run of set bits; a chunk divisible by 5^4 takes the exact
+          // walk for any higher power. It is reached only when the range fits 64 bits.
+          << "                _e5 = __ffs(~" << sh_div << "_f) - 1;\n"
+          << "                if (_e5 == 4) {\n"
+          << "                    SimpaticoPow5 _p5;\n"
+          << "                    for (int32_t i = tid; i < " << bp_len
+          << " && _p5.e != 4; i += 128) {\n"
+          << "                        _p5.add(static_cast<unsigned long long>(" << residual("i")
+          << "));\n"
+          << "                    }\n"
+          << "                    const int _ew = simpatico_warp_min(_p5.e < 0 ? 127 : "
+             "_p5.e);\n"
+          << "                    if ((tid & 31) == 0) atomicMin(&" << sh_div << "_e5, _ew);\n"
+          << "                    __syncthreads();\n"
+          << "                    _e5 = " << sh_div << "_e5;\n"
+          << "                }\n"
+          << "            }\n"
+          // Capped to fit the signed slot, which keeps it a common divisor.
+          << "            constexpr unsigned long long _lim = "
+          << (op_dt->elem_size <= 8
+                ? "static_cast<unsigned long long>(" + std::string(op_dt->max_literal) + ")"
+                : std::string("0x7FFFFFFFFFFFFFFFULL"))
+          << ";\n"
+          << "            unsigned long long _d = 1ULL;\n"
+          << "            for (int k = 0; k < _e5 && _d <= _lim / 5ULL; ++k) _d *= 5ULL;\n"
+          << "            for (int k = 0; k < _btz && _d <= _lim / 2ULL; ++k) _d *= 2ULL;\n"
+          << "            " << v_div << " = static_cast<" << in.elem_type << ">(_d);\n"
+          << "        }\n";
+  }
+  if (!pack) {
+    body_ << "        const " << bp_utype << " " << max_r << " = simpatico_bp_div(static_cast<"
+          << bp_utype << ">(static_cast<" << bp_utype << ">(" << sh_max << "_b) - static_cast<"
+          << bp_utype << ">(" << cmin << ")), " << v_div << ");\n"
+          << "        const int32_t " << bits_v << " = " << bp_width_fn << "("
+          << "static_cast<" << bp_utype << ">(" << max_r << "));\n"
+          << "        if (tid == 0) {\n"
+          << "            " << p_min << "[chunk_id] = " << cmin << ";\n"
+          << (gcd ? "            " + p_divs + "[chunk_id] = " + v_div + ";\n" + "            if (" +
+                      v_div + " != " + in.elem_type + "{1}) " + p_lws + "[" +
+                      std::to_string(::codegen::kBitpackDivisorFlagWord) + "] = 1u;\n"
+                  : std::string{})
+          << "            " << p_cnt << "[chunk_id] = " << bp_len << ";\n"
+          << "            " << p_bits << "[chunk_id] = static_cast<uint8_t>(" << bits_v << ");\n"
+          << "            const uint32_t _pw = static_cast<uint32_t>((static_cast<int32_t>("
+          << bp_len << ") * " << bits_v << " + 31) / 32);\n"
+          << "            atomicAdd(" << p_lws << " + (static_cast<uint32_t>(chunk_id) & "
+          << (::codegen::kBitpackLiveWordShards - 1) << "u) * "
+          << ::codegen::kBitpackLiveWordShardStride << "u, _pw);\n"
+          << "        }\n";
     // measure: the metadata and the live-word count are this mode's whole output.
     if (measure) { body_ << "        break;\n"; }
   }
@@ -1158,45 +1363,46 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   if (use_smem) {
     // Smem accumulation path: accumulate into per-block __shared__ slab,
     // then store to global.  Eliminates the cudaMemsetAsync pre-zero.
-    body_ << "        __shared__ uint32_t " << smem_pkd << "[" << kSmemPkdWords
-          << "];\n"
-          // _nwords_live: actual packed words written to global (matches lw_shards count).
-          // _nwords_slab: smem slab to zero (+ 2 guard words so the last element's
-          //   atomicOr can safely write _tw+1 without smem OOB).
-          << "        const int32_t _nwords_live_" << idstr << " = (static_cast<int32_t>(" << bp_len
-          << ") * " << bits_v << " + 31) / 32;\n"
-          << "        const int32_t _nwords_slab_" << idstr << " = _nwords_live_" << idstr
-          << " + 2;\n"
-          << "        for (int32_t _w = tid; _w < _nwords_slab_" << idstr << "; _w += 128)\n"
-          << "            " << smem_pkd << "[_w] = 0u;\n"
-          << "        __syncthreads();\n"
-          // Pack into smem (SM-local atomicOr, no L2 cache contention).
-          << "        for (int32_t i = tid; i < " << bp_len
-          << "; i += 128) {\n"
-          // uint64_t is sufficient here, unlike the global path below: this slab
-          // path is only ever reached with elements of 4 bytes or fewer -- RLE's
-          // `runs` child is always int32_t, and its `values` child takes it only
-          // for int8/int16/int32 (see vals_is_bp_leaf_smem). Widening the guard
-          // there would require widening this residual too.
-          << "            uint64_t _rv = static_cast<uint64_t>(" << at_lane(in.read_expr, "i")
-          << ") - static_cast<uint64_t>(" << cmin << ");\n"
-          << "            const int32_t _ibits = i * static_cast<int32_t>(" << bits_v << ");\n"
-          << "            int32_t _tw = _ibits >> 5;\n"
-          << "            int32_t _tb = _ibits & 31;\n"
-          << "            int32_t _rem = " << bits_v << ", _sv = 0;\n"
-          << "            while (_rem > 0) {\n"
-          << "                const int32_t _chunk = (32 - _tb < _rem) ? (32 - _tb) : _rem;\n"
-          << "                const uint32_t _mask = (_chunk == 32) ? 0xFFFFFFFFu : ((1u << "
-             "_chunk) - 1u);\n"
-          << "                atomicOr(&" << smem_pkd << "[_tw],\n"
-          << "                    static_cast<uint32_t>((_rv >> _sv) & _mask) << _tb);\n"
-          << "                _sv += _chunk; _rem -= _chunk; _tw++; _tb = 0;\n"
-          << "            }\n"
-          << "        }\n"
-          << "        __syncthreads();\n"
-          // Coalesced store from smem to global — live words only (guard words stay in smem).
-          << "        for (int32_t _w = tid; _w < _nwords_live_" << idstr << "; _w += 128)\n"
-          << "            " << dst << "[_w] = " << smem_pkd << "[_w];\n";
+    body_
+      << "        __shared__ uint32_t " << smem_pkd << "[" << kSmemPkdWords
+      << "];\n"
+      // _nwords_live: actual packed words written to global (matches lw_shards count).
+      // _nwords_slab: smem slab to zero (+ 2 guard words so the last element's
+      //   atomicOr can safely write _tw+1 without smem OOB).
+      << "        const int32_t _nwords_live_" << idstr << " = (static_cast<int32_t>(" << bp_len
+      << ") * " << bits_v << " + 31) / 32;\n"
+      << "        const int32_t _nwords_slab_" << idstr << " = _nwords_live_" << idstr << " + 2;\n"
+      << "        for (int32_t _w = tid; _w < _nwords_slab_" << idstr << "; _w += 128)\n"
+      << "            " << smem_pkd << "[_w] = 0u;\n"
+      << "        __syncthreads();\n"
+      // Pack into smem (SM-local atomicOr, no L2 cache contention).
+      << "        for (int32_t i = tid; i < " << bp_len
+      << "; i += 128) {\n"
+      // uint64_t is sufficient here, unlike the global path below: this slab
+      // path is only ever reached with elements of 4 bytes or fewer -- RLE's
+      // `runs` child is always int32_t, and its `values` child takes it only
+      // for int8/int16/int32 (see vals_is_bp_leaf_smem). Widening the guard
+      // there would require widening this residual too.
+      << "            uint64_t _rv = simpatico_bp_div(static_cast<uint64_t>(static_cast<uint64_t>("
+      << at_lane(in.read_expr, "i") << ") - static_cast<uint64_t>(" << cmin << ")), " << v_div
+      << ");\n"
+      << "            const int32_t _ibits = i * static_cast<int32_t>(" << bits_v << ");\n"
+      << "            int32_t _tw = _ibits >> 5;\n"
+      << "            int32_t _tb = _ibits & 31;\n"
+      << "            int32_t _rem = " << bits_v << ", _sv = 0;\n"
+      << "            while (_rem > 0) {\n"
+      << "                const int32_t _chunk = (32 - _tb < _rem) ? (32 - _tb) : _rem;\n"
+      << "                const uint32_t _mask = (_chunk == 32) ? 0xFFFFFFFFu : ((1u << "
+         "_chunk) - 1u);\n"
+      << "                atomicOr(&" << smem_pkd << "[_tw],\n"
+      << "                    static_cast<uint32_t>((_rv >> _sv) & _mask) << _tb);\n"
+      << "                _sv += _chunk; _rem -= _chunk; _tw++; _tb = 0;\n"
+      << "            }\n"
+      << "        }\n"
+      << "        __syncthreads();\n"
+      // Coalesced store from smem to global — live words only (guard words stay in smem).
+      << "        for (int32_t _w = tid; _w < _nwords_live_" << idstr << "; _w += 128)\n"
+      << "            " << dst << "[_w] = " << smem_pkd << "[_w];\n";
   } else {
     // Global atomicOr path (default): requires pre-zeroed packed buffer.
     // Pass 2: while-loop pack with one shared 32-bit multiply per element.
@@ -1205,8 +1411,9 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
     // One 32-bit IMAD (_ibits) shared for both _tw and _tb replaces
     // the original two independent 64-bit multiplies (~4 vs ~8 cycles).
     body_ << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
-          << "            " << bp_utype << " _rv = static_cast<" << bp_utype << ">("
-          << at_lane(in.read_expr, "i") << ") - static_cast<" << bp_utype << ">(" << cmin << ");\n"
+          << "            " << bp_utype << " _rv = simpatico_bp_div(static_cast<" << bp_utype
+          << ">(static_cast<" << bp_utype << ">(" << at_lane(in.read_expr, "i")
+          << ") - static_cast<" << bp_utype << ">(" << cmin << ")), " << v_div << ");\n"
           << "            const int32_t _ibits = i * static_cast<int32_t>(" << bits_v << ");\n"
           << "            int32_t _tw = _ibits >> 5;\n"
           << "            int32_t _tb = _ibits & 31;\n"

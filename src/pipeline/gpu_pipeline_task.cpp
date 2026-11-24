@@ -450,11 +450,34 @@ gpu_pipeline_task::~gpu_pipeline_task()
   }
   _subscribed_batches.clear();
 
-  if (_global_state == nullptr ||
-      _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
-    return;
+  if (_global_state == nullptr) { return; }
+  auto* pipeline = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+  if (pipeline == nullptr) { return; }
+  try {
+    pipeline->mark_task_completed();
+  } catch (...) {
+    // Completing the last task finalizes the pipeline's operators, which do device work and can
+    // throw. An exception leaving this destructor would terminate the process, so fail the
+    // task's query instead.
+    auto error = std::current_exception();
+    if (auto completion = get_completion_handler()) {
+      completion->report_error(error, transparent::late_failure_cause::gpu_error);
+    }
+    log::log_noexcept([&] {
+      try {
+        std::rethrow_exception(error);
+      } catch (std::exception const& e) {
+        SIRIUS_LOG_ERROR("gpu_pipeline_task: completing task {} of pipeline {} failed: {}",
+                         get_task_id(),
+                         pipeline->get_pipeline_id(),
+                         e.what());
+      } catch (...) {
+        SIRIUS_LOG_ERROR("gpu_pipeline_task: completing task {} of pipeline {} failed",
+                         get_task_id(),
+                         pipeline->get_pipeline_id());
+      }
+    });
   }
-  _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->mark_task_completed();
 }
 
 const sirius_pipeline* gpu_pipeline_task::get_pipeline() const

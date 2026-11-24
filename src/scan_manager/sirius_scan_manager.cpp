@@ -70,6 +70,7 @@
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/column_metadata.hpp>
+#include <cucascade/memory/cpu_constraints.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/error_data.hpp>
@@ -1415,20 +1416,55 @@ sirius_scan_manager::sirius_scan_manager(
   std::shared_ptr<const sirius::memory::topology_index> topology_index,
   std::shared_ptr<op::scan::physical_check_counters> physical_counters)
   : _query_lifecycle(lifecycle),
-    _config(validate_scan_manager_config(config)),
+    _config([&] {
+      auto resolved = validate_scan_manager_config(config);
+      if (resolved.startup_cpus.empty())
+        resolved.startup_cpus = cucascade::memory::discover_cpu_constraints().allowed_cpus;
+      auto& pool_cpus = resolved.thread_pool.cpu_affinity_list;
+      pool_cpus       = pool_cpus.empty()
+                          ? resolved.startup_cpus
+                          : cucascade::memory::intersect_cpu_affinity(pool_cpus, resolved.startup_cpus);
+      if (pool_cpus.empty())
+        throw std::invalid_argument("scan workers have no CPUs within the rank boundary");
+      resolved.worker_startup_cpus = resolved.worker_startup_cpus.empty()
+                                       ? resolved.startup_cpus
+                                       : cucascade::memory::intersect_cpu_affinity(
+                                           resolved.worker_startup_cpus, resolved.startup_cpus);
+      if (resolved.worker_startup_cpus.empty())
+        throw std::invalid_argument("scan control workers have no CPUs within the rank boundary");
+      return resolved;
+    }()),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _physical_counters(std::move(physical_counters)),
+    _metadata_placement(
+      _topology_index ? resolve_metadata_placement(*_topology_index, _config.startup_cpus, _config)
+                      : throw std::invalid_argument("scan manager requires topology")),
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
-                 _config.thread_pool.cpu_affinity_list),
+                 {},
+                 nullptr,
+                 _metadata_placement.cpus),
     _native_readers(_config.preparation.resolved_native_workers(),
-                    _config.preparation.resolved_native_readers()),
-    _coordinators(_config.preparation.resolved_coordinator_workers()),
+                    _config.preparation.resolved_native_readers(),
+                    _config.worker_startup_cpus),
+    _coordinators(_config.preparation.resolved_coordinator_workers(), _config.worker_startup_cpus),
     _ioctx_registry(_config.to_io_config(), reservation_manager)
 {
   if (!_topology_index) {
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
+  }
+
+  for (size_t domain = 0; domain < _metadata_placement.cpus.size(); ++domain) {
+    std::string cpus;
+    for (int cpu : _metadata_placement.cpus[domain]) {
+      if (!cpus.empty()) cpus += ",";
+      cpus += std::to_string(cpu);
+    }
+    SIRIUS_LOG_INFO("scan metadata domain={} numa_node={} cpus={}",
+                    domain,
+                    _metadata_placement.nodes[domain],
+                    cpus);
   }
 
   // The configured local context is mandatory: uring for native, cuFile for
@@ -1678,8 +1714,9 @@ void sirius_scan_manager::prepare_for_query(
   state->completion = completion;
   state->active_gpu_ids.assign(allocated_gpu_ids.begin(), allocated_gpu_ids.end());
   // Deliberately NOT divided by the query count: a lone query must still be able to use the
-  // whole pool. Dispatchers yield between tasks; each shared pool selects older queries
-  // first and preserves FIFO order within each query's priority.
+  // whole pool across its eligible domains. Dispatchers yield between tasks; the shared
+  // pool selects older queries first among work eligible for each worker. Within a query,
+  // pending metadata/coalescing classes alternate, with FIFO order within each class.
   auto const priority = sirius::query_priority_bits(query_id);
   state->dispatcher =
     std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads(), priority);
@@ -2209,12 +2246,29 @@ void sirius_scan_manager::prepare_for_query(
 std::unique_ptr<preparation_coordinator> sirius_scan_manager::make_preparation_coordinator(
   query_scan_manager_state& state)
 {
+  std::vector<int> domains;
+  for (int gpu : state.active_gpu_ids) {
+    auto node = _topology_index->numa_node_of(gpu);
+    auto it   = std::find(_metadata_placement.nodes.begin(), _metadata_placement.nodes.end(), node);
+    if (it != _metadata_placement.nodes.end()) {
+      auto domain = static_cast<int>(it - _metadata_placement.nodes.begin());
+      if (std::find(domains.begin(), domains.end(), domain) == domains.end())
+        domains.push_back(domain);
+    }
+  }
+  // CPU restrictions may exclude every GPU-local domain for this query. Use the
+  // first permitted manager domain, even when it is remote from the query's GPUs.
+  if (domains.empty()) domains.push_back(0);
+  rotate_metadata_domains(domains, _next_metadata_domain);
+  auto options                 = state.preparation;
+  options.control_cpu_affinity = _config.worker_startup_cpus;
   return std::make_unique<preparation_coordinator>(
     *state.completion,
     *state.dispatcher,
-    state.preparation,
+    std::move(options),
     &_native_readers,
-    _config.preparation.resolved_coordinator_workers() ? &_coordinators : nullptr);
+    _config.preparation.resolved_coordinator_workers() ? &_coordinators : nullptr,
+    std::move(domains));
 }
 
 void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state,
@@ -2520,8 +2574,9 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   // inherit it. First use may come from a pool thread whose mask excludes the CPUs reserved for
   // the reactors (e.g. a deferred Puffin read on a metadata worker), so build from the mask the
   // reservation was planned from.
-  if (type == cucascade::io::io_context_type::restful && !_config.rest_placement_cpus.empty()) {
-    exec::run_with_affinity(_config.rest_placement_cpus, build_and_start);
+  if (type == cucascade::io::io_context_type::restful && !_config.startup_cpus.empty()) {
+    exec::scoped_startup_affinity affinity(_config.startup_cpus);
+    build_and_start();
   } else {
     build_and_start();
   }
