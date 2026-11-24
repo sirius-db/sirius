@@ -116,7 +116,7 @@ during construction. Field names are case-sensitive; file schemas and engine sup
 belong to future preparation.
 
 ```text
-ParquetScan(schema, path) → Filter(predicate) → Plan
+ParquetScan(schema, location) → Filter(predicate) → Plan
 predicate = comparison(column, literal)
 ```
 
@@ -145,6 +145,11 @@ characters are never expanded. Relative local paths are resolved using the worki
 directory at future preparation time; the same relative description can therefore refer to
 different files in different directories.
 
+For example, `s3//b/k`, a name consisting of a space followed by `s3://b/k`, and `"s3://b/k"`
+with the quote bytes included are local paths. Their escaped names appear in the description.
+By contrast, `s3:/b/k` has a URI scheme but is not a valid S3 location, so construction
+refuses it.
+
 An S3 location is `s3://bucket/key`, with the scheme in either ASCII case. The bucket is one
 or more ASCII letters, digits, `.`, `_` or `-`, other than `.` or `..`. User-info and a port
 cannot be written, and a host name there is a bucket name, not an endpoint. The key is not
@@ -156,8 +161,9 @@ diagnostic does not repeat the input.
 A scan takes no credentials or object-store configuration, and construction does not select
 a store. Store selection belongs to future preparation and can refuse a location that
 construction accepts: object-store prefix matching currently cannot serve a key that contains
-`%`, an empty, `.` or `..` segment, or a trailing slash. sirius_plan_describe() shows every
-S3 scan as `s3://<redacted>` instead of printing its bucket or key.
+`%`, an empty, `.` or `..` segment, or a trailing slash. For the scan source,
+`sirius_plan_describe()` shows `s3://<redacted>` only for a location accepted as S3; it does
+not print that location's bucket or key.
 
 Plan nodes and expression trees currently support up to 256 levels. Unknown type
 and comparison identifiers, mismatched scopes, invalid schemas, and unsupported

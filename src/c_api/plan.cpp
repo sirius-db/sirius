@@ -62,26 +62,6 @@ bool has_uri_scheme(std::string_view path)
            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-") ==
          std::string_view::npos;
 }
-scan_source classify_scan_source(std::string_view source)
-{
-  if (!has_uri_scheme(source)) { return scan_source::local_path; }
-  constexpr std::string_view prefix = "s3://";
-  constexpr std::string_view bucket_bytes =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
-  require(absl::StartsWithIgnoreCase(source, prefix),
-          "Expected a local file path or an s3://bucket/key URI");
-  source.remove_prefix(prefix.size());
-  require(source.find_first_of("?#") == std::string_view::npos,
-          "S3 URI must not contain '?' or '#'");
-  auto slash  = source.find('/');
-  auto bucket = source.substr(0, slash);
-  require(!bucket.empty() && bucket != "." && bucket != "..",
-          "S3 bucket must not be empty, '.' or '..'");
-  require(bucket.find_first_not_of(bucket_bytes) == std::string_view::npos,
-          "S3 bucket must use only ASCII letters, digits, '.', '_' or '-'");
-  require(slash != std::string_view::npos && slash + 1 < source.size(), "S3 URI has no object key");
-  return scan_source::s3_object;
-}
 bool is_valid_utf8(std::string_view text)
 {
   while (!text.empty()) {
@@ -130,11 +110,15 @@ std::string describe(const sirius_plan_node& root)
   while (node) {
     result.append(indentation, ' ');
     if (auto scan = std::get_if<parquet_scan>(&node->value)) {
-      if (scan->source == scan_source::s3_object) {
-        result += "ParquetScan(uri=\"s3://<redacted>\")\n";
-      } else {
-        result += "ParquetScan(path=" + quoted(scan->path) + ")\n";
-      }
+      struct {
+        std::string& out;
+        void operator()(local_file const& file) const
+        {
+          out += "ParquetScan(path=" + quoted(file.path) + ")\n";
+        }
+        void operator()(s3_object const&) const { out += "ParquetScan(uri=\"s3://<redacted>\")\n"; }
+      } show{result};
+      std::visit(show, scan->source());
       node = nullptr;
     } else {
       const auto& value = std::get<filter>(node->value);
@@ -153,6 +137,30 @@ std::string describe(const sirius_plan_node& root)
   return definitions + result + '\n';
 }
 }  // namespace
+namespace sirius::c_api::plan {
+parquet_scan parquet_scan::parse_scan_source(char const* location, std::size_t location_size)
+{
+  auto name = bytes(location, location_size);
+  if (!has_uri_scheme(name)) { return parquet_scan{local_file{std::move(name)}}; }
+  constexpr std::string_view prefix = "s3://";
+  constexpr std::string_view bucket_bytes =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
+  std::string_view const uri = name;
+  require(absl::StartsWithIgnoreCase(uri, prefix),
+          "Expected a local file path or an s3://bucket/key URI");
+  require(uri.find_first_of("?#", prefix.size()) == std::string_view::npos,
+          "S3 URI must not contain '?' or '#'");
+  auto const bucket_end = uri.find('/', prefix.size());
+  auto const bucket     = uri.substr(prefix.size(), bucket_end - prefix.size());
+  require(!bucket.empty() && bucket != "." && bucket != "..",
+          "S3 bucket must not be empty, '.' or '..'");
+  require(bucket.find_first_not_of(bucket_bytes) == std::string_view::npos,
+          "S3 bucket must use only ASCII letters, digits, '.', '_' or '-'");
+  require(bucket_end != std::string_view::npos && bucket_end + 1 < uri.size(),
+          "S3 URI has no object key");
+  return parquet_scan{s3_object{std::move(name), bucket_end}};
+}
+}  // namespace sirius::c_api::plan
 
 sirius_status sirius_schema_create(const sirius_field* fields,
                                    size_t count,
@@ -192,17 +200,16 @@ sirius_status sirius_schema_field(const sirius_schema* schema,
     *out_field = {field.name.c_str(), field.name.size(), field.type, uint32_t{field.nullable}};
   });
 }
-sirius_status sirius_plan_scan_parquet(const char* path,
-                                       size_t path_size,
+sirius_status sirius_plan_scan_parquet(const char* location,
+                                       size_t location_size,
                                        const sirius_schema* schema,
                                        sirius_plan_node** out_node,
                                        sirius_error** out_error) noexcept
 {
   return create(out_node, out_error, [&] {
     require(schema != nullptr, "Schema is NULL");
-    auto name   = bytes(path, path_size);
-    auto source = classify_scan_source(name);
-    return new sirius_plan_node(acquire(schema), parquet_scan{std::move(name), source}, 1);
+    auto scan = parquet_scan::parse_scan_source(location, location_size);
+    return new sirius_plan_node(acquire(schema), std::move(scan), 1);
   });
 }
 sirius_status sirius_expression_column(const sirius_plan_node* input,

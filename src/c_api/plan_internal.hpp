@@ -4,9 +4,11 @@
 #include <sirius-c/plan/plan.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -45,10 +47,22 @@ struct comparison {
   owner<sirius_expression> right;
   sirius_comparison operation;
 };
-enum class scan_source : std::uint8_t { local_path, s3_object };
-struct parquet_scan {
+struct local_file {
   std::string path;
-  scan_source source = scan_source::local_path;
+};
+struct s3_object {
+  std::string uri;
+  std::size_t bucket_end;
+};
+class parquet_scan {
+ public:
+  using source_type = std::variant<local_file, s3_object>;
+  static parquet_scan parse_scan_source(char const* location, std::size_t location_size);
+  source_type const& source() const noexcept { return source_; }
+
+ private:
+  explicit parquet_scan(source_type source) : source_(std::move(source)) {}
+  source_type source_;
 };
 struct filter {
   owner<sirius_plan_node> input;

@@ -10,18 +10,29 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <iterator>
+#include <initializer_list>
 #include <latch>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
 namespace {
+using sirius::c_api::plan::local_file;
 using sirius::c_api::plan::parquet_scan;
-using sirius::c_api::plan::scan_source;
+using sirius::c_api::plan::s3_object;
+
+static_assert(!std::is_default_constructible_v<parquet_scan>);
+static_assert(!std::is_constructible_v<parquet_scan, std::string>);
+static_assert(!std::is_constructible_v<parquet_scan, const char*, size_t>);
+static_assert(!std::is_constructible_v<parquet_scan, parquet_scan::source_type>);
+static_assert(!std::is_constructible_v<parquet_scan, local_file>);
+static_assert(!std::is_constructible_v<parquet_scan, s3_object>);
+
+constexpr std::string_view redacted_scan_line = "ParquetScan(uri=\"s3://<redacted>\")\n";
 
 template <class T, auto Drop>
 using handle            = std::unique_ptr<T, decltype(Drop)>;
@@ -84,6 +95,51 @@ plan_handle plan(const sirius_plan_node* root)
   return {out, sirius_plan_release};
 }
 
+void check_s3_scan(const sirius_plan_node* node,
+                   std::string_view location,
+                   std::string_view bucket,
+                   std::string_view key)
+{
+  auto const* stored = std::get_if<parquet_scan>(&node->value);
+  REQUIRE(stored != nullptr);
+  auto const* object = std::get_if<s3_object>(&stored->source());
+  REQUIRE(object != nullptr);
+  std::string_view const uri = object->uri;
+  REQUIRE(uri == location);
+  auto const end = object->bucket_end;
+  REQUIRE(end == 5 + bucket.size());
+  REQUIRE(end < uri.size());
+  CHECK(uri[end] == '/');
+  CHECK(uri.substr(5, end - 5) == bucket);
+  CHECK(uri.substr(end + 1) == key);
+
+  auto result                        = plan(node);
+  std::string_view const description = sirius_plan_describe(result.get());
+  CHECK(description.starts_with(redacted_scan_line));
+  CHECK(description.find("BucketCanary") == std::string_view::npos);
+  CHECK(description.find("KeyCanary") == std::string_view::npos);
+}
+
+bool builds_redacted_scan(const sirius_schema* fields, std::string_view uri)
+{
+  sirius_plan_node* raw_node = nullptr;
+  auto status = sirius_plan_scan_parquet(uri.data(), uri.size(), fields, &raw_node, nullptr);
+  node_handle node(raw_node, sirius_plan_node_release);
+  if (status != SIRIUS_SUCCESS || !node) { return false; }
+  sirius_plan* raw_plan = nullptr;
+  status                = sirius_plan_from_root(node.get(), &raw_plan, nullptr);
+  plan_handle result(raw_plan, sirius_plan_release);
+  if (status != SIRIUS_SUCCESS || !result || sirius_plan_root(result.get()) != node.get()) {
+    return false;
+  }
+  auto text = sirius_plan_describe(result.get());
+  if (!text) { return false; }
+  std::string_view const description(text);
+  return description.starts_with(redacted_scan_line) &&
+         description.find("BucketCanary") == std::string_view::npos &&
+         description.find("KeyCanary") == std::string_view::npos;
+}
+
 std::string refusal_message(const sirius_schema* fields, const char* data, size_t size)
 {
   std::string message;
@@ -105,8 +161,10 @@ std::string refusal_message(const sirius_schema* fields, const char* data, size_
       REQUIRE(diagnostic != nullptr);
       message.assign(sirius_error_message(error), sirius_error_message_size(error));
       CHECK_FALSE(message.empty());
-      CHECK(message.find("Canary") == std::string::npos);
-      CHECK(message.find("SECRET") == std::string::npos);
+      if (data && size) {
+        CHECK(message.find("Canary") == std::string::npos);
+        CHECK(message.find("SECRET") == std::string::npos);
+      }
     }
   }
   return message;
@@ -115,24 +173,30 @@ std::string refusal_message(const sirius_schema* fields, const char* data, size_
 
 TEST_CASE("C Parquet scans keep exact S3 source bytes but hide the whole URI", "[public_plan]")
 {
-  constexpr std::string_view locations[]{"s3://bucket/file",
-                                         "S3://Bucket/a:b* c\xff",
-                                         "s3://b/k@part",
-                                         "s3://b/k%40part",
-                                         "s3://b/a//c",
-                                         "s3://b/./c",
-                                         "s3://b/a/../c",
-                                         "s3://b/a%20b",
-                                         "s3://b/dir/",
-                                         "s3://BucketCanary_9.-/KeyCanary",
-                                         "S3://BucketCanary/KeyCanary:a* b\xff",
-                                         "S3://BucketCanary/KeyCanary@part",
-                                         "s3://BucketCanary/KeyCanary%2Fpart",
-                                         "s3://BucketCanary/KeyCanary/part"};
+  struct parts {
+    std::string_view scheme, bucket, key;
+  };
+  constexpr parts locations[]{{"s3://", "bucket", "file"},
+                              {"S3://", "Bucket", "a:b* c\xff"},
+                              {"s3://", "b", "k@part"},
+                              {"s3://", "b", "k%40part"},
+                              {"s3://", "b", "a//c"},
+                              {"s3://", "b", "./c"},
+                              {"s3://", "b", "a/../c"},
+                              {"s3://", "b", "a%20b"},
+                              {"s3://", "b", "dir/"},
+                              {"s3://", "BucketCanary_9.-", "KeyCanary"},
+                              {"S3://", "BucketCanary", "KeyCanary:a* b\xff"},
+                              {"S3://", "BucketCanary", "KeyCanary@part"},
+                              {"s3://", "BucketCanary", "KeyCanary%2Fpart"},
+                              {"s3://", "BucketCanary", "KeyCanary/part"},
+                              {"s3://", "...", "k"},
+                              {"s3://", "-b", "k"},
+                              {"s3://", "_b", "k"}};
   auto fields = schema();
-  for (size_t i = 0; i < std::size(locations); ++i) {
-    CAPTURE(i);
-    auto const location = locations[i];
+  for (auto const& [scheme, bucket, key] : locations) {
+    std::string const location = std::string(scheme).append(bucket).append("/").append(key);
+    CAPTURE(location);
     std::string caller(location);
     sirius_plan_node* out = nullptr;
     const auto status =
@@ -145,66 +209,70 @@ TEST_CASE("C Parquet scans keep exact S3 source bytes but hide the whole URI", "
     CHECK(sirius_plan_node_get_kind(out) == SIRIUS_NODE_PARQUET_SCAN);
     CHECK(sirius_plan_node_input(out) == nullptr);
     CHECK(sirius_plan_node_schema(out) == fields.get());
-    auto const* stored = std::get_if<parquet_scan>(&out->value);
-    REQUIRE(stored != nullptr);
-    CHECK(stored->source == scan_source::s3_object);
-    CHECK(stored->path == location);
-
-    auto result                        = plan(out);
-    const std::string_view description = sirius_plan_describe(result.get());
-    const auto end                     = description.find('\n');
-    REQUIRE(end != std::string_view::npos);
-    CHECK(description.substr(0, end) == R"(ParquetScan(uri="s3://<redacted>"))");
-    CHECK(description.find("BucketCanary") == std::string_view::npos);
-    CHECK(description.find("KeyCanary") == std::string_view::npos);
+    check_s3_scan(out, location, bucket, key);
   }
+
+  std::string caller = "s3://b/k?x";
+  auto short_scan    = scan(fields.get(), {caller.data(), 8});
+  refusal_message(fields.get(), caller.data(), 9);
+  std::fill(caller.begin(), caller.end(), '!');
+  check_s3_scan(short_scan.get(), "s3://b/k", "b", "k");
 }
 
 TEST_CASE("C Parquet scans reject malformed locations without echoing input", "[public_plan]")
 {
   using namespace std::string_view_literals;
-  struct refusal {
-    const char* rule;
-    std::string_view first;
-    std::string_view second;
+  auto fields      = schema();
+  auto same_reason = [&](std::string_view control, std::initializer_list<std::string_view> inputs) {
+    CAPTURE(control);
+    auto reason = refusal_message(fields.get(), control.data(), control.size());
+    for (auto input : inputs) {
+      CAPTURE(input);
+      auto observed = refusal_message(fields.get(), input.data(), input.size());
+      CHECK(observed == reason);
+    }
+    return reason;
   };
-  constexpr refusal rows[]{
-    {"empty bucket", "s3:///KeyCanaryA", "s3:///KeyCanaryB"},
-    {"dot bucket", "s3://./KeyCanaryA", "s3://./KeyCanaryB"},
-    {"dot-dot bucket", "s3://../KeyCanaryA", "s3://../KeyCanaryB"},
-    {"authority @", "s3://UserCanaryA@b/k", "s3://UserCanaryB@c/j"},
-    {"authority colon", "s3://u:SECRET/with/slash@bucket/k", "s3://u:UserCanary/a@other/j"},
-    {"authority percent", "s3://BucketCanaryA%40b/k", "s3://BucketCanaryB%41c/j"},
-    {"authority space", "s3://BucketCanaryA b/k", "s3://BucketCanaryB c/j"},
-    {"non-ASCII authority", "s3://BucketCanaryA\xff/k", "s3://BucketCanaryB\xfe/j"},
-    {"no key separator", "s3://BucketCanaryA", "s3://BucketCanaryB"},
-    {"empty key", "s3://BucketCanaryA/", "s3://BucketCanaryB/"},
-    {"authority query", "s3://b?QueryCanaryA/k", "s3://c?QueryCanaryB/j"},
-    {"authority fragment", "s3://b#FragmentCanaryA/k", "s3://c#FragmentCanaryB/j"},
-    {"key query", "s3://b/k?QueryCanaryA", "s3://c/j?QueryCanaryB"},
-    {"key fragment", "s3://b/k#FragmentCanaryA", "s3://c/j#FragmentCanaryB"},
-    {"NUL", "s3://b/KeyCanaryA\0x"sv, "s3://c/KeyCanaryB\0y"sv},
-    {"other scheme", "https://BucketCanaryA/k", "https://BucketCanaryB/j"},
-    {"S3 without //", "s3:BucketCanaryA/k", "s3:BucketCanaryB/j"},
-  };
-  auto fields = schema();
   SECTION("null and empty ranges")
   {
     refusal_message(fields.get(), nullptr, 0);
     auto missing_a = refusal_message(fields.get(), nullptr, 1);
     auto missing_b = refusal_message(fields.get(), nullptr, 2);
     CHECK(missing_a == missing_b);
-    auto empty_a = refusal_message(fields.get(), "UnusedCanaryA", 0);
-    auto empty_b = refusal_message(fields.get(), "UnusedCanaryB", 0);
-    CHECK(empty_a == empty_b);
+    refusal_message(fields.get(), "", 0);
   }
-  for (auto const& row : rows) {
-    DYNAMIC_SECTION(row.rule)
-    {
-      auto first  = refusal_message(fields.get(), row.first.data(), row.first.size());
-      auto second = refusal_message(fields.get(), row.second.data(), row.second.size());
-      CHECK(first == second);
-    }
+  SECTION("a delimiter is not a bucket charset error")
+  {
+    auto charset = same_reason("s3://BucketCanaryA b/k",
+                               {"s3://BucketCanaryB c/j",
+                                "s3://UserCanaryA@b/k",
+                                "s3://UserCanaryB@c/j",
+                                "s3://u:SECRET/with/slash@bucket/k",
+                                "s3://u:UserCanary/a@other/j",
+                                "s3://BucketCanaryA%40b/k",
+                                "s3://BucketCanaryB%41c/j",
+                                "s3://BucketCanaryA\xff/k",
+                                "s3://BucketCanaryB\xfe/j"});
+    auto query =
+      same_reason("s3://b/k?QueryCanaryA",
+                  {"s3://c/j?QueryCanaryB", "s3://b?QueryCanaryA/k", "s3://c?QueryCanaryB/j"});
+    auto fragment = same_reason(
+      "s3://b/k#FragmentCanaryA",
+      {"s3://c/j#FragmentCanaryB", "s3://b#FragmentCanaryA/k", "s3://c#FragmentCanaryB/j"});
+    CHECK(query != charset);
+    CHECK(fragment != charset);
+  }
+  SECTION("bucket, key, scheme and counted bytes")
+  {
+    auto empty_bucket = same_reason("s3:///KeyCanaryA", {"s3:///KeyCanaryB", "s3://", "S3:///k"});
+    auto no_key       = same_reason("s3://BucketCanaryA",
+                                    {"s3://BucketCanaryB", "s3://BucketCanaryA/", "s3://BucketCanaryB/"});
+    CHECK(empty_bucket != no_key);
+    same_reason("s3://./KeyCanaryA", {"s3://./KeyCanaryB"});
+    same_reason("s3://../KeyCanaryA", {"s3://../KeyCanaryB"});
+    same_reason("https://BucketCanaryA/k", {"https://BucketCanaryB/j", "s3a://b/k"});
+    same_reason("s3:BucketCanaryA/k", {"s3:BucketCanaryB/j", "s3:/b/k"});
+    same_reason("s3://b/KeyCanaryA\0x"sv, {"s3://c/KeyCanaryB\0y"sv});
   }
 }
 
@@ -418,6 +486,20 @@ TEST_CASE("C plan failures clear outputs and provide optional diagnostics", "[pu
     CHECK(sirius_plan_scan_parquet(path.data(), path.size(), fields.get(), &invalid, nullptr) ==
           SIRIUS_INVALID_ARGUMENT);
   }
+  auto check_local = [&](std::string_view path, std::string_view expected_line) {
+    CAPTURE(path);
+    auto local         = scan(fields.get(), path);
+    auto const* stored = std::get_if<parquet_scan>(&local->value);
+    REQUIRE(stored != nullptr);
+    auto const* file = std::get_if<local_file>(&stored->source());
+    REQUIRE(file != nullptr);
+    CHECK(file->path == path);
+    auto literal_path                  = plan(local.get());
+    const std::string_view description = sirius_plan_describe(literal_path.get());
+    auto const end                     = description.find('\n');
+    REQUIRE(end != std::string_view::npos);
+    CHECK(description.substr(0, end) == expected_line);
+  };
   for (const std::string path : {"./data:1.parquet",
                                  "./name:part",
                                  "1a:x.parquet",
@@ -427,14 +509,11 @@ TEST_CASE("C plan failures clear outputs and provide optional diagnostics", "[pu
                                  "a].parquet",
                                  "./s3://b/k",
                                  "//name/path"}) {
-    auto local         = scan(fields.get(), path);
-    auto const* stored = std::get_if<parquet_scan>(&local->value);
-    REQUIRE(stored != nullptr);
-    CHECK(stored->source == scan_source::local_path);
-    auto literal_path                  = plan(local.get());
-    const std::string_view description = sirius_plan_describe(literal_path.get());
-    CHECK(description.starts_with("ParquetScan(path=\"" + path + "\")\n"));
+    check_local(path, "ParquetScan(path=\"" + path + "\")");
   }
+  check_local(" s3://b/k", R"(ParquetScan(path=" s3://b/k"))");
+  check_local("s3//b/k", R"(ParquetScan(path="s3//b/k"))");
+  check_local(R"("s3://b/k")", R"(ParquetScan(path="\"s3://b/k\""))");
   CHECK(sirius_plan_scan_parquet("a\0b", 3, fields.get(), &invalid, nullptr) ==
         SIRIUS_INVALID_ARGUMENT);
   CHECK(sirius_plan_scan_parquet(nullptr, 1, fields.get(), &invalid, nullptr) ==
@@ -506,33 +585,43 @@ TEST_CASE("C construction bounds depth and describes shared expressions linearly
 
 TEST_CASE("C immutable plans support concurrent ownership and construction", "[public_plan]")
 {
-  auto fields   = schema();
-  auto source   = scan(fields.get(), GENERATE("missing.parquet", "s3://bucket/file"));
-  auto yes      = truth();
-  auto original = plan(source.get());
+  auto fields                   = schema();
+  auto source                   = scan(fields.get());
+  auto yes                      = truth();
+  auto original                 = plan(source.get());
   const std::string description = sirius_plan_describe(original.get());
   std::atomic<unsigned> failures{0};
+  std::latch start{1};
+  auto worker = [&](std::string uri) {
+    start.wait();
+    for (int i = 0; i < 100; ++i) {
+      sirius_schema_retain(fields.get());
+      sirius_plan_node_retain(source.get());
+      sirius_expression_retain(yes.get());
+      sirius_plan_retain(original.get());
+      sirius_plan_node* next = nullptr;
+      if (sirius_plan_filter(source.get(), yes.get(), &next, nullptr) != SIRIUS_SUCCESS) ++failures;
+      if (std::string_view(sirius_plan_describe(original.get())) != description) ++failures;
+      if (!builds_redacted_scan(fields.get(), uri)) ++failures;
+      sirius_plan_node_release(next);
+      sirius_plan_release(original.get());
+      sirius_expression_release(yes.get());
+      sirius_plan_node_release(source.get());
+      sirius_schema_release(fields.get());
+    }
+  };
   {
     std::vector<std::jthread> threads;
-    for (int t = 0; t < 4; ++t) {
-      threads.emplace_back([&] {
-        for (int i = 0; i < 100; ++i) {
-          sirius_schema_retain(fields.get());
-          sirius_plan_node_retain(source.get());
-          sirius_expression_retain(yes.get());
-          sirius_plan_retain(original.get());
-          sirius_plan_node* next = nullptr;
-          if (sirius_plan_filter(source.get(), yes.get(), &next, nullptr) != SIRIUS_SUCCESS)
-            ++failures;
-          if (std::string(sirius_plan_describe(original.get())) != description) ++failures;
-          sirius_plan_node_release(next);
-          sirius_plan_release(original.get());
-          sirius_expression_release(yes.get());
-          sirius_plan_node_release(source.get());
-          sirius_schema_release(fields.get());
-        }
-      });
+    try {
+      for (int t = 0; t < 4; ++t) {
+        auto id = std::to_string(t);
+        threads.emplace_back(worker, "s3://BucketCanary" + id + "/KeyCanary" + id);
+      }
+    } catch (...) {
+      start.count_down();
+      throw;
     }
+    start.count_down();
   }
   CHECK(failures == 0);
 }
