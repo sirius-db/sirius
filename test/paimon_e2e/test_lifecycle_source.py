@@ -72,6 +72,20 @@ class AnchoredLifecycleTests(unittest.TestCase):
         self.assertEqual(facts["exit_status"], 0)
         self.assertEqual(facts["cleanup"]["anchor_exit_status"], -signal.SIGKILL)
 
+    def test_status_eof_after_deadline_is_not_success(self):
+        data = bytearray(struct.pack("!i", 0))
+        with mock.patch.object(
+            run_e2e.time, "monotonic", side_effect=[0.0, 0.003]
+        ), mock.patch.object(
+            run_e2e.select, "select", return_value=([42], [], [])
+        ) as ready, mock.patch.object(
+            run_e2e.os, "read", return_value=b""
+        ):
+            status = run_e2e.read_child_status(42, data, deadline=0.002)
+
+        self.assertIsNone(status)
+        ready.assert_called_once_with([42], [], [], 0.002)
+
     def test_cpp_failure_and_raw_survive_group_error(self):
         facts, error, _ = self.exercise(
             struct.pack("!i", 7), group_error=PermissionError("denied")
@@ -167,7 +181,9 @@ class AnchoredLifecycleTests(unittest.TestCase):
                 run_e2e, "Interrupts", return_value=interrupts
             ), mock.patch.object(
                 run_e2e, "run_child", side_effect=exit_then_cancel
-            ) as child, redirect_stdout(io.StringIO()):
+            ) as child, redirect_stdout(
+                io.StringIO()
+            ):
                 status = run_e2e.main(
                     [
                         "--binary",

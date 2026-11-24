@@ -327,7 +327,15 @@ def main(argv=None):
             report["decision"] = "CONSISTENT_OFFLINE_MODEL"
         except EvidenceError as error:
             report["reason"] = str(error)
-        except (OSError, ValueError, TypeError, KeyError, IndexError, RecursionError):
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            IndexError,
+            RecursionError,
+            DecimalException,
+        ):
             report["reason"] = "malformed_or_missing_evidence"
         report["checker_sha256"] = hashlib.sha256(
             Path(__file__).read_bytes()

@@ -387,6 +387,10 @@ class OfflineEvidenceTests(unittest.TestCase):
                 self.check(lambda e, o: o["result"].update(rows=rows))
         self.check(raw="[" * 2000 + "0" + "]" * 2000)
 
+    def test_unrepresentable_json_decimal_produces_structured_rejection(self):
+        report = self.check(raw='{"value": 1e99999999999999999999999999}')
+        self.assertEqual(report["reason"], "malformed_or_missing_evidence")
+
     def test_output_cannot_replace_inputs_or_previous_attempt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

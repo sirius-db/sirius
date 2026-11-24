@@ -114,14 +114,16 @@ def verify_xml(raw):
 
 def read_child_status(descriptor, data, deadline, interrupts=None):
     """Read a closed launch-failure record or a signed C++ exit status."""
-    while time.monotonic() < deadline:
+    while (remaining := deadline - time.monotonic()) > 0:
         if interrupts is not None:
             interrupts.check()
         if len(data) > 4:
             raise RuntimeError("Invalid C++ status length")
-        if select.select([descriptor], [], [], 0.02)[0]:
+        if select.select([descriptor], [], [], min(remaining, 0.02))[0]:
             chunk = os.read(descriptor, 5 - len(data))
             if not chunk:
+                if time.monotonic() >= deadline:
+                    return None
                 if data == LAUNCH_FAILED:
                     return LAUNCH_FAILED
                 if len(data) != 4:
@@ -211,9 +213,7 @@ def run_child(argv, directory, timeout, facts, interrupts):
             if code is None:
                 try:
                     os.write(control_write, b"x")
-                    code = read_child_status(
-                        status_read, data, time.monotonic() + 3
-                    )
+                    code = read_child_status(status_read, data, time.monotonic() + 3)
                     if code is None:
                         cleanup["errors"].append("C++ status remains unknown")
                 except Exception as error:
@@ -237,9 +237,7 @@ def run_child(argv, directory, timeout, facts, interrupts):
                 # status channel terminal. Retain a newly observed C++ raw
                 # status even though the attempt already failed.
                 try:
-                    code = read_child_status(
-                        status_read, data, time.monotonic() + 0.02
-                    )
+                    code = read_child_status(status_read, data, time.monotonic() + 0.02)
                 except Exception as error:
                     cleanup["errors"].append(type(error).__name__ + ": " + str(error))
         for descriptor in channels:

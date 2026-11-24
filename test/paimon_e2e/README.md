@@ -34,11 +34,12 @@ cases exist, missing discovery must fail. Do not add passing placeholders.
 
 Each invocation creates a fresh `run-*` directory and keeps the exact argv,
 binary hash, terminal status, stdout/stderr and XML, including failure/timeout
-output. No retries overwrite a previous attempt. The launcher checks executable
-bytes before and after execution. It requires a zero C++ exit status and complete
-successful XML with both case identities, no skips or expected failures, and a
-positive assertion count. It reads the binary and XML as regular files. The XML
-hash covers the same bytes it verifies.
+output. No retries overwrite a previous attempt. Keep the executable and its path
+stable throughout the attempt in the frozen deployment. The launcher checks the
+path's content hash before and after execution. It requires a zero C++ exit status
+and complete successful XML with both case identities, no skips or expected
+failures, and a positive assertion count. It reads the binary and XML as regular
+files. The XML hash covers the same bytes it verifies.
 
 On POSIX, a private session leader holds the process group identity until the
 launcher signals that group. This happens on both success and failure, including
@@ -70,6 +71,8 @@ and trace JSON are a **private synthetic normalized test model**, not Quent wire
 a production collector format or actual runtime evidence. The fixture's native
 ownership/view tokens model required relationships; they provide no independent
 proof of an actual SDK read. No production ID or observer API is introduced.
+Supply independently authored oracle values that are valid for their declared
+DuckDB types. The comparison checks type labels and normalized value equality.
 
 The model joins run/runtime/process/statement and artifact/input/oracle identity,
 execution window, one nonempty source's contract and deduplicated owned units,
