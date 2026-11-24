@@ -14,7 +14,9 @@ import zstandard
 
 import check
 
-FIXTURE = pathlib.Path(__file__).resolve().parents[1] / "warehouse/reference.db/append_basic"
+FIXTURE = (
+    pathlib.Path(__file__).resolve().parents[1] / "warehouse/reference.db/append_basic"
+)
 CHECK = pathlib.Path(check.__file__).resolve()
 
 
@@ -53,11 +55,23 @@ class AdmissionTest(unittest.TestCase):
         # The sentinel observes whether the caller enters the reader stage.
         code = "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()"
         result = subprocess.run(
-            [sys.executable, str(CHECK), str(self.root), "--",
-             sys.executable, "-c", code, str(self.calls)],
-            capture_output=True, text=True, timeout=10,
+            [
+                sys.executable,
+                str(CHECK),
+                str(self.root),
+                "--",
+                sys.executable,
+                "-c",
+                code,
+                str(self.calls),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
-        self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
+        self.assertEqual(
+            result.returncode, expected_status, result.stdout + result.stderr
+        )
         self.assertEqual(self.calls.exists(), expected_status == 0)
         return json.loads(result.stdout)
 
@@ -95,7 +109,7 @@ class AdmissionTest(unittest.TestCase):
         schema, rows = read_ocf(self.delta)
         entry = self.delta.parent / rows[0]["_FILE_NAME"]
         with entry.open("rb") as stream:
-            block, = fastavro.block_reader(stream)
+            (block,) = fastavro.block_reader(stream)
         cursor = check.Cursor(entry.read_bytes())
         cursor.get(4)
         while (count := cursor.long()) != 0:
@@ -106,8 +120,13 @@ class AdmissionTest(unittest.TestCase):
         compressed = zstandard.ZstdCompressor(write_content_size=False).compress(
             block.bytes_.getvalue()
         )
-        entry.write_bytes(cursor.data[:cursor.offset] + avro_long(block.num_records)
-                          + avro_long(len(compressed)) + compressed + sync)
+        entry.write_bytes(
+            cursor.data[: cursor.offset]
+            + avro_long(block.num_records)
+            + avro_long(len(compressed))
+            + compressed
+            + sync
+        )
         rows[0]["_FILE_SIZE"] = entry.stat().st_size
         write_ocf(self.delta, schema, rows)
         self.assertEqual(self.run_check(2)["reason"], "unknown-decoded-size")

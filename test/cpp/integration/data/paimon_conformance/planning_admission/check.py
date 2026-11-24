@@ -42,7 +42,7 @@ class Cursor:
     def get(self, size):
         end = self.offset + size
         need(0 <= size and end <= len(self.data), "invalid-length")
-        result = self.data[self.offset:end]
+        result = self.data[self.offset : end]
         self.offset = end
         return result
 
@@ -65,16 +65,27 @@ class Cursor:
 
 class FrameHeader(C.Structure):
     _fields_ = [
-        ("content_size", C.c_ulonglong), ("window_size", C.c_ulonglong),
-        ("block_size_max", C.c_uint), ("frame_type", C.c_uint),
-        ("header_size", C.c_uint), ("dict_id", C.c_uint),
-        ("checksum", C.c_uint), ("reserved1", C.c_uint), ("reserved2", C.c_uint),
+        ("content_size", C.c_ulonglong),
+        ("window_size", C.c_ulonglong),
+        ("block_size_max", C.c_uint),
+        ("frame_type", C.c_uint),
+        ("header_size", C.c_uint),
+        ("dict_id", C.c_uint),
+        ("checksum", C.c_uint),
+        ("reserved1", C.c_uint),
+        ("reserved2", C.c_uint),
     ]
 
 
 def zstd_library():
-    library = C.CDLL(os.environ.get("PAIMON_PROBE_ZSTD") or ctypes.util.find_library("zstd"))
-    library.ZSTD_getFrameHeader.argtypes = [C.POINTER(FrameHeader), C.c_void_p, C.c_size_t]
+    library = C.CDLL(
+        os.environ.get("PAIMON_PROBE_ZSTD") or ctypes.util.find_library("zstd")
+    )
+    library.ZSTD_getFrameHeader.argtypes = [
+        C.POINTER(FrameHeader),
+        C.c_void_p,
+        C.c_size_t,
+    ]
     library.ZSTD_getFrameHeader.restype = C.c_size_t
     library.ZSTD_findFrameCompressedSize.argtypes = [C.c_void_p, C.c_size_t]
     library.ZSTD_findFrameCompressedSize.restype = C.c_size_t
@@ -96,8 +107,10 @@ def read_bounded(path, cap=FILE_CAP):
 
 def simple_name(data, prefix):
     name = data.decode("ascii")
-    need(name.startswith(prefix) and all(c.isalnum() or c in "-_" for c in name),
-         "unsupported-name")
+    need(
+        name.startswith(prefix) and all(c.isalnum() or c in "-_" for c in name),
+        "unsupported-name",
+    )
     return name
 
 
@@ -114,24 +127,41 @@ def inspect_ocf(path, zstd, record_cap, expected_schema=None):
             attrs[key] = value
     need(attrs.get(b"avro.codec") == b"zstandard", "unsupported-codec")
     if expected_schema:
-        schema = json.dumps(json.loads(attrs[b"avro.schema"]), sort_keys=True, separators=(",", ":"))
-        need(hashlib.sha256(schema.encode()).hexdigest() == expected_schema, "unsupported-list-schema")
+        schema = json.dumps(
+            json.loads(attrs[b"avro.schema"]), sort_keys=True, separators=(",", ":")
+        )
+        need(
+            hashlib.sha256(schema.encode()).hexdigest() == expected_schema,
+            "unsupported-list-schema",
+        )
     sync = cursor.get(16)
     records = 0
     blocks = []
     while not cursor.done():
         count = cursor.long()
-        need(0 < count <= record_cap - records, "manifest-count-budget" if expected_schema
-             else "entry-count-budget")
+        need(
+            0 < count <= record_cap - records,
+            "manifest-count-budget" if expected_schema else "entry-count-budget",
+        )
         encoded = cursor.blob()
         need(cursor.get(16) == sync, "invalid-sync")
         header = FrameHeader()
-        need(zstd.ZSTD_getFrameHeader(C.byref(header), encoded, len(encoded)) == 0
-             and header.frame_type == 0 and header.dict_id == 0, "unknown-frame")
-        need(header.content_size not in (ZSTD_UNKNOWN, ZSTD_ERROR), "unknown-decoded-size")
+        need(
+            zstd.ZSTD_getFrameHeader(C.byref(header), encoded, len(encoded)) == 0
+            and header.frame_type == 0
+            and header.dict_id == 0,
+            "unknown-frame",
+        )
+        need(
+            header.content_size not in (ZSTD_UNKNOWN, ZSTD_ERROR),
+            "unknown-decoded-size",
+        )
         need(header.content_size <= BLOCK_CAP, "decoded-block-budget")
         need(header.window_size <= BLOCK_CAP, "decoder-window-budget")
-        need(zstd.ZSTD_findFrameCompressedSize(encoded, len(encoded)) == len(encoded), "not-one-frame")
+        need(
+            zstd.ZSTD_findFrameCompressedSize(encoded, len(encoded)) == len(encoded),
+            "not-one-frame",
+        )
         records += count
         blocks.append((count, header.content_size, encoded))
     return len(raw), records, blocks
@@ -140,7 +170,10 @@ def inspect_ocf(path, zstd, record_cap, expected_schema=None):
 def read_list(blocks, zstd):
     for count, size, encoded in blocks:
         destination = C.create_string_buffer(size)
-        need(zstd.ZSTD_decompress(destination, size, encoded, len(encoded)) == size, "invalid-list")
+        need(
+            zstd.ZSTD_decompress(destination, size, encoded, len(encoded)) == size,
+            "invalid-list",
+        )
         cursor = Cursor(destination.raw)
         for _ in range(count):
             need(cursor.long() == 2, "unsupported-list-version")
@@ -149,44 +182,65 @@ def read_list(blocks, zstd):
             cursor.blob()
             cursor.blob()
             tag = cursor.long()
-            need(tag == 0 or (tag == 1 and cursor.long() == 0), "unsupported-partition-stats")
-            need(tuple(cursor.long() for _ in range(3)) == (0, 0, 0), "unsupported-list-fields")
+            need(
+                tag == 0 or (tag == 1 and cursor.long() == 0),
+                "unsupported-partition-stats",
+            )
+            need(
+                tuple(cursor.long() for _ in range(3)) == (0, 0, 0),
+                "unsupported-list-fields",
+            )
             yield name, length, added, deleted
         need(cursor.done(), "list-size-mismatch")
 
 
 def admit(root, zstd):
     snapshot = json.loads(read_bounded(root / "snapshot/snapshot-2", SNAPSHOT_CAP))
-    need(snapshot["id"] == 2 and snapshot["schemaId"] == 0
-         and snapshot["commitKind"] == "APPEND", "unsupported-snapshot")
+    need(
+        snapshot["id"] == 2
+        and snapshot["schemaId"] == 0
+        and snapshot["commitKind"] == "APPEND",
+        "unsupported-snapshot",
+    )
     # The experiment uses an isolated, sealed clone. Stock SDK reopens these paths.
-    lists = [simple_name(snapshot[key].encode("ascii"), "manifest-list-")
-             for key in ("baseManifestList", "deltaManifestList")]
+    lists = [
+        simple_name(snapshot[key].encode("ascii"), "manifest-list-")
+        for key in ("baseManifestList", "deltaManifestList")
+    ]
     manifests, entries, decoded = 0, 0, 0
     for name in lists:
-        _, records, blocks = inspect_ocf(root / "manifest" / name, zstd,
-                                         MANIFEST_CAP - manifests, LIST_SCHEMA)
+        _, records, blocks = inspect_ocf(
+            root / "manifest" / name, zstd, MANIFEST_CAP - manifests, LIST_SCHEMA
+        )
         manifests += records
         decoded += sum(size for _, size, _ in blocks)
         need(decoded <= TOTAL_DECODED_CAP, "aggregate-decoded-budget")
         for filename, listed_size, added, deleted in read_list(blocks, zstd):
-            need(0 <= added and 0 <= deleted and added + deleted <= ENTRY_CAP - entries,
-                 "entry-count-budget")
-            size, rows, content = inspect_ocf(root / "manifest" / filename, zstd,
-                                              ENTRY_CAP - entries)
-            need(size == listed_size and rows == added + deleted, "manifest-metadata-mismatch")
+            need(
+                0 <= added and 0 <= deleted and added + deleted <= ENTRY_CAP - entries,
+                "entry-count-budget",
+            )
+            size, rows, content = inspect_ocf(
+                root / "manifest" / filename, zstd, ENTRY_CAP - entries
+            )
+            need(
+                size == listed_size and rows == added + deleted,
+                "manifest-metadata-mismatch",
+            )
             entries += rows
             decoded += sum(amount for _, amount, _ in content)
             need(decoded <= TOTAL_DECODED_CAP, "aggregate-decoded-budget")
     return {"manifest_refs": manifests, "entry_rows": entries, "decoded_bytes": decoded}
 
 
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("table", type=pathlib.Path, help="owned append_basic fixture")
-    parser.add_argument("reader", nargs=argparse.REMAINDER,
-                        help="optional reader command invoked after admission")
+    parser.add_argument(
+        "reader",
+        nargs=argparse.REMAINDER,
+        help="optional reader command invoked after admission",
+    )
     args = parser.parse_args(argv)
     table = args.table.resolve()
     try:
@@ -203,7 +257,8 @@ def main(argv=None):
         if command:
             try:
                 return subprocess.run(
-                    command, env=os.environ | {"PAIMON_PROBE_TABLE": str(table)},
+                    command,
+                    env=os.environ | {"PAIMON_PROBE_TABLE": str(table)},
                     timeout=45,
                 ).returncode
             except (OSError, subprocess.TimeoutExpired) as exc:

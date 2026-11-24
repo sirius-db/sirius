@@ -7,10 +7,11 @@ optionally running a reader command. The command receives the fixture path in
 `PAIMON_PROBE_TABLE`. Exit statuses 2 and 3 indicate refusal and errors in
 the diagnostic. A reader that runs supplies its own exit status.
 
-Run from this directory with Python 3.11+ and libzstd installed. The tests also
-need `fastavro` and `zstandard` for generating private fixture variants.
+Run from this directory with Python 3.11+ and libzstd installed. The tests
+generate private fixture variants with `fastavro` 1.12.1 and `zstandard` 0.25.0.
 
 ```sh
+python3 -m pip install fastavro==1.12.1 zstandard==0.25.0
 python3 -m unittest -v test_check.py
 python3 check.py ../warehouse/reference.db/append_basic
 ```
