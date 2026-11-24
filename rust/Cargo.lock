@@ -3001,6 +3001,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sirius-engine"
+version = "0.1.0"
+dependencies = [
+ "sirius-substrait",
+ "telemetry-bridge",
+]
+
+[[package]]
 name = "sirius-ffi"
 version = "0.1.0"
 dependencies = [
@@ -3014,6 +3022,10 @@ dependencies = [
  "substrait",
  "tempfile",
 ]
+
+[[package]]
+name = "sirius-substrait"
+version = "0.1.0"
 
 [[package]]
 name = "sirius-sys"

@@ -1,0 +1,14 @@
+[package]
+name = "sirius-engine"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "Rust components linked into the Sirius engine."
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+sirius-substrait = { path = "../sirius-substrait" }
+telemetry-bridge = { path = "../telemetry/bridge" }

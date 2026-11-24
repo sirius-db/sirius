@@ -61,7 +61,7 @@ if(SIRIUS_BUILD_STATIC)
   set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME sirius_library)
   corrosion_install(
     TARGETS
-    telemetry_bridge
+    sirius_engine
     EXPORT
     sirius-static-targets
     ARCHIVE

@@ -6,6 +6,8 @@ members = [
     "crates/telemetry/store",
     "crates/telemetry/analyzer",
     "crates/telemetry/server",
+    "crates/sirius-engine",
+    "crates/sirius-substrait",
     "crates/sirius-sys",
     "crates/sirius",
     "crates/sirius-ffi"

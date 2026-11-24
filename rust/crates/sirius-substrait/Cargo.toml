@@ -1,0 +1,7 @@
+[package]
+name = "sirius-substrait"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "Engine-side Substrait plan consumer for Sirius."
+publish = false
