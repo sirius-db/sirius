@@ -203,7 +203,7 @@ class nixl_fabric : public fabric {
   /// throws.
   void release() noexcept;
 
-  /// Creates this rank's receive mirror, near this GPU.
+  /// Creates this rank's receive mirror in shared memory, near this GPU.
   void make_mirror();
   /// Picks @p r's path once its hello is in (choose_path()); for TCP lanes, creates this rank's
   /// mirror and lanes.
@@ -245,7 +245,7 @@ class nixl_fabric : public fabric {
   std::vector<fabric_notification> _backlog;
 
   /// This rank's receive mirror (null with host_staging::never, or when no peer could stage or
-  /// write over lanes to it) and its shared-memory name.
+  /// write over lanes to it) and its shared-memory name (empty when only lanes write it).
   std::byte* _mirror{nullptr};
   std::string _mirror_name;
   CUstream_st* _d2h{nullptr};
