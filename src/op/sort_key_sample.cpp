@@ -71,6 +71,46 @@ std::unique_ptr<cudf::column> row_indices(std::size_t first,
   return column;
 }
 
+//! Of key rows taken at stride @p from, those kept at the larger stride @p to.
+std::unique_ptr<cudf::table> thin(cudf::table_view keys,
+                                  std::size_t from,
+                                  std::size_t to,
+                                  ::cuda::stream_ref stream,
+                                  rmm::device_async_resource_ref mr)
+{
+  // Kept row i is input row first_row(from) + i * from.
+  auto const step  = to / from;
+  auto const first = (sort_key_sample::first_row(to) - sort_key_sample::first_row(from)) / from;
+  auto index = row_indices(first, step, static_cast<std::size_t>(keys.num_rows()), stream, mr);
+  return cudf::gather(keys, index->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+}
+
+//! @p keys as cudf::pack() writes them: the metadata, and the data copied to @p data.
+std::unique_ptr<std::vector<std::uint8_t>> pack_to_host(cudf::table_view keys,
+                                                        std::vector<std::uint8_t>& data,
+                                                        ::cuda::stream_ref stream,
+                                                        rmm::device_async_resource_ref mr)
+{
+  auto packed = cudf::pack(keys, stream, mr);
+  data.resize(packed.gpu_data->size());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    data.data(), packed.gpu_data->data(), data.size(), cudaMemcpyDeviceToHost, stream.get()));
+  // The copy ends before its source is freed and before other tasks read the rows.
+  stream.sync();
+  return std::move(packed.metadata);
+}
+
+//! @p data copied to the GPU. The caller keeps @p data alive until the stream is synchronized.
+std::unique_ptr<rmm::device_buffer> to_device(std::vector<std::uint8_t> const& data,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  auto copied = std::make_unique<rmm::device_buffer>(data.size(), stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    copied->data(), data.data(), data.size(), cudaMemcpyHostToDevice, stream.get()));
+  return copied;
+}
+
 }  // namespace
 
 sort_key_sample::sort_key_sample(std::size_t max_key_rows) : _max_key_rows(max_key_rows)
@@ -118,32 +158,76 @@ void sort_key_sample::add(std::uint64_t batch_id,
     auto index    = row_indices(first_row(made->stride), made->stride, rows, stream, mr);
     auto keys =
       cudf::gather(sorted_keys, index->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
-    auto packed    = cudf::pack(keys->view(), stream, mr);
-    made->metadata = std::move(packed.metadata);
-    made->data.resize(packed.gpu_data->size());
-    CUDF_CUDA_TRY(cudaMemcpyAsync(made->data.data(),
-                                  packed.gpu_data->data(),
-                                  made->data.size(),
-                                  cudaMemcpyDeviceToHost,
-                                  stream.get()));
-    // The copy ends before its source is freed and before other tasks read the rows.
-    stream.sync();
+    made->metadata = pack_to_host(keys->view(), made->data, stream, mr);
   }
 
-  std::lock_guard lock(_mutex);
-  if (_closed.load(std::memory_order_acquire)) { return; }
-  auto& slot = _pieces[batch_id];
-  if (slot) {
-    --_seen.batches;
-    _seen.rows -= slot->rows;
-    _seen.bytes -= slot->bytes;
+  {
+    std::lock_guard lock(_mutex);
+    if (_closed.load(std::memory_order_acquire)) { return; }
+    auto& slot = _pieces[batch_id];
+    if (slot) {
+      --_seen.batches;
+      _seen.rows -= slot->rows;
+      _seen.bytes -= slot->bytes;
+    }
+    ++_seen.batches;
+    _seen.rows += rows;
+    _seen.bytes += batch_bytes;
+    slot = std::move(made);
+    while (kept_at(_stride, nullptr) > _max_key_rows) {
+      _stride *= 2;
+    }
   }
-  ++_seen.batches;
-  _seen.rows += rows;
-  _seen.bytes += batch_bytes;
-  slot = std::move(made);
-  while (kept_at(_stride, nullptr) > _max_key_rows) {
-    _stride *= 2;
+  thin_held_rows(space, stream);
+}
+
+std::size_t sort_key_sample::held_key_rows() const
+{
+  std::size_t held = 0;
+  for (auto const& [id, entry] : _pieces) {
+    held += entry->key_rows;
+  }
+  return held;
+}
+
+void sort_key_sample::thin_held_rows(cucascade::memory::memory_space& space,
+                                     ::cuda::stream_ref stream)
+{
+  auto const mr = space.get_default_allocator();
+  while (true) {
+    std::size_t stride = 1;
+    std::vector<std::shared_ptr<piece const>> dense;
+    {
+      std::lock_guard lock(_mutex);
+      // At the current stride the rows fit, so past the cap some piece is denser than that.
+      if (_closed.load(std::memory_order_acquire) || held_key_rows() <= _max_key_rows) { return; }
+      stride = _stride;
+      for (auto const& [id, entry] : _pieces) {
+        if (entry->stride < stride) { dense.push_back(entry); }
+      }
+    }
+    if (dense.empty()) { return; }
+
+    for (auto const& old : dense) {
+      auto thinned      = std::make_shared<piece>();
+      thinned->batch_id = old->batch_id;
+      thinned->rows     = old->rows;
+      thinned->bytes    = old->bytes;
+      thinned->stride   = stride;
+      thinned->key_rows = key_row_count(old->rows, stride);
+      if (thinned->key_rows != 0) {
+        auto copied = to_device(old->data, stream, mr);
+        auto view =
+          cudf::unpack(old->metadata->data(), static_cast<std::uint8_t const*>(copied->data()));
+        auto keys         = thin(view, old->stride, stride, stream, mr);
+        thinned->metadata = pack_to_host(keys->view(), thinned->data, stream, mr);
+      }
+      std::lock_guard lock(_mutex);
+      // A retried task or another thinning pass may have replaced the piece meanwhile.
+      if (auto slot = _pieces.find(old->batch_id); slot != _pieces.end() && slot->second == old) {
+        slot->second = std::move(thinned);
+      }
+    }
   }
 }
 
@@ -157,6 +241,12 @@ std::size_t sort_key_sample::stride() const
 {
   std::lock_guard lock(_mutex);
   return _stride;
+}
+
+std::size_t sort_key_sample::host_key_rows() const
+{
+  std::lock_guard lock(_mutex);
+  return held_key_rows();
 }
 
 void sort_key_sample::clear()
@@ -189,22 +279,12 @@ sort_key_sample::device_keys sort_key_sample::on_device(cucascade::memory::memor
   for (auto const& entry : out.pieces) {
     if (key_row_count(entry->rows, out.stride) == 0) { continue; }
     // out.pieces keeps the host copy alive while the device copy is in flight.
-    auto copied = std::make_unique<rmm::device_buffer>(entry->data.size(), stream, mr);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(copied->data(),
-                                  entry->data.data(),
-                                  entry->data.size(),
-                                  cudaMemcpyHostToDevice,
-                                  stream.get()));
+    auto copied = to_device(entry->data, stream, mr);
     auto view =
       cudf::unpack(entry->metadata->data(), static_cast<std::uint8_t const*>(copied->data()));
     if (entry->stride != out.stride) {
-      // Kept row i is input row first_row(entry->stride) + i * entry->stride.
-      auto const step  = out.stride / entry->stride;
-      auto const first = (first_row(out.stride) - first_row(entry->stride)) / entry->stride;
-      auto index       = row_indices(first, step, entry->key_rows, stream, mr);
-      auto thinned =
-        cudf::gather(view, index->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
-      view = thinned->view();
+      auto thinned = thin(view, entry->stride, out.stride, stream, mr);
+      view         = thinned->view();
       out.thinned.push_back(std::move(thinned));
       // Only the thinned rows stay on the GPU, so the copies never add up to more than the cap.
       stream.sync();

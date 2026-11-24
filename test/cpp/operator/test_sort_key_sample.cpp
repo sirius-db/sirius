@@ -167,6 +167,30 @@ TEST_CASE("Sort key sample doubles the stride until the kept rows fit, whatever 
   CHECK(forward.on_device(*space, cudf::get_default_stream()).stride == stride);
 }
 
+TEST_CASE("Sort key sample holds at most its cap of key rows in host memory", "[sort_key_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  constexpr std::size_t max_key_rows = 64;
+  std::vector<run> runs;
+  for (std::int32_t i = 0; i < 16; ++i) {
+    runs.push_back({i * 10000, 1024});
+  }
+
+  // The first batches are taken at smaller strides than the final one.
+  sort_key_sample sample(max_key_rows);
+  for (auto const& r : runs) {
+    auto batch = sorted_batch(*space, r);
+    add(sample, *batch, *space);
+    CHECK(sample.host_key_rows() <= max_key_rows);
+  }
+
+  auto const stride = smallest_stride(runs, max_key_rows);
+  REQUIRE(stride > 16);
+  CHECK(sample.stride() == stride);
+  CHECK(kept(sample, *space) == rows_at(runs, stride));
+}
+
 TEST_CASE("Sort key sample counts a batch that is added again once", "[sort_key_sample]")
 {
   auto* space = get_default_gpu_space();

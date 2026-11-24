@@ -42,8 +42,9 @@ namespace sirius::op {
  *
  * Every batch gives the rows at one common stride, so each kept row stands for the same number
  * of input rows. The stride is a power of two. It doubles until at most max_key_rows() rows are
- * kept. The rows kept at a stride are among those kept at every smaller stride, so the kept rows
- * depend only on the batches, not on the order they are added in.
+ * kept, and the rows taken at a smaller stride are then thinned to it. The rows kept at a stride
+ * are among those kept at every smaller stride, so the kept rows depend only on the batches, not
+ * on the order they are added in.
  *
  * Thread safe.
  */
@@ -84,7 +85,8 @@ class sort_key_sample {
    * @param batch_id Names the batch.
    * @param sorted_keys Key columns of the sorted batch, on @p space's GPU.
    * @param batch_bytes Size of the whole batch.
-   * @param space Memory space of the batch.
+   * @param space Memory space of the batch. Rows of earlier batches are thinned on its GPU when
+   * the stride doubles.
    * @param stream Stream of the calling task. Synchronized before this returns.
    */
   void add(std::uint64_t batch_id,
@@ -96,6 +98,9 @@ class sort_key_sample {
   [[nodiscard]] totals seen() const;
   [[nodiscard]] std::size_t stride() const;
   [[nodiscard]] std::size_t max_key_rows() const noexcept { return _max_key_rows; }
+
+  //! Key rows held in host memory: at most max_key_rows() while no add() is running.
+  [[nodiscard]] std::size_t host_key_rows() const;
 
   //! Later add() calls keep nothing.
   void close() noexcept { _closed.store(true, std::memory_order_release); }
@@ -128,6 +133,12 @@ class sort_key_sample {
  private:
   //! Rows kept at @p stride from every batch except @p skip_batch_id. Caller holds _mutex.
   [[nodiscard]] std::size_t kept_at(std::size_t stride, std::uint64_t const* skip_batch_id) const;
+
+  //! Key rows held in host memory. Caller holds _mutex.
+  [[nodiscard]] std::size_t held_key_rows() const;
+
+  //! Thin the rows taken at a smaller stride than the current one until the held rows fit the cap.
+  void thin_held_rows(cucascade::memory::memory_space& space, ::cuda::stream_ref stream);
 
   std::size_t _max_key_rows;
   mutable std::mutex _mutex;
