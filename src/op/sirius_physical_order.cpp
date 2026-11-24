@@ -69,8 +69,18 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());
 
-  for (auto const& batch : input_batches) {
-    auto* space = batch.get_memory_space();
+  // One per input batch. A retry sorts the same input again, as a clone with a new ID if it moved
+  // to another GPU, and the key rows of the retry must replace the earlier ones.
+  auto const original_ids = input.original_batch_ids();
+  if (original_ids.size() != input_batches.size()) {
+    throw internal_exception("Order by input has {} batches and {} original batch IDs",
+                             input_batches.size(),
+                             original_ids.size());
+  }
+
+  for (std::size_t position = 0; position < input_batches.size(); ++position) {
+    auto const& batch = input_batches[position];
+    auto* space       = batch.get_memory_space();
     if (!space) { continue; }
 
     auto sorted_batch = gpu_order_impl::local_order_by(batch,
@@ -82,10 +92,8 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
                                                        *space,
                                                        batch_telemetry());
     if (!sorted_batch) { continue; }
-    // Keyed by the input batch: a retry of this task sorts the same input again, and its key
-    // rows must replace the earlier ones.
     if (_sort_sample) {
-      _sort_sample->add_sorted_batch(batch.get_batch_id(), *sorted_batch, stream);
+      _sort_sample->add_sorted_batch(original_ids[position], *sorted_batch, stream);
     }
     output_batches.push_back(std::move(sorted_batch));
   }

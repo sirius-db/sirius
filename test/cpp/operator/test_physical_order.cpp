@@ -499,4 +499,13 @@ TEST_CASE("sirius_physical_order hands each sorted batch to its sort sample once
   (void)op.execute(input, cudf::get_default_stream());
   CHECK(sample.sampled_input().batches == 2);
   CHECK(sample.sampled_input().rows == 7);
+
+  // A retry on another GPU gets clones of its input, which have new batch IDs.
+  auto const cloned = input.with_batches_preserving_rows(
+    {make_1col_batch(*space, {5, 1, 9, 3}), make_1col_batch(*space, {7, 2, 8})});
+  REQUIRE(cloned->original_batch_ids() ==
+          std::vector<std::uint64_t>{first->get_batch_id(), second->get_batch_id()});
+  (void)op.execute(*cloned, cudf::get_default_stream());
+  CHECK(sample.sampled_input().batches == 2);
+  CHECK(sample.sampled_input().rows == 7);
 }
