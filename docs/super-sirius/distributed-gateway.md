@@ -225,7 +225,7 @@ the gateway set it up as its only rank), and `sirius_rank_exit()`
 |---|---|---|
 | `sirius_gateway_duckdb_binary` | | DuckDB that runs each spawned rank |
 | `sirius_gateway_sirius_extension` | | Sirius extension the ranks load; empty runs CPU ranks, for tests |
-| `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings, so it cannot change them |
+| `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings. It must not change them: a rank whose exchange settings differ from the ones it connected with fails every distributed query |
 | `sirius_gateway_exchange_host_staging` | `auto` | `sirius_exchange_host_staging` for every rank: `auto` (TCP lanes to ranks on other hosts), `always`, `never` or `remote` |
 | `sirius_gateway_exchange_tcp_lanes` | 0 | `sirius_exchange_tcp_lanes` for every rank, at most 64; 0 shares 16 lanes among the ranks of a host |
 | `sirius_gateway_exchange_mnnvl` | `auto` | `sirius_exchange_mnnvl` for every rank: `auto`, `require` or `off` put the rings in fabric memory, for NVLink between nodes |

@@ -2871,9 +2871,8 @@ static void SetExchangeHostStaging(ClientContext& context, SetScope scope, Value
 
 static void SetExchangeMnnvl(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto value = StringValue::Get(parameter);
-  static_cast<void>(sirius::exchange::parse_mnnvl(value));
-  get_operator_params(context, scope)->exchange_mnnvl = std::move(value);
+  get_operator_params(context, scope)->exchange_mnnvl =
+    sirius::exchange::parse_mnnvl(StringValue::Get(parameter));
 }
 
 static void SetExchangeFrameBytes(ClientContext& context, SetScope scope, Value& parameter)

@@ -26,6 +26,9 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <format>
+#include <optional>
+#include <string>
 #include <utility>
 
 namespace sirius::exchange {
@@ -34,6 +37,8 @@ namespace {
 
 /// The probe's bar: writes over the network rails top out near 100 GB/s.
 constexpr double nvlink_probe_min_gbps = 150;
+/// A smaller write is over before its bandwidth shows.
+constexpr std::size_t nvlink_probe_min_bytes = std::size_t{32} << 20;
 
 /**
  * @brief Times one write, as large as the transport's largest, to each peer on the NVLink
@@ -41,42 +46,51 @@ constexpr double nvlink_probe_min_gbps = 150;
  * memory; this says so at connect instead of in a slow query.
  *
  * Runs before the transport starts: each write lands in this rank's own credit frames on the
- * peer, which no other rank writes, and carries no notification.
- * @throws sirius::internal_exception on a slow peer when opts.mnnvl is require.
+ * peer, which no other rank writes, and carries no notification. Does nothing when the
+ * transport's largest write is under 32 MiB.
+ * @throws sirius::internal_exception on a slow peer when opts.mnnvl is require, or when a write
+ *         fails.
  */
 void probe_nvlink_peers(nixl_fabric& fab, nixl_exchange_options const& opts)
 {
   auto const frames =
     std::max<std::uint32_t>(1, std::min(opts.recv_frames_per_peer, opts.send_frames) / 2);
   auto const bytes = std::size_t{frames} * opts.frame_bytes;
-  for (rank_t peer = 0; peer < fab.world_size(); ++peer) {
-    if (peer == fab.rank() || fab.path_to(peer) != path::nvlink_fabric) { continue; }
+  if (bytes < nvlink_probe_min_bytes) { return; }
+  auto const gbps_of = [bytes](std::optional<double> seconds) {
+    return seconds ? static_cast<double>(bytes) / *seconds / 1e9 : 0.0;
+  };
+  // Each rank starts at its next neighbour, so the ranks do not all write rank 0 first.
+  for (rank_t step = 1; step < fab.world_size(); ++step) {
+    auto const peer = (fab.rank() + step) % fab.world_size();
+    if (fab.path_to(peer) != path::nvlink_fabric) { continue; }
     auto const slot = fab.rank() < peer ? fab.rank() : fab.rank() - 1;
     auto const dst  = std::size_t{slot} * opts.recv_frames_per_peer * opts.frame_bytes;
+    double gbps     = 0;
     // The first write also maps the peer's memory.
-    static_cast<void>(fab.timed_write(peer, dst, bytes));
-    auto const seconds = fab.timed_write(peer, dst, bytes);
-    auto const gbps    = static_cast<double>(bytes) / seconds / 1e9;
+    if (fab.timed_write(peer, dst, bytes)) {
+      gbps = gbps_of(fab.timed_write(peer, dst, bytes));
+      // Another rank may be probing the same peer: one more try before calling it slow.
+      if (gbps < nvlink_probe_min_gbps) { gbps = gbps_of(fab.timed_write(peer, dst, bytes)); }
+    }
     if (gbps >= nvlink_probe_min_gbps) {
-      SIRIUS_LOG_INFO("exchange: probe to rank {}: {} MiB in {:.1f} us, {:.0f} GB/s",
-                      peer,
-                      bytes >> 20,
-                      seconds * 1e6,
-                      gbps);
+      SIRIUS_LOG_INFO("exchange: probe to rank {}: {} MiB at {:.0f} GB/s", peer, bytes >> 20, gbps);
       continue;
     }
+    auto const speed =
+      gbps > 0 ? std::format("ran at {:.0f} GB/s", gbps) : std::string{"took over ten seconds"};
     if (opts.mnnvl == mnnvl_mode::require) {
       throw sirius::internal_exception(
-        "exchange: a write to rank {} over the NVLink fabric ran at {:.0f} GB/s; UCX did not "
-        "take cuda_ipc (check UCX_TLS and UCX_CUDA_IPC_ENABLE_MNNVL)",
+        "exchange: a write to rank {} over the NVLink fabric {}; UCX did not take cuda_ipc "
+        "(check UCX_TLS and UCX_CUDA_IPC_ENABLE_MNNVL)",
         peer,
-        gbps);
+        speed);
     }
     SIRIUS_LOG_WARN(
-      "exchange: a write to rank {} over the NVLink fabric ran at {:.0f} GB/s; UCX did not take "
-      "cuda_ipc (check UCX_TLS and UCX_CUDA_IPC_ENABLE_MNNVL)",
+      "exchange: a write to rank {} over the NVLink fabric {}; UCX did not take cuda_ipc (check "
+      "UCX_TLS and UCX_CUDA_IPC_ENABLE_MNNVL)",
       peer,
-      gbps);
+      speed);
   }
 }
 
