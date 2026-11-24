@@ -9,6 +9,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -267,7 +268,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     field.children = {child};
     std::vector<std::unique_ptr<cudf::column>> children;
     children.push_back(std::move(column));
-    column = cudf::make_structs_column(0, std::move(children), 0, {});
+    column = cudf::make_structs_column(
+      0, std::move(children), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
   } else if (kind == 3) {
     field.type              = sirius::logical_type::make_decimal(9, 2);
     field.decimal_precision = 9;
@@ -962,7 +964,11 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                        values,
                        sizeof(values),
                        cudaMemcpyHostToDevice) == cudaSuccess);
-    return cudf::make_lists_column(4, std::move(offsets), seconds(), 0, {});
+    return cudf::make_lists_column(4,
+                                   std::move(offsets),
+                                   seconds(),
+                                   0,
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
   };
   output::parquet_field scalar;
   scalar.name = "t";
@@ -986,7 +992,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   children.push_back(seconds());
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(seconds());
-  columns.push_back(cudf::make_structs_column(4, std::move(children), 0, {}));
+  columns.push_back(cudf::make_structs_column(
+    4, std::move(children), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED)));
   columns.push_back(list());
   columns.push_back(list());
   cudf::table table(std::move(columns));
@@ -1175,7 +1182,11 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                        values,
                        sizeof(values),
                        cudaMemcpyHostToDevice) == cudaSuccess);
-    return cudf::make_lists_column(3, std::move(offsets), decimal(), 0, {});
+    return cudf::make_lists_column(3,
+                                   std::move(offsets),
+                                   decimal(),
+                                   0,
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
   };
   output::parquet_field scalar;
   scalar.name              = "d";
@@ -1200,7 +1211,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   children.push_back(decimal());
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(decimal());
-  columns.push_back(cudf::make_structs_column(3, std::move(children), 0, {}));
+  columns.push_back(cudf::make_structs_column(
+    3, std::move(children), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED)));
   columns.push_back(list());
   columns.push_back(list());
   cudf::table table(std::move(columns));
