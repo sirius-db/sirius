@@ -1,7 +1,7 @@
 # Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 """Scheduling and failure-path tests; never loads Sirius or accesses AWS."""
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 import csv
 import io
 import json
@@ -41,9 +41,7 @@ with (r/"csv/runtimes.csv").open("w") as f:
         log.parent.mkdir(parents=True)
         log.write_text("Transparent execution: physical plan replaced with GPU operator\\n"*int(a.iterations))
 """
-        for hardware, failed in (
-            (h, f) for h in ("gb300", "g7e") for f in (False, True)
-        ):
+        for hardware, failed in ((h, f) for h in ("gb300",) for f in (False, True)):
             with self.subTest(
                 hardware=hardware, failed=failed
             ), tempfile.TemporaryDirectory() as tmp:
@@ -100,7 +98,14 @@ with (r/"csv/runtimes.csv").open("w") as f:
     def test_cold_restarts_every_measurement_on_both_hardware_types(self):
         for hardware in ("gb300", "g7e"):
             with self.subTest(hardware=hardware):
-                steps = replay.schedule(hardware, "cold", [3, 6], 2, 1000)
+                steps = replay.schedule(
+                    hardware,
+                    "cold",
+                    [3, 6],
+                    2,
+                    1000,
+                    config=Path("/guide-cold.yaml") if hardware == "g7e" else None,
+                )
                 self.assertEqual(
                     [(s["queries"], s["iterations"]) for s in steps],
                     [([3], [1]), ([6], [1]), ([3], [2]), ([6], [2])],
@@ -125,7 +130,9 @@ with (r/"csv/runtimes.csv").open("w") as f:
 
     def test_g7e_hot_and_pinned_reuse_only_within_query(self):
         for profile in ("hot", "pinned"):
-            steps = replay.schedule("g7e", profile, [3, 6], 2, 1000)
+            steps = replay.schedule(
+                "g7e", profile, [3, 6], 2, 1000, config=Path("/guide-hot.yaml")
+            )
             self.assertEqual(
                 [(s["queries"], s["iterations"]) for s in steps],
                 [([3], [1, 2]), ([6], [1, 2])],
@@ -156,7 +163,7 @@ with (r/"csv/runtimes.csv").open("w") as f:
                 code = replay.main(
                     [
                         "--hardware",
-                        "g7e",
+                        "gb300",
                         "--sf",
                         "1000",
                         "--profile",
@@ -181,7 +188,7 @@ with (r/"csv/runtimes.csv").open("w") as f:
                 "SIRIUS_PIN_COMPRESSION_TABLES": "old",
             },
         ):
-            env = replay.child_env("g7e", "cold")
+            env = replay.child_env("gb300", "cold")
         self.assertNotIn("SIRIUS_DISABLE", env)
         self.assertNotIn("SIRIUS_CONFIG_FILE", env)
         self.assertNotIn("SIRIUS_PIN_COMPRESSION_TABLES", env)
@@ -199,7 +206,7 @@ with (r/"csv/runtimes.csv").open("w") as f:
                 replay.main(
                     [
                         "--hardware",
-                        "g7e",
+                        "gb300",
                         "--sf",
                         "10000",
                         "--profile",
@@ -218,7 +225,7 @@ with (r/"csv/runtimes.csv").open("w") as f:
             )
             self.assertEqual(
                 Path(plan["steps"][0]["config"]),
-                replay.ROOT / "bench/g7e/configs/cold.yaml",
+                replay.ROOT / "bench/gb300/configs/cold.yaml",
             )
             self.assertFalse(engine.exists())
 
@@ -228,8 +235,6 @@ with (r/"csv/runtimes.csv").open("w") as f:
             original = "sirius:\n  executor:\n    pipeline: {num_threads: 4}\n"
             config.write_text(original)
             for hardware, profile in (
-                ("g7e", "cold"),
-                ("g7e", "hot"),
                 ("gb300", "cold"),
                 ("gb300", "hot"),
             ):
@@ -377,25 +382,29 @@ with (r/"csv/runtimes.csv").open("w") as f:
                 checks.verify_s3("s3://example/data", "us-east-1")
         client.head_bucket.assert_not_called()
 
-    def test_saved_g7e_snapshot_hashes_and_sums(self):
-        root = replay.ROOT / "bench/g7e/results/baseline-20261111"
-        manifest = json.loads((root / "manifest.json").read_text())
-        for name, expected in manifest["checksums_sha256"].items():
-            self.assertEqual(replay.digest(root / name), expected, name)
-        with (root / "per-query.csv").open(newline="") as stream:
-            rows = list(csv.DictReader(stream))
-        for summary in manifest["summaries"]:
-            group = [r for r in rows if r["stage"] == summary["stage"]]
-            self.assertEqual(len(group), 22)
-            best = [
-                float(r["best_available_s"]) for r in group if r["best_available_s"]
-            ]
-            self.assertAlmostEqual(math.fsum(best), summary["sum_best_s"], places=8)
-        self.assertEqual(manifest["summaries"][-1]["queries_with_timings"], 21)
-        self.assertEqual(
-            (replay.ROOT / "bench/g7e/configs/hot.yaml").read_bytes(),
-            (replay.ROOT / "bench/g7e/configs/pinned.yaml").read_bytes(),
-        )
+    def test_legacy_g7e_execution_is_rejected_before_config_or_aws_access(self):
+        captured = io.StringIO()
+        with redirect_stderr(captured), patch.object(
+            replay, "preflight", side_effect=AssertionError("AWS accessed")
+        ):
+            with self.assertRaises(SystemExit) as error:
+                replay.main(
+                    [
+                        "--hardware",
+                        "g7e",
+                        "--sf",
+                        "3000",
+                        "--profile",
+                        "cold",
+                        "--config",
+                        "/unused/custom.yaml",
+                        "--dry-run",
+                    ]
+                )
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("bench/g7e/replay.sh", captured.getvalue())
+        with self.assertRaises(ValueError):
+            replay.schedule("g7e", "cold", [1], 1, 3000)
 
     def test_ebs_is_rejected_by_default_and_requires_explicit_exception(self):
         with tempfile.TemporaryDirectory() as tmp:

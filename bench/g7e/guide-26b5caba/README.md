@@ -8,6 +8,10 @@ machine-specific paths and instance IDs with explicit arguments. Original
 machine scripts remain in the retained run archives; their hashes are in
 [original-runner-sha256.json](original-runner-sha256.json).
 
+The guide-derived family is the only G7e configuration published by this PR.
+The reproducer fixes the guide YAML and the process protocol below; it exposes
+no custom-config override.
+
 ## Recipes
 
 | Scale | Cold YAML | Hot YAML | Session threads |
@@ -50,15 +54,15 @@ sudo modprobe tls
 From this runner checkout:
 
 ```bash
-bash bench/g7e/guide-26b5caba/replay.sh \
+bash bench/g7e/replay.sh 3000 cold \
   --source-dir /path/to/built/sirius-26b5caba \
-  --sf 3000 --profile cold --iterations 1 \
+  --iterations 1 \
   --input s3://YOUR_SAME_REGION_BUCKET/datasets/tpch_sf3000_regenerated/ \
   --output /path/to/new-sf3000-cold-run
 
-bash bench/g7e/guide-26b5caba/replay.sh \
+bash bench/g7e/replay.sh 3000 hot \
   --source-dir /path/to/built/sirius-26b5caba \
-  --sf 3000 --profile hot --iterations 2 \
+  --iterations 2 \
   --input s3://YOUR_SAME_REGION_BUCKET/datasets/tpch_sf3000_regenerated/ \
   --output /path/to/new-sf3000-hot-run
 ```
@@ -86,9 +90,9 @@ SF100/SF300/SF1000 host-pin runs, byte-identical Parquet files were staged on th
 same instance's NVMe before timing. Supply that existing mirror:
 
 ```bash
-bash bench/g7e/guide-26b5caba/replay.sh \
+bash bench/g7e/replay.sh 1000 pinned \
   --source-dir /path/to/built/sirius-26b5caba \
-  --sf 1000 --profile pinned --iterations 2 \
+  --iterations 2 \
   --input s3://YOUR_SAME_REGION_BUCKET/datasets/tpch_sf1000_regenerated/ \
   --host-input /mnt/datasets/pinned-inputs/sf1000 \
   --output /path/to/new-sf1000-pinned-run

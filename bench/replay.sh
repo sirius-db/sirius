@@ -10,6 +10,11 @@ sf=$2
 profile=$3
 shift 3
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ "$hardware" == g7e ]]; then
+    [[ "$profile" != pin ]] || profile=pinned
+    exec bash "$repo/bench/g7e/guide-26b5caba/replay.sh" \
+        --sf "$sf" --profile "$profile" "$@"
+fi
 for option in "$@"; do
     if [[ "$option" == --dry-run ]]; then
         exec python3 "$repo/bench/common/replay.py" --hardware "$hardware" --sf "$sf" --profile "$profile" "$@"

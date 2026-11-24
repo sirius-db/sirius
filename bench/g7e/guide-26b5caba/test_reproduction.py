@@ -126,6 +126,54 @@ class Recipes(unittest.TestCase):
                 ]
             )
 
+    def test_public_entrypoints_select_the_same_guide_recipe(self):
+        repo = HERE.parents[2]
+        common = [
+            "--source-dir",
+            "/unused-engine",
+            "--input",
+            "s3://unused/data/",
+            "--dry-run",
+        ]
+        commands = [
+            ["bash", str(repo / "bench/g7e/replay.sh"), "3000", "hot", *common],
+            ["bash", str(repo / "bench/replay.sh"), "g7e", "3000", "hot", *common],
+        ]
+        plans = [
+            json.loads(subprocess.check_output(cmd, text=True)) for cmd in commands
+        ]
+        self.assertEqual(plans[0], plans[1])
+        self.assertEqual(Path(plans[0]["config"]).name, "balanced-hot.yaml")
+        self.assertEqual(len(plans[0]["steps"]), 22)
+        self.assertTrue(
+            all(s["config"] == plans[0]["config"] for s in plans[0]["steps"])
+        )
+
+    def test_custom_config_override_is_rejected(self):
+        command = [
+            "bash",
+            str(HERE.parent / "replay.sh"),
+            "3000",
+            "cold",
+            "--source-dir",
+            "/unused-engine",
+            "--input",
+            "s3://unused/data/",
+            "--config",
+            "/unused-custom.yaml",
+            "--dry-run",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unrecognized arguments: --config", result.stderr)
+
+    def test_no_competing_g7e_config_or_result_folders(self):
+        self.assertFalse((HERE.parent / "configs").exists())
+        self.assertEqual(
+            {p.name for p in (HERE.parent / "results").iterdir()},
+            {"guide-ktls-20261123"},
+        )
+
     def test_selected_results_match_all_22_rows_and_exact_config_hashes(self):
         snapshot = HERE.parent / "results/guide-ktls-20261123"
         manifest = json.loads((snapshot / "manifest.json").read_text())

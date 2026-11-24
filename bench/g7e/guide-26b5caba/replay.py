@@ -32,10 +32,8 @@ def recipe(sf, profile):
 
 
 def plan(sf, profile, selected, iterations):
-    steps = shared.schedule("g7e", profile, selected, iterations, sf)
     config, session = recipe(sf, profile)
-    for step in steps:
-        step["config"] = str(config)
+    steps = shared.schedule("g7e", profile, selected, iterations, sf, config=config)
     return {
         "engine_commit": PIN,
         "scale_factor": sf,

@@ -37,10 +37,15 @@ def queries(value):
     return result
 
 
-def schedule(hardware, profile, selected, iterations, sf):
+def schedule(hardware, profile, selected, iterations, sf, config=None):
     if hardware == "gb300" and sf == 10000 and profile == "pinned":
         raise ValueError("There is no successful saved GB300 SF10000 host-pin result")
-    config = ROOT / "bench" / hardware / "configs" / f"{profile}.yaml"
+    if hardware == "g7e":
+        if config is None:
+            raise ValueError("G7e requires its selected guide config")
+        config = Path(config)
+    else:
+        config = ROOT / "bench" / hardware / "configs" / f"{profile}.yaml"
     if profile == "cold":
         groups = [([q], [i]) for i in range(1, iterations + 1) for q in selected]
     elif hardware == "g7e":
@@ -277,6 +282,11 @@ def main(argv=None):
         help="Print plan only; no GPU, AWS, filesystem writes, or dataset access",
     )
     args = parser.parse_args(argv)
+    if args.hardware == "g7e":
+        parser.error(
+            "G7e uses one guide reproducer: bash bench/g7e/replay.sh <SF> "
+            "<cold|hot|pinned> --source-dir <built-26b5caba> --input <s3-prefix>"
+        )
     args.source_dir = args.source_dir.resolve()
     args.profile = "pinned" if args.profile == "pin" else args.profile
     args.iterations = (

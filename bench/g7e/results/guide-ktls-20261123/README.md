@@ -37,9 +37,7 @@ worker. Enabled spilling was verified on EC2 local NVMe instance storage.
 
 SF3000 cold completed one iteration. SF3000 hot sums are **371.765623 s** and
 **273.535501 s**; the sum across all 44 measurements is **645.301124 s**.
-SF10000 cold sums are **1915.140082 s** and **1906.310348 s**. The older SF3000
-custom-config sum of 980.376540 s and CPU-budget-guide sum of 1041.159627 s
-remain in the local archives; they are not the selected SF3000 result here.
+SF10000 cold sums are **1915.140082 s** and **1906.310348 s**.
 
 ## Saved artifacts
 
@@ -57,4 +55,5 @@ large trace bundles and raw datasets are not committed to Git.
 The portable adapter was checked locally with CPU-only tests and dry runs.
 These selected timings came from the original EC2 campaigns, whose script
 hashes and raw output are retained; they are not a GPU rerun of the portable
-adapter. Earlier checked-in G7e snapshots and all GB300 results are unchanged.
+adapter. Earlier custom G7e snapshots are retained locally outside this guide-only
+publication. All GB300 results remain unchanged.

@@ -1,73 +1,56 @@
 # G7e.8xlarge benchmarks
 
-The [November 23 guide results](results/guide-ktls-20261123/README.md) contain the
-best complete validated SF100–SF10000 runs on `26b5caba`, including SF3000 cold
-362.445844 s and hot 371.765623 / 273.535501 s. Their exact configs and portable
-reproduction adapter are in [guide-26b5caba](guide-26b5caba/README.md). Use that
-versioned runner to reproduce those measurements and session settings.
+G7e publishes one configuration family: the **guide-derived presets** used by
+our selected `26b5caba` London results. The reproducer selects the appropriate
+guide preset by scale; there is no custom-config choice or `--config` override.
 
-## Earlier current presets
+| Scale | Guide preset | Session threads |
+| --- | --- | ---: |
+| SF100 / SF300 | CPU-budget | Engine default |
+| SF1000 | CPU-budget | 24 |
+| SF3000 / SF10000 | SF10000 balanced-large-scans | 24 |
 
-The [current configs](configs/) target one GPU on AWS `g7e.8xlarge`. They were
-saved against Sirius main `6c53654c0498026d8b48daa7e1f19edd3c5ff988`. No timings
-have been selected for these updated presets.
+Cold preserves the measured guide YAML. Hot uses its corresponding LRU copy;
+for SF3000/SF10000, eviction is the only YAML difference. Host-pinned uses the
+hot YAML with explicit per-query host pinning. Exact files and detailed
+instructions are in [guide-26b5caba](guide-26b5caba/README.md).
 
-| Preset | Eviction | Pipeline threads | REST reactors | Read-ahead |
-| --- | --- | ---: | ---: | ---: |
-| `cold.yaml` | idle | 4 | 4 | 16 |
-| `hot.yaml` | lru | 4 | 4 | 16 |
-| `pinned.yaml` | lru | 4 | 4 | 16 |
+## Reproduce
 
-All use `backend: native`, `cache.mode: cucs`, eviction threshold 0.8, 225 GiB
-host capacity, and 1 TiB compressed spill. Pinned is byte-for-byte identical to
-hot. The runner selects actual input pinning separately. The old three
-`SIRIUS_EXP_*` master flags are retired; their replacement optimization settings
-default to true, so no environment sidecar is needed.
-
-## Replay
+Use a separate engine checkout built at
+`26b5caba3e2c96290fdc63d4cf40ac42572eaab8` and same-region S3 data:
 
 ```bash
-bash bench/g7e/replay.sh 1000 cold --iterations 2 --dry-run
-bash bench/g7e/replay.sh 3000 hot --iterations 2 --dry-run
-bash bench/g7e/replay.sh 10000 cold --iterations 1 --dry-run
-bash bench/g7e/replay.sh 1000 pinned --pin-tier host --dry-run
+bash bench/g7e/replay.sh 3000 cold \
+  --source-dir /path/to/built/sirius-26b5caba \
+  --input s3://YOUR_SAME_REGION_BUCKET/datasets/tpch_sf3000_regenerated/ \
+  --iterations 1 --dry-run
+
+bash bench/g7e/replay.sh 3000 hot \
+  --source-dir /path/to/built/sirius-26b5caba \
+  --input s3://YOUR_SAME_REGION_BUCKET/datasets/tpch_sf3000_regenerated/ \
+  --iterations 2 --dry-run
 ```
 
-G7e cold starts a fresh Sirius process and clears the local dataset-file OS
-cache and Sirius cache before **every query iteration**, in suite
-order: Q1(1), ..., Q22(1), Q1(2), ..., Q22(2). Hot starts a fresh process for
-**each query** and reuses that process for its iterations: Q1(1), Q1(2), restart,
-Q2(1), Q2(2), and so on. Pinned uses hot's process lifetime with explicit host
-or GPU pinning. No extra warmup is hidden in these measurements.
+Remove `--dry-run` to execute. Both this entry point and `bench/replay.sh g7e`
+invoke the same reproducer. The wrapper's profile chooses cold/hot/host-pinned
+behavior; it passes `--mode` to `performance_test.py`, not the harness's
+`--profile` option. Source YAML is preserved; effective copies add only Quent.
 
-For an actual run, pass a complete local Parquet directory or a same-region S3
-prefix using `--input`, then remove `--dry-run`. The script verifies the actual
-EC2 region, bucket location and table presence, and requires suitable AWS read
-credentials. It does not launch an instance or generate a dataset.
-
-`/mnt/datasets/spill` must already exist on writable local NVMe instance storage
-with space for the configured spill tier. The runner follows the backing
-devices and rejects EBS by default, including EBS devices named `nvme*`.
-`--allow-ebs-spill` is an explicit opt-in exception. The runner never formats
-disks or silently changes spill paths. Recheck mounts after EC2 stop/start.
+Cold uses a fresh engine and cleared OS/Sirius caches for every measurement.
+Hot and pinned use a fresh engine per query, retaining it and its cache between
+the two measurements. There is no extra warmup. The reproducer verifies the
+actual EC2 and bucket regions, dataset manifest, kTLS and local NVMe spill
+storage. It never provisions, stops or terminates instances. Pinned additionally
+requires an existing byte-verified local mirror; see the detailed instructions.
 
 ## Results
 
-The [November 20 SF10000 custom run](results/sf10000-host200-rest8-20261120/README.md)
-uses engine `26b5caba`, the exact archived 200 GiB host / 8 REST reactor configs,
-and read-ahead 16. All 22 queries completed once cold and twice hot. Sums are
-2216.256305 s cold, 3715.063708 / 2434.062834 s hot, and 2258.198262 s for the
-best hot time per query. Hot Q21's first iteration spent 1466.775056 s in a run
-with prolonged memory retries, then its second iteration completed in 89.838282 s.
-Exact configs, both iterations, provenance, archive checksums and replay commands
-are saved beside the result. These timings do not use the 225 GiB / 4 REST
-reactor presets above.
+The [guide result snapshot](results/guide-ktls-20261123/README.md) contains the
+best complete CPU-validated sums from SF100 through SF10000, both contributing
+iterations, exact config hashes and retained archive checksums. SF3000 cold is
+362.445844 s; hot sums are 371.765623 / 273.535501 s.
 
-## Historical results
-
-The [November 11 baseline](results/baseline-20261111/README.md) contains the
-previously frozen SF1000/SF3000 cold/hot and SF10000 cold/incomplete-hot results.
-Its measured configs and flags are archived beside the timings. These are
-older configs and source commits, not results from the current presets above.
-No pinned result is available. Raw Quent traces remain in the separately
-retained archive identified by the baseline manifest.
+The older custom presets and historical custom-config snapshots are retained
+locally outside this guide-only publication. The selected table and reproducer
+refer to the same guide-derived configuration family and process protocol.
