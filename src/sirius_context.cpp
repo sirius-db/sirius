@@ -1632,6 +1632,7 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     .exists_minmax_rewrites = exists_minmax_rewrite_count_.load(std::memory_order_relaxed),
     .partial_aggregate_pushdowns =
       partial_aggregate_pushdown_count_.load(std::memory_order_relaxed),
+    .scan_reuse_rewrites = scan_reuse_rewrite_count_.load(std::memory_order_relaxed),
     .provider_internal_skips =
       transparent_provider_internal_skip_count_.load(std::memory_order_relaxed),
     .hidden_catalog_skips = transparent_hidden_catalog_skip_count_.load(std::memory_order_relaxed),
@@ -1844,6 +1845,11 @@ void SiriusContext::record_exists_minmax_rewrites(uint64_t count) noexcept
 void SiriusContext::record_partial_aggregate_pushdowns(uint64_t count) noexcept
 {
   partial_aggregate_pushdown_count_.fetch_add(count, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_scan_reuse_rewrites(uint64_t count) noexcept
+{
+  scan_reuse_rewrite_count_.fetch_add(count, std::memory_order_relaxed);
 }
 
 void SiriusContext::record_transparent_certificate_incomplete() noexcept

@@ -18,6 +18,7 @@ target_sources(
           query.cpp
           query_index.cpp
           scan_column_origin.cpp
+          scan_reuse_rewrites.cpp
           sirius_physical_plan_generator.cpp
           substrait_scan_ranges.cpp
           sirius_plan_copy.cpp

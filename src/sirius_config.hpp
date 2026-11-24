@@ -131,6 +131,8 @@ constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
 constexpr bool DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE = true;
 
+constexpr bool DEFAULT_ENABLE_SCAN_REUSE_REWRITES = true;
+
 /// Merge sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same
 /// table into one scan and a per-key MIN/MAX aggregate.
 constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
@@ -363,6 +365,10 @@ struct operator_params {
   /// variable-width group-by columns, so the join repeats them once per key instead of once per
   /// row. See `push_partial_aggregates_below_joins`.
   bool enable_partial_aggregate_below_join = config::DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN;
+
+  /// Reuse an IN-subquery's grouped SUM for the outer query's SUM over the same table instead of
+  /// scanning it again (TPC-H Q18). See `rewrite_repeated_scans`.
+  bool enable_scan_reuse_rewrites = config::DEFAULT_ENABLE_SCAN_REUSE_REWRITES;
 
   /// Under `delim_join_as_cte`, a subquery restricted to the outer rows' keys on one column also
   /// gets them on every column of another table an equality ties to it. See

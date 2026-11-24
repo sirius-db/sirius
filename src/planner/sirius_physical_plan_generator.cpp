@@ -50,6 +50,7 @@
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -80,6 +81,7 @@
 #include "planner/connector_registry.hpp"
 #include "planner/distributed_plan.hpp"
 #include "planner/mark_join_conversion.hpp"
+#include "planner/scan_reuse_rewrites.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "planner/sirius_plan_window.hpp"
@@ -2018,6 +2020,30 @@ bool compressed_materialization_active(duckdb::ClientContext& context)
   return state != nullptr && duckdb::compressed_materialization_enabled(context);
 }
 
+/// The connection's Sirius runtime state, or null when none is registered.
+duckdb::shared_ptr<duckdb::SiriusContext> registered_sirius_context(duckdb::ClientContext& context)
+{
+  if (!context.registered_state) { return nullptr; }
+  return context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+}
+
+/// Whether `rewrite_repeated_scans` runs (sirius.operator_params.enable_scan_reuse_rewrites); on
+/// without a Sirius context.
+bool scan_reuse_rewrites_enabled(duckdb::ClientContext& context)
+{
+  return !registered_sirius_context(context) ||
+         duckdb::query_operator_options(context)->enable_scan_reuse_rewrites;
+}
+
+/// Count @p removed scans in the Sirius context's transparent-execution statistics, when there is
+/// one.
+void record_scan_reuse_rewrites(duckdb::ClientContext& context, std::size_t removed)
+{
+  if (auto const sirius_ctx = registered_sirius_context(context)) {
+    sirius_ctx->record_scan_reuse_rewrites(removed);
+  }
+}
+
 }  // namespace
 
 duckdb::unique_ptr<op::sirius_physical_operator> lower_prepared_scan(
@@ -2399,6 +2425,20 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   // its outer side (RIGHT_SEMI, RIGHT_ANTI) when that side is the small, filtered one, so that its
   // keys are published into the subquery.
   sirius::planner::convert_mark_joins(context, op);
+
+  // After the MARK conversion, whose SEMI and RIGHT_SEMI joins it matches; before binding
+  // resolution, since it edits bindings. Sirius's copy only: DuckDB's plan still reads the removed
+  // scans, which read-view validation must count.
+  // An exception leaves `op` partly rewritten; it propagates out of this function, which owns
+  // `op`, so the plan is discarded with it.
+  if (scan_reuse_rewrites_enabled(context)) {
+    auto const removed = sirius::planner::rewrite_repeated_scans(context, op);
+    for (auto const& subtree : removed) {
+      read_views->record_skipped_scans(
+        sirius::op::scan::capture_bound_read_views(*subtree, context));
+    }
+    record_scan_reuse_rewrites(context, removed.size());
+  }
 
   {
     auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerResolveTypes>();

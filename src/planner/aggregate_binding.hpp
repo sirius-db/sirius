@@ -37,4 +37,9 @@ duckdb::unique_ptr<duckdb::BoundAggregateExpression> bind_builtin_aggregate(
   duckdb::unique_ptr<duckdb::Expression> argument,
   duckdb::unique_ptr<duckdb::Expression> filter = nullptr);
 
+/// Returns whether the planner can compute SUM as a sum of subtotals. Only DECIMAL inputs stored in
+/// at most 64 bits qualify. DuckDB widens their subtotals to DECIMAL(38) and sums them exactly at
+/// the same scale.
+[[nodiscard]] bool sum_combines_exactly(duckdb::LogicalType const& argument);
+
 }  // namespace sirius::planner

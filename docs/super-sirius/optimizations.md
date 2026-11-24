@@ -239,6 +239,37 @@ DuckDB's own `PARTIAL_AGGREGATE_PUSHDOWN` optimizer stays disabled (`unsupported
 
 **Config:** `enable_partial_aggregate_below_join` (default `true`, see [Configuration](configuration.md)).
 
+### IN-Subquery SUM Reused by the Outer Query
+
+**Motivation:** TPC-H q18 sums `l_quantity` per order twice. Its `IN` subquery groups all of `lineitem` by `l_orderkey` to keep the orders whose total exceeds 300, and the outer query then joins all of `lineitem` again, the largest table, only to recompute that same total for the few orders the subquery kept.
+
+**Mechanism:** `rewrite_repeated_scans` runs in `sirius_physical_plan_generator::create_plan` on Sirius's copy of DuckDB's optimized plan, after `convert_mark_joins` and before binding resolution. It turns the subquery's SEMI (or RIGHT_SEMI) join into an INNER join that carries the subquery's sums up, removes the outer join with `lineitem`, and sums the carried sums instead:
+
+```
+AGGREGATE(groups; sum(l.c))               AGGREGATE(groups; sum(s))
+ └─ JOIN l.k = o                           └─ ... (the same INNER joins and filters)
+     ├─ lineitem l                              └─ JOIN o = x (was SEMI)
+     └─ ... (INNER joins, filters)                  ├─ ...
+         └─ SEMI JOIN o = x                         └─ ... carrying s = sum(c)
+             ├─ ...                                     └─ AGGREGATE(x = k; sum(c))
+             └─ ...                                         └─ lineitem
+                 └─ AGGREGATE(x = k; sum(c))
+                     └─ lineitem
+```
+
+The subquery's keys are unique, so the INNER join emits each row once, as the SEMI join did. Every operator between the two joins gets the carried sums added to its projection map. Each rewrite is decided completely before the plan changes, and DuckDB's own plan, which a CPU fallback runs, keeps both scans: the removed scan is recorded with `read_view_registry::record_skipped_scans`, as for an unreferenced CTE, so read-view validation still accounts for it.
+
+**When it applies:**
+- The outer aggregate sits directly on an INNER join with one `=` condition between two plain columns, one side of which is a scan `L` with no projection or filter above it. Every outer aggregate is a `SUM` (or `sum_no_overflow`) of a column of `L` over a DECIMAL stored in at most 64 bits, without DISTINCT, FILTER or ORDER BY, and no outer group reads `L`. A sum of such sums is the same DECIMAL(38) total; integer sums would re-sum 128-bit partials, and floating-point sums depend on the order of addition.
+- The other side reaches, through INNER comparison joins and filters only, a SEMI or RIGHT_SEMI join with one `=` condition on the outer join's key. Its subquery side is, through projections that pass the key on and filters, an aggregate with exactly that one group, over a scan `T` grouped by the same column as the outer join's key. For each outer `SUM` the subquery sums the same column.
+- `L` and `T` read the same rows for every key: the same source with the same files and snapshot, no sampling or table function input, equal required filters, and optional (dynamic) filters on `T` only on the key column, which drop whole key groups. `L`'s optional filters are ignored, since `L` is removed.
+- Why the answer is unchanged: a row with key `o` joined every row of `L` with that key, and `T` reads the same rows for that key, so the subquery's sum for `o` is exactly what the outer aggregate added for the row. The row passed the SEMI join only if that group exists, so it never meets an empty sum, and both joins compare with `=`, so a NULL key matches in neither plan.
+- Declines: aggregates other than a plain `SUM`, integer, floating-point or wide-decimal arguments, groups that read `L`, multi-key or non-`=` joins, a subquery grouped by more than one column or by another column, different files, filters or sampling, anything other than INNER joins and filters between the two joins, and a projection or filter directly above `L`.
+
+**Code path:** `src/planner/scan_reuse_rewrites.cpp`, called from `src/planner/sirius_physical_plan_generator.cpp`.
+
+**Config:** `enable_scan_reuse_rewrites` (default `true`, see [Configuration](configuration.md)).
+
 ### Subquery Keys Carried Across an Equality
 
 **Motivation:** under `delim_join_as_cte = true`, DuckDB restricts a decorrelated subquery to the outer rows' distinct keys with a SEMI join on the column the correlation names. In TPC-Havoc Q05_V01 that column is `s_nationkey`, and the subquery also says `c_nationkey = s_nationkey`. DuckDB's filter combiner derives `c_nationkey = key` only when the keys are a relation in a filter over cross products, which is their form with `delim_join_as_cte = false`; a SEMI join's condition is outside its reach. So `customer` gets no restriction, join ordering puts it last, and `customer`, `orders` and `lineitem` are read for every nation instead of the outer rows' five.

@@ -8,10 +8,11 @@ This document covers three interconnected topics: translating DuckDB logical pla
 
 The `sirius_physical_plan_generator::create_plan()` method is the entry point. It:
 
-1. Resolves types for each logical operator
-2. Resolves column references via `ColumnBindingResolver`
-3. Dispatches to operator-specific `create_plan()` overloads via a switch on `op.type`
-4. Returns a `sirius_physical_operator` tree
+1. Rewrites its own copy of the logical plan: `convert_mark_joins` (MARK -> SEMI/ANTI), then `rewrite_repeated_scans` (see [IN-Subquery SUM Reused by the Outer Query](optimizations.md#in-subquery-sum-reused-by-the-outer-query))
+2. Resolves types for each logical operator
+3. Resolves column references via `ColumnBindingResolver`
+4. Dispatches to operator-specific `create_plan()` overloads via a switch on `op.type`
+5. Returns a `sirius_physical_operator` tree
 
 ### Operator Mapping Table
 

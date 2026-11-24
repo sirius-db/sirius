@@ -231,21 +231,6 @@ char const* combining_aggregate(std::string const& name)
   return nullptr;
 }
 
-/// A SUM whose results add up to a result of the same type without an overflow the original could
-/// not have: DuckDB sums a DECIMAL stored in at most 64 bits into a DECIMAL(38), and the sum of
-/// such sums is the same DECIMAL(38) total. Integer sums combine through a 128-bit sum that the
-/// GPU range-checks on every merge, and floating-point sums depend on the order of addition.
-bool sum_combines_exactly(LogicalType const& argument)
-{
-  if (argument.id() != duckdb::LogicalTypeId::DECIMAL) { return false; }
-  switch (argument.InternalType()) {
-    case duckdb::PhysicalType::INT16:
-    case duckdb::PhysicalType::INT32:
-    case duckdb::PhysicalType::INT64: return true;
-    default: return false;
-  }
-}
-
 /// Whether @p expression is safe to evaluate on rows a join above would have removed: it cannot
 /// throw, or it only adds, subtracts and multiplies such values. Arithmetic can still overflow on
 /// a row the unrewritten plan never evaluates it on; DuckDB's own partial aggregate pushdown
