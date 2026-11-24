@@ -117,6 +117,10 @@ set(TEST_SOURCES
     test/cpp/integration/test_compressed_materialization_partition.cpp
     test/cpp/integration/test_gpu_execution_aggregate_filter.cpp
     test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
+    test/cpp/integration/test_gpu_execution_agg_table.cpp
+    test/cpp/integration/test_gpu_execution_agg_table_concurrency.cpp
+    test/cpp/integration/test_gpu_execution_agg_table_fault.cpp
+    test/cpp/integration/test_gpu_execution_agg_table_tpch.cpp
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_cast_date_predicates.cpp
