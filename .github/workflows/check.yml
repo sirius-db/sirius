@@ -235,12 +235,13 @@ jobs:
           [[ "$declared" == "$engine" ]]
 
           # DUCKDB_EXPLICIT_VERSION must name the declared tag everywhere, or nowhere for a SHA.
-          files=(sirius-duckdb/Makefile cmake/sirius-duckdb-provider.cmake .github/workflows/test.yml .github/workflows/distribution.yml)
+          files=(sirius-duckdb/Makefile gateway/Makefile cmake/sirius-duckdb-provider.cmake .github/workflows/test.yml .github/workflows/distribution.yml)
           explicit=$(grep -h 'DUCKDB_EXPLICIT_VERSION' "${files[@]}" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*' | sort -u || true)
           if [[ -n "$tag" ]]; then
             [[ "$explicit" == "$tag" ]]
             for f in "${files[@]}"; do grep 'DUCKDB_EXPLICIT_VERSION' "$f" | grep -qF "$tag"; done
             grep -qF "$engine" sirius-duckdb/Makefile
+            grep -qF "$engine" gateway/Makefile
             grep -qF "$engine" cmake/sirius-duckdb-provider.cmake
           else
             [[ -z "$explicit" ]]
