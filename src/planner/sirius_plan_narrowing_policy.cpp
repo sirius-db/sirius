@@ -353,8 +353,8 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
       // A host-tier pin keeps its narrow numeric columns, which shrink the upload, but its
       // dictionary carriers upload the same compressed bytes either way and are judged.
       bool const judge_narrow = scan.sidecar_from_gpu_tier_pin;
-      auto const native    = native_physical_schema(op);
-      auto const& physical = op.get_physical_types();
+      auto const native       = native_physical_schema(op);
+      auto const& physical    = op.get_physical_types();
       D_ASSERT(native.size() == physical.size());
       if (native.size() != physical.size()) { return map; }
       for (std::size_t column_idx = 0; column_idx < physical.size(); ++column_idx) {
@@ -541,14 +541,18 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
       }
 
       // Group keys earn transport: the aggregate's PARTITION/MERGE_GROUP_BY exchange moves narrow
-      // key bytes. Other carried columns are unused by the aggregate and die free.
+      // key bytes. Other carried columns are unused by the aggregate and die free. A dictionary
+      // carrier key earns it by grouping on its codes, and ends here: the aggregate emits strings.
       carried_columns map(op.types.size());
       for (std::size_t key_pos = 0; key_pos < aggregate.group_idx.size(); ++key_pos) {
         if (key_pos >= map.size()) { break; }
         auto const child_idx = static_cast<std::size_t>(aggregate.group_idx[key_pos]);
         if (child_idx < inputs.size() && inputs[child_idx]) {
-          state.candidates[*inputs[child_idx]].transport = true;
-          map[key_pos]                                   = inputs[child_idx];
+          auto& candidate     = state.candidates[*inputs[child_idx]];
+          candidate.transport = true;
+          if (candidate.carrier.id() != cudf::type_id::DICTIONARY32) {
+            map[key_pos] = inputs[child_idx];
+          }
         }
       }
       return map;

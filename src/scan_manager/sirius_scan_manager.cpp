@@ -3976,12 +3976,14 @@ std::optional<cudf::data_type> pinned_column_narrow_carrier(pinned_entry const& 
   return widest;
 }
 
-bool pinned_column_dictionary_in_all_chunks(pinned_entry const& entry, std::size_t entry_position)
+bool pinned_column_dictionary_carriable(pinned_entry const& entry,
+                                        std::size_t entry_position,
+                                        std::size_t max_keys_bytes)
 {
-  if (entry.column_storage.empty()) { return false; }
-  return std::ranges::all_of(
+  return std::ranges::any_of(
     entry.column_storage, [&](std::vector<pinned_column_storage_meta> const& row) {
-      return entry_position < row.size() && row[entry_position].string_dictionary;
+      return entry_position < row.size() && row[entry_position].dictionary_keys_bytes &&
+             *row[entry_position].dictionary_keys_bytes <= max_keys_bytes;
     });
 }
 

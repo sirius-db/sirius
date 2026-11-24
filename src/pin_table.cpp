@@ -620,15 +620,18 @@ bool pin_below_min_size(cudf::table const& tbl,
   return below;
 }
 
-/// Record which columns of the compressed chunk @p ct have a string `dictionary` value root.
+/// Record the keys bytes of each column of the compressed chunk @p ct with a string `dictionary`
+/// value root.
 void record_string_dictionaries(simpatico::compressed_table const& ct,
                                 std::vector<pinned_column_storage_meta>& column_storage)
 {
   auto const count = std::min(column_storage.size(), ct.columns.size());
   for (std::size_t i = 0; i < count; ++i) {
     auto const& tree = ct.columns[i].plan_tree;
-    column_storage[i].string_dictionary =
-      tree && simpatico::probe_column(*tree).can_answer_equality;
+    if (tree) {
+      column_storage[i].dictionary_keys_bytes =
+        simpatico::probe_column(*tree).dictionary_keys_bytes;
+    }
   }
 }
 

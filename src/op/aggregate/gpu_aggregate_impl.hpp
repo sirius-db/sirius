@@ -102,9 +102,6 @@ class gpu_aggregate_impl {
    *        sirius_physical_grouped_aggregate::split_wide_sum_max_groups).
    * @param[out] num_groups If not null, receives the number of groups in the output.
    * @param enable_low_cardinality_groupby Query policy for the specialized aggregation kernel.
-   * @param keep_dictionary_keys Parallel to `group_idx`, or empty for none: true where a group key
-   *        that arrives as a DICTIONARY32 carrier leaves as one. Every other dictionary key in the
-   *        output is decoded to its keys' type.
    *
    * @return The output data batch: the group keys, one column per aggregate, then the carried
    * columns.
@@ -123,8 +120,7 @@ class gpu_aggregate_impl {
     const std::vector<bool>& aggregate_is_wide_integer_sum                   = {},
     bool split_wide_integer_sums                                             = false,
     cudf::size_type* num_groups                                              = nullptr,
-    bool enable_low_cardinality_groupby                                      = true,
-    const std::vector<bool>& keep_dictionary_keys                            = {});
+    bool enable_low_cardinality_groupby                                      = true);
 
   /**
    * @brief Perform local grouped aggregate over several grouping sets on the input data batch.

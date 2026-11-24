@@ -18,6 +18,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/carried_columns.hpp"
@@ -106,8 +107,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   for (const auto& batch : input) {
     input_cudf_table_views.push_back(get_cudf_table_view(batch));
   }
-  auto output_cudf_table =
-    cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
+  auto output_cudf_table = concatenate_carriers(
+    std::move(input_cudf_table_views), stream, memory_space.get_default_allocator());
 
   // Create output data batch.
   return make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info);
@@ -455,11 +456,9 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
   auto output_cols    = groupby_result.first->release();
 
-  // Decode the group key columns encoded above back to STRING. A key that arrived as a dictionary
-  // carrier leaves as one; its restore boundary decodes the grouped output.
+  // Decode dictionary-encoded group key columns back to STRING
   for (size_t i = 0; i < static_cast<size_t>(num_group_cols); i++) {
-    if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32 &&
-        !cudf::is_dictionary(concatenated->get_column(static_cast<cudf::size_type>(i)).type())) {
+    if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
       cudf::dictionary_column_view dict_view(output_cols[i]->view());
       output_cols[i] = cudf::dictionary::decode(dict_view, stream, mr);
     }

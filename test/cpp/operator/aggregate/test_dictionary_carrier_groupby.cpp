@@ -18,8 +18,8 @@
  * @file test_dictionary_carrier_groupby.cpp
  * @brief A grouped aggregate over DICTIONARY32 carriers matches the one over decoded strings.
  *
- * A dictionary group key groups on its codes and leaves as a dictionary only when asked to; a
- * COUNT over a dictionary value counts its codes.
+ * A dictionary group key groups on its codes and leaves as STRING, the end of its carrier; a COUNT
+ * over a dictionary value counts its codes.
  */
 
 #include "data/data_batch_utils.hpp"
@@ -30,7 +30,7 @@
 
 #include <cudf/aggregation.hpp>
 #include <cudf/column/column.hpp>
-#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
@@ -122,9 +122,9 @@ std::vector<T> to_host(cudf::column_view const& column)
 using group_row = std::tuple<int64_t, int64_t, int64_t>;  // SUM(v), COUNT(s), COUNT(*)
 
 // Run SUM(v), COUNT(s), COUNT(*) grouped by k over [k, v, s], and return each group's results
-// keyed by its decoded key, with the type the key column left as.
+// keyed by its key, with the type the key column left as.
 std::pair<std::map<std::optional<std::string>, group_row>, cudf::type_id> grouped(
-  cudf::column_view key, cudf::column_view value, cudf::column_view counted, bool keep_key)
+  cudf::column_view key, cudf::column_view value, cudf::column_view counted)
 {
   auto* space       = sirius::test::operator_utils::get_default_gpu_space();
   auto const stream = cudf::get_default_stream();
@@ -150,17 +150,11 @@ std::pair<std::map<std::optional<std::string>, group_row>, cudf::type_id> groupe
     {},
     false,
     nullptr,
-    true,
-    {keep_key});
+    true);
   auto const view = sirius::get_cudf_table_view(*output);
   auto const type = view.column(0).type().id();
-  std::unique_ptr<cudf::column> decoded;
-  auto keys = view.column(0);
-  if (type == cudf::type_id::DICTIONARY32) {
-    decoded = cudf::dictionary::decode(cudf::dictionary_column_view(keys));
-    keys    = decoded->view();
-  }
-  auto const names  = strings_to_host(keys);
+  if (type != cudf::type_id::STRING || view.num_rows() == 0) { return {{}, type}; }
+  auto const names  = strings_to_host(view.column(0));
   auto const sums   = to_host<int64_t>(view.column(1));
   auto const counts = to_host<int64_t>(view.column(2));
   auto const all    = to_host<int64_t>(view.column(3));
@@ -182,33 +176,62 @@ TEST_CASE("grouped aggregate over dictionary carriers matches decoded strings",
   for (int row = 0; row < num_rows; ++row) {
     values[row] = row % 101 - 50;
   }
-  auto const value = vector_to_cudf_column<gpu_type_traits<int64_t>>(values);
-  auto const [expected, plain_type] =
-    grouped(key->view(), value->view(), counted->view(), /*keep_key=*/false);
+  auto const value                  = vector_to_cudf_column<gpu_type_traits<int64_t>>(values);
+  auto const [expected, plain_type] = grouped(key->view(), value->view(), counted->view());
   REQUIRE(plain_type == cudf::type_id::STRING);
   REQUIRE(expected.size() == 8);  // seven values and the NULL group
 
   auto const dictionary_key     = encode(key->view());
   auto const dictionary_counted = encode(counted->view());
-  SECTION("a kept dictionary key leaves as a dictionary")
+  SECTION("a dictionary key leaves as strings")
   {
     auto const [actual, type] =
-      grouped(dictionary_key->view(), value->view(), dictionary_counted->view(), true);
-    CHECK(type == cudf::type_id::DICTIONARY32);
-    CHECK(actual == expected);
-  }
-  SECTION("a dictionary key not kept is decoded")
-  {
-    auto const [actual, type] =
-      grouped(dictionary_key->view(), value->view(), dictionary_counted->view(), false);
+      grouped(dictionary_key->view(), value->view(), dictionary_counted->view());
     CHECK(type == cudf::type_id::STRING);
     CHECK(actual == expected);
   }
   SECTION("a string key with a counted dictionary value")
   {
-    auto const [actual, type] =
-      grouped(key->view(), value->view(), dictionary_counted->view(), false);
+    auto const [actual, type] = grouped(key->view(), value->view(), dictionary_counted->view());
     CHECK(type == cudf::type_id::STRING);
     CHECK(actual == expected);
+  }
+}
+
+TEST_CASE("a null-free dictionary key of few values leaves the low-cardinality path as strings",
+          "[aggregate][dictionary_carrier]")
+{
+  std::vector<std::string> names;
+  for (int row = 0; row < num_rows; ++row) {
+    names.push_back("value_" + std::to_string(row % 7));
+  }
+  auto const key = vector_to_cudf_column<gpu_type_traits<string_tag>>(names);
+  std::vector<int64_t> values(num_rows, 1);
+  auto const value          = vector_to_cudf_column<gpu_type_traits<int64_t>>(values);
+  auto const [expected, _]  = grouped(key->view(), value->view(), key->view());
+  auto const dictionary_key = encode(key->view());
+  auto const [actual, type] = grouped(dictionary_key->view(), value->view(), key->view());
+  CHECK(type == cudf::type_id::STRING);
+  CHECK(actual == expected);
+}
+
+TEST_CASE("a zero-row dictionary key groups to an empty string key",
+          "[aggregate][dictionary_carrier]")
+{
+  auto const value   = cudf::make_empty_column(cudf::type_id::INT64);
+  auto const counted = cudf::make_empty_column(cudf::type_id::STRING);
+  SECTION("without children")
+  {
+    auto const key            = cudf::make_empty_column(cudf::type_id::DICTIONARY32);
+    auto const [groups, type] = grouped(key->view(), value->view(), counted->view());
+    CHECK(type == cudf::type_id::STRING);
+    CHECK(groups.empty());
+  }
+  SECTION("with children")
+  {
+    auto const key            = encode(cudf::make_empty_column(cudf::type_id::STRING)->view());
+    auto const [groups, type] = grouped(key->view(), value->view(), counted->view());
+    CHECK(type == cudf::type_id::STRING);
+    CHECK(groups.empty());
   }
 }

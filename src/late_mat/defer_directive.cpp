@@ -161,8 +161,10 @@ defer_pair make_defer_pair(std::vector<cudf::data_type> const& scan_schema,
     if (i > 0 && scan_position <= scan_positions[i - 1]) { return {}; }
     // A pin may STORE a column narrowed, so the scan carries the narrow carrier
     // while the port is declared to hold the type the planner restores it to.
+    // A deferred dictionary carrier materializes as its STRING values.
     if (port_schema[port_position] != scan_schema[scan_position] &&
-        !sirius::can_restore_to(scan_schema[scan_position], port_schema[port_position])) {
+        !sirius::can_restore_to(scan_schema[scan_position], port_schema[port_position]) &&
+        !sirius::is_dictionary_carrier_of(scan_schema[scan_position], port_schema[port_position])) {
       return {};
     }
     // The rowid rides at the FIRST deferred scan position; the rest become

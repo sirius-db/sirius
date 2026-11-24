@@ -361,7 +361,9 @@ inline std::unique_ptr<cudf::table> make_empty_table(const duckdb::vector<logica
  * The carrier-exact counterpart of the logical-type overload, for callers holding an operator's
  * `physical_types` sidecar: the result reproduces those carriers instead of re-deriving native
  * ones. Every entry must be non-nested: an id-only `cudf::data_type` carries no child type, so a
- * nested carrier cannot be synthesized here.
+ * nested carrier cannot be synthesized here. A DICTIONARY32 entry, a dictionary carrier, becomes
+ * an empty STRING column: a carrier is a hint any batch may drop, and an empty dictionary has no
+ * keys child for consumers to read.
  *
  * @throws duckdb::InvalidInputException on a nested entry — use the logical-type overload, which
  *         carries element types.
@@ -379,7 +381,8 @@ inline std::unique_ptr<cudf::table> make_empty_table(const std::vector<cudf::dat
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(types.size());
   for (auto const& t : types) {
-    columns.push_back(cudf::make_empty_column(t));
+    columns.push_back(cudf::make_empty_column(
+      t.id() == cudf::type_id::DICTIONARY32 ? cudf::data_type{cudf::type_id::STRING} : t));
   }
   return std::make_unique<cudf::table>(std::move(columns));
 }

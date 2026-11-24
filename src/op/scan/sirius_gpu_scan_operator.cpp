@@ -278,18 +278,22 @@ std::vector<carrier_conversion_plan> preflight_physical_schema(
     auto const& column = table.column(column_idx);
     auto const actual  = column.type();
     auto const target  = targets[column_idx];
-    if (actual == target) {
+    // A dictionary carrier is a hint: a batch whose keys exceed the cap carries its strings.
+    if (actual == target && actual.id() == cudf::type_id::DICTIONARY32 &&
+        dictionary_keys_bytes(column, stream) > dictionary_carrier_max_keys_bytes) {
+      plan.push_back(
+        {actual, cudf::data_type{cudf::type_id::STRING}, carrier_conversion_kind::RESTORE});
+      continue;
+    }
+    // A chunk that decoded to strings (stored without a dictionary root, or decoded on a route that
+    // cannot return one) stays STRING, which every consumer of a carrier accepts.
+    if (actual == target ||
+        (has_explicit_physical_schema && is_dictionary_carrier_of(target, actual))) {
       plan.push_back({actual, target, carrier_conversion_kind::NONE});
       continue;
     }
     if (can_restore_to(actual, target) || is_dictionary_carrier_of(actual, target)) {
       plan.push_back({actual, target, carrier_conversion_kind::RESTORE});
-      continue;
-    }
-    // A chunk that decoded to strings (stored without a dictionary root, or decoded on a route that
-    // cannot return one) is encoded; an encode needs no range proof.
-    if (has_explicit_physical_schema && is_dictionary_carrier_of(target, actual)) {
-      plan.push_back({actual, target, carrier_conversion_kind::NARROW});
       continue;
     }
 
@@ -343,9 +347,16 @@ scan_operator_input::converted_column_replacements build_carrier_replacements(
 void record_carrier_conversions(const std::vector<carrier_conversion_plan>& plan,
                                 duckdb::SiriusContext* observer)
 {
+  std::uint64_t dictionary_carriers = 0;
   for (std::size_t column_idx = 0; column_idx < plan.size(); ++column_idx) {
     auto const& conversion = plan[column_idx];
-    if (conversion.kind == carrier_conversion_kind::NONE) { continue; }
+    if (conversion.kind == carrier_conversion_kind::NONE) {
+      if (conversion.actual.id() == cudf::type_id::DICTIONARY32 &&
+          conversion.target.id() == cudf::type_id::DICTIONARY32) {
+        ++dictionary_carriers;
+      }
+      continue;
+    }
     auto const narrowing = conversion.kind == carrier_conversion_kind::NARROW;
     if (observer != nullptr) {
       if (narrowing) {
@@ -361,6 +372,11 @@ void record_carrier_conversions(const std::vector<carrier_conversion_plan>& plan
                      narrowing ? "narrowed" : "restored",
                      cudf::type_to_name(conversion.actual),
                      cudf::type_to_name(conversion.target));
+  }
+  if (dictionary_carriers > 0 && observer != nullptr) {
+    observer->get_event_publisher().publish_compressed_materialization(
+      sirius::event::compressed_materialization_activity::scan_dictionary_carriers,
+      dictionary_carriers);
   }
 }
 

@@ -17,6 +17,7 @@
 #include "compressed_scan.hpp"
 
 #include "decompression_pushdown_policy.hpp"
+#include "helper/numeric_narrowing.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -567,6 +568,14 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   return table;
 }
 
+/// Whether @p request asks the decode to return a column as a DICTIONARY32 carrier.
+bool requests_dictionary_output(pushdown_request const& request)
+{
+  return std::ranges::any_of(request.output_types, [](auto const& type) {
+    return type && type->id() == cudf::type_id::DICTIONARY32;
+  });
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -583,7 +592,9 @@ decompression_pushdown_scan::without_row_selection() const
   for (auto const& column : _request.columns) {
     narrowed.columns.push_back({column.equals_any, std::nullopt, {}});
   }
-  if (narrowed.empty() && narrowed.enable_fused_scan_filter && !narrowed.fused_scan.diagnostics) {
+  narrowed.output_types = _request.output_types;
+  if (narrowed.empty() && narrowed.enable_fused_scan_filter && !narrowed.fused_scan.diagnostics &&
+      !requests_dictionary_output(narrowed)) {
     return nullptr;
   }
   narrowed.row_selection_disabled = true;
@@ -639,7 +650,9 @@ std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::
     }
     any_asked = any_asked || !column.empty();
   }
-  if (!any_asked && narrowed.enable_fused_scan_filter && !narrowed.fused_scan.diagnostics) {
+  // A dictionary output changes even a plain decode.
+  if (!any_asked && narrowed.enable_fused_scan_filter && !narrowed.fused_scan.diagnostics &&
+      !requests_dictionary_output(narrowed)) {
     return nullptr;
   }
   return std::make_shared<const decompression_pushdown_scan>(std::move(narrowed));
@@ -792,12 +805,23 @@ decompress_result decompress_chunk(
     out.outcome.membership_skipped = requested_membership_probes(request) > 0;
     // Only a DICTIONARY32 entry changes a plain decode; widening targets apply to compacted ones.
     std::vector<std::optional<cudf::data_type>> dictionary_outputs(selected.size());
+    bool wants_dictionary = false;
     for (std::size_t i = 0; i < request.output_types.size() && i < selected.size(); ++i) {
       if (request.output_types[i] && request.output_types[i]->id() == cudf::type_id::DICTIONARY32) {
         dictionary_outputs[i] = request.output_types[i];
+        wants_dictionary      = true;
       }
     }
-    out.table = simpatico::decompress(chunk, selected, predicates, dictionary_outputs, lanes, mr);
+    static_assert(
+      simpatico::dictionary_output_max_keys_bytes == sirius::dictionary_carrier_max_keys_bytes,
+      "a pin plans the dictionary carriers its decode returns");
+    if (wants_dictionary) {
+      out.table = simpatico::decompress(chunk, selected, predicates, dictionary_outputs, lanes, mr);
+    } else {
+      out.table = predicates.empty()
+                    ? simpatico::decompress(chunk, selected, lanes, mr)
+                    : simpatico::decompress(chunk, selected, predicates, lanes, mr);
+    }
   }
   // An active equality directive yields BOOL8 on every path — the filtered decode and the plain
   // rerun alike — so the substituted positions are exactly the active entries the decoded table

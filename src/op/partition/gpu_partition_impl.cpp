@@ -18,6 +18,7 @@
 
 #include "cudf/hugeint_carrier.hpp"
 #include "data/data_batch_utils.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/key_preparation.hpp"
 
@@ -34,6 +35,11 @@
 #include <cudf/utilities/traits.hpp>
 
 #include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -112,6 +118,36 @@ hash_partition_result stable_hash_partition(cudf::table_view const& input,
   return {std::move(reordered), std::move(offsets)};
 }
 
+/// @p input with its dictionary carriers decoded where splitting it into @p num_partitions would
+/// copy too many keys: each partition copies a dictionary's keys whole, so a carrier whose keys
+/// times the partitions exceed an eighth of @p batch_bytes is decoded. A carrier in @p key_indices
+/// is always decoded, so its rows hash as they do in batches that carry its strings. The decoded
+/// columns are appended to @p owners.
+cudf::table_view decode_costly_carriers(cudf::table_view input,
+                                        std::vector<int> const& key_indices,
+                                        int num_partitions,
+                                        std::size_t batch_bytes,
+                                        std::vector<std::unique_ptr<cudf::column>>& owners,
+                                        ::cuda::stream_ref stream,
+                                        rmm::device_async_resource_ref mr)
+{
+  std::vector<cudf::column_view> columns(input.begin(), input.end());
+  bool decoded = false;
+  for (int i = 0; i < input.num_columns(); ++i) {
+    if (columns[i].type().id() != cudf::type_id::DICTIONARY32) { continue; }
+    bool const is_key = std::ranges::find(key_indices, i) != key_indices.end();
+    if (!is_key &&
+        dictionary_keys_bytes(columns[i], stream) * static_cast<std::size_t>(num_partitions) <=
+          batch_bytes / 8) {
+      continue;
+    }
+    owners.push_back(decode_dictionary_carrier(columns[i], stream, mr));
+    columns[i] = owners.back()->view();
+    decoded    = true;
+  }
+  return decoded ? cudf::table_view(columns) : input;
+}
+
 }  // namespace
 
 std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_partition(
@@ -130,7 +166,14 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
     throw std::runtime_error("`num_partitions` in `hash_partition()` should be at least 2");
   }
 
-  auto input_table = get_cudf_table_view(input);
+  std::vector<std::unique_ptr<cudf::column>> decoded_carriers;
+  auto input_table = decode_costly_carriers(get_cudf_table_view(input),
+                                            partition_key_idx,
+                                            num_partitions,
+                                            input.get_data()->get_size_in_bytes(),
+                                            decoded_carriers,
+                                            stream,
+                                            memory_space.get_default_allocator());
 
   // When a join condition has mixed key types (e.g. INT32 vs INT64), cuDF's murmur3 hash
   // produces different values for the same integer in different representations. We apply the
@@ -240,8 +283,16 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_p
     throw std::runtime_error("`num_partitions` in `evenly_partition()` should be at least 2");
   }
 
+  std::vector<std::unique_ptr<cudf::column>> decoded_carriers;
+  auto input_table = decode_costly_carriers(get_cudf_table_view(input),
+                                            {},
+                                            num_partitions,
+                                            input.get_data()->get_size_in_bytes(),
+                                            decoded_carriers,
+                                            stream,
+                                            memory_space.get_default_allocator());
+
   // Compute slice indices
-  auto input_table                        = get_cudf_table_view(input);
   cudf::size_type partition_num_rows_base = input_table.num_rows() / num_partitions;
   cudf::size_type remainder               = input_table.num_rows() % num_partitions;
   std::vector<cudf::size_type> slice_indices;

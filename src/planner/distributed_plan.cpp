@@ -145,10 +145,11 @@ struct rewriter {
                                             bool ordered)
   {
     // Refused before any rank runs: the wire would refuse the first batch. Grouped STDDEV_SAMP
-    // partials are STRUCT columns, an ungrouped COUNT(DISTINCT) partial a LIST.
+    // partials are STRUCT columns, an ungrouped COUNT(DISTINCT) partial a LIST. A dictionary
+    // carrier crosses as its strings: the sink decodes it.
     for (auto const& type : slot->has_physical_overrides() ? slot->get_physical_types()
                                                            : physical_types_of(slot->types)) {
-      if (!exchange::sendable(type)) {
+      if (type.id() != cudf::type_id::DICTIONARY32 && !exchange::sendable(type)) {
         throw sirius::not_implemented_exception(
           "distributed execution: an exchange of a column of cuDF type id {}",
           static_cast<std::int32_t>(type.id()));
@@ -175,8 +176,14 @@ struct rewriter {
     source->set_query_lifecycle(*lifecycle);
     source->set_memory_space(*gpu);
     if (child->has_physical_overrides()) {
+      auto received = child->get_physical_types();
+      for (auto& type : received) {
+        if (type.id() == cudf::type_id::DICTIONARY32) {
+          type = cudf::data_type{cudf::type_id::STRING};
+        }
+      }
       sink->set_physical_types(child->get_physical_types());
-      source->set_physical_types(child->get_physical_types());
+      source->set_physical_types(std::move(received));
     }
     auto& sink_ref = *sink;
     sink->children.push_back(std::move(child));

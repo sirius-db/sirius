@@ -488,14 +488,18 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       // Output prefix 0..group_idx.size()-1 holds the keys (get_output_grouping_indices is the
       // iota over it) and mirrors the child key carriers; aggregate outputs are cast to their
       // declared return types by the aggregation implementation and stay native. No restore is
-      // inserted above: downstream boundaries widen the keys on the small grouped output.
+      // inserted above: downstream boundaries widen the keys on the small grouped output. A
+      // dictionary carrier key ends here: the aggregate groups on its codes and emits strings.
       auto const child_schema = output_physical_schema(*slot->children[0]);
       auto const native       = native_physical_schema(*slot);
       auto schema             = native;
       for (std::size_t key_pos = 0; key_pos < aggregate.group_idx.size(); ++key_pos) {
         if (key_pos >= schema.size()) { break; }
         auto const child_idx = static_cast<std::size_t>(aggregate.group_idx[key_pos]);
-        if (child_idx < child_schema.size()) { schema[key_pos] = child_schema[child_idx]; }
+        if (child_idx < child_schema.size() &&
+            child_schema[child_idx].id() != cudf::type_id::DICTIONARY32) {
+          schema[key_pos] = child_schema[child_idx];
+        }
       }
       install_physical_schema(*slot, std::move(schema), native);
       return;

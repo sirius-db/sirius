@@ -19,11 +19,12 @@
  * @brief enable_dictionary_carrier on compressed pinned scans.
  *
  * The planner carries a string column as DICTIONARY32 when its Simpatico pin dictionary-encodes it
- * and the scan does not filter it, and every query over such a carrier returns DuckDB's results. A
- * compressed pin qualifies on either tier.
+ * with keys under the carrier cap and the scan does not filter it, and every query over such a
+ * carrier returns DuckDB's results. A compressed pin qualifies on either tier.
  */
 
 #include "utils/gpu_execution_fixture.hpp"
+#include "utils/transparent_execution_test_utils.hpp"
 
 #include <catch.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
@@ -76,11 +77,13 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
     dir = fs::temp_directory_path() / ("sirius_dictionary_carrier_" + std::to_string(::getpid()) +
                                        "_" + std::to_string(counter++));
     fs::create_directories(dir);
-    // `low`, `group` and `nullable` repeat a few values; `distinct_values` never repeats.
+    // `low`, `group` and `nullable` repeat a few values; `distinct_values` never repeats; `wide`
+    // repeats, but its keys take more than the carrier cap.
     run_ok(
       "CREATE TABLE t AS SELECT range AS x, 'k' || (range % 10) AS low, 'g' || (range % 7) AS "
       "\"group\", CASE WHEN range % 5 = 0 THEN NULL ELSE 'n' || (range % 3) END AS nullable, "
-      "'u' || range AS distinct_values FROM range(100000);");
+      "'u' || range AS distinct_values, 'w' || (range % 50000) || repeat('_', 40) AS wide FROM "
+      "range(100000);");
     run_ok("CREATE TABLE dim AS SELECT 'k' || range AS key, range AS w FROM range(5);");
     run_ok("CHECKPOINT;");
     run_ok("SET enable_dictionary_carrier = true;");
@@ -107,15 +110,20 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
     fs::create_directories(plan_dir);
     {
       std::ofstream plan(plan_dir / "t.txt");
-      plan << "input -> identity\n"
+      // `x` is bitpacked and the codes of `group` too, so a filter on `x` decodes `group` on the
+      // compacted dict_codes route.
+      plan << "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
               "---\n"
               "input -> dictionary -> keys_offsets, keys_chars, indices\n"
               "---\n"
               "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+              "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
               "---\n"
               "input -> dictionary -> keys_offsets, keys_chars, indices\n"
               "---\n"
-              "input -> identity\n";
+              "input -> identity\n"
+              "---\n"
+              "input -> dictionary -> keys_offsets, keys_chars, indices\n";
     }
     run_ok("SET pin_table_compression = true;");
     run_ok("SET pin_table_compression_min_batch_size_bytes = 0;");
@@ -157,6 +165,10 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
            "SELECT upper(low), count(*) FROM {} GROUP BY 1",
            "SELECT low, count(*) FROM {} WHERE x % 3 = 0 GROUP BY low",
            "SELECT low, sum(w) FROM {} JOIN dim ON low = key GROUP BY low",
+           "SELECT \"group\", count(*), sum(x) FROM {} WHERE x < 30000 GROUP BY \"group\"",
+           "SELECT \"group\", low, count(*) FROM {} WHERE x BETWEEN 1000 AND 1999 GROUP BY ALL",
+           "SELECT wide, count(*) FROM {} GROUP BY wide",
+           "SELECT low, count(*) FROM {} WHERE x < 0 GROUP BY low",
          }) {
       std::string sql = query;
       sql.replace(sql.find("{}"), 2, source);
@@ -185,5 +197,12 @@ TEST_CASE_METHOD(
   CHECK(carried_dictionaries("SELECT low, nullable, \"group\" FROM t") == 3);
   // An identity plan stores `distinct_values` as plain strings.
   CHECK(carried_dictionaries("SELECT low, distinct_values FROM t") == 1);
+  CHECK(carried_dictionaries("SELECT wide, count(*) FROM t GROUP BY wide") == 0);
   compare_all("t");
+
+  // The carrier reaches the scan's output batches, which the planner hands to the aggregate.
+  auto const before = sirius::test::get_compressed_materialization_stats(*con);
+  compare_gpu_vs_cpu("SELECT low, count(*) FROM t GROUP BY low");
+  auto const after = sirius::test::get_compressed_materialization_stats(*con);
+  CHECK(after.scan_dictionary_carriers > before.scan_dictionary_carriers);
 }

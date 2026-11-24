@@ -347,8 +347,8 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
 
     if (dictionary_candidate) {
       if (!scan_filters_column(op, *ids_position) &&
-          sirius::scan_manager::pinned_column_dictionary_in_all_chunks(*entry,
-                                                                       projection[*ids_position])) {
+          sirius::scan_manager::pinned_column_dictionary_carriable(
+            *entry, projection[*ids_position], sirius::dictionary_carrier_max_keys_bytes)) {
         carry_as_dictionary(result.back(), output_idx, ids[*ids_position]);
         changed = true;
       }
