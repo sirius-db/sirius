@@ -943,6 +943,23 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
     {{}, {}, 0},
   }};
   rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  {
+    // The direct codec keeps nulls on the dictionary parent; decode must not take a fast path
+    // that reads the null row's code as a key.
+    for (auto const& values :
+         std::vector<std::vector<std::string>>{{"a", "longer", "", "a"}, {"aa", "bb", "", "aa"}}) {
+      auto input = make_strings_column(values, {true, true, false, true}, stream);
+      auto rep   = simpatico::dictionary_compressor{}.compress(input->view(), stream, mr);
+      auto& dict = dynamic_cast<simpatico::dictionary_compressed_representation&>(*rep);
+      std::array const streams{::cuda::stream_ref{stream}};
+      simpatico::decode_session session(streams, mr);
+      auto out = dict.decompress(simpatico::decode_session_test_access::frame(session));
+      stream.synchronize();
+      expect(out->null_count() == 1, "nullable dictionary lost the null row");
+      expect(strings_equal_completed(input->view(), out->view(), stream),
+             "nullable dictionary roundtrip mismatch");
+    }
+  }
   simpatico::stream_pool pool;
   expect(pool.init(2), "dictionary width pool init");
   for (auto const& fixture : fixtures) {
