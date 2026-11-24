@@ -195,7 +195,11 @@ def main():
         run = runs[(query, k)]
         if reference is not None:
             ref = reference.get((query, 1))
-            ref_rows = None if ref is None or ref["error"] or ref["time"] is None else ref["rows"]
+            ref_rows = (
+                None
+                if ref is None or ref["error"] or ref["time"] is None
+                else ref["rows"]
+            )
         else:
             path = os.path.join(args.ref_dir, args.ref_pattern.format(n=query))
             ref_rows = parse_csv_file(path) if os.path.isfile(path) else None
@@ -252,7 +256,9 @@ def main():
             for match in map(name.fullmatch, os.listdir(args.ref_dir))
             if match
         }
-        missing = [(query, "-") for query in sorted(expected - {query for query, _ in runs})]
+        missing = [
+            (query, "-") for query in sorted(expected - {query for query, _ in runs})
+        ]
     # A client that stopped early leaves no marker for the runs it never reached.
     for query, k in missing:
         print(f"| Q{query} | {k} | - | - | - | NOT RUN |")

@@ -1,7 +1,5 @@
 #include "gateway_state.hpp"
 
-#include "statement_facts.hpp"
-
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
@@ -10,6 +8,7 @@
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/set_statement.hpp"
+#include "statement_facts.hpp"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -73,9 +72,7 @@ constexpr std::array<char const*, 7> credential_words{
 bool changes_state(duckdb::SQLStatement& stmt)
 {
   switch (stmt.type) {
-    case duckdb::StatementType::SELECT_STATEMENT:
-      try {
-        return facts_of(stmt).writes;
+    case duckdb::StatementType::SELECT_STATEMENT: try { return facts_of(stmt).writes;
       } catch (duckdb::NotImplementedException&) {
         return true;  // a tree that cannot be walked may hold a write
       }
@@ -403,7 +400,8 @@ void run_canceller(duckdb::DatabaseInstance& db, std::shared_ptr<canceller> self
       std::this_thread::sleep_for(100ms);
     }
   } catch (std::exception& e) {  // the fan-out's grace period still bounds the statement
-    std::fprintf(stderr, "sirius_gateway: the cancel of %s stopped: %s\n", self->catalog.c_str(), e.what());
+    std::fprintf(
+      stderr, "sirius_gateway: the cancel of %s stopped: %s\n", self->catalog.c_str(), e.what());
   }
   std::lock_guard lock{self->mutex};
   self->finished = true;
@@ -593,8 +591,8 @@ gateway_state::rank_plan gateway_state::plan_ranks(start_options const& options)
 
   // With no gpus argument, Sirius ranks stay inside the gateway's own CUDA_VISIBLE_DEVICES.
   std::vector<std::string> visible;
-  if (auto const* mask = std::getenv("CUDA_VISIBLE_DEVICES");
-      options.gpus.empty() && !options.sirius_extension.empty() && mask != nullptr &&
+  auto const* mask = std::getenv("CUDA_VISIBLE_DEVICES");
+  if (options.gpus.empty() && !options.sirius_extension.empty() && mask != nullptr &&
       *mask != '\0') {
     visible = duckdb::StringUtil::Split(mask, ',');
     if (visible.size() < options.ranks) {
@@ -612,7 +610,9 @@ gateway_state::rank_plan gateway_state::plan_ranks(start_options const& options)
     r.index         = i;
     r.name          = "rank_" + std::to_string(i);
     r.token         = plan.token;
-    r.gpu = !options.gpus.empty() ? options.gpus[i] : !visible.empty() ? visible[i] : std::to_string(i);
+    r.gpu           = !options.gpus.empty() ? options.gpus[i]
+                      : !visible.empty()    ? visible[i]
+                                            : std::to_string(i);
     r.host          = "127.0.0.1";
     r.quack_host    = r.host;
     r.quack_port    = options.quack_base_port + i;
@@ -1302,8 +1302,9 @@ gateway_state::fan_out_result gateway_state::fan_out(
       started.join();
     }
     std::lock_guard lock{state_mutex_};
-    fail_locked("could not start the statement on every rank, so the gateway restarts the ranks "
-                "before the next statement");
+    fail_locked(
+      "could not start the statement on every rank, so the gateway restarts the ranks "
+      "before the next statement");
     throw;
   }
 
@@ -1326,8 +1327,8 @@ gateway_state::fan_out_result gateway_state::fan_out(
       } else {
         continue;
       }
-      cancelled_at       = now;
-      shared->cancel     = true;
+      cancelled_at   = now;
+      shared->cancel = true;
       for (auto const& r : ranks_) {
         auto one     = std::make_shared<canceller>();
         one->shared  = shared;

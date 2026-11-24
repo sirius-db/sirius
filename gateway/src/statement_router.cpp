@@ -1,11 +1,10 @@
 #include "statement_router.hpp"
 
-#include "statement_facts.hpp"
-
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/set_statement.hpp"
+#include "statement_facts.hpp"
 
 #include <algorithm>
 #include <array>
@@ -117,10 +116,9 @@ bool runs_on_gateway(SQLStatement& stmt, bool allow_join)
   // The statement runs as written in the client's gateway session. Anything else it read or
   // wrote there would be the gateway host's files, or SQL run by a function such as query().
   bool const other_source =
-    facts.reads_table ||
-    std::any_of(facts.table_functions.begin(), facts.table_functions.end(), [](auto const& name) {
-      return !is_gateway_name(name);
-    });
+    facts.reads_table || std::any_of(facts.table_functions.begin(),
+                                     facts.table_functions.end(),
+                                     [](auto const& name) { return !is_gateway_name(name); });
   if (local && facts.writes) {
     throw InvalidInputException(
       "a statement that calls a gateway function cannot write tables or files");

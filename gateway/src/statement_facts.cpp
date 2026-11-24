@@ -39,8 +39,8 @@ struct walk {
     if (e.GetExpressionClass() == ExpressionClass::SUBQUERY) {
       query(*e.Cast<SubqueryExpression>().SubqueryMutable()->node);
     }
-    ParsedExpressionIterator::EnumerateChildren(e,
-                                                [&](ParsedExpression& child) { expression(child); });
+    ParsedExpressionIterator::EnumerateChildren(
+      e, [&](ParsedExpression& child) { expression(child); });
   }
 
   /// The iterator calls back for each expression and table reference below @p node, but not for

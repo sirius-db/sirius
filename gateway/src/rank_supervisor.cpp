@@ -159,8 +159,7 @@ namespace {
 /// By its path, as sirius_rank_node.sh does: shm_unlink needs librt with the sysroot's glibc.
 void unlink_mirror(pid_t pid, uint32_t index)
 {
-  unlink(
-    ("/dev/shm/sirius-exchange-" + std::to_string(pid) + "-" + std::to_string(index)).c_str());
+  unlink(("/dev/shm/sirius-exchange-" + std::to_string(pid) + "-" + std::to_string(index)).c_str());
 }
 
 }  // namespace
