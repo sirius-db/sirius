@@ -84,7 +84,8 @@ else from `cudaMalloc`. It is never pool memory: UCX `cuda_ipc` cannot export st
 allocations, and a pool block could be reused while a peer's write into it is still landing.
 
 - **Writes.** One write covers as many consecutive frames as the sender holds consecutive send
-  frames and credits for, up to half a peer's credits, so two writes to a peer can be in flight.
+  frames and credits for, up to half of the smaller of a peer's credits and the send frames, so
+  two writes to a peer can be in flight.
   NVLink between nodes needs large writes: one write at a time moves about 450 GB/s at 16 MB,
   700 at 128 MB and 770 at 1 GB, because each write costs about 15 µs.
 
@@ -156,7 +157,12 @@ lane carries one). Every rank must use the same `sirius_exchange_host_staging` a
 lanes by a peer it reaches another way fails to connect, saying so. On gcn-17/gcn-18 over one
 200 Gb/s port (`[nixl_bandwidth]`, 16 receive frames per peer), 1+1 ranks with 16 lanes moved
 19.0 GB/s each way instead of 0.19, and 4+4 ranks with 4 lanes about 10 GB/s per rank, 23 GB/s
-across the link each way; raw TCP reaches 24.75 there.
+across the link each way; raw TCP reaches 24.75 there. These figures are from the branch the
+lanes were ported from, with UCX `tcp` on bond0; this code has not been measured again.
+
+On a cluster with RDMA between hosts and no fabric memory, set
+`sirius_exchange_host_staging = 'never'`: direct NIXL writes over the RDMA NICs are faster than
+lanes there, and `auto` does not yet tell such a cluster from one with TCP only.
 
 ### NVLink between nodes (MNNVL)
 

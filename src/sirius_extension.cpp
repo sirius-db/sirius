@@ -3938,7 +3938,8 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             SetExchangeRank);
   config.AddExtensionOption(
     "sirius_exchange_host_staging",
-    "Distributed execution: how the exchange's writes reach a peer. auto: over TCP lanes to "
+    "Distributed execution: how the exchange's writes reach a peer; auto and never take the "
+    "NVLink fabric first where it reaches (sirius_exchange_mnnvl). auto: over TCP lanes to "
     "ranks on other hosts, and through a pinned shared-memory mirror to same-host GPUs without "
     "peer access; always: the mirror for every same-host peer; never: NIXL to every peer; "
     "remote: TCP lanes to every peer. Same on every rank; set before sirius_exchange_rank, "
@@ -3957,9 +3958,9 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     SetExchangeMnnvl);
   config.AddExtensionOption(
     "sirius_exchange_frame_bytes",
-    "Distributed execution: the exchange's frame size in bytes; one write covers up to half a "
-    "peer's receive frames (one frame over TCP lanes). Same on every rank; set before "
-    "sirius_exchange_rank",
+    "Distributed execution: the exchange's frame size in bytes; one write covers up to half of "
+    "the smaller of a peer's receive frames and the send frames (one frame over TCP lanes). Same "
+    "on every rank; set before sirius_exchange_rank",
     LogicalType::UBIGINT,
     Value::UBIGINT(8ull << 20),
     SetExchangeFrameBytes);

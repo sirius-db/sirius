@@ -131,8 +131,9 @@ struct transport::engine {
   options opts;
   int device{0};
   std::uint32_t credits_per_peer{0};
-  /// The most frames one write covers: half a peer's credits, so that two writes to a peer can
-  /// be in flight while the receiver copies the first out.
+  /// The most frames one write covers: half of the smaller of a peer's credits and the send
+  /// frames, so that two writes to a peer can be in flight while the receiver copies the first
+  /// out.
   std::uint32_t max_write_frames{1};
   rmm::cuda_stream send_stream;
   rmm::cuda_stream recv_stream;
