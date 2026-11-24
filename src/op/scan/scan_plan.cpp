@@ -74,6 +74,15 @@ std::unordered_set<std::size_t> scan_plan::filter_only_batch_positions() const
   return positions;
 }
 
+std::unordered_set<std::size_t> scan_plan::delete_key_batch_positions() const
+{
+  std::unordered_set<std::size_t> positions;
+  for (std::size_t d = 0; d < columns.data_roles.size(); ++d) {
+    if (columns.data_roles[d] == scan_column_layout::data_role::DELETE_KEY) positions.insert(d);
+  }
+  return positions;
+}
+
 std::unordered_set<std::size_t> scan_plan::non_output_batch_positions() const
 {
   std::unordered_set<std::size_t> positions;
@@ -261,9 +270,12 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           std::size_t projected_output_count,
                           duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
                           std::vector<bound_virtual_column> const& virtual_columns,
-                          bool allow_metadata_only)
+                          bool allow_metadata_only,
+                          std::span<std::size_t const> delete_key_primary_indices)
 {
   scan_plan plan;
+  std::unordered_set<std::size_t> const delete_keys(delete_key_primary_indices.begin(),
+                                                    delete_key_primary_indices.end());
 
   // Register partition primary indices up-front so the filter-expression builder
   // can drop filters on partition columns regardless of whether they appear in
@@ -377,7 +389,9 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
         std::string col_name = names.empty() ? std::string{} : names.at(primary_idx);
         plan.data_columns.push_back(scan_plan::data_column{primary_idx, std::move(col_name)});
         plan.columns.data_roles.push_back(is_output ? scan_column_layout::data_role::OUTPUT
-                                                    : scan_column_layout::data_role::FILTER_ONLY);
+                                          : delete_keys.contains(primary_idx)
+                                            ? scan_column_layout::data_role::DELETE_KEY
+                                            : scan_column_layout::data_role::FILTER_ONLY);
         plan.columns.materialized_primary_indices.push_back(primary_idx);
       }
       if (is_output) {

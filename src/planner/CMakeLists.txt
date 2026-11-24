@@ -20,15 +20,14 @@ target_sources(
           scan_column_origin.cpp
           sirius_physical_plan_generator.cpp
           substrait_scan_ranges.cpp
+          sirius_plan_copy.cpp
           sirius_plan_aggregate.cpp
           sirius_plan_column_data_get.cpp
           sirius_plan_comparison_join.cpp
           sirius_plan_compressed_schema.cpp
           sirius_plan_cross_product.cpp
           sirius_plan_cte.cpp
-          sirius_plan_delim_get.cpp
           sirius_plan_delim_aggregate_reuse.cpp
-          sirius_plan_delim_join.cpp
           sirius_plan_distinct.cpp
           sirius_plan_dummy_scan.cpp
           sirius_plan_empty_result.cpp
@@ -43,7 +42,7 @@ target_sources(
           sirius_plan_partial_aggregate_pushdown.cpp
           sirius_plan_projection.cpp
           sirius_plan_projection_utils.cpp
-          sirius_plan_recursive_cte.cpp
+          sirius_plan_cte_ref.cpp
           sirius_plan_set_operation.cpp
           sirius_plan_top_n.cpp
           sirius_plan_window.cpp)

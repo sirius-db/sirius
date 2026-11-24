@@ -168,6 +168,33 @@ Without virtual columns, scans carrying deletes suppress reader filtering and us
 
 Row mapping is a **list of runs, not one offset**. `build_batch_layout` emits one `batch_row_run` per (file, row group), because splits span files and pruning leaves gaps; the decoded row count must equal the sum of run rows or it throws.
 
+#### Equality deletes
+
+An equality delete removes rows by key **value**, so it is applied as an anti join on the decoded batch, right after positional deletes and before the query predicate.
+
+```text
+plan gate      inventory (iceberg_metadata)  -> live EQUALITY_DELETES present?
+               delete manifests (read_avro)  -> equality_ids, sizes and partition of each delete file
+               applicable delete files per data file, key field IDs to bound columns,
+               type / budget / device limits
+lowering       append missing key columns to the scan as DELETE_KEY columns
+               read key columns of each delete file by field ID, normalize types, build groups
+execution      coalescer keeps data files with different applicable groups in separate batches
+               decode -> field mapping -> positional deletes -> equality deletes -> residual -> projection
+```
+
+**Applicability.** A delete file applies to a data file with a strictly lower data sequence number in the same partition (spec and partition tuple); a delete stored under a spec that does not partition applies to every data file. The inventory supplies each file's inherited `data_sequence_number` and the manifest that lists it; `manifest_sequence_number` is not used, because rewriting a manifest changes it. `read_equality_plan` reads the delete manifests with `read_avro` for `equality_ids`, record counts, file sizes and partition tuples, and the data manifests only when a delete is partition-scoped. Data manifests written under format version 1, which have no `content` field, are read. A manifest whose live entries differ from the inventory's declines the scan. The table path is not resolved again (see the table-replacement limitation below). A partition-scoped delete stored under a floating-point partition value of zero declines the scan: DuckDB's Iceberg reader takes `-0.0` and `+0.0` for one partition, while the spec compares their bit patterns. Delete files are not pruned by key bounds, so this path may open more of them than DuckDB; the rows are the same.
+
+**Keys are `equality_ids`, matched by field ID.** A delete file may store whole rows; only the columns named by the manifest entry's `equality_ids` are read and compared. They are located in the delete file's footer by field ID, so a renamed key still matches, and are normalized to the bound key type (`INT32` to `INT64` is the one accepted difference). NULL keys compare equal, as the spec requires.
+
+**Key columns need not be selected.** The lowering appends every key the query does not already read to the scan's `column_ids` and `projection_ids` without changing `projected_output_count`, so `build_scan_plan` gives them the `DELETE_KEY` role and the output projection drops them. `DELETE_KEY` is separate from `FILTER_ONLY` because a filter-only column may be replaced by a predicate's BOOL8 answer, and a key must keep its values. Only the ingestible's bind data is widened; the scan node, its output types and the DuckDB plan are unchanged.
+
+**Groups and batches.** Delete files that share their keys and apply to exactly the same data files are concatenated, deduplicated and built into one `cudf::distinct_hash_join`; a data file is probed against each group that applies to it. Data files with the same applicability share one group list, and the coalescer ends a batch when the next file's list differs (`parquet_file_scan_info::visibility_class`), so a batch has a single answer. A scanned file that the equality plan does not list is refused rather than treated as having no deletes.
+
+**Ceilings.** Planning limits rows per delete file and rows and file bytes per statement. Before decoding keys, the reader checks the file size and Parquet row counts against the manifest entries used for those charges. A separate ceiling limits the number of applicable delete files per data file. A scan or statement above a ceiling is declined (`iceberg_equality_budget`).
+
+**Allocation and lifetime.** Lowering builds the group tables with a stream and allocator from the configured GPU's memory space. The tables count against that space's capacity and remain resident until the scan is released. They have no build reservation or spill path. If allocation fails during planning, Sirius releases the tables and follows the query's fallback policy. Equality deletes use eager preparation, including when the same scan has deletion vectors.
+
 **Delete discovery** (`iceberg_metadata_reader.{
   hpp, cpp}`) delegates manifest parsing to DuckDB's `iceberg` and `avro` extensions. `iceberg_metadata()` covers everything except the three V3 deletion-vector fields it does not expose (`content_offset`, `content_size_in_bytes`, `referenced_data_file`), which a `read_avro` query over the containing manifest supplies. Results are memoized per query, keyed on transaction id plus table path plus snapshot, because one query reads delete data more than once — `iceberg_scan` is not serializable, so the plan is generated twice. `read_deletion_vector` (`puffin_reader.cpp`) validates the Puffin container's leading and trailing magic before seeking to a blob offset inside it, then checks the deletion-vector blob's own magic and CRC-32.
 
@@ -197,14 +224,14 @@ including an opened-object version change, are terminal `reader_io` at the charg
 the version-change counter is recorded before that classification. Cancellation, allocation
 failures, and typed planning refusals retain their own outcomes.
 
-**Current limitation: table replacement at the same URI.** Delete discovery reuses the data scan's table URI and selected snapshot ID, but `iceberg_metadata()` does not expose the UUID of the table it resolves. UUID checks between data bindings do not validate this separate lookup. The URI must continue to identify the same Iceberg table throughout the query; replacing it with another table containing the same snapshot ID can mix data and deletes from different tables. Validation of this lookup is deferred until the Iceberg extension exposes its bound table identity or resolved immutable metadata URI. No additional UUID query is issued.
+**Current limitation: table replacement at the same URI.** Delete discovery reuses the data scan's table URI and selected snapshot ID, but `iceberg_metadata()` does not expose the UUID of the table it resolves. UUID checks between data bindings do not validate this separate lookup. When the loaded Iceberg extension accepts `expected_table_uuid` on `iceberg_metadata()`, Sirius passes the bound table UUID and the lookup fails for another table, which declines the scan. With an extension that does not accept it, the URI must continue to identify the same Iceberg table throughout the query; replacing it with another table containing the same snapshot ID can mix data and deletes from different tables. No additional UUID query is issued.
 
 Known unsupported bindings **decline at plan time** (`sirius_plan_get.cpp`); file-schema checks and admitted deletion-vector reads run during metadata preparation. Execution-time failures stop and drain the query before the [CPU replay policy](scan-contracts-design.md#cpu-replay-policy) is applied.
 
 Currently declined:
 
-- **Default snapshot selection without binding evidence.** For `iceberg_scan(path)`, Sirius uses Iceberg's bound snapshot ID for delete discovery and checks the table UUID, snapshot ID, and schema ID after a rebind. Missing binding evidence declines the scan.
-- **Equality deletes.** The filter, the GPU anti-join mask and the group build all exist, but key projection is not wired, and two pieces do not implement the spec: the applicability test compares the *manifest's* sequence number rather than the entry's inherited data sequence number, and keys are taken from every column of the delete file rather than the entry's declared `equality_ids`. `read_iceberg_delete_data` refuses live equality entries behind `kEqualityDeleteRouteImplementedToSpec`, which is the single switch that turns the route on; the components are covered directly by `test/cpp/scan/test_iceberg_equality_delete.cpp`, because no SQL test can reach them.
+- **Default snapshot selection without binding evidence.** For `iceberg_scan(path)`, Sirius uses Iceberg's bound snapshot ID for delete discovery and checks the table UUID, snapshot ID, and schema ID after a rebind. Missing binding evidence declines the scan. A scan with `snapshot_from_id` gets the same check after a rebind when the binding publishes these values, and proceeds without it otherwise.
+- **Equality deletes outside the supported shape.** A scan is declined when its manifests cannot be read or contradict the inventory, or a partition-scoped delete is stored under a floating-point zero (`iceberg_equality_plan_unproven`); when a key is not a top-level `BOOLEAN`, `INTEGER`, `BIGINT`, `DATE`, `TIMESTAMP`, `TIMESTAMP_NS` or `VARCHAR` column of the bound schema (`iceberg_equality_key_unsupported`); when a ceiling is exceeded (`iceberg_equality_budget`); when more than one GPU is configured (`iceberg_equality_multi_gpu`); or when an equality-delete file is not local (`iceberg_equality_remote`). The spec also allows the other primitive key types except `float` and `double`, struct members, and keys the table has since dropped. See [Equality deletes](#equality-deletes).
 - **`snapshot_from_timestamp` and `version`.** The delete path resolves only by `snapshot_from_id`, so these would read one snapshot's data against another's deletes.
 - **`allow_moved_paths = true`.** It rewrites every data-file path to `<table_path>/data/<name>`, while delete discovery calls `iceberg_metadata()` without the flag and keeps the manifests' original paths; the two would not match and the deletes would be dropped.
 - **Schema changes outside `iceberg_flat_v1`**, including nested transformations, date/timestamp or decimal evolution, files lacking complete field IDs, and missing columns whose partition-constant semantics cannot be proved. Existing matching-schema support for these types is unchanged.
@@ -286,7 +313,7 @@ For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple p
 | `sirius_scan_manager` | `scan_manager/sirius_scan_manager.{hpp,cpp}` | Owns the shared thread pool, ioctx, cache, and pinned-table registry; `prepare_for_query` registers per-query providers; `start_metadata_processing` arms preparation |
 | `split_provider` | `scan_manager/split_provider.{hpp,cpp}` | Binds a `gpu_ingestible` to its I/O resolver and returns its preparation sources |
 | `load_balancing_scan_batch_coalescer` | `scan_manager/load_balancing_scan_batch_coalescer.{hpp,cpp}` | Registers per-scan coalescing, placement and publication with the coordinator; drains cached providers on workers |
-| `preparation_coordinator` | `scan_manager/preparation_coordinator.{hpp,cpp}` | Bounds pending work and validates publication; runs on the query owner for metadata-only attempts, otherwise on the manager coordinator pool, with dedicated threads available via `coordinator_workers: 0` |
+| `preparation_coordinator` | `scan_manager/preparation_coordinator.{hpp,cpp}` | Bounds pending work and validates publication; uses the manager coordinator pool for Parquet/Iceberg and reader attempts; synchronous-only metadata attempts retain query-owner coordination, with dedicated threads available via `coordinator_workers: 0` |
 | `batch_coalescer` | `op/scan/batch_coalescer.hpp` (impls in the ingestibles) | Bundles per-unit `scan_info`s into right-sized data-batch splits |
 | `balancing_strategy` / `round_robin_strategy` | `scan_manager/balancing_strategy.hpp`, `round_robin_strategy.{
   hpp, cpp}` | Picks the target GPU for each split and stamps `preferred_device_id` on it |
@@ -300,7 +327,7 @@ For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple p
 2. **Per-query preparation.** `prepare_for_query(query, pruning, allocated_gpu_ids)` creates state keyed by the query id, builds a `round_robin_strategy` over the query's admitted GPU ids and a fresh `load_balancing_scan_batch_coalescer`, then walks the query's `GPU_SCAN` operators in order. The admitted set is passed in by `SiriusContext::create_query`, which reads it back off `task_creator` after `sirius_engine::initialize_internal` installed it — so scan placement, partition pins and `pipeline_build_context` all draw on one list (see [configuration.md](configuration.md) for `topology.gpus_per_query`). For each it `register_pipeline`s a sequencer slot (which builds the ingestible's `batch_coalescer` and captures the operator's connector). Then either:
    - **Cache hit** — `try_assign_cached_entries` finds a pinned entry whose identity and columns can serve the scan; it attaches a `databatch_provider` to the slot and skips disk reading entirely; or
    - **Cache miss** — a `split_provider` is built over the operator's ingestible and stored with that query's scan entry.
-3. **Execution.** Preparation starts after GPU consumers are ready. Metadata-only attempts advance coordination on the query owner. Attempts with query-owner or native-reader sources use the manager's shared coordinator pool by default; `coordinator_workers: 0` selects a dedicated thread per attempt. All drivers use the same control steps to coalesce and validate ready inputs, select a GPU, and publish batches to each operator's connector. Later scans can progress before earlier scans close. See [execution domains and ownership](scan-contracts-design.md#execution-and-ownership).
+3. **Execution.** Preparation starts after GPU consumers are ready. Parquet/Iceberg coalescing runs asynchronously on NUMA-assigned metadata workers. These attempts, and attempts with query-owner or native-reader sources, use the manager's shared coordinator pool by default; `coordinator_workers: 0` selects a dedicated thread per attempt. All drivers use the same control steps to schedule coalescing and validate ready inputs, select a GPU, and publish batches to each operator's connector. Later scans can progress before earlier scans close. See [execution domains and ownership](scan-contracts-design.md#execution-and-ownership).
 4. **Teardown.** The coordinator closes each connector after all of its preparation lanes settle. Preparation errors are reported through the query completion handler, which preserves the first error. Once closed and drained, the operator's `all_ports_empty()` returns true and `get_next_task_hint()` returns `nullopt`. Success requires both preparation and GPU work to drain. Failure or interruption stops new preparation and publication and drains workers and consumers before resources are released. `quiesce(query_id)` drains that query's preparation and waits for its final control step to return, while retaining its providers; after execution work retires, `reset(query_id)` releases that query's state without stopping the shared pool.
 
 ### split_provider
@@ -805,7 +832,7 @@ graph TD
     SM[sirius_scan_manager.prepare_for_query] -->|cache miss| SP["split_provider<br/>(composes ingestible)"]
     SM -->|pinned-cache hit| DBP[cached_databatch_provider]
 
-    SP -->|make_preparation_sources| SEQ["preparation_coordinator<br/>metadata only: query owner<br/>reader sources: dedicated thread or shared pool"]
+    SP -->|make_preparation_sources| SEQ["preparation_coordinator<br/>Parquet / readers: shared pool or dedicated thread<br/>other metadata: query owner"]
     SEQ -->|metadata jobs| DISP[dispatcher thread pool]
     SEQ -->|provider jobs| Q["query owner<br/>await_query_completion / advance"]
     SEQ -->|native reader jobs| N[native_reader_executor]
@@ -985,6 +1012,13 @@ existing name, Iceberg field-ID and flat compatibility rules. Immutable mapping
 results preserve physical-check evidence and diagnostics, and distinguish field
 correspondence from the reader projection, including cardinality carriers and
 natural-read fallback. Preparation still reads and certifies each footer once.
+
+Scans and the join-key checks resolve source columns by the names the table function
+bound (`scan_source_names`, `src/planner/scan_source_names.hpp`), not by
+`LogicalGet::names`, which holds column aliases such as `AS t(b, a)`. Multi-file binds
+(`read_parquet`, `iceberg_scan`) and `sirius_read_parquet` supply the bound names; any other
+bind, or one whose column count differs from the `LogicalGet`'s, falls back to
+`LogicalGet::names`.
 
 ## Key Files
 

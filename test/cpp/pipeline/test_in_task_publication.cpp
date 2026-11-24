@@ -45,6 +45,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -523,6 +524,10 @@ TEST_CASE("mandatory scatter OOM retries the elected identity through the execut
   auto record                     = std::make_shared<retry_record>();
   record->constrain_first_attempt = true;
   auto tasks                      = test.tasks({first, final}, record);
+  auto const first_delivery       = tasks[0]->get_task_id();
+  auto const final_delivery       = tasks[1]->get_task_id();
+  std::vector<op::delivery_metadata> deliveries;
+  std::mutex deliveries_mutex;
   std::atomic<bool> fail_next{false};
   std::atomic<std::size_t> failures{0};
   test.allocations->before_allocate = [&](int, ::cuda::stream_ref, std::size_t) {
@@ -533,7 +538,11 @@ TEST_CASE("mandatory scatter OOM retries the elected identity through the execut
   };
   std::atomic<bool> retry_deposit_ready{false};
   std::atomic<bool> retry_kept_build_open{false};
-  test.partition->before_execute = [&](op::operator_data const&, ::cuda::stream_ref) {
+  test.partition->before_execute = [&](op::operator_data const& input, ::cuda::stream_ref) {
+    if (auto const* metadata = input.delivery()) {
+      std::lock_guard lock(deliveries_mutex);
+      deliveries.push_back(*metadata);
+    }
     if (record->retries.load() != 0) {
       retry_kept_build_open.store(!test.partition->finalized.load() &&
                                   !test.memory.channel->snapshot().terminal());
@@ -559,6 +568,16 @@ TEST_CASE("mandatory scatter OOM retries the elected identity through the execut
   REQUIRE(record->resume_index == 0);
   REQUIRE(record->original_id == final->get_batch_id());
   REQUIRE(record->floor >= pl::gpu_pipeline_task_local_state::kDefaultRetryRequestBytes);
+  {
+    std::lock_guard lock(deliveries_mutex);
+    REQUIRE(deliveries.size() == 3);
+    REQUIRE(deliveries[0].original_task_id == first_delivery);
+    REQUIRE(deliveries[0].retry_count == 0);
+    REQUIRE(deliveries[1].original_task_id == final_delivery);
+    REQUIRE(deliveries[1].retry_count == 0);
+    REQUIRE(deliveries[2].original_task_id == final_delivery);
+    REQUIRE(deliveries[2].retry_count == 1);
+  }
   REQUIRE(retry_deposit_ready.load());
   REQUIRE(retry_kept_build_open.load());
   REQUIRE(test.partition->finalized.load());

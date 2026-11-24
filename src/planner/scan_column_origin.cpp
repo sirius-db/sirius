@@ -162,7 +162,6 @@ std::optional<ordinal_origin> step_origin(duckdb::LogicalOperator const& op,
       return join_origin(op.Cast<duckdb::LogicalJoin>(), ordinal, policy);
     case duckdb::LogicalOperatorType::LOGICAL_ANY_JOIN:
     case duckdb::LogicalOperatorType::LOGICAL_ASOF_JOIN:
-    case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
       if (policy != origin_policy::value_preserving) { return std::nullopt; }
       return join_origin(op.Cast<duckdb::LogicalJoin>(), ordinal, policy);
     case duckdb::LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {

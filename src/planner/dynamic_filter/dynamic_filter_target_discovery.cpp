@@ -212,7 +212,6 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::RECURSIVE_CTE_SCAN:
     case SiriusPhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN:
     case SiriusPhysicalOperatorType::CTE_SCAN:
-    case SiriusPhysicalOperatorType::DELIM_SCAN:
     case SiriusPhysicalOperatorType::EXPRESSION_SCAN:
     case SiriusPhysicalOperatorType::POSITIONAL_SCAN:
     case SiriusPhysicalOperatorType::BLOCKWISE_NL_JOIN:
@@ -220,8 +219,6 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::CROSS_PRODUCT:
     case SiriusPhysicalOperatorType::PIECEWISE_MERGE_JOIN:
     case SiriusPhysicalOperatorType::IE_JOIN:
-    case SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
-    case SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
     case SiriusPhysicalOperatorType::POSITIONAL_JOIN:
     case SiriusPhysicalOperatorType::ASOF_JOIN:
     case SiriusPhysicalOperatorType::RECURSIVE_CTE:

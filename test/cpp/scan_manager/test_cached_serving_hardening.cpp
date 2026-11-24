@@ -2608,13 +2608,20 @@ TEST_CASE(
   auto& split = dynamic_cast<scan_operator_input&>(*handed);
   REQUIRE(split.cached_view_possible);
   split.needs_carrier_conversion = converting;
+  if (deferring) {
+    auto origin   = std::make_shared<sirius::late_mat::scan_batch_origin>();
+    origin->range = {0, 64};
+    split.origin  = std::move(origin);
+  }
+  // The deferral's rowid column rides on every envelope.
+  std::size_t const rowid_bytes = deferring ? 64 * sizeof(std::uint64_t) : 0;
   auto const decode_probes =
     split.enable_fused_scan_filter && split.consumer && !split.consumer->decode_bindings().empty();
   auto const ordinary = [&] {
     auto const batch_bytes = split.get_estimated_size_in_bytes();
-    return decode_probes ? batch_bytes + batch_bytes / 4 : batch_bytes;
+    return (decode_probes ? batch_bytes + batch_bytes / 4 : batch_bytes) + rowid_bytes;
   };
-  auto const envelope = [&] { return 2 * split.get_estimated_size_in_bytes(); };
+  auto const envelope = [&] { return 2 * split.get_estimated_size_in_bytes() + rowid_bytes; };
   REQUIRE(split.get_estimated_size_in_bytes() > 0);
 
   // Before preparation every split the checkpoint could borrow reserves its gather.
@@ -2626,11 +2633,6 @@ TEST_CASE(
   CHECK(split.get_estimated_working_set_size_in_bytes() ==
         (exit == table_exit::prepare ? ordinary() : envelope()));
 
-  if (deferring) {
-    auto origin   = std::make_shared<sirius::late_mat::scan_batch_origin>();
-    origin->range = {0, 64};
-    split.origin  = std::move(origin);
-  }
   auto const output = scan.execute(split, e.stream());
   REQUIRE(output);
   CHECK(split.cached_checkpoint_possible() == (exit == table_exit::never));

@@ -48,6 +48,26 @@ pixi run python test/scripts/classify_queries.py --benchmark tpch-havoc \
   --output-dir ...
 ```
 
+With a Parquet directory, `--decimal-as-double` reads every top-level
+`DECIMAL(p,s)` column as DOUBLE, through views that cast them. Some TPC-DS datasets
+store the money columns as DOUBLE, which takes different GPU paths (floating point
+sums and extrema) than the DECIMAL columns of DuckDB's generator. The views cast
+after the scan, so they exercise the DOUBLE paths of the operators above it, not
+those of a DOUBLE Parquet file: the reader still decodes DECIMAL values, and filter
+pushdown and row-group pruning see DECIMAL columns and statistics. For DOUBLE files,
+write a copy of the data with stock DuckDB and classify that directory, for example
+per table:
+
+```sql
+COPY (SELECT * REPLACE (ss_sales_price::DOUBLE AS ss_sales_price, ...)
+      FROM 'store_sales/*.parquet') TO 'double/store_sales/part.0.parquet';
+```
+
+Over DOUBLE, sums that are equal in exact arithmetic can differ in their last bit
+depending on the order of the additions, on the CPU and the GPU alike. A query that
+ranks or filters on such sums can then differ in a rank or a row although every
+value is within tolerance. TPC-DS Q67 ranks `ROLLUP` totals and shows this.
+
 The output directory must be new. Add `--queries 3 7 42` for a subset (with
 `tpch-havoc`, base query numbers or labels such as `Q05_V03`) or `--timeout 60` to
 limit each process to 60 seconds. Table inputs can be named
@@ -60,7 +80,9 @@ It is a small baseline for SF1, not a memory recommendation for larger scales.
 For each query, it saves:
 
 - `plans.json`: DuckDB's unoptimized logical, optimized logical, and CPU physical
-  trees, using Sirius's disabled optimizer mask.
+  trees, with the optimizers Sirius disables when it loads. They come from DuckDB
+  without the extension loaded, so Sirius's optimizer hooks do not run and the plans
+  can still differ from the plans Sirius receives.
 - `plans/`: the exact EXPLAIN input, stdout and stderr.
 - `gpu/`: the exact execution input, CSV results, stderr and Sirius logs.
 - `classification.csv`: completed GPU execution, plan rejection, runtime failure,
@@ -68,8 +90,17 @@ For each query, it saves:
   error. With `tpch-havoc`, `duplicates` lists the labels of identical rewrites.
 - `features.json`: query membership for plan operators, join types and function
   names visible in the EXPLAIN trees. This is an inventory, not a support verdict.
-- `metadata.json` and `sirius.yaml`: source revision, dirty status, CLI and
-  extension hashes, input location, optimizer mask, timeout and configuration.
+- `metadata.json`: the run's inputs and settings. `utc`, `benchmark`,
+  `scale_factor`, `data`, `decimal_as_double` and `query_dir` describe the input.
+  `revision` and `git_status` give the source tree, `binary` and `extension` the
+  CLI and the extension with their `_mtime` and `_sha256`. `optimizer_mask` lists
+  the optimizers Sirius disables, read from the extension. `timeout_seconds` and
+  `CUDA_VISIBLE_DEVICES` are the run's limits. `result_validation`,
+  `validation_float_abs_tol`, `validation_float_rel_tol` and `validation_row_order`
+  describe the validation. Without `--validate`, `result_validation` is
+  `"not performed"` and the other three are `null`.
+- `sirius.yaml`: a copy of the Sirius config.
+- `probe_log/`: the Sirius log of the load that reads the disabled optimizers.
 - `summary.md`: counts by outcome (per base query for `tpch-havoc`) and the first
   error of each root cause, ready to paste into an issue.
 
@@ -82,9 +113,11 @@ settings. Rejected or failed GPU queries are marked `not_applicable` for validat
 Execution status stays separate from correctness status.
 
 Validation compares row multisets, preserving duplicate multiplicities while
-ignoring order, as the TPC-H runner does. FLOAT/DOUBLE values use absolute tolerance
-1e-10 (override with `--float-tolerance`); integers, decimals, strings and NULLs
-compare exactly. JSON output preserves NULLs and avoids truncated display tables.
+ignoring order, as the TPC-H runner does. A GPU FLOAT/DOUBLE value matches the CPU
+value when they differ by at most an absolute tolerance of 1e-10
+(`--float-tolerance`) or a relative tolerance of 1e-9 of the CPU value
+(`--float-rel-tolerance`), whichever is larger; integers, decimals, strings and
+NULLs compare exactly. JSON output preserves NULLs and avoids truncated display tables.
 This checks result contents, not ORDER BY behavior; LIMIT queries with unresolved
 ties can select different valid rows and require inspection of reported mismatches.
 
@@ -114,8 +147,10 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
+import tempfile
 
 import yaml
 
@@ -135,8 +170,8 @@ QUERY_FILES = {
     "tpcds": (ROOT / "duckdb/extension/tpcds/dsdgen/queries", 99),
     "tpch": (ROOT / "duckdb/extension/tpch/dbgen/queries", 22),
 }
-MASK = "in_clause,compressed_materialization,late_materialization"
 DEFAULT_FLOAT_TOLERANCE = 1e-10
+DEFAULT_FLOAT_REL_TOLERANCE = 1e-9
 # summary.md outcomes, in column order.
 OUTCOMES = {
     "gpu": "GPU",
@@ -174,7 +209,7 @@ def json_results(output):
     return results
 
 
-def compare_result_rows(schema, expected, actual, float_tolerance):
+def compare_result_rows(schema, expected, actual, float_tolerance, float_rel_tolerance):
     """Compare row multisets: exact non-floats and tolerance-aware float matching."""
     names = tuple(column["column_name"] for column in schema)
     types = [column["column_type"].upper() for column in schema]
@@ -208,46 +243,82 @@ def compare_result_rows(schema, expected, actual, float_tolerance):
         missing = next((cpu - gpu).elements())
         return False, f"No matching GPU row for CPU row {missing!r}"
 
-    def matches(lhs, rhs):
-        for i, (a, b) in enumerate(zip(lhs, rhs)):
+    def matches(reference, value):
+        """Whether a GPU row `value` matches the CPU row `reference`."""
+        for i, (a, b) in enumerate(zip(reference, value)):
             if a == b:
                 continue
             if i not in floats or a is None or b is None:
                 return False
-            if not (
-                (math.isnan(a) and math.isnan(b))
-                or math.isclose(a, b, rel_tol=0.0, abs_tol=float_tolerance)
-            ):
+            if math.isnan(a) and math.isnan(b):
+                continue
+            # Equal infinities matched above, any other non-finite pair differs.
+            if not (math.isfinite(a) and math.isfinite(b)):
+                return False
+            if abs(a - b) > max(float_tolerance, float_rel_tolerance * abs(a)):
                 return False
         return True
 
-    # A maximum bipartite matching avoids false mismatches from sorting approximate
+    def mismatch(row):
+        return (
+            False,
+            f"No matching GPU row for CPU row {row!r} "
+            f"(abs_tol={float_tolerance:g}, rel_tol={float_rel_tolerance:g})",
+        )
+
+    # Rows can only match within a group of equal non-float values. Within a group,
+    # a maximum bipartite matching avoids false mismatches from sorting approximate
     # floats and prevents one GPU row from satisfying multiple CPU duplicate rows.
-    edges = [
-        [j for j, rhs in enumerate(actual) if matches(lhs, rhs)] for lhs in expected
-    ]
-    assigned = {}
+    exact = [i for i in range(len(names)) if i not in floats]
+    groups = collections.defaultdict(lambda: ([], []))
+    for side, rows in enumerate((expected, actual)):
+        for row in rows:
+            groups[tuple(row[i] for i in exact)][side].append(row)
 
-    def assign(i, seen):
-        for j in edges[i]:
-            if j in seen:
+    def float_order(row):
+        return tuple((row[i] is None, row[i] or 0.0) for i in floats)
+
+    for left, right in groups.values():
+        left.sort(key=float_order)
+        right.sort(key=float_order)
+        partner, owner = {}, {}
+        # Sorted rows usually match their counterpart at the same position.
+        for i, (a, b) in enumerate(zip(left, right)):
+            if matches(a, b):
+                partner[i] = owner[i] = i
+        # Find an augmenting path for each remaining CPU row, iteratively so that
+        # large groups cannot exhaust Python's call stack.
+        for start in range(len(left)):
+            if start in partner:
                 continue
-            seen.add(j)
-            if j not in assigned or assign(assigned[j], seen):
-                assigned[j] = i
-                return True
-        return False
+            queue, parents, free = collections.deque([start]), {}, None
+            while queue and free is None:
+                i = queue.popleft()
+                for j, row in enumerate(right):
+                    if j in parents or not matches(left[i], row):
+                        continue
+                    parents[j] = i
+                    if j not in owner:
+                        free = j
+                        break
+                    queue.append(owner[j])
+            if free is None:
+                return mismatch(left[start])
+            while free is not None:
+                i = parents[free]
+                previous = partner.get(i)
+                partner[i], owner[free] = free, i
+                free = previous
+    return (
+        True,
+        f"Row multiset match within float abs_tol={float_tolerance:g}, "
+        f"rel_tol={float_rel_tolerance:g}",
+    )
 
-    for i in range(len(expected)):
-        if not assign(i, set()):
-            return (
-                False,
-                f"No matching GPU row for CPU row {expected[i]!r} (abs_tol={float_tolerance:g})",
-            )
-    return True, f"Row multiset match within float abs_tol={float_tolerance:g}"
 
-
-def validate_result(binary, setup, sql, env, directory, timeout, gpu_output, tolerance):
+def validate_result(
+    binary, setup, sql, env, directory, timeout, gpu_output, tolerance, rel_tolerance
+):
     code, stdout, stderr = run_cli(
         binary,
         setup + ".mode json\nDESCRIBE " + sql + sql,
@@ -264,7 +335,9 @@ def validate_result(binary, setup, sql, env, directory, timeout, gpu_output, tol
         gpu = json_results(gpu_output)
         if len(cpu) != 2 or len(gpu) != 1:
             raise ValueError("Expected CPU schema plus one CPU/GPU query result set")
-        match, detail = compare_result_rows(cpu[0], cpu[1], gpu[0], tolerance)
+        match, detail = compare_result_rows(
+            cpu[0], cpu[1], gpu[0], tolerance, rel_tolerance
+        )
     except (ValueError, TypeError, KeyError, ArithmeticError) as exc:
         return "error", f"Cannot compare results: {exc}"
     return "pass" if match else "mismatch", detail
@@ -281,7 +354,9 @@ def walk(nodes):
 
 
 def explain_arrays(output):
-    # DuckDB's shell renders EXPLAIN JSON specially, even with -json.
+    # DuckDB's shell renders EXPLAIN JSON specially, even with -json. Its warnings end
+    # in a color reset before the next line.
+    output = re.sub(r"\x1b\[[0-9;]*m", "", output)
     decoder = json.JSONDecoder()
     arrays = []
     for match in re.finditer(r"^\[", output, re.MULTILINE):
@@ -294,6 +369,181 @@ def explain_arrays(output):
     if len(arrays) != 3:
         raise ValueError(f"Expected three EXPLAIN trees, found {len(arrays)}")
     return dict(zip(("logical", "logical_optimized", "physical"), arrays))
+
+
+class ProbeError(Exception):
+    """A setup query run with the CLI failed."""
+
+
+def sirius_env(config, log_dir):
+    """The environment of a CLI process that loads Sirius with `config`.
+
+    Parameters
+    ----------
+    config
+        Path to the Sirius config file.
+    log_dir
+        Directory for the Sirius log.
+
+    Returns
+    -------
+    dict
+        A copy of this script's environment with `SIRIUS_CONFIG_FILE`,
+        `SIRIUS_LOG_DIR` and `SIRIUS_LOG_LEVEL=info` set and `SIRIUS_DISABLE` removed.
+    """
+    env = dict(
+        os.environ,
+        SIRIUS_CONFIG_FILE=str(config),
+        SIRIUS_LOG_DIR=str(log_dir),
+        SIRIUS_LOG_LEVEL="info",
+    )
+    env.pop("SIRIUS_DISABLE", None)
+    return env
+
+
+def probe(binary, sql, timeout, env=None, extension=None):
+    """Run a setup query with the DuckDB CLI and return its rows.
+
+    The CLI runs in JSON mode with `-bail`, so `sql` must produce exactly one result
+    set; statements without output, such as `SET`, may come before it.
+
+    Parameters
+    ----------
+    binary
+        Path to the DuckDB CLI.
+    sql
+        The SQL text to run, fed to the CLI on stdin.
+    timeout
+        Seconds the CLI process may run.
+    env
+        Environment of the CLI process. `None` inherits the environment of this script.
+    extension
+        Path to the Sirius extension. When given, the CLI starts with `-unsigned` and
+        runs `LOAD` on the extension before `sql`.
+
+    Returns
+    -------
+    list of dict
+        The rows of the result set, one dict per row keyed by column name.
+
+    Raises
+    ------
+    ProbeError
+        If the CLI exits with an error, with its stderr (or stdout) as the message,
+        if it runs longer than `timeout`, or if its output is not one JSON result set.
+    """
+    args = [str(binary), "-bail", "-no-agent", "-json"]
+    if extension is not None:
+        args.insert(1, "-unsigned")
+        sql = f"LOAD {quote(extension)};\n" + sql
+    try:
+        result = subprocess.run(
+            args,
+            input=sql,
+            text=True,
+            capture_output=True,
+            env=env,
+            cwd=ROOT,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ProbeError(f"timed out after {timeout:g} s") from exc
+    if result.returncode != 0:
+        raise ProbeError(result.stderr.strip() or result.stdout.strip())
+    try:
+        return json.loads(result.stdout)
+    except ValueError as exc:
+        raise ProbeError(f"unexpected output {result.stdout!r}") from exc
+
+
+def decimal_as_double_view(binary, table, files, timeout):
+    """Build a view of a Parquet table with its DECIMAL columns read as DOUBLE.
+
+    The schema comes from `DESCRIBE` on the Parquet files. Every top-level column whose
+    type is `DECIMAL(p,s)` becomes `CAST(column AS DOUBLE)` under its own name, and
+    every other column is passed through, including LIST, ARRAY, STRUCT and MAP
+    columns that contain DECIMAL values. The cast happens after the scan, so the
+    Parquet reader still decodes DECIMAL values, and filter pushdown and row-group
+    pruning see the DECIMAL columns, not DOUBLE ones.
+
+    Parameters
+    ----------
+    binary
+        Path to the DuckDB CLI, used to read the schema.
+    table
+        Name of the view, the table name the queries use.
+    files
+        Paths of the table's Parquet files, in the order to read them.
+    timeout
+        Seconds the schema query may run.
+
+    Returns
+    -------
+    str
+        A `CREATE VIEW` statement, ending in a newline.
+
+    Raises
+    ------
+    ProbeError
+        If DuckDB cannot read the schema of `files` within `timeout`.
+    """
+    source = "read_parquet([" + ",".join(quote(path) for path in files) + "])"
+    rows = probe(
+        binary,
+        f"SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM {source});\n",
+        timeout,
+    )
+    columns = []
+    for row in rows:
+        name = '"' + row["column_name"].replace('"', '""') + '"'
+        if re.fullmatch(r"DECIMAL\(\d+,\s*\d+\)", row["column_type"]):
+            columns.append(f"{name}::DOUBLE AS {name}")
+        else:
+            columns.append(name)
+    return f"CREATE VIEW {table} AS SELECT {', '.join(columns)} FROM {source};\n"
+
+
+def sirius_disabled_optimizers(binary, extension, env, timeout):
+    """Read the optimizers Sirius disables when it loads.
+
+    Loading the extension adds the optimizers Sirius cannot plan for to
+    `disabled_optimizers`. Loading it with `SIRIUS_DISABLE` set does not, so `env`
+    should be the environment of the GPU runs, see `sirius_env`.
+
+    Parameters
+    ----------
+    binary
+        Path to the DuckDB CLI.
+    extension
+        Path to the Sirius extension to load.
+    env
+        Environment of the CLI process.
+    timeout
+        Seconds the CLI process, including the load of Sirius, may run.
+
+    Returns
+    -------
+    str
+        The disabled optimizers, comma-separated, as `SET disabled_optimizers` takes
+        them.
+
+    Raises
+    ------
+    ProbeError
+        If the extension fails to load within `timeout`, or if `disabled_optimizers`
+        is empty or not a comma-separated list of optimizer names.
+    """
+    (row,) = probe(
+        binary,
+        "SELECT current_setting('disabled_optimizers') AS disabled_optimizers;\n",
+        timeout,
+        env,
+        extension,
+    )
+    mask = row["disabled_optimizers"]
+    if not re.fullmatch(r"[a-z_]+(,[a-z_]+)*", mask):
+        raise ProbeError(f"unexpected disabled_optimizers {mask!r}")
+    return mask
 
 
 def run_cli(binary, sql, env, directory, timeout, extension=None):
@@ -468,6 +718,11 @@ def main():
     )
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument(
+        "--decimal-as-double",
+        action="store_true",
+        help="Read every top-level DECIMAL column of the Parquet tables as DOUBLE",
+    )
+    parser.add_argument(
         "--validate",
         action="store_true",
         help="Compare completed GPU queries against CPU DuckDB results",
@@ -478,11 +733,21 @@ def main():
         default=DEFAULT_FLOAT_TOLERANCE,
         help="Absolute FLOAT/DOUBLE tolerance for validation (default: 1e-10)",
     )
+    parser.add_argument(
+        "--float-rel-tolerance",
+        type=float,
+        default=DEFAULT_FLOAT_REL_TOLERANCE,
+        help="Relative FLOAT/DOUBLE tolerance for validation (default: 1e-9)",
+    )
     args = parser.parse_args()
     if not math.isfinite(args.float_tolerance) or args.float_tolerance < 0:
         parser.error("--float-tolerance must be finite and non-negative")
+    if not math.isfinite(args.float_rel_tolerance) or args.float_rel_tolerance < 0:
+        parser.error("--float-rel-tolerance must be finite and non-negative")
     if (args.parquet_dir is None) == (args.duckdb_file is None):
         parser.error("pass either a Parquet directory or --duckdb-file")
+    if args.decimal_as_double and args.duckdb_file:
+        parser.error("--decimal-as-double applies to a Parquet directory only")
     havoc = args.benchmark == "tpch-havoc"
     if havoc and args.scale_factor is None:
         parser.error("--benchmark tpch-havoc needs --scale-factor")
@@ -541,11 +806,19 @@ def main():
             )
             if not files:
                 parser.error(f"No parquet files for {table} in {data}")
-            views.append(
-                f"CREATE VIEW {table} AS SELECT * FROM read_parquet(["
-                + ",".join(quote(path) for path in files)
-                + "]);\n"
-            )
+            if args.decimal_as_double:
+                try:
+                    views.append(
+                        decimal_as_double_view(binary, table, files, args.timeout)
+                    )
+                except ProbeError as exc:
+                    parser.error(f"Cannot read the schema of {table}: {exc}")
+            else:
+                views.append(
+                    f"CREATE VIEW {table} AS SELECT * FROM read_parquet(["
+                    + ",".join(quote(path) for path in files)
+                    + "]);\n"
+                )
         setup = "".join(views)
     if havoc:
         # Q01_V07 uses `x -> ...` lambdas, which DuckDB accepts only with this setting.
@@ -556,13 +829,26 @@ def main():
     output = args.output_dir.resolve()
     if output.exists():
         parser.error("output directory already exists; choose a fresh directory")
+    # The plans use the optimizers Sirius disables, read from the extension loaded with
+    # the environment of the GPU runs. Its log moves to the output directory.
+    probe_log = Path(tempfile.mkdtemp(prefix="classify-probe-"))
+    try:
+        mask = sirius_disabled_optimizers(
+            binary, extension, sirius_env(config, probe_log), args.timeout
+        )
+    except ProbeError as exc:
+        parser.error(
+            f"Cannot read the optimizers Sirius disables: {exc} (Sirius log: {probe_log})"
+        )
     output.mkdir(parents=True)
+    shutil.move(probe_log, output / "probe_log")
     (output / "sirius.yaml").write_bytes(config.read_bytes())
     metadata = {
         "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "benchmark": args.benchmark,
         "scale_factor": args.scale_factor,
         "data": str(data),
+        "decimal_as_double": args.decimal_as_double,
         "query_dir": str(query_dir),
         "revision": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
@@ -576,7 +862,7 @@ def main():
         "extension": str(extension),
         "extension_mtime": extension.stat().st_mtime,
         "extension_sha256": sha256(extension),
-        "optimizer_mask": MASK,
+        "optimizer_mask": mask,
         "timeout_seconds": args.timeout,
         "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "result_validation": (
@@ -585,6 +871,9 @@ def main():
             else "not performed"
         ),
         "validation_float_abs_tol": args.float_tolerance if args.validate else None,
+        "validation_float_rel_tol": (
+            args.float_rel_tolerance if args.validate else None
+        ),
         "validation_row_order": (
             "ignored; duplicate multiplicity preserved" if args.validate else None
         ),
@@ -599,7 +888,8 @@ def main():
         code, stdout, stderr = run_cli(
             binary,
             setup
-            + f"SET disabled_optimizers={quote(MASK)}; SET explain_output='all';\n"
+            + f"SET disabled_optimizers={quote(mask)};\n"
+            + "SET explain_output='all';\n"
             + "EXPLAIN (FORMAT JSON) "
             + sql,
             cpu_env,
@@ -643,13 +933,7 @@ def main():
                                         )
             except ValueError as exc:
                 row["plan_status"] = str(exc)
-        gpu_env = dict(
-            os.environ,
-            SIRIUS_CONFIG_FILE=str(config),
-            SIRIUS_LOG_DIR=str(directory / "gpu/log"),
-            SIRIUS_LOG_LEVEL="info",
-        )
-        gpu_env.pop("SIRIUS_DISABLE", None)
+        gpu_env = sirius_env(config, directory / "gpu/log")
         code, stdout, stderr = run_cli(
             binary,
             setup
@@ -703,6 +987,7 @@ def main():
                     args.timeout,
                     stdout,
                     args.float_tolerance,
+                    args.float_rel_tolerance,
                 )
             (directory / "validation.json").write_text(
                 json.dumps(
@@ -743,7 +1028,10 @@ def main():
     context = f"`{args.benchmark}`"
     if args.scale_factor is not None:
         context += f" at SF {args.scale_factor:g}"
-    context += f" on `{data.name}`, revision `{metadata['revision'][:8]}`, "
+    context += f" on `{data.name}`"
+    if args.decimal_as_double:
+        context += " with DECIMAL columns read as DOUBLE"
+    context += f", revision `{metadata['revision'][:8]}`, "
     context += "validated against DuckDB on CPU." if args.validate else "not validated."
     (output / "summary.md").write_text(
         summary(list(zip(queries, rows)), context, per_base_query=havoc)

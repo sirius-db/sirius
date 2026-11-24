@@ -27,7 +27,6 @@
 #include "op/scan/parquet_scan_types.hpp"
 #include "op/scan/scan_plan.hpp"
 #include "op/sirius_physical_cte.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_gpu_values.hpp"
@@ -276,44 +275,6 @@ struct rewriter {
         hash_below(build, join.join_type == duckdb::JoinType::MARK);
         return done(placement::spread);
       }
-
-      case T::LEFT_DELIM_JOIN:
-      case T::RIGHT_DELIM_JOIN: {
-        // A delim join fans one input out to a side of its inner join (LEFT: the probe, RIGHT:
-        // the build) and to the DISTINCT that the DELIM_SCANs replay. That input is hashed on the
-        // delim columns before the fan-out, exactly as its join side would be: each rank's
-        // DISTINCT then holds keys no other rank holds, and that join side needs no exchange.
-        auto& delim = node.Cast<op::sirius_physical_delim_join>();
-        if (!delim.join || delim.join->type != T::HASH_JOIN || delim.distinct == nullptr) {
-          throw sirius::not_implemented_exception(
-            "distributed execution: a delim join without a hash join");
-        }
-        auto& join  = delim.join->Cast<op::sirius_physical_hash_join>();
-        auto& probe = expect(*expect(*join.children[0], T::CONCAT).children[0], T::PARTITION)
-                        .Cast<op::sirius_physical_partition>();
-        auto& build = expect(*expect(*join.children[1], T::CONCAT).children[0], T::PARTITION)
-                        .Cast<op::sirius_physical_partition>();
-        bool const left  = node.type == T::LEFT_DELIM_JOIN;
-        auto& fanned     = left ? probe : build;
-        auto& other      = left ? build : probe;
-        auto const& keys = fanned.partition_keys();
-        if (std::set<int>(keys.begin(), keys.end()) !=
-            std::set<int>(delim.distinct->group_idx.begin(), delim.distinct->group_idx.end())) {
-          throw sirius::not_implemented_exception(
-            "distributed execution: a delim join whose join keys are not its delim columns");
-        }
-        visit(node.children[0]);
-        exchange_spec spec;
-        spec.key_columns    = keys;
-        spec.key_cast_types = fanned.specification().key_cast_types;
-        insert(node.children[0], std::move(spec), false);
-        merge_filters_across_ranks(join);
-        hash_below(other);
-        return done(placement::spread);
-      }
-
-      // A rank's share of its delim join's DISTINCT (see LEFT_DELIM_JOIN).
-      case T::DELIM_SCAN: return done(placement::spread);
 
       // A literal table (VALUES, or a count DuckDB took from Parquet metadata): every rank planned
       // the same rows, so rank 0 keeps them and the other ranks emit none.

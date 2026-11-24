@@ -54,7 +54,7 @@ are forwarded to `tpch_power_throughput.py` verbatim (e.g. `--scratch-db`, `--up
 | `ROLLBACK` | `0` | `1`: append `--rollback-scratch` and delete `<scratch>.wal` after the run — refresh mutations stay in the WAL, so discarding it restores the scratch DB to content-pristine without a 440 GB re-copy. Requires passing `--scratch-db <path>` in the forwarded args. |
 | `PROBE_TRIES` | `20` | Attempts (60 s apart) of the GPU-pool probe before giving up. On a shared box the pool reservation fails for minutes after another workload exits (lazy driver reclaim) — the failing LOAD itself is the only reliable gate; nvidia-smi lies. |
 | `SF`, `DB`, `REFRESH` | SF1000 paths | Scale factor, native `.duckdb` input, refresh-set directory. |
-| `CUDF_SO`, `PLANS`, `LAYOUT`, `CFG` | repro-kit paths | Optional patched libcudf to `LD_PRELOAD` (unset = pixi-provided, like `run.sh`), compression-plan dir, pin-layout JSON, Sirius config YAML. |
+| `CUDF_SO`, `LAYOUT`, `CFG` | repro-kit paths | Optional patched libcudf to `LD_PRELOAD` (unset = pixi-provided, like `run.sh`), pin-layout JSON, Sirius config YAML. |
 | `SIRIUS_PRE_SQL` | `ast_jit` SET | SQL run after `LOAD`, before any pin; override for diagnosis runs (e.g. append a log-level SET). |
 
 ### Diagnostics: sanitizer sweeps and concurrency gates
@@ -129,7 +129,14 @@ scratch, so the lower nominal ratio cost nothing.
 The campaign's original plan-selection rule was *"max ratio with decompress >= 250 GB/s"*. For
 GPU-resident data that optimises the wrong variable: once the data fits in HBM, ratio buys nothing
 and decode throughput is everything. The same reasoning applies to `l_shipinstruct`, kept as a
-`dictionary` plan here specifically so the decode-time predicate pushdown can answer from its keys.
+`dictionary` plan specifically so the decode-time predicate pushdown can answer from its keys.
+
+The hand-tuned plan files this kit used to ship are gone: automatic plan selection now matches
+them (SF1000 suite 3.713 s automatic vs 3.683 s with the tuned files on GB300, inside the ±1.2%
+suite noise). It pins only `lineitem` and `orders` compressed, as the files did, because the
+other tables' pins are under `pin_table_compression_min_table_device_fraction` of GPU memory; it
+delta-bitpacks the sorted order keys and leaves rle, which decodes in full on every scan, for
+columns where it saves much more.
 
 `l_comment` and `o_clerk` still carry entropy tails, and that is fine — **no TPC-H query references
 either column**, so per-query pinning never decodes them.
@@ -170,10 +177,10 @@ because it is still cached in `CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES`, and 17 C
 `rmm/cuda_stream_view.hpp: No such file`. Always append (`"$CXXFLAGS -isystem …"`).
 `build-libcudf.sh` does this correctly.
 
-**`l_shipinstruct` must stay `dictionary` in `plans/lineitem.txt`.** The decode-time predicate
-pushdown resolves q19's equality against the dictionary keys. If that column is switched to
-`identity`, the pushdown has nothing to answer from and silently no-ops — costing q19 ~21% and
-~78 GB of GPU peak.
+**`l_shipinstruct` must stay `dictionary`-encoded.** The decode-time predicate pushdown resolves
+q19's equality against the dictionary keys. If that column is pinned as is, the pushdown has
+nothing to answer from and silently no-ops — costing q19 ~21% and ~78 GB of GPU peak. Automatic
+plan selection dictionary-encodes it, as it does any string column with few distinct values.
 
 **A GPU-vs-CPU check on an *in-memory* DuckDB compares CPU to CPU.** Sirius rejects the scan
 ("requires a single-file block manager") and both arms fall back, so the outputs match trivially.

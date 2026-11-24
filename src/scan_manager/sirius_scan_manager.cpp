@@ -40,6 +40,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
+#include "scan_manager/late_mat_resolver.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 #include "sirius_config.hpp"
@@ -54,6 +55,7 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
@@ -61,6 +63,7 @@
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/column_metadata.hpp>
+#include <cucascade/memory/cpu_constraints.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/error_data.hpp>
@@ -692,6 +695,22 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
            : late_mat::kRowidType;
 }
 
+/// Nulls one compressed chunk records for a column, or nullopt when the chunk
+/// cannot say.
+///
+/// Compression strips a column's validity into a sidecar the .hpln header
+/// carries, so the count is a header read and no decode happens here. A chunk
+/// carrying no blob at all is a legitimate shape (serving paths that need only
+/// a row count never load one), and it answers nothing.
+[[nodiscard]] std::optional<std::size_t> compressed_chunk_null_count(
+  sirius::compressed_device_representation const& compressed, std::size_t column_position)
+{
+  if (!compressed.has_table()) { return std::nullopt; }
+  auto const count = simpatico::column_null_count(compressed.table(), column_position);
+  if (!count.has_value()) { return std::nullopt; }
+  return static_cast<std::size_t>(*count);
+}
+
 /// Nulls in one pinned column across every chunk, or nullopt when the storage
 /// cannot say without decompressing — which reads as "assume the worst".
 [[nodiscard]] std::optional<std::size_t> pinned_column_null_count(pinned_entry const& entry,
@@ -701,8 +720,14 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   std::size_t nulls = 0;
   if (!entry.device_chunks.empty()) {
     for (auto const& chunk : entry.device_chunks) {
-      if (chunk.compressed || column_position >= chunk.columns.size() ||
-          !chunk.columns[column_position]) {
+      if (chunk.compressed) {
+        auto const compressed_nulls =
+          compressed_chunk_null_count(*chunk.compressed, column_position);
+        if (!compressed_nulls.has_value()) { return std::nullopt; }
+        nulls += *compressed_nulls;
+        continue;
+      }
+      if (column_position >= chunk.columns.size() || !chunk.columns[column_position]) {
         return std::nullopt;
       }
       nulls += static_cast<std::size_t>(chunk.columns[column_position]->null_count());
@@ -719,9 +744,16 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   return nulls;
 }
 
-/// Whether this column's pin is uncompressed — every such gather shape (single-batch,
-/// multi-batch fixed-width, multi-batch variable-width) propagates validity. Must agree with
-/// resolve_pinned_column's own check.
+/// Whether materialization can carry this column's validity through.
+///
+/// Every uncompressed gather shape (single-batch, multi-batch fixed-width,
+/// multi-batch variable-width) propagates validity. A compressed chunk does too,
+/// provided its blob is loaded and records the column's validity sidecar: a full
+/// decode reattaches the mask, and the two compacting routes gather it by the
+/// same rows they selected the values by (materialize.cpp's
+/// attach_selected_validity). A chunk carrying no blob answers nothing and is
+/// unsafe, which is also where resolve_pinned_column refuses — the two checks
+/// must agree.
 [[nodiscard]] bool pinned_column_nulls_are_safe(pinned_entry const& entry,
                                                 std::size_t column_position)
 {
@@ -729,8 +761,10 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   if (!entry.device_chunks.empty()) {
     return std::all_of(
       entry.device_chunks.begin(), entry.device_chunks.end(), [&](auto const& chunk) {
-        return !chunk.compressed && column_position < chunk.columns.size() &&
-               chunk.columns[column_position] != nullptr;
+        if (chunk.compressed) {
+          return compressed_chunk_null_count(*chunk.compressed, column_position).has_value();
+        }
+        return column_position < chunk.columns.size() && chunk.columns[column_position] != nullptr;
       });
   }
   if (column_position >= entry.cache_info.names.size()) { return false; }
@@ -738,6 +772,17 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   return it != entry.data_batches_by_column.end() &&
          std::all_of(
            it->second.begin(), it->second.end(), [](auto const& col) { return col != nullptr; });
+}
+
+/// Whether the port will find every deferred origin, asked of the same resolver
+/// materialize_at_port reads them through. Admission must not accept a shape that
+/// resolver refuses — a column whose chunks were narrowed to different carriers is
+/// one — because by the port the scan has already given the values up.
+[[nodiscard]] bool deferred_origins_resolve(std::span<late_mat::column_origin const> origins)
+{
+  if (origins.empty() || !resolve_pinned_layout(origins.front())) { return false; }
+  return std::ranges::all_of(
+    origins, [](auto const& origin) { return resolve_pinned_column(origin).has_value(); });
 }
 
 /// Whether every chunk of a GPU-tier pin records the memory space it lives in,
@@ -927,16 +972,14 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   }
   if (scan_op.get_ingestible().has_row_filter()) {
     // A filtered batch is no longer the chunk's rows in order, so the rowid has
-    // to come from the survivor positions the filter produced. That only works
-    // where the filter runs where we can see it — post-serve, over a whole
-    // served chunk. A COMPRESSED chunk is filtered inside the fused decode
-    // instead, and those survivors never reach the scan's output path, so a
-    // pin with any compressed chunk is refused rather than guessed at.
-    if (has_compressed_chunk) {
-      return decline(
-        "the scan restricts rows and its pin is compressed, so the surviving rows are decided "
-        "inside the decode");
-    }
+    // to come from the survivor positions the filter produced. A COMPRESSED
+    // chunk may be restricted twice — inside the fused decode and again by
+    // whatever conjuncts the decode could not carry — and both stages report
+    // their survivors: the decode through pushdown_outcome::survivor_rows,
+    // requested per split by late_mat_wants_survivors, and the residual through
+    // post_filter_and_project. The scan composes them
+    // (sirius_gpu_scan_operator's compose_survivors) and throws rather than
+    // guess if a compaction arrives unaccounted for.
     if (!entry.host_chunks.empty()) {
       return decline("the scan restricts rows and its pin is host-tier");
     }
@@ -1078,9 +1121,7 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   // pinned_column_nulls_are_safe).
   for (auto const position : planned.positions) {
     if (position >= selected_columns.size()) { continue; }  // caught again, and reported, below
-    if (pinned_column_nulls_are_safe(entry, selected_columns[position])) { continue; }
-    auto const nulls = pinned_column_null_count(entry, selected_columns[position]);
-    if (!nulls.has_value() || *nulls != 0) {
+    if (!pinned_column_nulls_restorable(entry, selected_columns[position])) {
       return decline(
         "a deferred column's pinned values may contain nulls, which materialization cannot "
         "restore");
@@ -1102,6 +1143,11 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
     origin.column_pos = static_cast<std::uint32_t>(selected_columns[position]);
     origin.generation = entry.late_mat_handle->generation();
     origins.push_back(std::move(origin));
+  }
+  if (!deferred_origins_resolve(origins)) {
+    return decline(
+      "a deferred column would not resolve at the port (its chunks disagree on the carrier, or "
+      "one carries no readable blob)");
   }
 
   // The port sees the batch its INPUT produced, not the scan's output: a join
@@ -1291,16 +1337,10 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
     }
 
     // Same gap and exemption as the primary bundle's install, above.
-    bool rider_null_free = true;
-    for (auto const position : planned.positions) {
-      if (position >= candidate.columns.size()) { continue; }  // caught again below
-      if (pinned_column_nulls_are_safe(entry, candidate.columns[position])) { continue; }
-      auto const nulls = pinned_column_null_count(entry, candidate.columns[position]);
-      if (!nulls.has_value() || *nulls != 0) {
-        rider_null_free = false;
-        break;
-      }
-    }
+    bool const rider_null_free = std::ranges::all_of(planned.positions, [&](std::size_t position) {
+      return position >= candidate.columns.size() ||  // caught again below
+             pinned_column_nulls_restorable(entry, candidate.columns[position]);
+    });
     if (!rider_null_free) {
       decline(
         "a deferred column's pinned values may contain nulls, which materialization cannot "
@@ -1323,6 +1363,12 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
     }
     if (origins.empty()) {
       decline("a deferred output position has no served column");
+      continue;
+    }
+    if (!deferred_origins_resolve(origins)) {
+      decline(
+        "a deferred column would not resolve at the port (its chunks disagree on the carrier, or "
+        "one carries no readable blob)");
       continue;
     }
 
@@ -1359,6 +1405,13 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
 
 }  // namespace
 
+bool pinned_column_nulls_restorable(pinned_entry const& entry, std::size_t column_position)
+{
+  if (pinned_column_nulls_are_safe(entry, column_position)) { return true; }
+  auto const nulls = pinned_column_null_count(entry, column_position);
+  return nulls.has_value() && *nulls == 0;
+}
+
 sirius_scan_manager::sirius_scan_manager(
   sirius::exec::query_lifecycle_registry& lifecycle,
   const scan_manager_config& config,
@@ -1366,20 +1419,55 @@ sirius_scan_manager::sirius_scan_manager(
   std::shared_ptr<const sirius::memory::topology_index> topology_index,
   std::shared_ptr<op::scan::physical_check_counters> physical_counters)
   : _query_lifecycle(lifecycle),
-    _config(validate_scan_manager_config(config)),
+    _config([&] {
+      auto resolved = validate_scan_manager_config(config);
+      if (resolved.startup_cpus.empty())
+        resolved.startup_cpus = cucascade::memory::discover_cpu_constraints().allowed_cpus;
+      auto& pool_cpus = resolved.thread_pool.cpu_affinity_list;
+      pool_cpus       = pool_cpus.empty()
+                          ? resolved.startup_cpus
+                          : cucascade::memory::intersect_cpu_affinity(pool_cpus, resolved.startup_cpus);
+      if (pool_cpus.empty())
+        throw std::invalid_argument("scan workers have no CPUs within the rank boundary");
+      resolved.worker_startup_cpus = resolved.worker_startup_cpus.empty()
+                                       ? resolved.startup_cpus
+                                       : cucascade::memory::intersect_cpu_affinity(
+                                           resolved.worker_startup_cpus, resolved.startup_cpus);
+      if (resolved.worker_startup_cpus.empty())
+        throw std::invalid_argument("scan control workers have no CPUs within the rank boundary");
+      return resolved;
+    }()),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _physical_counters(std::move(physical_counters)),
+    _metadata_placement(
+      _topology_index ? resolve_metadata_placement(*_topology_index, _config.startup_cpus, _config)
+                      : throw std::invalid_argument("scan manager requires topology")),
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
-                 _config.thread_pool.cpu_affinity_list),
+                 {},
+                 nullptr,
+                 _metadata_placement.cpus),
     _native_readers(_config.preparation.resolved_native_workers(),
-                    _config.preparation.resolved_native_readers()),
-    _coordinators(_config.preparation.resolved_coordinator_workers()),
+                    _config.preparation.resolved_native_readers(),
+                    _config.worker_startup_cpus),
+    _coordinators(_config.preparation.resolved_coordinator_workers(), _config.worker_startup_cpus),
     _ioctx_registry(_config.to_io_config(), reservation_manager)
 {
   if (!_topology_index) {
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
+  }
+
+  for (size_t domain = 0; domain < _metadata_placement.cpus.size(); ++domain) {
+    std::string cpus;
+    for (int cpu : _metadata_placement.cpus[domain]) {
+      if (!cpus.empty()) cpus += ",";
+      cpus += std::to_string(cpu);
+    }
+    SIRIUS_LOG_INFO("scan metadata domain={} numa_node={} cpus={}",
+                    domain,
+                    _metadata_placement.nodes[domain],
+                    cpus);
   }
 
   // scan_manager always owns the local io_ctx (uring for backend=native), so
@@ -1388,6 +1476,7 @@ sirius_scan_manager::sirius_scan_manager(
   // staging resource from the reservation manager it was constructed with.  The
   // registry routes s3:// paths independently to the REST backend; there is no
   // catch-all backend for other URL schemes.
+
   //
   // The default ioctx is mandatory, so its failure is thrown rather than logged:
   // the cause is explained once, in the exception.
@@ -1573,8 +1662,9 @@ void sirius_scan_manager::prepare_for_query(
   state->completion = completion;
   state->active_gpu_ids.assign(allocated_gpu_ids.begin(), allocated_gpu_ids.end());
   // Deliberately NOT divided by the query count: a lone query must still be able to use the
-  // whole pool. Dispatchers yield between tasks; each shared pool selects older queries
-  // first and preserves FIFO order within each query's priority.
+  // whole pool across its eligible domains. Dispatchers yield between tasks; the shared
+  // pool selects older queries first among work eligible for each worker. Within a query,
+  // pending metadata/coalescing classes alternate, with FIFO order within each class.
   auto const priority = sirius::query_priority_bits(query_id);
   state->dispatcher =
     std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads(), priority);
@@ -2101,12 +2191,29 @@ void sirius_scan_manager::prepare_for_query(
 std::unique_ptr<preparation_coordinator> sirius_scan_manager::make_preparation_coordinator(
   query_scan_manager_state& state)
 {
+  std::vector<int> domains;
+  for (int gpu : state.active_gpu_ids) {
+    auto node = _topology_index->numa_node_of(gpu);
+    auto it   = std::find(_metadata_placement.nodes.begin(), _metadata_placement.nodes.end(), node);
+    if (it != _metadata_placement.nodes.end()) {
+      auto domain = static_cast<int>(it - _metadata_placement.nodes.begin());
+      if (std::find(domains.begin(), domains.end(), domain) == domains.end())
+        domains.push_back(domain);
+    }
+  }
+  // CPU restrictions may exclude every GPU-local domain for this query. Use the
+  // first permitted manager domain, even when it is remote from the query's GPUs.
+  if (domains.empty()) domains.push_back(0);
+  rotate_metadata_domains(domains, _next_metadata_domain);
+  auto options                 = state.preparation;
+  options.control_cpu_affinity = _config.worker_startup_cpus;
   return std::make_unique<preparation_coordinator>(
     *state.completion,
     *state.dispatcher,
-    state.preparation,
+    std::move(options),
     &_native_readers,
-    _config.preparation.resolved_coordinator_workers() ? &_coordinators : nullptr);
+    _config.preparation.resolved_coordinator_workers() ? &_coordinators : nullptr,
+    std::move(domains));
 }
 
 void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state,
@@ -2397,8 +2504,9 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   // inherit it. First use may come from a pool thread whose mask excludes the CPUs reserved for
   // the reactors (e.g. a deferred Puffin read on a metadata worker), so build from the mask the
   // reservation was planned from.
-  if (type == cucascade::io::io_context_type::restful && !_config.rest_placement_cpus.empty()) {
-    exec::run_with_affinity(_config.rest_placement_cpus, build_and_start);
+  if (type == cucascade::io::io_context_type::restful && !_config.startup_cpus.empty()) {
+    exec::scoped_startup_affinity affinity(_config.startup_cpus);
+    build_and_start();
   } else {
     build_and_start();
   }

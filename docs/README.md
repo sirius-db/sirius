@@ -66,7 +66,7 @@ Build from source to use the latest code on `main`, make changes to Sirius, or r
 ### Build Requirements
 
 - Git (to clone the repo)
-- Pixi (install instructions [here](https://pixi.sh/latest/installation/))
+- Pixi 0.84.2 or newer (install instructions [here](https://pixi.sh/latest/installation/))
 
 ### Quick Start
 
@@ -121,8 +121,10 @@ keep it alive before creating another instance. See the [Context API documentati
 for process-wide configuration and lifetime restrictions.
 
 The v2 extension requires the exact DuckDB revision pinned in this repository.
-Use the built CLI above. The default environment's DuckDB 1.5 Python package cannot
-load this extension; Python use requires a package built from the matching revision.
+Python use requires a package built from that matching revision. The DuckDB Python
+package in [`pixi.toml`](../pixi.toml) is intended for fixtures and data generation;
+its version number alone does not establish extension compatibility. Use the built
+CLI above if a matching Python client is unavailable.
 
 Save this example as `example.py` in the repository root and replace `/path/to/lineitem.parquet`
 with your TPC-H Parquet file. `allow_unsigned_extensions` allows loading the locally built
@@ -149,7 +151,8 @@ print(rows)
 con.close()
 ```
 
-Run it from the repository root:
+Run it from the repository root with a Python client built from the matching DuckDB
+revision. If that client is installed in your Pixi environment, use:
 
 ```bash
 pixi run python example.py
@@ -159,8 +162,8 @@ For an example using TPC-H data from Parquet files or a DuckDB database, see the
 [Python benchmark script](../test/tpch_performance/performance_test.py).
 
 The Python benchmark and power/throughput runners require a Python DuckDB client
-built from the pinned v2 revision; the default environment's 1.5 client cannot
-load this extension. The CLI-based scripts use the built v2 host.
+built from the pinned v2 revision, as described above. The CLI-based scripts use
+the built v2 host.
 
 ## Pinning Tables for Hot Runs
 
@@ -322,7 +325,7 @@ exporter, per-query labeling, generating telemetry (using a TPC-H helper), and v
 Sirius is under active development. Notable current limitations include:
 
 - **Data Type Coverage:** Sirius currently supports commonly used data types including `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, `VARCHAR`, `DATE`, `TIMESTAMP`, and `DECIMAL`. We are actively working on supporting additional data types—such as nested types.
-- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop/Delim), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`.
+- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`.
 
 - **DuckDB v2 regex rewrites:** Whole-input backreference replacements, including the ClickBench Q28 URL pattern, are rewritten to `regexp_extract(..., 'k')` and currently require CPU fallback instead of using the GPU regex implementation. Tracked in [#2146](https://github.com/sirius-db/sirius/issues/2146).
 
