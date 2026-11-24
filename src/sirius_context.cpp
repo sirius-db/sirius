@@ -292,6 +292,10 @@ void SiriusContext::QueryBegin(ClientContext& context)
   // decorates.
   try {
     auto query = context.GetCurrentQuery();
+    // The literals of CREATE SECRET and ATTACH are credentials: log the kind, not the text.
+    if (auto const kind = sirius::credential_statement_kind(query); !kind.empty()) {
+      query = std::string(kind) + " <text withheld: may hold credentials>";
+    }
     // Collapse every run of whitespace (incl. newlines/tabs) to a single space,
     // trim leading/trailing whitespace, and log the full normalized query so
     // log_analysis tools can correlate by SQL text without truncation.

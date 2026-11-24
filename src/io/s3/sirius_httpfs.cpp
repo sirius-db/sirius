@@ -259,12 +259,13 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
   }
   auto s3_config = resolve_duckdb_s3_secret(
     *client, path, sirius_ctx->get_config().get_scan_manager_config().object_store);
-  sirius_ctx->get_scan_manager().install_s3_config(path, std::move(s3_config));
+  auto const planned = sirius_ctx->get_scan_manager().install_s3_config(path, std::move(s3_config));
   // Resolve through the scan_manager's datasource factory (the routed seam):
   // the returned datasource performs the HEAD and carries the backend;
   // HEAD failures (missing key / auth / network) propagate as exceptions for
   // DuckDB to surface at bind time.
-  auto datasource = sirius_ctx->get_scan_manager().create_datasource(path);
+  auto datasource = sirius_ctx->get_scan_manager().create_datasource(
+    path, cucascade::io::open_hint::generic, planned ? &*planned : nullptr);
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + path + "'");
   }
@@ -295,12 +296,13 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
   }
   auto s3_config = resolve_duckdb_s3_secret(
     *client, file.path, sirius_ctx->get_config().get_scan_manager_config().object_store);
-  sirius_ctx->get_scan_manager().install_s3_config(file.path, std::move(s3_config));
+  auto const planned =
+    sirius_ctx->get_scan_manager().install_s3_config(file.path, std::move(s3_config));
   // A parquet_footer_probe open: one suffix-range GET resolves the size (== the
   // LIST size that rode the glob expansion) and stashes the footer, so the
   // binder's footer reads are served locally (no HEAD, no separate footer GETs).
   auto datasource = sirius_ctx->get_scan_manager().create_datasource(
-    file.path, cucascade::io::open_hint::parquet_footer_probe);
+    file.path, cucascade::io::open_hint::parquet_footer_probe, planned ? &*planned : nullptr);
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + file.path + "'");
   }

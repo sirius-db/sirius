@@ -978,6 +978,9 @@ requires startup configuration.
   Level and enable are governed by DuckDB, not `sirius_log_level`.
 - **`noop`**: discards all logs.
 
+Each statement's SQL text is logged at `info` when it begins. `CREATE SECRET` and `ATTACH` are the
+exception: their literals are credentials, so the log names the statement kind and withholds the text.
+
 Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA
 error reports, and its I/O layer where enabled) go to the same sink, prefixed `[cucascade]`.
 cuCascade's own gate mirrors what the active sink accepts: `sirius_log_level` under `spdlog`,

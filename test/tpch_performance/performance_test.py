@@ -796,8 +796,9 @@ def open_connection(
              Read-only avoids write locks / accidental WAL and is correct for a
              read-only benchmark; it mirrors how run_tpch_duckdb.sh opens the file.
     iceberg: `source` is the catalog.schema of an Iceberg REST catalog. The SQL in
-             CATALOG_SETUP_PATH attaches it on every connection; httpfs supplies the
-             catalog client, and Sirius still reads the s3:// bytes itself.
+             CATALOG_SETUP_PATH attaches it on every connection, before Sirius is
+             loaded; httpfs supplies the catalog client, and Sirius still reads the
+             s3:// bytes itself.
     """
     config = {"allow_unsigned_extensions": "true"}
     s3_source = data_source != "duckdb" and is_s3_source(source)
@@ -834,6 +835,14 @@ def open_connection(
 def _configure_connection(con, source, gpu_execution, data_source, s3_input, workload):
     """Configure a connection; the caller closes it if any setup fails."""
 
+    if data_source == "iceberg":
+        # The setup file holds credentials and Sirius logs statement text, so
+        # run it before Sirius is loaded.
+        for extension in ("httpfs", "avro", "iceberg"):
+            con.execute(f"LOAD {extension}")
+        with open(CATALOG_SETUP_PATH) as f:
+            _execute_multi(con, f.read())
+
     # Load Sirius before registering S3 views. GPU execution stays on while the
     # views bind: sirius_httpfs serves S3 only under gpu_execution=true.
     if gpu_execution:
@@ -849,10 +858,6 @@ def _configure_connection(con, source, gpu_execution, data_source, s3_input, wor
         s3_input.refresh_secret(con, gpu_execution)
 
     if data_source == "iceberg":
-        for extension in ("httpfs", "avro", "iceberg"):
-            con.execute(f"LOAD {extension}")
-        with open(CATALOG_SETUP_PATH) as f:
-            _execute_multi(con, f.read())
         log(f"Registering TPC-H views over catalog schema {source}")
         _execute_multi(con, _build_catalog_views_sql(source))
     elif data_source != "duckdb":
@@ -2112,7 +2117,8 @@ def parse_args():
         help=(
             "--data-source iceberg: SQL file run on every connection to attach the "
             "catalog (CREATE SECRET ...; ATTACH ...). It holds credentials: keep it "
-            "outside the repository."
+            "outside the repository. It runs before Sirius is loaded, so it cannot "
+            "create SIRIUS_S3 secrets."
         ),
     )
     p.add_argument(

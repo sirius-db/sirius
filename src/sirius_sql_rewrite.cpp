@@ -16,6 +16,7 @@
 
 #include "sirius_sql_rewrite.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <optional>
@@ -45,6 +46,35 @@ bool iequals_prefix(std::string_view value, std::string_view prefix)
     if (std::tolower(lhs) != std::tolower(rhs)) { return false; }
   }
   return true;
+}
+
+bool iequals(std::string_view lhs, std::string_view rhs)
+{
+  return lhs.size() == rhs.size() && iequals_prefix(lhs, rhs);
+}
+
+// The word at @p pos after whitespace and comments, advancing @p pos past it. Empty when the
+// next token is not a word.
+std::string_view next_keyword(std::string_view sql, std::size_t& pos)
+{
+  for (;;) {
+    while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos])) != 0) {
+      ++pos;
+    }
+    if (sql.substr(pos, 2) == "--") {
+      pos = std::min(sql.find('\n', pos), sql.size());
+    } else if (sql.substr(pos, 2) == "/*") {
+      auto const end = sql.find("*/", pos + 2);
+      pos            = end == std::string_view::npos ? sql.size() : end + 2;
+    } else {
+      break;
+    }
+  }
+  auto const begin = pos;
+  while (pos < sql.size() && is_identifier_char(sql[pos])) {
+    ++pos;
+  }
+  return sql.substr(begin, pos - begin);
 }
 
 std::size_t skip_whitespace(std::string const& text, std::size_t pos)
@@ -208,6 +238,22 @@ bool references_sirius_owned_s3_parquet(std::string const& query)
   // call iff the rewrite changes it. Defining the predicate in terms of the
   // rewrite keeps the two in lockstep — one source of truth, no drift.
   return rewrite_sirius_owned_remote_parquet_calls(query) != query;
+}
+
+std::string_view credential_statement_kind(std::string_view statement)
+{
+  std::size_t pos = 0;
+  auto word       = next_keyword(statement, pos);
+  if (iequals(word, "ATTACH")) { return "ATTACH"; }
+  if (!iequals(word, "CREATE")) { return {}; }
+  for (;;) {
+    word = next_keyword(statement, pos);
+    if (iequals(word, "SECRET")) { return "CREATE SECRET"; }
+    if (!iequals(word, "OR") && !iequals(word, "REPLACE") && !iequals(word, "PERSISTENT") &&
+        !iequals(word, "TEMPORARY") && !iequals(word, "TEMP")) {
+      return {};
+    }
+  }
 }
 
 }  // namespace sirius

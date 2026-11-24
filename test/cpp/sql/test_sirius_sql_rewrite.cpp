@@ -179,3 +179,17 @@ TEST_CASE("S3 SQL rewrite targets only Sirius-owned remote parquet calls", "[sql
       "SELECT * FROM read_parquet_mr('s3://b/k.parquet')"));
   }
 }
+
+TEST_CASE("Statements whose literals are credentials are recognised by kind", "[sql][log]")
+{
+  using sirius::credential_statement_kind;
+  CHECK(credential_statement_kind("CREATE SECRET s (TYPE S3, SECRET 'x')") == "CREATE SECRET");
+  CHECK(credential_statement_kind("create or replace\n persistent secret s (TYPE S3)") ==
+        "CREATE SECRET");
+  CHECK(credential_statement_kind("-- setup\n/* lake */ ATTACH '' AS c (TOKEN 'x')") == "ATTACH");
+  // Everything else keeps its text in the log.
+  CHECK(credential_statement_kind("CREATE TABLE secret (attach INT)").empty());
+  CHECK(credential_statement_kind("SELECT 'ATTACH', secret FROM t").empty());
+  CHECK(credential_statement_kind("DETACH c").empty());
+  CHECK(credential_statement_kind("/* unterminated").empty());
+}

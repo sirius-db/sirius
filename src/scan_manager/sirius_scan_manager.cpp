@@ -1678,11 +1678,13 @@ void sirius_scan_manager::prepare_for_query(
   // the shared contexts.
   std::vector<std::shared_ptr<cucascade::io::ioctx>> query_io_ctxs;
   std::unordered_set<cucascade::io::ioctx const*> seen_query_io_ctxs;
+  auto planned_io_ctxs = std::make_shared<planned_s3_io_ctxs>();
   for (auto const& scan_op : query.get_scan_operators()) {
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
-    auto const& op = scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
-    for (auto const& path : op.get_ingestible().table_info().file_paths()) {
-      auto io_ctx = ioctx_for_path(path);
+    auto const& op   = scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
+    auto const& info = op.get_ingestible().table_info();
+    for (auto const& path : info.file_paths()) {
+      auto io_ctx = ioctx_for_scan(info, path, *planned_io_ctxs);
       if (io_ctx && seen_query_io_ctxs.insert(io_ctx.get()).second) {
         query_io_ctxs.push_back(std::move(io_ctx));
       }
@@ -1755,8 +1757,11 @@ void sirius_scan_manager::prepare_for_query(
     // One path per operator, not per file: the backend warms per endpoint and
     // rate-limits itself, so the extra paths would only re-ask the same
     // question. A no-op for local backends, which have nothing to connect.
-    if (auto const paths = op->get_ingestible().table_info().file_paths(); !paths.empty()) {
-      if (auto io_ctx = ioctx_for_path(paths.front())) { io_ctx->warmup(paths.front()); }
+    auto const* info = &op->get_ingestible().table_info();
+    if (auto const paths = info->file_paths(); !paths.empty()) {
+      if (auto io_ctx = ioctx_for_scan(*info, paths.front(), *planned_io_ctxs)) {
+        io_ctx->warmup(paths.front());
+      }
     }
     state->metadata_processor->register_pipeline(op, round_robin, state->readahead);
     // On a pinned-cache hit the coalescer serves this operator from a cached
@@ -1806,15 +1811,15 @@ void sirius_scan_manager::prepare_for_query(
     if (native) { pause_native_with_key_for_testing(); }
     auto provider = std::make_unique<split_provider>(
       op->get_ingestible(),
-      sirius::io::ioctx_resolver{
-        [this](std::string_view file_path) -> std::shared_ptr<cucascade::io::ioctx> {
-          auto io_ctx = ioctx_for_path(file_path);
-          if (!io_ctx) {
-            throw std::runtime_error("scan_manager: no backend supports path: " +
-                                     std::string(file_path));
-          }
-          return io_ctx;
-        }});
+      sirius::io::ioctx_resolver{[this, info, planned_io_ctxs](std::string_view file_path)
+                                   -> std::shared_ptr<cucascade::io::ioctx> {
+        auto io_ctx = ioctx_for_scan(*info, file_path, *planned_io_ctxs);
+        if (!io_ctx) {
+          throw std::runtime_error("scan_manager: no backend supports path: " +
+                                   std::string(file_path));
+        }
+        return io_ctx;
+      }});
     state->scans.push_back({op, query_scan_manager_state::disk_scan{std::move(provider)}});
   }
 
@@ -2336,10 +2341,10 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
 }
 
 std::shared_ptr<cucascade::io::datasource> sirius_scan_manager::create_datasource(
-  std::string_view path, cucascade::io::open_hint hint)
+  std::string_view path, cucascade::io::open_hint hint, s3_config_snapshot const* planned)
 {
   auto file_path = normalize_path(std::string(path));
-  auto io_ctx    = ioctx_for_path(file_path);
+  auto io_ctx    = ioctx_for_path(file_path, planned);
   if (!io_ctx) { return nullptr; }  // no backend supports the path
   // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
   // only "no backend" is reported as nullptr (callers map it to that message).
@@ -2418,7 +2423,8 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
   return rest->list_max_matches();
 }
 
-std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
+std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_path(
+  std::string_view path, s3_config_snapshot const* planned)
 {
   // Normalize here so every caller (incl. the scan resolver, which forwards raw
   // ingestible paths) routes `file://` the same way create_datasource does.
@@ -2430,7 +2436,20 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_path(std::s
   }
   auto type = _ioctx_registry.lookup_path(file_path);
   if (!type) { return nullptr; }
-  return ioctx_for_type(*type, file_path);
+  return ioctx_for_type(*type, file_path, planned);
+}
+
+std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_scan(
+  ingestible_table_info const& info, std::string_view path, planned_s3_io_ctxs& planned)
+{
+  auto const config = info.s3_configs.find(std::string(path));
+  if (config == info.s3_configs.end()) { return ioctx_for_path(path); }
+  // One lookup per config and query: a context this query had to build for itself is built
+  // once and lives as long as its scans.
+  std::lock_guard lk{planned.mtx};
+  auto& io_ctx = planned.by_config[config->second.id];
+  if (!io_ctx) { io_ctx = ioctx_for_path(path, &config->second); }
+  return io_ctx;
 }
 
 std::optional<cucascade::io::io_context_type> sirius_scan_manager::planning_io_backend(
@@ -2444,13 +2463,15 @@ std::optional<cucascade::io::io_context_type> sirius_scan_manager::planning_io_b
 }
 
 std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
-  cucascade::io::io_context_type type, std::string_view path)
+  cucascade::io::io_context_type type, std::string_view path, s3_config_snapshot const* planned)
 {
   auto const canonical_path = path.empty() ? std::string{} : normalize_path(std::string(path));
   bool const uses_object_store_config = type == cucascade::io::io_context_type::restful;
-  auto const snapshot                 = uses_object_store_config && !canonical_path.empty()
+  bool const uses_planned_config      = uses_object_store_config && planned != nullptr;
+  auto const snapshot                 = uses_planned_config ? std::optional{*planned}
+                                        : uses_object_store_config && !canonical_path.empty()
                                           ? _s3_configs.resolve(canonical_path)
-                                          : std::optional<sirius::io::scoped_object_store_configs::snapshot>{};
+                                          : std::optional<s3_config_snapshot>{};
   auto const config_id                = snapshot ? snapshot->id : 0;
   auto const cache_key                = routed_ioctx_key{type, config_id};
   // The local default `_io_ctx` already serves uring; only an off-default
@@ -2469,7 +2490,10 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   // mutex serializes builders instead, so two first-touches of the same type
   // never construct twice (a losing ioctx would need drain/stop teardown).
   std::unique_lock build_lk{_routed_io_ctxs_build_mtx};
-  if (uses_object_store_config && !canonical_path.empty()) {
+  // A context is retired when the last path leaves its config. One cached for a planned config
+  // that no path maps to any more would never be retired, so the caller owns it instead.
+  bool const cached = !uses_planned_config || _s3_configs.contains(config_id);
+  if (!uses_planned_config && uses_object_store_config && !canonical_path.empty()) {
     auto latest          = _s3_configs.resolve(canonical_path);
     auto const latest_id = latest ? latest->id : 0;
     if (latest_id != config_id) {
@@ -2512,11 +2536,12 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   }
   auto& [io_ctx, failure] = build;
   if (!io_ctx) {
-    _failed_io_ctxs.insert_or_assign(cache_key, failure.by_configuration);
+    if (cached) { _failed_io_ctxs.insert_or_assign(cache_key, failure.by_configuration); }
     return nullptr;
   }
   _failed_io_ctxs.erase(cache_key);
   init_cache_for(*io_ctx);
+  if (!cached) { return std::move(io_ctx); }
   std::lock_guard lk{_routed_io_ctxs_mtx};
   auto [it, inserted] =
     _routed_io_ctxs.emplace(routed_ioctx_key{type, config_id}, std::move(io_ctx));
@@ -2606,14 +2631,15 @@ std::shared_ptr<cucascade::io::rest::rest_ioctx> sirius_scan_manager::rest_ioctx
   return std::dynamic_pointer_cast<cucascade::io::rest::rest_ioctx>(io_ctx);
 }
 
-void sirius_scan_manager::install_s3_config(std::string_view path,
-                                            cucascade::io::object_store_config config)
+std::optional<sirius_scan_manager::s3_config_snapshot> sirius_scan_manager::install_s3_config(
+  std::string_view path, cucascade::io::object_store_config config)
 {
   auto scope = normalize_path(std::string(path));
   std::vector<std::shared_ptr<cucascade::io::ioctx>> retired;
   std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
   auto superseded_id = _s3_configs.install(scope, std::move(config));
-  if (!superseded_id) { return; }
+  auto installed     = _s3_configs.resolve(scope);
+  if (!superseded_id) { return installed; }
   std::lock_guard ctx_lk{_routed_io_ctxs_mtx};
   routed_ioctx_key const key{cucascade::io::io_context_type::restful, *superseded_id};
   _failed_io_ctxs.erase(key);
@@ -2622,6 +2648,7 @@ void sirius_scan_manager::install_s3_config(std::string_view path,
     retired.push_back(std::move(it->second));
     _routed_io_ctxs.erase(it);
   }
+  return installed;
 }
 
 void sirius_scan_manager::query_scan_manager_state::drain() noexcept

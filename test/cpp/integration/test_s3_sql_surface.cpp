@@ -18,6 +18,7 @@
 #include "sirius_extension.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 #include "utils/isolated_checkpoint_test.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/mock_iceberg_rest_catalog.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/s3_backend.hpp"
@@ -1543,6 +1544,41 @@ TEST_CASE("S3 LIST keeps its REST context alive while credentials rotate",
                                return true;
                              });
   CHECK(pages >= 2);
+}
+
+TEST_CASE("S3 planned read opens with its own config after the path's is replaced",
+          "[s3][integration][filesystem][secret][rotation]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto sirius_ctx =
+    fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& manager   = sirius_ctx->get_scan_manager();
+  auto const path = s3_uri(env->bucket, "parquet/nation.parquet");
+  using signing   = cucascade::io::object_store_config::signing_mode;
+
+  // Differs from every other installed config, so this path alone maps to its snapshot.
+  auto own = fixture.config_env.object_store();
+  own.s3_signing_mode =
+    own.s3_signing_mode == signing::header ? signing::presigned : signing::header;
+  auto const planned = manager.install_s3_config(path, own);
+  REQUIRE(planned);
+  // Another connection resolves the same path to credentials that cannot read it.
+  auto other       = fixture.config_env.object_store();
+  other.secret_key = "wrong";
+  manager.install_s3_config(path, other);
+
+  CHECK_THROWS(manager.create_datasource(path));
+  auto opened = manager.create_datasource(path, cucascade::io::open_hint::generic, &*planned);
+  REQUIRE(opened);
+  // No path maps to that config any more, so nothing would retire a context the manager kept.
+  std::weak_ptr<cucascade::io::ioctx> context = opened->io_ctx();
+  opened.reset();
+  CHECK(context.expired());
+  manager.install_s3_config(path, fixture.config_env.object_store());
 }
 
 TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
@@ -4501,16 +4537,31 @@ TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credenti
   catalog.put("ns", "fruit", metadata("v1.metadata.json"));
   catalog.put("ns", "fruit_again", metadata("v1.metadata.json"));
   catalog.put("ns", "empty", metadata("empty.metadata.json"));
-  require_query_ok(con,
-                   "ATTACH '' AS lake (TYPE ICEBERG, AUTHORIZATION_TYPE 'none', ENDPOINT '" +
-                     catalog.uri() + "')");
-  // A broader static secret with wrong credentials stays in place throughout: the vended secret
-  // is more specific and must win, for the statement and for connections reading on its behalf.
-  require_query_ok(con,
-                   "CREATE SECRET broad (TYPE S3, KEY_ID 'wrong', SECRET 'wrong', REGION " +
-                     sql_quote(env->region) + ", ENDPOINT " + sql_quote(env->endpoint) +
-                     ", URL_STYLE 'path', USE_SSL " +
-                     (env->endpoint.rfind("https://", 0) == 0 ? "true" : "false") + ")");
+  {
+    sirius::test::scoped_recording_log_sink logs{"info"};
+    require_query_ok(con,
+                     "ATTACH '' AS lake (TYPE ICEBERG, AUTHORIZATION_TYPE 'none', ENDPOINT '" +
+                       catalog.uri() + "')");
+    // A broader static secret with wrong credentials stays in place throughout: the vended
+    // secret is more specific and must win, for the statement and for connections reading on
+    // its behalf.
+    require_query_ok(con,
+                     "CREATE SECRET broad (TYPE S3, KEY_ID 'wrong', SECRET 'wrong', REGION " +
+                       sql_quote(env->region) + ", ENDPOINT " + sql_quote(env->endpoint) +
+                       ", URL_STYLE 'path', USE_SSL " +
+                       (env->endpoint.rfind("https://", 0) == 0 ? "true" : "false") + ")");
+    // Both statements hold credentials as literals: the log names their kind, not their text.
+    auto const records = logs.records();
+    auto const logged  = [&](std::string_view text) {
+      return std::ranges::any_of(records, [&](auto const& record) {
+        return record.message.find(text) != std::string::npos;
+      });
+    };
+    CHECK(logged("SQL: ATTACH <text withheld"));
+    CHECK(logged("SQL: CREATE SECRET <text withheld"));
+    CHECK_FALSE(logged("AUTHORIZATION_TYPE"));
+    CHECK_FALSE(logged("KEY_ID"));
+  }
 
   using rows_t = std::vector<std::vector<std::string>>;
   rows_t const fruit{{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}};
@@ -4596,8 +4647,38 @@ TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credenti
                 {dv_remote + "/metadata/v1.metadata.json",
                  read_text_file(local / "metadata/v1.metadata.json")});
     rows_t const kept{{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}};
+    // Just before the statement opens its Puffin file, a second connection resolves the same
+    // path. It sees only the broad secret, whose credentials cannot read the file; the statement
+    // must still open it with the credentials it planned with.
+    auto const sirius_ctx =
+      con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx);
+    auto const counters = sirius_ctx->physical_counters();
+    duckdb::Connection other(db);
+    std::string replaced_with;
+    counters->iceberg_dv_phase_for_testing = [&](std::string const& puffin, bool start) {
+      if (!start) return;
+      auto config   = sirius::io::s3::resolve_duckdb_s3_secret(*other.context, puffin, {});
+      replaced_with = config.access_key;
+      sirius_ctx->get_scan_manager().install_s3_config(puffin, std::move(config));
+    };
     expect_gpu(
       "SELECT fruit, count FROM lake.ns.dv ORDER BY count", kept, 1, dv_remote + "/data/a.parquet");
+    counters->iceberg_dv_phase_for_testing = {};
+    CHECK(replaced_with == "wrong");
+    // The same for a data file, whose path is replaced between planning and execution.
+    auto prepared = con.Prepare(query);
+    REQUIRE_FALSE(prepared->HasError());
+    duckdb::vector<duckdb::Value> no_parameters;
+    auto pending = prepared->Submit(no_parameters);
+    REQUIRE_FALSE(pending->HasError());
+    auto replaced = sirius::io::s3::resolve_duckdb_s3_secret(*other.context, data_file, {});
+    CHECK(replaced.access_key == "wrong");
+    sirius_ctx->get_scan_manager().install_s3_config(data_file, std::move(replaced));
+    pending->Complete();
+    INFO((pending->HasError() ? pending->GetError() : ""));
+    REQUIRE_FALSE(pending->HasError());
+    CHECK(collect_rows(*pending) == fruit);
     CHECK(cpu_rows("test/cpp/integration/data/iceberg_v3_deletion_vector") == kept);
   }
 

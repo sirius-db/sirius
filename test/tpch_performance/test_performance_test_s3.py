@@ -172,6 +172,38 @@ class PerformanceTestS3Tests(unittest.TestCase):
         self.assertEqual(events[1], ("secret", con, True))
         self.assertTrue(events[2].startswith("CREATE OR REPLACE VIEW customer"))
 
+    def test_runs_catalog_setup_before_loading_sirius(self):
+        events = []
+        con = Mock()
+        con.execute.side_effect = lambda sql: events.append(sql) or con
+        with tempfile.NamedTemporaryFile("w", suffix=".sql") as setup:
+            setup.write(
+                "CREATE SECRET c (TYPE ICEBERG, TOKEN 'synthetic-token');\n"
+                "ATTACH '' AS lake (TYPE ICEBERG, SECRET c);\n"
+            )
+            setup.flush()
+            with patch.object(
+                benchmark.duckdb, "connect", return_value=con
+            ), patch.object(benchmark, "CATALOG_SETUP_PATH", setup.name), patch.object(
+                benchmark, "EXTENSION_PATH", "/build/sirius.duckdb_extension"
+            ), patch.dict(
+                os.environ, {"SIRIUS_PRE_SQL": ""}
+            ):
+                benchmark.open_connection(
+                    "lake.tpch", gpu_execution=True, data_source="iceberg"
+                )
+
+        # Sirius logs statement text, so the setup file must be done before it loads.
+        sirius = events.index("LOAD '/build/sirius.duckdb_extension'")
+        self.assertTrue(events[sirius - 1].startswith("ATTACH "))
+        self.assertTrue(any("synthetic-token" in sql for sql in events[:sirius]))
+        self.assertTrue(
+            all(
+                sql.startswith("CREATE OR REPLACE VIEW ")
+                for sql in events[sirius + 1 :]
+            )
+        )
+
     def test_s3_profiler_child_writes_timings_but_no_secret_sql(self):
         source = Mock()
         source.pin_globs.return_value = {"lineitem": "s3://bucket/lineitem.parquet"}

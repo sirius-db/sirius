@@ -537,10 +537,14 @@ class sirius_scan_manager {
 
   using ingestible_table_info = op::scan::ingestible_table_info;
 
+  using s3_config_snapshot = sirius::io::scoped_object_store_configs::snapshot;
+
   /// Install the immutable S3 configuration resolved for @p path on the
   /// client thread while binding a query. Matching scans and LIST/glob calls
   /// reuse this snapshot; subsequent replacement affects only future lookups.
-  void install_s3_config(std::string_view path, cucascade::io::object_store_config config);
+  /// Returns the snapshot now serving @p path, for a read that must open with it.
+  std::optional<s3_config_snapshot> install_s3_config(std::string_view path,
+                                                      cucascade::io::object_store_config config);
 
   /// \brief Prepare per-scan state for the given query.
   ///
@@ -936,8 +940,11 @@ class sirius_scan_manager {
     _query_event_publisher = publisher.shared_from_this();
   }
 
+  /// @p planned, when set, is the S3 configuration to open with instead of the path's current one.
   [[nodiscard]] std::shared_ptr<cucascade::io::datasource> create_datasource(
-    std::string_view path, cucascade::io::open_hint hint = cucascade::io::open_hint::generic);
+    std::string_view path,
+    cucascade::io::open_hint hint     = cucascade::io::open_hint::generic,
+    s3_config_snapshot const* planned = nullptr);
 
   /// \brief Stream ListObjectsV2 pages for @p s3_prefix_uri ("s3://bucket/prefix")
   ///        to @p sink, one call per page; @p sink returns false to stop early.
@@ -1119,13 +1126,28 @@ class sirius_scan_manager {
   /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
   /// is uring.  Returns nullptr when no backend supports the path.
   /// @throws std::invalid_argument for a raw `http://` / `https://` URL (use `s3://`).
-  std::shared_ptr<cucascade::io::ioctx> ioctx_for_path(std::string_view path);
+  std::shared_ptr<cucascade::io::ioctx> ioctx_for_path(std::string_view path,
+                                                       s3_config_snapshot const* planned = nullptr);
 
   /// Resolve the ioctx of @p type, building and caching it on first use (the
   /// by-path routing above resolves to a type and then lands here).  Returns
-  /// nullptr when the registry cannot build that backend.
+  /// nullptr when the registry cannot build that backend.  A REST context is built
+  /// for @p planned when set, else for the S3 configuration @p path maps to now.
   std::shared_ptr<cucascade::io::ioctx> ioctx_for_type(cucascade::io::io_context_type type,
-                                                       std::string_view path = {});
+                                                       std::string_view path             = {},
+                                                       s3_config_snapshot const* planned = nullptr);
+
+  /// The contexts one query's scans opened for the S3 configurations its statement planned with.
+  struct planned_s3_io_ctxs {
+    std::mutex mtx;
+    std::unordered_map<std::uint64_t, std::shared_ptr<cucascade::io::ioctx>> by_config;
+  };
+
+  /// The ioctx for @p path of the scan @p info describes: the one for the S3 configuration its
+  /// statement planned with when it recorded one, else the one @p path maps to now.
+  std::shared_ptr<cucascade::io::ioctx> ioctx_for_scan(ingestible_table_info const& info,
+                                                       std::string_view path,
+                                                       planned_s3_io_ctxs& planned);
 
   /// Why the registry could not build a backend, as far as Sirius can tell.
   struct ioctx_failure {

@@ -188,16 +188,28 @@ bool is_nested_logical_type(duckdb::LogicalType const& type)
          id == duckdb::LogicalTypeId::MAP;
 }
 
-void install_parquet_s3_configs(sirius::op::scan::parquet_ingestible_table_info const& table_info,
+// Install the S3 configuration this statement resolves for @p path and record it in @p info, so
+// the scan opens the file with it.
+void plan_s3_config(sirius::op::scan::parquet_ingestible_table_info& info,
+                    std::string const& path,
+                    duckdb::ClientContext& context,
+                    duckdb::SiriusContext& sirius_ctx)
+{
+  if (!sirius::io::s3::is_s3_path(path)) { return; }
+  auto config = sirius::io::s3::resolve_duckdb_s3_secret(
+    context, path, sirius_ctx.get_config().get_scan_manager_config().object_store);
+  if (auto planned = sirius_ctx.get_scan_manager().install_s3_config(path, std::move(config))) {
+    info.s3_configs.insert_or_assign(path, std::move(*planned));
+  }
+}
+
+void install_parquet_s3_configs(sirius::op::scan::parquet_ingestible_table_info& table_info,
                                 duckdb::ClientContext& context,
                                 duckdb::SiriusContext* sirius_ctx)
 {
   if (sirius_ctx == nullptr) { return; }
-  auto const& defaults = sirius_ctx->get_config().get_scan_manager_config().object_store;
   for (auto const& path : table_info.resolved_file_paths) {
-    if (!sirius::io::s3::is_s3_path(path)) { continue; }
-    auto config = sirius::io::s3::resolve_duckdb_s3_secret(context, path, defaults);
-    sirius_ctx->get_scan_manager().install_s3_config(path, std::move(config));
+    plan_s3_config(table_info, path, context, *sirius_ctx);
   }
 }
 
@@ -557,11 +569,7 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   // A deletion vector is opened by path after planning. Install the credential this statement
   // resolves for it now, as for the data files.
   for (auto const& dv : discovery.deletion_vector_entries) {
-    if (!sirius::io::s3::is_s3_path(dv.file_path)) { continue; }
-    sirius_ctx->get_scan_manager().install_s3_config(
-      dv.file_path,
-      sirius::io::s3::resolve_duckdb_s3_secret(
-        context, dv.file_path, sirius_ctx->get_config().get_scan_manager_config().object_store));
+    plan_s3_config(*info, dv.file_path, context, *sirius_ctx);
   }
   if (supplied_discovery)
     *supplied_discovery = std::move(discovery);
