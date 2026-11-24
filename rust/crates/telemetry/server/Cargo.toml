@@ -13,16 +13,16 @@ clap = { version = "4", features = ["derive", "env"] }
 sirius-telemetry-instrumentation = { package = "instrumentation-model", path = "../model", features = ["collector"] }
 sirius-telemetry-analyzer = { path = "../analyzer" }
 sirius-telemetry-store = { path = "../store" }
-nvtx-server = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
-quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
-quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae", default-features = false, features = ["ndjson"] }
-quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
-quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
-quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae", default-features = false, features = ["io-ndjson"] }
+nvtx-server = { workspace = true }
+quent-analyzer = { workspace = true }
+quent-io = { workspace = true, features = ["ndjson"] }
+quent-query-engine-analyzer = { workspace = true }
+quent-query-engine-server = { workspace = true }
+quent-store = { workspace = true, features = ["io-ndjson"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 
 [build-dependencies]
-quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
-quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
+quent-query-engine-ui = { workspace = true }
+quent-ui = { workspace = true }
 ts-rs = { version = "12", features = ["uuid-impl", "serde-json-impl"] }

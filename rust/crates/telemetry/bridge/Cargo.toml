@@ -10,17 +10,17 @@ crate-type = ["staticlib"]
 [dependencies]
 cxx = "1"
 instrumentation-model = { path = "../model" }
-quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
-quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae", features = ["io-ndjson"] }
-quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae", default-features = false, features = ["ndjson"] }
-nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae", features = ["static-injection"] }
-quent-nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
-quent-nvtx-events = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
+quent-dynamic-attributes = { workspace = true }
+quent-instrumentation = { workspace = true, features = ["io-ndjson"] }
+quent-io = { workspace = true, features = ["ndjson"] }
+nvtx-injection = { workspace = true, features = ["static-injection"] }
+quent-nvtx-bridge = { workspace = true }
+quent-nvtx-events = { workspace = true }
 
 [build-dependencies]
 cxx-build = "1"
 # Experimental and unstable: quent's `experimental/vibe/codegen/cpp` (LLM-written, unreviewed
 # upstream, `publish = false`). Its generated C++ API can change on any rev bump; there is no
 # stable C++ generator yet.
-quent-schema-codegen-cpp = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
-quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
+quent-schema-codegen-cpp = { workspace = true }
+quent-yaml = { workspace = true }
