@@ -188,7 +188,7 @@ unique_ptr<FunctionData> add_rank_bind(ClientContext& context,
   if (colon == std::string::npos) {
     throw InvalidInputException("sirius_gateway_add_rank: '%s' is not host:port", address);
   }
-  spec.quack_host = address.substr(0, colon);
+  spec.quack_host   = address.substr(0, colon);
   auto const digits = address.substr(colon + 1);
   auto const parsed =
     std::from_chars(digits.data(), digits.data() + digits.size(), spec.quack_port);
@@ -405,74 +405,72 @@ void LoadInternal(ExtensionLoader& loader)
       name, description, std::move(type), fallback, nullptr, SetScope::GLOBAL);
   };
   option("sirius_gateway_duckdb_binary",
-                            "DuckDB binary that runs each rank",
-                            LogicalType::VARCHAR,
-                            Value(""));
+         "DuckDB binary that runs each rank",
+         LogicalType::VARCHAR,
+         Value(""));
   option("sirius_gateway_sirius_extension",
-                            "Sirius extension each rank loads; empty runs CPU ranks without Sirius",
-                            LogicalType::VARCHAR,
-                            Value(""));
+         "Sirius extension each rank loads; empty runs CPU ranks without Sirius",
+         LogicalType::VARCHAR,
+         Value(""));
   option("sirius_gateway_rank_init",
-                            "SQL each rank's session runs after the exchange settings",
-                            LogicalType::VARCHAR,
-                            Value(""));
+         "SQL each rank's session runs after the exchange settings",
+         LogicalType::VARCHAR,
+         Value(""));
   option("sirius_gateway_log_dir",
-                            "Directory for rank init files and logs; empty uses a temporary one",
-                            LogicalType::VARCHAR,
-                            Value(""));
+         "Directory for rank init files and logs; empty uses a temporary one",
+         LogicalType::VARCHAR,
+         Value(""));
   // A rank waiting on a peer that never ran the query has no bound of its own, so 0 can hold
   // the gateway's one turn forever.
-  option(
-    "sirius_gateway_statement_timeout",
-    "Seconds one statement may run before it is cancelled on every rank; 0 is none. Raise it "
-    "for long queries",
-    LogicalType::UBIGINT,
-    Value::UBIGINT(3600));
-  option(
-    "sirius_gateway_allow_join",
-    "Let clients call sirius_gateway_add_rank and sirius_gateway_drop_rank, "
-    "so that ranks register themselves",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(false));
+  option("sirius_gateway_statement_timeout",
+         "Seconds one statement may run before it is cancelled on every rank; 0 is none. Raise it "
+         "for long queries",
+         LogicalType::UBIGINT,
+         Value::UBIGINT(3600));
+  option("sirius_gateway_allow_join",
+         "Let clients call sirius_gateway_add_rank and sirius_gateway_drop_rank, "
+         "so that ranks register themselves",
+         LogicalType::BOOLEAN,
+         Value::BOOLEAN(false));
   option("sirius_gateway_min_ranks",
-                            "Registered ranks the gateway waits for before the first statement "
-                            "starts them",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(1));
+         "Registered ranks the gateway waits for before the first statement "
+         "starts them",
+         LogicalType::UBIGINT,
+         Value::UBIGINT(1));
   option("sirius_gateway_join_wait",
-                            "Seconds a statement waits for sirius_gateway_min_ranks ranks to "
-                            "register before it fails; 0 fails at once",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(600));
+         "Seconds a statement waits for sirius_gateway_min_ranks ranks to "
+         "register before it fails; 0 fails at once",
+         LogicalType::UBIGINT,
+         Value::UBIGINT(600));
   option("sirius_gateway_state_dir",
-                            "Directory where the gateway keeps its DDL log (ddl.sql) across its "
-                            "own restarts; empty keeps it in memory only",
-                            LogicalType::VARCHAR,
-                            Value(""));
+         "Directory where the gateway keeps its DDL log (ddl.sql) across its "
+         "own restarts; empty keeps it in memory only",
+         LogicalType::VARCHAR,
+         Value(""));
   option("sirius_gateway_cancel_grace",
-                            "Seconds a cancelled statement may keep running on a rank before the "
-                            "gateway kills the rank and restarts every rank",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(30));
+         "Seconds a cancelled statement may keep running on a rank before the "
+         "gateway kills the rank and restarts every rank",
+         LogicalType::UBIGINT,
+         Value::UBIGINT(30));
   option("sirius_gateway_rank_boot_id_sql",
-                            "Query that names a registered rank's process; it changes when the "
-                            "rank restarts",
-                            LogicalType::VARCHAR,
-                            Value("SELECT boot_id FROM sirius_rank_info()"));
+         "Query that names a registered rank's process; it changes when the "
+         "rank restarts",
+         LogicalType::VARCHAR,
+         Value("SELECT boot_id FROM sirius_rank_info()"));
   option("sirius_gateway_rank_joined_sql",
-                            "Query that says whether a registered rank's process has joined a set "
-                            "of ranks, so must restart to join another; empty restarts every time",
-                            LogicalType::VARCHAR,
-                            Value("SELECT joined FROM sirius_rank_info()"));
+         "Query that says whether a registered rank's process has joined a set "
+         "of ranks, so must restart to join another; empty restarts every time",
+         LogicalType::VARCHAR,
+         Value("SELECT joined FROM sirius_rank_info()"));
   option("sirius_gateway_rank_exit_sql",
-                            "Statement that ends a registered rank's process, for its launcher to "
-                            "start it again",
-                            LogicalType::VARCHAR,
-                            Value("CALL sirius_rank_exit()"));
+         "Statement that ends a registered rank's process, for its launcher to "
+         "start it again",
+         LogicalType::VARCHAR,
+         Value("CALL sirius_rank_exit()"));
   option("sirius_gateway_query_id_setting",
-                            "Setting that carries the query number to each rank; empty sends none",
-                            LogicalType::VARCHAR,
-                            Value("sirius_distributed_query_id"));
+         "Setting that carries the query number to each rank; empty sends none",
+         LogicalType::VARCHAR,
+         Value("sirius_distributed_query_id"));
 }
 
 }  // namespace
