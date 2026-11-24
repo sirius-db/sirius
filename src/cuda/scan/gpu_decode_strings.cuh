@@ -73,4 +73,14 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
                                                         ::cuda::stream_ref stream,
                                                         rmm::device_async_resource_ref mr);
 
+/// Decode a varchar column to a DICTIONARY32 column (INT32 codes over distinct, sorted keys)
+/// without gathering strings: every segment's dictionary entries are stacked and deduplicated once,
+/// then each row's code is remapped onto the merged keys. Null when a run is not DICT_FSST, so the
+/// caller decodes strings instead. A STRING column when a segment stores no dictionary (FSST_ONLY):
+/// it is decoded from the state already prepared rather than leaving the caller to prepare again.
+std::unique_ptr<cudf::column> gpu_decode_strings_dictionary_column(
+  gpu_string_column_decode_input const& col,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr);
+
 }  // namespace sirius::cuda::scan

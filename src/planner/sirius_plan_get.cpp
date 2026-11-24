@@ -553,6 +553,73 @@ void carry_as_dictionary(cudf::data_type& carrier,
                    id.GetPrimaryIndex());
 }
 
+// An unpinned DuckDB-native scan carries an unfiltered string column as DICTIONARY32
+// when its storage dictionary-encodes it (@p dictionary_encoded, by table column index): the reader
+// then returns its codes and keys without gathering strings.
+std::vector<cudf::data_type> source_dictionary_schema(
+  duckdb::LogicalGet& op,
+  const duckdb::vector<duckdb::ColumnIndex>& ids,
+  std::unordered_set<std::size_t> const& dictionary_encoded)
+{
+  std::vector<cudf::data_type> result;
+  result.reserve(op.types.size());
+  bool changed = false;
+  for (std::size_t output_idx = 0; output_idx < op.types.size(); output_idx++) {
+    auto const native = sirius::get_cudf_type(sirius::from_duckdb(op.types[output_idx]));
+    if (!native) { return {}; }
+    result.push_back(*native);
+    if (native->id() != cudf::type_id::STRING) { continue; }
+    auto const ids_position = scan_ids_position(op, output_idx, ids.size());
+    if (!ids_position || !ids[*ids_position].HasPrimaryIndex() ||
+        ids[*ids_position].IsVirtualColumn() || scan_filters_column(op, *ids_position) ||
+        !dictionary_encoded.contains(ids[*ids_position].GetPrimaryIndex())) {
+      continue;
+    }
+    carry_as_dictionary(result.back(), output_idx, ids[*ids_position]);
+    changed = true;
+  }
+  return changed ? result : std::vector<cudf::data_type>{};
+}
+
+// A DuckDB table column whose distinct-count estimate is at most this is a dictionary candidate.
+// DuckDB picks dictionary segments for such columns; a split that stores one otherwise decodes to
+// strings, the carrier's STRING form.
+constexpr duckdb::idx_t native_dictionary_carrier_max_distinct = 1 << 16;
+
+// The table columns among @p ids that a DuckDB-native scan's storage dictionary-encodes.
+std::unordered_set<std::size_t> source_dictionary_columns(
+  duckdb::ClientContext& context,
+  duckdb::LogicalGet& op,
+  const duckdb::vector<duckdb::ColumnIndex>& ids)
+{
+  std::unordered_set<std::size_t> result;
+  if (op.function.GetName() != "seq_scan") { return result; }
+  auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
+  if (bind == nullptr || !bind->table.IsDuckTable()) { return result; }
+  auto& table = bind->table.Cast<duckdb::DuckTableEntry>();
+  for (auto const& id : ids) {
+    if (!id.HasPrimaryIndex() || id.IsVirtualColumn()) { continue; }
+    auto const primary = id.GetPrimaryIndex();
+    if (primary >= op.returned_types.size() ||
+        op.returned_types[primary].id() != duckdb::LogicalTypeId::VARCHAR) {
+      continue;
+    }
+    auto const stats = table.GetStatistics(context, primary);
+    if (!stats) { continue; }
+    auto const distinct = stats->GetDistinctCount();
+    if (distinct == 0 || distinct > native_dictionary_carrier_max_distinct) { continue; }
+    // Keys bounded by every distinct value at the longest length; a column that may exceed the
+    // carrier cap would have its dictionary built only for the scan to decode it.
+    if (duckdb::StringStats::HasMaxStringLength(*stats) &&
+        distinct * (duckdb::StringStats::MaxStringLength(*stats) + sizeof(cudf::size_type)) >
+          sirius::dictionary_carrier_max_keys_bytes) {
+      continue;
+    }
+    result.insert(primary);
+  }
+  return result;
+}
+
 std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
                                                   duckdb::SiriusContext* state,
                                                   bool compressed_materialization_on,
@@ -884,12 +951,21 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     }
   }
 
-  auto physical_types = scan_physical_schema(op,
+  auto physical_types            = scan_physical_schema(op,
                                              sirius_state.get(),
                                              compressed_materialization_on,
                                              dictionary_carrier_on,
                                              column_ids,
                                              serves_insert_deltas ? nullptr : pinned);
+  bool source_dictionary_sidecar = false;
+  if (physical_types.empty() && pinned == nullptr && !marked_decline && sirius_state &&
+      dictionary_carrier_on) {
+    auto const eligible = source_dictionary_columns(context, op, column_ids);
+    if (!eligible.empty()) {
+      physical_types            = source_dictionary_schema(op, column_ids, eligible);
+      source_dictionary_sidecar = !physical_types.empty();
+    }
+  }
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");
@@ -1324,6 +1400,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     node->set_physical_types(std::move(physical_types));
     node->sidecar_from_gpu_tier_pin =
       pinned != nullptr && pinned->tier == cucascade::memory::Tier::GPU;
+    node->sidecar_from_source_dictionaries = source_dictionary_sidecar;
     if (sirius_state) {
       sirius_state->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::scan_sidecar_installed);

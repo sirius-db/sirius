@@ -16,11 +16,11 @@
 
 /**
  * @file test_dictionary_carrier_sources.cpp
- * @brief enable_dictionary_carrier on compressed pinned scans.
+ * @brief enable_dictionary_carrier on DuckDB-native and compressed pinned scans.
  *
- * The planner carries a string column as DICTIONARY32 when its Simpatico pin dictionary-encodes it
- * with keys under the carrier cap and the scan does not filter it, and every query over such a
- * carrier returns DuckDB's results. A compressed pin qualifies on either tier.
+ * The planner carries a string column as DICTIONARY32 when its storage dictionary-encodes it with
+ * keys under the carrier cap and the scan does not filter it, and every query over such a carrier
+ * returns DuckDB's results. A compressed pin qualifies on either tier.
  */
 
 #include "utils/gpu_execution_fixture.hpp"
@@ -184,6 +184,7 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
       carried = static_cast<std::size_t>(std::ranges::count_if(
         scan->get_physical_types(),
         [](cudf::data_type type) { return type.id() == cudf::type_id::DICTIONARY32; }));
+      CHECK(scan->sidecar_from_source_dictionaries == (!pinned && carried > 0));
     }
     run_ok("ROLLBACK;");
     run_ok("SET gpu_execution = true;");
@@ -222,6 +223,21 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
 
 }  // namespace
 
+TEST_CASE_METHOD(DictionaryCarrierFixture,
+                 "dictionary carrier - a DuckDB-native scan carries its low-cardinality strings",
+                 "[integration][gpu_execution][dictionary_carrier]")
+{
+  CHECK(carried_dictionaries("SELECT low, count(*) FROM t GROUP BY low") == 1);
+  CHECK(carried_dictionaries("SELECT low, distinct_values FROM t") == 1);
+  // A filtered column keeps its strings; the other carried column does not.
+  CHECK(carried_dictionaries("SELECT low, \"group\" FROM t WHERE low > 'k1'") == 1);
+  CHECK(carried_dictionaries("SELECT low, x FROM t WHERE x > 10") == 1);
+  // Its distinct values at their longest length could exceed the carrier cap.
+  CHECK(carried_dictionaries("SELECT wide, count(*) FROM t GROUP BY wide") == 0);
+  run_ok("SET enable_dictionary_carrier = false;");
+  CHECK(carried_dictionaries("SELECT low, count(*) FROM t GROUP BY low") == 0);
+}
+
 TEST_CASE_METHOD(
   DictionaryCarrierFixture,
   "dictionary carrier - a compressed pin carries its dictionary columns on either tier",
@@ -229,7 +245,6 @@ TEST_CASE_METHOD(
 {
   auto const tier = GENERATE(as<std::string>{}, "gpu", "host");
   CAPTURE(tier);
-  CHECK(carried_dictionaries("SELECT low, count(*) FROM t GROUP BY low") == 0);
   pin_compressed(tier);
   CHECK(carried_dictionaries("SELECT low, count(*) FROM t GROUP BY low") == 1);
   CHECK(carried_dictionaries("SELECT low, nullable, \"group\" FROM t") == 3);
@@ -319,4 +334,11 @@ TEST_CASE_METHOD(DictionaryCarrierFixture,
   REQUIRE(carried_dictionaries("SELECT low, count(*) FROM t GROUP BY low") == 1);
   run_ok("SET sirius_exchange_peers = '127.0.0.1:62998,127.0.0.1:62999';");
   CHECK(carried_dictionaries("SELECT low, count(*) FROM t GROUP BY low") == 0);
+}
+
+TEST_CASE_METHOD(DictionaryCarrierFixture,
+                 "dictionary carrier - queries over DuckDB-native carriers match DuckDB",
+                 "[integration][gpu_execution][dictionary_carrier]")
+{
+  compare_all("t");
 }

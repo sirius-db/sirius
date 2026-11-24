@@ -531,6 +531,49 @@ __global__ void kernel_dict_fsst_mark_nulls(dict_fsst_desc const* __restrict__ d
   }
 }
 
+__global__ void kernel_dict_fsst_entry_pairs(dict_fsst_desc const* __restrict__ descs,
+                                             int num_segments,
+                                             uint32_t const* __restrict__ d_byte_offsets,
+                                             uint32_t const* __restrict__ d_decoded_offsets,
+                                             uint8_t const* __restrict__ predecode_buf,
+                                             dict_entry_pair* __restrict__ d_pairs)
+{
+  int seg_idx = blockIdx.x;
+  if (seg_idx >= num_segments) return;
+  auto const desc       = descs[seg_idx];
+  bool const predecoded = desc.mode == DICT_FSST_MODE_DICT_FSST;
+  uint32_t const* offsets =
+    (predecoded ? d_decoded_offsets : d_byte_offsets) + desc.seg_dict_offset_base;
+  auto const* bytes = reinterpret_cast<char const*>(
+    predecoded ? predecode_buf + desc.predecode_seg_offset : desc.d_bytes + desc.dict_data_offset);
+  auto* pairs = d_pairs + desc.seg_dict_offset_base;
+  for (uint32_t k = threadIdx.x; k <= desc.dict_count; k += blockDim.x) {
+    if (k == 0 || k == desc.dict_count) {
+      pairs[k] = {nullptr, 0};
+      continue;
+    }
+    pairs[k] = {bytes + offsets[k], static_cast<cudf::size_type>(offsets[k + 1] - offsets[k])};
+  }
+}
+
+__global__ void kernel_dict_fsst_codes(dict_fsst_desc const* __restrict__ descs,
+                                       int num_chunks,
+                                       int32_t const* __restrict__ d_slot_to_key,
+                                       int32_t* __restrict__ d_codes,
+                                       int32_t* __restrict__ d_out_of_range)
+{
+  int chunk_idx = blockIdx.x;
+  if (chunk_idx >= num_chunks) return;
+  auto const desc   = descs[chunk_idx];
+  auto const* d_idx = reinterpret_cast<uint32_t const*>(desc.d_bytes + desc.dict_indices_offset);
+  for (int i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    auto const idx = unpack_value<uint32_t>(d_idx, desc.seg_row_start + i, desc.dict_indices_width);
+    if (idx >= desc.dict_count) { *d_out_of_range = 1; }
+    d_codes[desc.global_row_start + i] =
+      (idx == 0 || idx >= desc.dict_count) ? 0 : d_slot_to_key[desc.seg_dict_offset_base + idx];
+  }
+}
+
 }  // namespace
 
 //! Prepare DICT_FSST state after host validation. Synchronizes for headers and, when rows
@@ -672,8 +715,24 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
   for (uint32_t i = 0; i < num_segs; ++i) {
     auto const& seg = run.segments[i];
     if (seg.row_count == 0) continue;
-    auto const& p          = pre[i];
-    auto const& hdr        = headers[i];
+    auto const& p   = pre[i];
+    auto const& hdr = headers[i];
+    // The device scan sums the entry lengths in uint32, so a corrupt length shows as a decreasing
+    // offset (wrap) or a total past the dictionary region; either would read out of bounds.
+    auto const* entry_offsets = out.byte_offsets.data() + p.base_off;
+    for (uint32_t k = 0; k < p.dict_count; ++k) {
+      if (entry_offsets[k + 1] < entry_offsets[k]) {
+        throw_malformed_segment(DICT_FSST_CODEC_NAME, i, seg, "dictionary entry lengths overflow");
+      }
+    }
+    if (entry_offsets[p.dict_count] > hdr.dict_size) {
+      throw_malformed_segment(DICT_FSST_CODEC_NAME,
+                              i,
+                              seg,
+                              "dictionary entry lengths " +
+                                std::to_string(entry_offsets[p.dict_count]) + " exceed dict_size " +
+                                std::to_string(hdr.dict_size));
+    }
     uint32_t predecode_off = 0;
     if (p.mode == DICT_FSST_MODE_DICT_FSST) {
       predecode_off = predecode_cursor;
@@ -766,6 +825,31 @@ void launch_dict_fsst_mark_nulls(dict_fsst_desc const* d_descs,
   if (n_segments == 0) return;
   kernel_dict_fsst_mark_nulls<<<n_segments, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
     d_descs, d_null_mask, n_segments);
+}
+
+void launch_dict_fsst_entry_pairs(dict_fsst_desc const* d_descs,
+                                  uint32_t n_segments,
+                                  uint32_t const* d_byte_offsets,
+                                  uint32_t const* d_decoded_offsets,
+                                  uint8_t const* d_predecode,
+                                  dict_entry_pair* d_pairs,
+                                  ::cuda::stream_ref stream)
+{
+  if (n_segments == 0) return;
+  kernel_dict_fsst_entry_pairs<<<n_segments, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
+    d_descs, n_segments, d_byte_offsets, d_decoded_offsets, d_predecode, d_pairs);
+}
+
+void launch_dict_fsst_codes(dict_fsst_desc const* d_chunks,
+                            uint32_t n_chunks,
+                            int32_t const* d_slot_to_key,
+                            int32_t* d_codes,
+                            int32_t* d_out_of_range,
+                            ::cuda::stream_ref stream)
+{
+  if (n_chunks == 0) return;
+  kernel_dict_fsst_codes<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
+    d_chunks, n_chunks, d_slot_to_key, d_codes, d_out_of_range);
 }
 
 }  // namespace sirius::cuda::scan

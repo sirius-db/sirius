@@ -949,6 +949,7 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
       t = scan_op.returned_types.at(col_idx.GetPrimaryIndex());
     }
     info->projected_types.push_back(t);
+    info->dictionary_projected.push_back(scan_op.carries_source_dictionary(k));
   }
 
   // Filters drive row-group pruning in the metadata walk and post-decode filtering.
