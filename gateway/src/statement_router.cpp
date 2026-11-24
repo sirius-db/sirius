@@ -1,17 +1,13 @@
 #include "statement_router.hpp"
 
-#include "duckdb/common/string_util.hpp"
-#include "duckdb/parser/expression/function_expression.hpp"
-#include "duckdb/parser/expression/subquery_expression.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
-#include "duckdb/parser/parsed_expression_iterator.hpp"
-#include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/query_node.hpp"
-#include "duckdb/parser/statement/call_statement.hpp"
-#include "duckdb/parser/statement/select_statement.hpp"
-#include "duckdb/parser/statement/set_statement.hpp"
-#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "statement_facts.hpp"
 
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/set_statement.hpp"
+
+#include <algorithm>
 #include <array>
 
 namespace sirius_gateway {
@@ -34,57 +30,9 @@ bool is_gateway_name(std::string const& name)
          StringUtil::StartsWith(name, "quack_") || StringUtil::StartsWith(name, "sirius_rank_");
 }
 
-/// What a statement calls and reads, at any depth: subqueries, CTEs and join sides included.
-struct references {
-  std::vector<std::string> functions;  ///< every function called, table functions included
-  /// The statement reads a table, a file, or a table function that is not a gateway function.
-  bool other_source = false;
-};
-
-void collect(QueryNode& node, references& refs);
-
-void collect(ParsedExpression& e, references& refs)
-{
-  if (e.GetExpressionClass() == ExpressionClass::FUNCTION) {
-    refs.functions.push_back(
-      StringUtil::Lower(e.Cast<FunctionExpression>().FunctionName().GetIdentifierName()));
-  }
-  // The iterator stops at a subquery expression: its query is not one of its children.
-  if (e.GetExpressionClass() == ExpressionClass::SUBQUERY) {
-    collect(*e.Cast<SubqueryExpression>().SubqueryMutable()->node, refs);
-  }
-  ParsedExpressionIterator::EnumerateChildren(
-    e, [&](ParsedExpression& child) { collect(child, refs); });
-}
-
-void collect(QueryNode& node, references& refs)
-{
-  ParsedExpressionIterator::EnumerateQueryNodeChildren(
-    node,
-    [&](unique_ptr<ParsedExpression>& e) {
-      if (e) { collect(*e, refs); }
-    },
-    [&](TableRef& ref) {
-      switch (ref.type) {
-        case TableReferenceType::JOIN:
-        case TableReferenceType::SUBQUERY:
-        case TableReferenceType::EMPTY_FROM:
-        case TableReferenceType::EXPRESSION_LIST: break;  // their parts are visited on their own
-        case TableReferenceType::TABLE_FUNCTION: {
-          auto& f = *ref.Cast<TableFunctionRef>().function;
-          refs.other_source |= f.GetExpressionClass() != ExpressionClass::FUNCTION ||
-                               !is_gateway_name(StringUtil::Lower(
-                                 f.Cast<FunctionExpression>().FunctionName().GetIdentifierName()));
-          break;
-        }
-        default: refs.other_source = true;
-      }
-    });
-}
-
 /// The gateway function that @p sql calls by name, or empty: an identifier with such a name,
 /// quoted or not, that an opening parenthesis follows. A check on the tokens, so it also finds
-/// the name of a table or a column there; for the statements that references_of() does not walk.
+/// the name of a table or a column there; for the statements that facts_of() does not walk.
 std::string gateway_call_in(std::string const& sql)
 {
   auto const tokens = Parser::Tokenize(sql);
@@ -105,18 +53,6 @@ std::string gateway_call_in(std::string const& sql)
     if (is_gateway_name(name)) { return name; }
   }
   return {};
-}
-
-references references_of(SQLStatement& stmt)
-{
-  references refs;
-  if (stmt.type == StatementType::CALL_STATEMENT) {
-    collect(*stmt.Cast<CallStatement>().function, refs);
-  }
-  if (stmt.type == StatementType::SELECT_STATEMENT) {
-    collect(*stmt.Cast<SelectStatement>().node, refs);
-  }
-  return refs;
 }
 
 /// Whether a client may call @p name, a gateway function, which then runs on the gateway.
@@ -155,9 +91,9 @@ bool runs_on_gateway(SQLStatement& stmt, bool allow_join)
   // INSERT, a COPY, a view or a macro must not carry a call there.
   bool walked =
     stmt.type == StatementType::CALL_STATEMENT || stmt.type == StatementType::SELECT_STATEMENT;
-  references refs;
+  statement_facts facts;
   try {
-    refs = references_of(stmt);
+    facts = facts_of(stmt);
   } catch (NotImplementedException&) {
     walked = false;
   }
@@ -171,16 +107,25 @@ bool runs_on_gateway(SQLStatement& stmt, bool allow_join)
     return false;
   }
   bool local = false;
-  for (auto const& name : refs.functions) {
+  for (auto const& name : facts.functions) {
     if (!is_gateway_name(name)) { continue; }
     if (!client_may_call(name, allow_join)) {
       throw InvalidInputException("%s can only be called on the gateway's console", name);
     }
     local = true;
   }
-  // The statement runs as written in the client's gateway session. Anything else it read there
-  // would be the gateway host's files, or SQL run by a function such as query().
-  if (local && refs.other_source) {
+  // The statement runs as written in the client's gateway session. Anything else it read or
+  // wrote there would be the gateway host's files, or SQL run by a function such as query().
+  bool const other_source =
+    facts.reads_table ||
+    std::any_of(facts.table_functions.begin(), facts.table_functions.end(), [](auto const& name) {
+      return !is_gateway_name(name);
+    });
+  if (local && facts.writes) {
+    throw InvalidInputException(
+      "a statement that calls a gateway function cannot write tables or files");
+  }
+  if (local && other_source) {
     throw InvalidInputException(
       "a statement that calls a gateway function cannot read tables, files or other table "
       "functions");
@@ -193,11 +138,9 @@ bool runs_on_gateway(SQLStatement& stmt, bool allow_join)
 std::string route(std::string const& sql, bool allow_join)
 {
   Parser parser{ParserOptions::Builtin()};
-  try {
-    parser.ParseQuery(sql);
-  } catch (std::exception&) {
-    return sql;  // DuckDB reports the parse error when it runs the text
-  }
+  // Text that does not parse is refused whole. Run as written, the client's gateway session
+  // would execute, unrouted, each statement before the one that does not parse.
+  parser.ParseQuery(sql);
   std::string routed;
   for (auto& stmt : parser.statements) {
     // The parser leaves each statement's own text in query (and its location at 0).
@@ -205,8 +148,9 @@ std::string route(std::string const& sql, bool allow_join)
     // DuckDB 2.0.1 starts a statement's text right after the terminator of the one before.
     StringUtil::LTrim(text);
     StringUtil::RTrim(text, ";\n\t ");
+    // The newline ends a trailing line comment, which would otherwise hold the terminator.
     routed += runs_on_gateway(*stmt, allow_join)
-                ? text
+                ? text + "\n"
                 : "FROM sirius_gateway_run(" + KeywordHelper::WriteQuoted(text) + ")";
     routed += ";\n";
   }
