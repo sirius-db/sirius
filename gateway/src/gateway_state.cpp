@@ -126,10 +126,12 @@ bool holds_credentials(std::string const& sql)
       case duckdb::StatementType::SET_STATEMENT:
         return secret_like(stmt->template Cast<duckdb::SetStatement>().name.GetIdentifierName());
       case duckdb::StatementType::ATTACH_STATEMENT: {
-        auto const& info = *stmt->template Cast<duckdb::AttachStatement>().info;
-        return std::any_of(info.parsed_options.begin(),
-                           info.parsed_options.end(),
-                           [&](auto const& option) { return secret_like(option.first); });
+        // The parser keeps a constant option, such as TOKEN 'x', in options, and any other
+        // expression in parsed_options.
+        auto const& info  = *stmt->template Cast<duckdb::AttachStatement>().info;
+        auto const secret = [&](auto const& option) { return secret_like(option.first); };
+        return std::any_of(info.options.begin(), info.options.end(), secret) ||
+               std::any_of(info.parsed_options.begin(), info.parsed_options.end(), secret);
       }
       default: return false;
     }
