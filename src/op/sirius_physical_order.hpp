@@ -34,6 +34,8 @@ inline duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
   return result;
 }
 
+class sirius_physical_sort_sample;
+
 class sirius_physical_order : public sirius_physical_operator {
  public:
   [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
@@ -60,6 +62,17 @@ class sirius_physical_order : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
+
+  //! Hand every sorted batch to @p sample, which picks range boundaries from their key rows. Set
+  //! while planning.
+  void set_sort_sample(sirius_physical_sort_sample* sample) noexcept { _sort_sample = sample; }
+  [[nodiscard]] sirius_physical_sort_sample* get_sort_sample() const noexcept
+  {
+    return _sort_sample;
+  }
+
+ private:
+  sirius_physical_sort_sample* _sort_sample = nullptr;
 };
 
 }  // namespace op

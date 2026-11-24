@@ -36,6 +36,7 @@
 #include <pipeline/sirius_pipeline.hpp>
 #include <sirius_config.hpp>
 
+#include <algorithm>
 #include <numeric>
 #include <vector>
 
@@ -87,7 +88,17 @@ sirius_physical_sort_sample make_sort_sample(uint64_t sort_sample_bytes,
     max_partition_bytes);
 }
 
-void add_int_batches(cucascade::shared_data_repository& repo,
+/// As pipeline 1 does: the sorted batch gives its key rows, then goes to the input port.
+void feed(sirius_physical_sort_sample& sample_op,
+          cucascade::shared_data_repository& repo,
+          std::shared_ptr<cucascade::data_batch> batch)
+{
+  sample_op.add_sorted_batch(batch->get_batch_id(), *batch, cudf::get_default_stream());
+  repo.add_data_batch(std::move(batch), 0);
+}
+
+void add_int_batches(sirius_physical_sort_sample& sample_op,
+                     cucascade::shared_data_repository& repo,
                      memory_space& space,
                      int num_batches,
                      std::size_t rows_per_batch)
@@ -95,7 +106,7 @@ void add_int_batches(cucascade::shared_data_repository& repo,
   for (int b = 0; b < num_batches; ++b) {
     std::vector<int32_t> values(rows_per_batch);
     std::iota(values.begin(), values.end(), static_cast<int32_t>(b * rows_per_batch));
-    repo.add_data_batch(make_numeric_batch<int32_t>(space, values, cudf::type_id::INT32), 0);
+    feed(sample_op, repo, make_numeric_batch<int32_t>(space, values, cudf::type_id::INT32));
   }
 }
 
@@ -142,7 +153,7 @@ int32_t read_int32_column(const cudf::column_view& col, cudf::size_type row)
 
 }  // namespace
 
-TEST_CASE("sirius_physical_sort_sample stops sampling at sort_sample_bytes threshold",
+TEST_CASE("sirius_physical_sort_sample starts the boundary task once sort_sample_bytes arrived",
           "[physical_sort_sample]")
 {
   auto* space = get_default_gpu_space();
@@ -154,26 +165,78 @@ TEST_CASE("sirius_physical_sort_sample stops sampling at sort_sample_bytes thres
 
   auto sample_op = make_sort_sample(threshold);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
-  add_int_batches(*repo, *space, num_batches, rows_per_batch);
   attach_port(sample_op, *repo);
 
+  // One batch is below the setting.
+  add_int_batches(sample_op, *repo, *space, 1, rows_per_batch);
+  REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+
+  // The boundary task carries one batch; its sample is every batch handed over.
+  add_int_batches(sample_op, *repo, *space, 1, rows_per_batch);
   auto result = sample_op.get_next_task_input_data();
   REQUIRE(result != nullptr);
-  REQUIRE(batch_count(*result) < static_cast<std::size_t>(num_batches));
-  REQUIRE(batch_count(*result) >= 1);
+  REQUIRE(batch_count(*result) == 1);
   REQUIRE(sample_op.get_next_task_input_data() == nullptr);
 
   (void)sample_op.execute(*result, cudf::get_default_stream());
   REQUIRE(sample_op.boundaries_computed());
+  CHECK(sample_op.get_range_sample_stats().sample_batches == 2);
+  CHECK(sample_op.get_range_sample_stats().sample_rows == 2 * rows_per_batch);
+  CHECK_FALSE(sample_op.get_range_sample_stats().complete_input);
 
+  // Later batches are not sampled and pass through one per task.
+  add_int_batches(sample_op, *repo, *space, num_batches - 2, rows_per_batch);
+  CHECK(sample_op.sampled_input().batches == 2);
   std::size_t total_batches_returned = batch_count(*result);
   while (true) {
     auto next = sample_op.get_next_task_input_data();
     if (!next) { break; }
+    CHECK(batch_count(*next) == 1);
     total_batches_returned += batch_count(*next);
   }
 
   REQUIRE(total_batches_returned == static_cast<std::size_t>(num_batches));
+}
+
+TEST_CASE("sirius_physical_sort_sample counts a batch handed over twice once",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const stream = cudf::get_default_stream();
+
+  constexpr std::size_t rows = 1000;
+  std::vector<int32_t> values(rows);
+  std::iota(values.begin(), values.end(), 0);
+  auto batch = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
+  std::size_t batch_bytes;
+  {
+    auto read_only = batch->to_read_only();
+    batch_bytes    = read_only.get_data()->get_size_in_bytes();
+  }
+
+  auto sample_op = make_sort_sample(/*sort_sample_bytes=*/2 * batch_bytes);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  attach_port(sample_op, *repo);
+
+  // A retried ORDER_BY task hands its batch over again under the same id.
+  sample_op.add_sorted_batch(7, *batch, stream);
+  sample_op.add_sorted_batch(7, *batch, stream);
+  CHECK(sample_op.sampled_input().batches == 1);
+  CHECK(sample_op.sampled_input().rows == rows);
+  CHECK(sample_op.sampled_input().bytes == batch_bytes);
+
+  // Key rows alone do not start the boundary task: a batch has to wait in the port.
+  sample_op.add_sorted_batch(8, *batch, stream);
+  CHECK(sample_op.sampled_input().batches == 2);
+  CHECK(sample_op.get_next_task_input_data() == nullptr);
+
+  repo->add_data_batch(batch, 0);
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  (void)sample_op.execute(*input, stream);
+  CHECK(sample_op.get_range_sample_stats().sample_batches == 2);
+  CHECK(sample_op.get_range_sample_stats().sample_rows == 2 * rows);
 }
 
 TEST_CASE("sirius_physical_sort_sample get_next_task_hint waits for sample bytes",
@@ -202,13 +265,13 @@ TEST_CASE("sirius_physical_sort_sample get_next_task_hint waits for sample bytes
 
   attach_port(sample_op, *repo, src_pipeline);
 
-  add_int_batches(*repo, *space, 1, rows_per_batch);
+  add_int_batches(sample_op, *repo, *space, 1, rows_per_batch);
   auto waiting_hint = sample_op.get_next_task_hint();
   REQUIRE(waiting_hint.has_value());
   REQUIRE(waiting_hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
   REQUIRE(waiting_hint->producer == upstream_producer.get());
 
-  add_int_batches(*repo, *space, 1, rows_per_batch);
+  add_int_batches(sample_op, *repo, *space, 1, rows_per_batch);
   auto ready_hint = sample_op.get_next_task_hint();
   REQUIRE(ready_hint.has_value());
   REQUIRE(ready_hint->hint == TaskCreationHint::READY);
@@ -309,7 +372,7 @@ TEST_CASE("sirius_physical_sort_sample get_next_task_hint returns nullopt while 
 
   auto sample_op = make_sort_sample(threshold);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
-  add_int_batches(*repo, *space, 2, rows_per_batch);
+  add_int_batches(sample_op, *repo, *space, 2, rows_per_batch);
   attach_port(sample_op, *repo);
 
   REQUIRE(sample_op.get_next_task_hint()->hint == TaskCreationHint::READY);
@@ -317,9 +380,8 @@ TEST_CASE("sirius_physical_sort_sample get_next_task_hint returns nullopt while 
   REQUIRE_FALSE(sample_op.get_next_task_hint().has_value());
 }
 
-TEST_CASE(
-  "sirius_physical_sort_sample pulls all remaining data when upstream finished below threshold",
-  "[physical_sort_sample]")
+TEST_CASE("sirius_physical_sort_sample samples all input when upstream finished below threshold",
+          "[physical_sort_sample]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -330,25 +392,76 @@ TEST_CASE(
 
   auto sample_op = make_sort_sample(threshold);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
-  add_int_batches(*repo, *space, num_batches, rows_per_batch);
+  add_int_batches(sample_op, *repo, *space, num_batches, rows_per_batch);
 
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
-  src_pipeline->set_finished(true);
   attach_port(sample_op, *repo, src_pipeline);
+  REQUIRE(sample_op.get_next_task_input_data() == nullptr);
 
+  src_pipeline->set_finished(true);
   auto ready_hint = sample_op.get_next_task_hint();
   REQUIRE(ready_hint.has_value());
   REQUIRE(ready_hint->hint == TaskCreationHint::READY);
 
   auto result = sample_op.get_next_task_input_data();
   REQUIRE(result != nullptr);
-  REQUIRE(batch_count(*result) == static_cast<std::size_t>(num_batches));
+  REQUIRE(batch_count(*result) == 1);
   REQUIRE(sample_op.get_next_task_input_data() == nullptr);
 
   (void)sample_op.execute(*result, cudf::get_default_stream());
   REQUIRE(sample_op.boundaries_computed());
+  auto const& stats = sample_op.get_range_sample_stats();
+  CHECK(stats.complete_input);
+  CHECK(stats.est_source == "measured");
+  CHECK(stats.sample_batches == static_cast<std::size_t>(num_batches));
+  CHECK(stats.sample_rows == num_batches * rows_per_batch);
+
+  // The batches the boundary task left behind pass through.
+  for (int b = 1; b < num_batches; ++b) {
+    auto next = sample_op.get_next_task_input_data();
+    REQUIRE(next != nullptr);
+    CHECK(batch_count(*next) == 1);
+  }
   REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+}
+
+TEST_CASE("sirius_physical_sort_sample waits for all its input when sort_sample_bytes is 0",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto sample_op = make_sort_sample(/*sort_sample_bytes=*/0);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
+  auto src_pipeline      = std::make_shared<mock_gpu_pipeline>(build_ctx);
+  auto upstream_producer = duckdb::make_uniq<sirius::op::test_physical_operator>(
+    SiriusPhysicalOperatorType::ORDER_BY,
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000);
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*src_pipeline, *upstream_producer);
+  attach_port(sample_op, *repo, src_pipeline);
+
+  // However much input was handed over, the boundary task waits for the last of it.
+  constexpr int num_batches = 3;
+  add_int_batches(sample_op, *repo, *space, num_batches, 1000);
+  auto waiting_hint = sample_op.get_next_task_hint();
+  REQUIRE(waiting_hint.has_value());
+  CHECK(waiting_hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  CHECK(sample_op.get_next_task_input_data() == nullptr);
+
+  src_pipeline->set_finished(true);
+  auto ready_hint = sample_op.get_next_task_hint();
+  REQUIRE(ready_hint.has_value());
+  CHECK(ready_hint->hint == TaskCreationHint::READY);
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  (void)sample_op.execute(*input, cudf::get_default_stream());
+  CHECK(sample_op.get_range_sample_stats().complete_input);
+  CHECK(sample_op.get_range_sample_stats().sample_batches == static_cast<std::size_t>(num_batches));
 }
 
 TEST_CASE("sirius_physical_sort_sample merges pre-sorted batches for partition boundaries",
@@ -378,8 +491,10 @@ TEST_CASE("sirius_physical_sort_sample merges pre-sorted batches for partition b
     2500,
     sirius::config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
 
-  auto output = sample_op.execute(pipelineable_operator_data({batch_high, batch_low}),
-                                  cudf::get_default_stream());
+  auto const stream = cudf::get_default_stream();
+  sample_op.add_sorted_batch(batch_high->get_batch_id(), *batch_high, stream);
+  sample_op.add_sorted_batch(batch_low->get_batch_id(), *batch_low, stream);
+  auto output = sample_op.execute(pipelineable_operator_data({batch_high, batch_low}), stream);
   REQUIRE(output != nullptr);
   REQUIRE(sample_op.boundaries_computed());
   REQUIRE(sample_op.get_num_partitions() == 2);
@@ -409,7 +524,7 @@ TEST_CASE("sirius_physical_sort_sample sizes a complete input from its actual by
   auto sample_op = make_sort_sample(/*sort_sample_bytes=*/batch_bytes,
                                     /*max_partition_bytes=*/batch_bytes - 1);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
-  repo->add_data_batch(std::move(batch), 0);
+  feed(sample_op, *repo, std::move(batch));
 
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
@@ -442,7 +557,7 @@ TEST_CASE("sirius_physical_sort_sample sizes partial input without duplicate bou
     num_batches       = 1;
     expect_repo_empty = true;
   }
-  SECTION("upstream is finished with an unsampled batch")
+  SECTION("upstream is finished with a batch still waiting")
   {
     upstream_finished = true;
     num_batches       = 2;
@@ -461,8 +576,10 @@ TEST_CASE("sirius_physical_sort_sample sizes partial input without duplicate bou
   auto sample_op = make_sort_sample(/*sort_sample_bytes=*/batch_bytes,
                                     /*max_partition_bytes=*/batch_bytes - 1);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
-  repo->add_data_batch(std::move(first_batch), 0);
-  if (num_batches > 1) { add_int_batches(*repo, *space, num_batches - 1, rows_per_batch); }
+  feed(sample_op, *repo, std::move(first_batch));
+  if (num_batches > 1) {
+    add_int_batches(sample_op, *repo, *space, num_batches - 1, rows_per_batch);
+  }
 
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
@@ -496,7 +613,7 @@ TEST_CASE("sirius_physical_sort_sample scales planner bytes by sampled rows",
     /*sort_sample_bytes=*/rows_per_batch * sizeof(int32_t),
     /*max_partition_bytes=*/100);
   auto repo = std::make_unique<cucascade::shared_data_repository>();
-  add_int_batches(*repo, *space, 1, rows_per_batch);
+  add_int_batches(sample_op, *repo, *space, 1, rows_per_batch);
 
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
@@ -515,17 +632,73 @@ TEST_CASE("sirius_physical_sort_sample records key-row stride", "[physical_sort_
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto sample_op = make_sort_sample(1000000, 30000);
-  auto repo      = std::make_unique<cucascade::shared_data_repository>();
-  add_int_batches(*repo, *space, 3, 20000);
+  bool const capped = GENERATE(false, true);
+  auto sample_op    = make_sort_sample(1000, 30000);
+  if (capped) { sample_op.set_max_sample_key_rows(4096); }
+  auto repo = std::make_unique<cucascade::shared_data_repository>();
   attach_port(sample_op, *repo);
+  add_int_batches(sample_op, *repo, *space, 3, 20000);
+  // The cap is fixed once a batch was handed over.
+  CHECK_THROWS_AS(sample_op.set_max_sample_key_rows(8192), std::logic_error);
   auto input = sample_op.get_next_task_input_data();
   REQUIRE(input != nullptr);
   (void)sample_op.execute(*input, cudf::get_default_stream());
   auto const& stats = sample_op.get_range_sample_stats();
   CHECK(stats.sample_rows == 60000);
-  CHECK(stats.sample_stride == 15);
-  CHECK(stats.sample_key_rows == 3999);
+  // Every row fits the default cap; 4096 rows leave room for every 16th row of each batch.
+  CHECK(stats.sample_stride == (capped ? std::size_t{16} : std::size_t{1}));
+  CHECK(stats.sample_key_rows == (capped ? std::size_t{3750} : std::size_t{60000}));
+}
+
+TEST_CASE("sirius_physical_sort_sample picks the same boundaries from all input in any order",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const stream = cudf::get_default_stream();
+
+  struct run {
+    int32_t first;
+    std::size_t rows;
+  };
+  std::vector<run> const runs{{0, 1000}, {10000, 300}, {20000, 2500}, {30000, 3}};
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  std::size_t bytes = 0;
+  for (auto const& r : runs) {
+    std::vector<int32_t> values(r.rows);
+    std::iota(values.begin(), values.end(), r.first);
+    batches.push_back(make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32));
+    bytes += batches.back()->to_read_only().get_data()->get_size_in_bytes();
+  }
+  bool const reversed = GENERATE(false, true);
+  if (reversed) { std::reverse(batches.begin(), batches.end()); }
+
+  // A quarter of the input per range, from all the input.
+  auto sample_op = make_sort_sample(/*sort_sample_bytes=*/0,
+                                    /*max_partition_bytes=*/(bytes + 3) / 4);
+  cucascade::shared_data_repository repo;
+  auto source =
+    std::make_shared<mock_gpu_pipeline>(sirius::pipeline::pipeline_build_context{nullptr});
+  attach_port(sample_op, repo, source);
+  for (auto const& batch : batches) {
+    feed(sample_op, repo, batch);
+  }
+  REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+
+  source->set_finished(true);
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  (void)sample_op.execute(*input, stream);
+
+  auto const& stats = sample_op.get_range_sample_stats();
+  CHECK(stats.complete_input);
+  CHECK(stats.sample_batches == 4);
+  CHECK(stats.sample_rows == 3803);
+  CHECK(stats.sample_key_rows == 3803);
+  CHECK(stats.sample_stride == 1);
+  REQUIRE(sample_op.get_num_partitions() == 4);
+  CHECK(copy_column_to_host<int32_t>(sample_op.get_partition_boundaries().view().column(0)) ==
+        std::vector<int32_t>{950, 20601, 21552});
 }
 
 TEST_CASE("Sort range count respects bytes, rows, and sample size", "[physical_sort_sample]")
@@ -587,7 +760,7 @@ TEST_CASE("Sort boundary diagnostic failure preserves completed distributed boun
   auto sample = make_sort_sample(1024, 40);
   sample.set_cross_rank_boundaries(hook);
   cucascade::shared_data_repository repo;
-  if (!empty_input) { add_int_batches(repo, *space, 1, 30); }
+  if (!empty_input) { add_int_batches(sample, repo, *space, 1, 30); }
   auto source =
     std::make_shared<mock_gpu_pipeline>(sirius::pipeline::pipeline_build_context{nullptr});
   source->set_finished(true);

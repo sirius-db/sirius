@@ -1659,7 +1659,8 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 //! `projections`/`types` are overwritten with the identity over the input's types so every
 //! column stays visible to SORT_SAMPLE / SORT_PARTITION; a non-identity original projection is
 //! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
-//! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape, matching legacy).
+//! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape, matching legacy). ORDER_BY
+//! hands each sorted batch's key rows to SORT_SAMPLE, which picks the range boundaries from them.
 void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                    const sirius::operator_params& op_params)
 {
@@ -1687,6 +1688,7 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
       op_params.max_sort_partition_bytes,
       op_params.max_sort_partition_memory_fraction);
     auto* sample_ptr = sample.get();
+    order_ptr->set_sort_sample(sample_ptr);
     sample->children.push_back(std::move(order_op));
 
     auto partition = duckdb::make_uniq<sirius::op::sirius_physical_sort_partition>(order_ptr);

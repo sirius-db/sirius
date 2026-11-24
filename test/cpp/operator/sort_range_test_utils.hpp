@@ -50,6 +50,7 @@ class mock_pipeline : public pipeline::sirius_pipeline {
     : sirius_pipeline(pipeline::pipeline_build_context{nullptr}), _finished(finished)
   {
   }
+  void set_finished(bool finished) { _finished = finished; }
   bool is_pipeline_finished() const override { return _finished; }
 
  private:
@@ -111,12 +112,17 @@ inline std::vector<key_row> read_keys(cucascade::data_batch& batch,
   return rows;
 }
 
+//! Runs @p batches through SORT_SAMPLE, SORT_PARTITION and MERGE_SORT as the pipelines do: each
+//! batch is handed over and pushed in turn, and every task that is ready runs before the next
+//! batch arrives. The input ends, if @p upstream_finished, only after the last batch.
+//! @p max_sample_key_rows of 0 keeps the operator's cap.
 inline layout run_layout(std::vector<std::shared_ptr<cucascade::data_batch>> const& batches,
                          duckdb::vector<duckdb::BoundOrderByNode> const& orders,
                          std::uint64_t sort_sample_bytes,
                          std::uint64_t max_partition_bytes,
                          std::size_t estimated_cardinality,
-                         bool upstream_finished)
+                         bool upstream_finished,
+                         std::size_t max_sample_key_rows = 0)
 {
   if (batches.empty()) { throw std::runtime_error("Sort-range test needs input"); }
   auto table = sirius::get_cudf_table_view(*batches.front());
@@ -127,13 +133,14 @@ inline layout run_layout(std::vector<std::shared_ptr<cucascade::data_batch>> con
   auto types = sirius::from_duckdb_vec(duck_types);
   op::sirius_physical_sort_sample sample(
     types, op::copy_orders(orders), estimated_cardinality, sort_sample_bytes, max_partition_bytes);
+  if (max_sample_key_rows != 0) { sample.set_max_sample_key_rows(max_sample_key_rows); }
   op::sirius_physical_sort_partition partition(
     types, op::copy_orders(orders), {}, estimated_cardinality);
   partition.set_sample_op(&sample);
   op::sirius_physical_merge_sort merge(types, op::copy_orders(orders), {}, estimated_cardinality);
   cucascade::shared_data_repository input_repo;
   cucascade::data_repository output_repo;
-  auto source        = std::make_shared<mock_pipeline>(upstream_finished);
+  auto source        = std::make_shared<mock_pipeline>(false);
   auto port          = std::make_unique<op::sirius_physical_operator::port>();
   port->type         = op::MemoryBarrierType::PIPELINE;
   port->repo         = &input_repo;
@@ -143,15 +150,21 @@ inline layout run_layout(std::vector<std::shared_ptr<cucascade::data_batch>> con
                  std::make_unique<op::sirius_physical_operator::port>(
                    op::MemoryBarrierType::FULL, &output_repo, nullptr, nullptr));
   partition.add_next_port_after_sink({&merge, "default"});
+  auto stream                = cudf::get_default_stream();
+  auto const run_ready_tasks = [&] {
+    while (auto next = sample.get_next_task_input_data()) {
+      auto sampled = sample.execute(*next, stream);
+      auto cut     = partition.execute(*sampled, stream);
+      partition.sink(*cut, stream);
+    }
+  };
   for (auto const& batch : batches) {
+    sample.add_sorted_batch(batch->get_batch_id(), *batch, stream);
     input_repo.add_data_batch(batch, 0);
+    run_ready_tasks();
   }
-  auto stream = cudf::get_default_stream();
-  while (auto next = sample.get_next_task_input_data()) {
-    auto sampled = sample.execute(*next, stream);
-    auto cut     = partition.execute(*sampled, stream);
-    partition.sink(*cut, stream);
-  }
+  source->set_finished(upstream_finished);
+  run_ready_tasks();
   layout result;
   result.input_batches = sample.get_input_batch_count();
   result.sample        = sample.get_range_sample_stats();

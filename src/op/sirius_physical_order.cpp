@@ -19,6 +19,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/order/gpu_order_impl.hpp"
+#include "op/sirius_physical_sort_sample.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -80,7 +81,13 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
                                                        stream,
                                                        *space,
                                                        batch_telemetry());
-    if (sorted_batch) { output_batches.push_back(std::move(sorted_batch)); }
+    if (!sorted_batch) { continue; }
+    // Keyed by the input batch: a retry of this task sorts the same input again, and its key
+    // rows must replace the earlier ones.
+    if (_sort_sample) {
+      _sort_sample->add_sorted_batch(batch.get_batch_id(), *sorted_batch, stream);
+    }
+    output_batches.push_back(std::move(sorted_batch));
   }
 
   return std::make_unique<pipelineable_operator_data>(output_batches);

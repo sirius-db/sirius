@@ -19,6 +19,7 @@
 #include "op/cross_rank_sort_boundaries.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
+#include "op/sort_key_sample.hpp"
 #include "sirius_config.hpp"
 
 #include <cudf/column/column.hpp>
@@ -89,7 +90,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
 
-  //! Target bytes to accumulate for the boundary sample.
+  //! Input bytes to see before the boundaries are chosen; 0 waits for all the input. Input that
+  //! ends first is used whole.
   [[nodiscard]] uint64_t sort_sample_bytes() const noexcept { return _sort_sample_bytes; }
   //! Max partition bytes, or 0 to size partitions from the GPU memory fraction.
   [[nodiscard]] size_t max_partition_bytes_override() const noexcept
@@ -111,10 +113,35 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
-  //! Override to wait for enough sample bytes before returning READY
+  /**
+   * @brief Keep the key rows of @p sorted, a sorted batch on its way to this operator's input.
+   *
+   * Every batch has to be handed over before it is pushed to the input port. Handing @p id over
+   * again replaces its earlier rows. Keeps nothing once the boundaries are chosen.
+   */
+  void add_sorted_batch(std::uint64_t id, cucascade::data_batch& sorted, ::cuda::stream_ref stream);
+
+  //! The input whose key rows have been handed over so far.
+  [[nodiscard]] sort_key_sample::totals sampled_input() const { return _key_sample->seen(); }
+
+  //! Cap on the key rows kept for the boundaries. Set while planning.
+  //! @throws std::logic_error once a batch was handed over or the boundary task was claimed.
+  void set_max_sample_key_rows(std::size_t rows)
+  {
+    if (boundary_state() != BoundaryState::NOT_DONE || _key_sample->seen().batches != 0) {
+      throw std::logic_error(
+        "[sirius_physical_sort_sample::set_max_sample_key_rows] the plan cannot change during "
+        "execution");
+    }
+    _key_sample = std::make_unique<sort_key_sample>(rows);
+  }
+
+  //! READY for the boundary task once the input has ended, or once sort_sample_bytes() of it
+  //! were handed over when that is not 0; afterwards as the base class.
   std::optional<task_creation_hint> get_next_task_hint() override;
 
-  //! Override to pull sample bytes before boundary computation, then one batch at a time
+  //! One batch for the boundary task, which reads its sample from the handed-over key rows, then
+  //! one batch at a time.
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   //! Get the computed partition boundaries (P-1 rows, sort key columns only)
@@ -180,10 +207,58 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
                                    cucascade::memory::memory_space* space,
                                    ::cuda::stream_ref stream);
 
+  //! Positions and order of the sort key columns, from @ref orders.
+  struct key_order {
+    std::vector<int> columns;
+    std::vector<cudf::order> column_order;
+    std::vector<cudf::null_order> null_precedence;
+  };
+  //! @throws not_implemented_exception for a key that is not a column reference.
+  [[nodiscard]] key_order sort_key_order() const;
+
+  //! The input the ranges are sized from.
+  struct sample_summary {
+    std::size_t batches    = 0;  //!< Batches the key rows come from.
+    std::size_t rows       = 0;  //!< Rows of those batches.
+    std::size_t bytes      = 0;  //!< Bytes of those batches.
+    bool upstream_finished = false;
+    bool complete_input    = false;
+    //! Projected bytes of the whole input, while upstream is still running.
+    std::optional<std::size_t> projected_bytes;
+  };
+  //! Whether the boundary task may start on @p input: the input has ended, or a batch waits and
+  //! sort_sample_bytes() of input were handed over. At 0 it waits for the end of the input.
+  [[nodiscard]] bool boundary_input_ready(port const& input) const;
+
+  struct range_sizing {
+    std::size_t num_parts             = 1;
+    std::size_t target_range_bytes    = 0;
+    std::size_t estimated_total_bytes = 0;
+    std::string_view est_source       = "observed";
+  };
+  //! The number of ranges for the input @p summary describes.
+  [[nodiscard]] range_sizing size_ranges(sample_summary const& summary,
+                                         cucascade::memory::memory_space& space,
+                                         ::cuda::stream_ref stream) const;
+
+  //! Ends the boundary task with one range, or with the hook's answer to an empty sample.
+  void set_boundaries_without_sample(::cuda::stream_ref stream);
+  //! Sets the boundaries from @p key_tables, each sorted and taken at @p stride.
+  void set_boundaries(sample_summary const& summary,
+                      range_sizing const& sizing,
+                      key_order const& keys,
+                      std::vector<cudf::table_view> const& key_tables,
+                      std::size_t stride,
+                      cucascade::memory::memory_space& space,
+                      ::cuda::stream_ref stream);
+
   [[nodiscard]] BoundaryState boundary_state() const noexcept
   {
     return _boundary_state.load(std::memory_order_acquire);
   }
+
+  //! Key rows of the batches handed over, until the boundaries are chosen.
+  std::unique_ptr<sort_key_sample> _key_sample = std::make_unique<sort_key_sample>();
 
   //! Partition boundary rows (P-1 rows containing sort key column values)
   std::unique_ptr<cudf::table> _partition_boundaries;
@@ -199,7 +274,7 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! rescheduled task retries while task_creator does not spawn a duplicate boundary task.
   std::atomic<BoundaryState> _boundary_state{BoundaryState::NOT_DONE};
 
-  //! Target bytes to accumulate for the boundary sample (from sirius_config operator_params)
+  //! See sort_sample_bytes() (from sirius_config operator_params)
   uint64_t _sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
   //! Override for max partition bytes (0 = use GPU memory fraction)

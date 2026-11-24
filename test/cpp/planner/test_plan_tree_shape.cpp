@@ -45,6 +45,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "op/sirius_physical_sort_sample.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"  // IWYU pragma: keep
 #include "planner/delim_cte_proof.hpp"
@@ -3308,7 +3309,10 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto* sort_sample = sort_partition->children[0].get();
     REQUIRE(sort_sample->type == SiriusPhysicalOperatorType::SORT_SAMPLE);
     REQUIRE(sort_sample->children.size() == 1);
-    CHECK(sort_sample->children[0]->type == SiriusPhysicalOperatorType::ORDER_BY);
+    REQUIRE(sort_sample->children[0]->type == SiriusPhysicalOperatorType::ORDER_BY);
+    // ORDER_BY hands its sorted batches to the sample operator.
+    CHECK(sort_sample->children[0]->Cast<sirius::op::sirius_physical_order>().get_sort_sample() ==
+          sort_sample);
   }
 
   SECTION("top-n becomes MERGE_TOP_N -> TOP_N")

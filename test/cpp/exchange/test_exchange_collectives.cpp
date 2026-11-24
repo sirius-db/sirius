@@ -231,6 +231,15 @@ sirius::op::sample_all_gather_boundaries const& gathering(sirius_physical_sort_s
     *sample.cross_rank_boundaries());
 }
 
+/// As a rank's ORDER_BY does: hands each sorted batch of @p input over to @p sample.
+void hand_over(sirius_physical_sort_sample& sample,
+               std::vector<std::shared_ptr<cucascade::data_batch>> const& input)
+{
+  for (auto const& batch : input) {
+    sample.add_sorted_batch(batch->get_batch_id(), *batch, utils::default_stream());
+  }
+}
+
 using sirius::op::dynamic_filter_publish_plan;
 
 /// A join's filter plan on INT64 key column 0, publishing to @p channel.
@@ -613,6 +622,7 @@ TEST_CASE("an aborted query wakes a SORT_SAMPLE waiting on its peer's sample",
     c.all[1].service->abort(sirius::exchange::query_of(stream), "injected failure");
   });
   std::vector<std::shared_ptr<cucascade::data_batch>> const input{keys_batch(0, 1, 20'000)};
+  hand_over(*sample, input);
   pipelineable_operator_data data{input};
   auto const start = std::chrono::steady_clock::now();
   CHECK_THROWS_WITH(sample->execute(data, utils::default_stream()),
@@ -632,6 +642,7 @@ TEST_CASE("a SORT_SAMPLE gives up on a rank that sends no sample within its wait
                              [](std::shared_ptr<cudf::table const>) {},
                              std::chrono::milliseconds{200}});
   std::vector<std::shared_ptr<cucascade::data_batch>> const input{keys_batch(0, 1, 20'000)};
+  hand_over(*sample, input);
   pipelineable_operator_data data{input};
   auto const start = std::chrono::steady_clock::now();
   CHECK_THROWS_AS(sample->execute(data, utils::default_stream()), sirius::internal_exception);
@@ -758,6 +769,7 @@ TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every ra
   inputs[0] = {keys_batch(0, 1, 20'000), keys_batch(20'000, 1, 20'000)};
   inputs[1] = {keys_batch(0, 7, 20'000)};
   on_every_rank(world, [&](rank_t r) {
+    hand_over(*samples[r], inputs[r]);
     pipelineable_operator_data data{inputs[r]};
     static_cast<void>(samples[r]->execute(data, utils::default_stream()));
   });
@@ -812,6 +824,7 @@ TEST_CASE("an OOM after the boundary all-gather retries without gathering again"
   inputs[1]        = {keys_batch(0, 7, 20'000)};
   auto const start = std::chrono::steady_clock::now();
   on_every_rank(world, [&](rank_t r) {
+    hand_over(*samples[r], inputs[r]);
     pipelineable_operator_data data{inputs[r]};
     if (r == 0) {
       CHECK_THROWS_AS(samples[r]->execute(data, utils::default_stream()), rmm::out_of_memory);
@@ -867,6 +880,7 @@ TEST_CASE("a DESC NULLS LAST range exchange keeps rank order and puts NULLs on t
     auto sample =
       make_local_sample(duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST);
     sirius::planner::install_sort_boundaries(*sample, sink, c.all[r].service, 34, *env().gpu);
+    hand_over(*sample, inputs[r]);
     pipelineable_operator_data data{inputs[r]};
     auto out    = sample->execute(data, utils::default_stream());
     auto routed = sink.execute(*out, utils::default_stream());
@@ -936,6 +950,7 @@ TEST_CASE("a range exchange on gathered boundaries leaves every rank a sorted ra
     sirius::op::sirius_physical_exchange_sink sink(key_types(), 0, c.all[r].service, 31, spec);
     auto sample = make_local_sample();
     sirius::planner::install_sort_boundaries(*sample, sink, c.all[r].service, 32, *env().gpu);
+    hand_over(*sample, inputs[r]);
     pipelineable_operator_data data{inputs[r]};
     auto out    = sample->execute(data, utils::default_stream());
     auto routed = sink.execute(*out, utils::default_stream());
