@@ -270,9 +270,10 @@ void prepare_for_sirius(duckdb::OptimizerExtensionInput& input, duckdb::LogicalO
   }
   bool const gpu_execution = gpu_execution_enabled(context);
   // Only a statement that can reach the GPU is rewritten; anything else must get the plan DuckDB
-  // makes alone. That takes a statement that returns rows (`INSERT ... SELECT`, `CREATE TABLE AS`
-  // and `COPY` do not, and Sirius never runs them), and not the second planning pass of a query
-  // Sirius has already left to DuckDB.
+  // makes alone. That takes a statement that returns rows, and not the second planning pass of a
+  // query Sirius has already left to DuckDB. `INSERT ... SELECT` and `CREATE TABLE AS` return
+  // none, and Sirius never runs them. A `COPY` returns none either, so the Parquet export Sirius
+  // does run is planned without these rewrites.
   bool const headed_to_gpu = declined == decline_reason::none &&
                              !conn_state->replanning_for_cpu() && ctx->is_initialized() &&
                              properties.return_type == duckdb::StatementReturnType::QUERY_RESULT &&

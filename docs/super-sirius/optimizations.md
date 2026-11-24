@@ -259,7 +259,7 @@ Every row the filter keeps has `x = y`, so the added join removes only rows the 
 
 **Code path:** `src/planner/delim_cte_rewrites.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp` (`rewrite_delim_ctes`), for queries headed to the GPU.
 
-**CPU fallback:** this rule and the next one edit DuckDB's own plan, which DuckDB also builds its CPU plan from. They therefore run only for a statement that can reach the GPU: GPU execution on, Sirius initialized, and a statement that returns rows (`INSERT ... SELECT`, `CREATE TABLE AS` and `COPY` are left alone). When Sirius then does not run a query a rule changed, the CPU gets the plan DuckDB makes alone:
+**CPU fallback:** this rule and the next one edit DuckDB's own plan, which DuckDB also builds its CPU plan from. They therefore run only for a statement that can reach the GPU: GPU execution on, Sirius initialized, and a statement that returns rows (`INSERT ... SELECT`, `CREATE TABLE AS` and `COPY` are left alone, so a [Parquet `COPY`](parquet-output.md) that Sirius runs on the GPU is planned without the two rules). When Sirius then does not run a query a rule changed, the CPU gets the plan DuckDB makes alone:
 
 - If GPU planning turns the query down, `OnFinalizePrepare` asks DuckDB to plan the statement again (`ATTEMPT_TO_REBIND`), and the connection state records that it is re-planning for the CPU, which keeps both optimizer hooks out of that second pass.
 - A statement that returns rows but is not a `SELECT` is planned again the same way, since Sirius runs only `SELECT`s: `EXPLAIN ANALYZE`, and `INSERT`, `UPDATE` or `DELETE` with `RETURNING`.
