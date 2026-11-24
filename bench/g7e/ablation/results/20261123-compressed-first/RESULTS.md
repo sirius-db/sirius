@@ -29,3 +29,24 @@ The corresponding saved YAMLs match byte for byte, with identical per-call pin p
 Every staged local NVMe input hash matched the same SF1000 generation manifest. The live S3 bucket and EC2 regions both matched London; inventory and manifest were unchanged afterward. Host-pin setup uses this verified local mirror because the pinned engine cannot pin S3 directly. The engine was not rebuilt. The unchanged guide preset leaves disk spilling disabled; no EBS fallback was added.
 
 [Stage configs](configs/), [session SQL](session.sql), [feature plan](stage-plan.json), [pin audit](pin-audit.json), [native compression evidence](compressed-chunks.json), [per-query timings](per-query.csv), [sums](summary.csv), [full proofs](summary.json), [validation](validation.json) and [provenance](manifest.json) are saved here. All native logs, CPU/GPU answers and Quent traces remain in the locally retained archive identified by size and SHA256 in the manifest. Every payload hash was verified after download. Earlier results remain unchanged. The instance remains running.
+
+## Reproduction command
+
+The [study wrapper](reproduce.sh) invokes the measured [ablation runner](../../run.py)
+with `--order compressed-first`, the recorded CUDA environment and London S3
+provenance. It uses the instance's attached role. Run it in detached tmux on a
+London g7e.8xlarge after building the pinned engine and preparing the verified
+local dataset and independent CPU references:
+
+```bash
+bash bench/g7e/ablation/results/20261123-compressed-first/reproduce.sh \
+  /home/ec2-user/sirius-26b5caba \
+  /mnt/datasets/pinned-inputs/sf1000 \
+  /path/to/independent-cpu-references \
+  /path/to/new-output
+```
+
+The wrapper was added after measurement for convenience. The exact original
+launch script, executed runner sources, CPU references, logs and Quent traces
+remain in the verified archive. The wrapper runs the same five stages without
+changing the saved configs, stopping the instance or adding diagnostic queries.

@@ -62,6 +62,12 @@
   "native_library_sha256": "090f552314d37196b6c0509a261a9656034a287e03524531dd7e1af3ccc79236",
   "protocol": "G7e compressed-first cumulative ablation",
   "region": "eu-west-2",
+  "reproduction_script": {
+    "added_after_measurement": true,
+    "delegates_to": "../../run.py",
+    "path": "reproduce.sh",
+    "sha256": "bb76e103d1d5a53485d62a31960a16909af2c7e656c1e8f16a753b6f4e176056"
+  },
   "result_date": "2026-11-23",
   "runner_package_sha256": "099672017a0878c4a588f95a912f3de3c1bfa79db1e932989dcbeb64329e6e7a",
   "same_region_s3": {
