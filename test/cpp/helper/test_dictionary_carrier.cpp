@@ -154,6 +154,23 @@ TEST_CASE("concatenating carriers decodes only a column that mixes the two forms
     auto const decoded = sirius::decode_dictionary_carrier(out->get_column(0).view(), stream);
     CHECK(to_host(decoded->view()) == std::vector<std::string>{"a", "b", "b", "c"});
   }
+  SECTION("an empty dictionary without keys beside a dictionary leaves the dictionary")
+  {
+    auto const childless = cudf::make_empty_column(cudf::type_id::DICTIONARY32);
+    auto const out       = sirius::concatenate_carriers(
+      {cudf::table_view{{childless->view()}}, cudf::table_view{{second_dictionary->view()}}},
+      stream);
+    REQUIRE(out->get_column(0).type().id() == cudf::type_id::DICTIONARY32);
+    auto const decoded = sirius::decode_dictionary_carrier(out->get_column(0).view(), stream);
+    CHECK(to_host(decoded->view()) == std::vector<std::string>{"b", "c"});
+  }
+  SECTION("empty tables alone leave an empty table")
+  {
+    auto const childless = cudf::make_empty_column(cudf::type_id::DICTIONARY32);
+    auto const out       = sirius::concatenate_carriers(
+      {cudf::table_view{{childless->view()}}, cudf::table_view{{childless->view()}}}, stream);
+    CHECK(out->num_rows() == 0);
+  }
 }
 
 TEST_CASE("hash partitioning decodes a carrier key and a carrier whose keys every split copies",

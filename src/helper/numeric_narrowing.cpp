@@ -307,6 +307,14 @@ std::unique_ptr<cudf::table> concatenate_carriers(std::vector<cudf::table_view> 
                                                   ::cuda::stream_ref stream,
                                                   rmm::device_async_resource_ref mr)
 {
+  // An empty carrier may lack the keys child, so its type cannot match a populated one.
+  if (tables.size() > 1) {
+    auto const empty = [](cudf::table_view const& table) { return table.num_rows() == 0; };
+    if (std::ranges::all_of(tables, empty)) {
+      return std::make_unique<cudf::table>(tables.front(), stream, mr);
+    }
+    std::erase_if(tables, empty);
+  }
   std::vector<std::unique_ptr<cudf::column>> decoded;
   auto const width = tables.empty() ? 0 : tables.front().num_columns();
   for (cudf::size_type c = 0; c < width; ++c) {
