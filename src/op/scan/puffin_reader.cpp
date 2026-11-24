@@ -115,8 +115,7 @@ class datasource_puffin_source final : public puffin_byte_source {
     for (auto destination : destinations)
       total += destination.size();
     return read_at_offset(total, [&] {
-      // One dispatch, so the backend can fuse the adjacent ranges into the requests it would
-      // issue for a single read of the same bytes.
+      // One dispatch for all blocks, which lets the backend fuse the adjacent ranges.
       std::vector<cucascade::io::slice> slices;
       slices.reserve(destinations.size());
       auto offset = static_cast<std::size_t>(offset_);

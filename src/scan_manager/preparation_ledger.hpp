@@ -67,8 +67,8 @@ struct backing_allocation {
   std::byte* data;
   std::shared_ptr<void> owner;
 };
-// One allocation as blocks that need not be adjacent. Each block holds block_size bytes; the
-// last holds the remainder.
+// One allocation as blocks that need not be adjacent. Every block is block_size bytes long,
+// the last included; the request's remainder lands there.
 struct backing_blocks {
   std::vector<std::byte*> blocks;
   uint64_t block_size;
