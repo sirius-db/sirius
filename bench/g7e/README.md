@@ -1,5 +1,13 @@
 # G7e.8xlarge benchmarks
 
+The [November 23 guide results](results/guide-ktls-20261123/README.md) contain the
+best complete validated SF100–SF10000 runs on `26b5caba`, including SF3000 cold
+362.445844 s and hot 371.765623 / 273.535501 s. Their exact configs and portable
+reproduction adapter are in [guide-26b5caba](guide-26b5caba/README.md). Use that
+versioned runner to reproduce those measurements and session settings.
+
+## Earlier current presets
+
 The [current configs](configs/) target one GPU on AWS `g7e.8xlarge`. They were
 saved against Sirius main `6c53654c0498026d8b48daa7e1f19edd3c5ff988`. No timings
 have been selected for these updated presets.

@@ -1,0 +1,180 @@
+{
+  "archives": {
+    "g7e8-london-guide-matrix-20261123": {
+      "bytes": 203193424,
+      "files": 9909,
+      "sha256": "1e3824f2099b85afea577e11e983898198893037a7a2fed5eaddc1f5d391c6f7"
+    },
+    "g7e8-london-sf10k-guide-ktls-two-iterations-20261123": {
+      "bytes": 425671017,
+      "files": 1660,
+      "sha256": "da9be9d5b5550e26ad4c531dbd5c06849e42a6655d02db7b5e024d6040dadf18"
+    },
+    "g7e8-london-sf1k-guide-ktls-two-iterations-20261123": {
+      "bytes": 41770393,
+      "files": 1642,
+      "sha256": "b52db0694366f13aa0a3bb4efadc72e0365d01b0d7bb97e6b4eb3ec2ca56578c"
+    },
+    "g7e8-london-sf3k-cold-sf10k-guide-one-iteration-20261123": {
+      "bytes": 76698704,
+      "files": 873,
+      "sha256": "af4613dbd711c6bb3c010d07b52054d3a7ba49323ef43c7041347b257f32e69b"
+    },
+    "g7e8-london-sf3k-hot-sf10k-guide-two-iterations-20261123": {
+      "bytes": 117450359,
+      "files": 898,
+      "sha256": "eddf374fef4cfa58c7dcbe93568e5ae11bcf20120e3fa79ecd7de8c75e023de1"
+    }
+  },
+  "engine_commit": "26b5caba3e2c96290fdc63d4cf40ac42572eaab8",
+  "generator_commit": "8e9a6ef307d74c2b60ad02ff287920f53193e26e",
+  "hardware": "g7e.8xlarge",
+  "region": "eu-west-2",
+  "selected": [
+    {
+      "config_sha256": "63b69623ff3a115bf3c58d1f6c05f7489d6fbb822a2fd94b24412ba3beff6f19",
+      "configuration": "../../guide-26b5caba/configs/cpu-budget-cold.yaml",
+      "correct_queries": 22,
+      "iteration": 2,
+      "profile": "cold",
+      "scale_factor": 100,
+      "source_archive": "g7e8-london-guide-matrix-20261123",
+      "source_summary_sha256": "a09cb93cea1ea55cc3b36969191b059eee66d6e451e5573f6b0eade6ada68bd6",
+      "sql_threads": null,
+      "sum_s": 37.473543
+    },
+    {
+      "config_sha256": "a96d6e0715fddcd807c7b5e69fc8d0ecfcfd93c5ecf11f26a13556dad325e642",
+      "configuration": "../../guide-26b5caba/configs/cpu-budget-hot.yaml",
+      "correct_queries": 22,
+      "iteration": 2,
+      "profile": "hot",
+      "scale_factor": 100,
+      "source_archive": "g7e8-london-guide-matrix-20261123",
+      "source_summary_sha256": "a09cb93cea1ea55cc3b36969191b059eee66d6e451e5573f6b0eade6ada68bd6",
+      "sql_threads": null,
+      "sum_s": 8.718906
+    },
+    {
+      "config_sha256": "a96d6e0715fddcd807c7b5e69fc8d0ecfcfd93c5ecf11f26a13556dad325e642",
+      "configuration": "../../guide-26b5caba/configs/cpu-budget-pinned.yaml",
+      "correct_queries": 22,
+      "iteration": 2,
+      "profile": "pinned",
+      "scale_factor": 100,
+      "source_archive": "g7e8-london-guide-matrix-20261123",
+      "source_summary_sha256": "a09cb93cea1ea55cc3b36969191b059eee66d6e451e5573f6b0eade6ada68bd6",
+      "sql_threads": null,
+      "sum_s": 2.691681
+    },
+    {
+      "config_sha256": "63b69623ff3a115bf3c58d1f6c05f7489d6fbb822a2fd94b24412ba3beff6f19",
+      "configuration": "../../guide-26b5caba/configs/cpu-budget-cold.yaml",
+      "correct_queries": 22,
+      "iteration": 2,
+      "profile": "cold",
+      "scale_factor": 300,
+      "source_archive": "g7e8-london-guide-matrix-20261123",
+      "source_summary_sha256": "a09cb93cea1ea55cc3b36969191b059eee66d6e451e5573f6b0eade6ada68bd6",
+      "sql_threads": null,
+      "sum_s": 53.731252
+    },
+    {
+      "config_sha256": "a96d6e0715fddcd807c7b5e69fc8d0ecfcfd93c5ecf11f26a13556dad325e642",
+      "configuration": "../../guide-26b5caba/configs/cpu-budget-hot.yaml",
+      "correct_queries": 22,
+      "iteration": 2,
+      "profile": "hot",
+      "scale_factor": 300,
+      "source_archive": "g7e8-london-guide-matrix-20261123",
+      "source_summary_sha256": "a09cb93cea1ea55cc3b36969191b059eee66d6e451e5573f6b0eade6ada68bd6",
+      "sql_threads": null,
+      "sum_s": 16.496861
+    },
+    {
+      "config_sha256": "a96d6e0715fddcd807c7b5e69fc8d0ecfcfd93c5ecf11f26a13556dad325e642",
+      "configuration": "../../guide-26b5caba/configs/cpu-budget-pinned.yaml",
+      "correct_queries": 22,
+      "iteration": 2,
+      "profile": "pinned",
+      "scale_factor": 300,
+      "source_archive": "g7e8-london-guide-matrix-20261123",
+      "source_summary_sha256": "a09cb93cea1ea55cc3b36969191b059eee66d6e451e5573f6b0eade6ada68bd6",
+      "sql_threads": null,
+      "sum_s": 7.642228
+    },
+    {
+      "config_sha256": "a96d6e0715fddcd807c7b5e69fc8d0ecfcfd93c5ecf11f26a13556dad325e642",
+      "configuration": "../../guide-26b5caba/configs/cpu-budget-hot.yaml",
+      "correct_queries": 22,
+      "iteration": 2,
+      "profile": "hot",
+      "scale_factor": 1000,
+      "source_archive": "g7e8-london-guide-matrix-20261123",
+      "source_summary_sha256": "a09cb93cea1ea55cc3b36969191b059eee66d6e451e5573f6b0eade6ada68bd6",
+      "sql_threads": 24,
+      "sum_s": 45.809267
+    },
+    {
+      "config_sha256": "a96d6e0715fddcd807c7b5e69fc8d0ecfcfd93c5ecf11f26a13556dad325e642",
+      "configuration": "../../guide-26b5caba/configs/cpu-budget-pinned.yaml",
+      "correct_queries": 22,
+      "iteration": 2,
+      "profile": "pinned",
+      "scale_factor": 1000,
+      "source_archive": "g7e8-london-guide-matrix-20261123",
+      "source_summary_sha256": "a09cb93cea1ea55cc3b36969191b059eee66d6e451e5573f6b0eade6ada68bd6",
+      "sql_threads": 24,
+      "sum_s": 26.244293
+    },
+    {
+      "config_sha256": "b33dc1f656ee5efd0c546fab6e3464cc6bb78c6b87884e95ea91811b75a6a776",
+      "configuration": "../../guide-26b5caba/configs/balanced-cold.yaml",
+      "correct_queries": 22,
+      "iteration": 1,
+      "profile": "cold",
+      "scale_factor": 3000,
+      "source_archive": "g7e8-london-sf3k-cold-sf10k-guide-one-iteration-20261123",
+      "source_summary_sha256": "9a5258e18f73c96715d2a9704214281bfde469c4962ca0c378df166920ebd7b0",
+      "sql_threads": 24,
+      "sum_s": 362.445844
+    },
+    {
+      "config_sha256": "63b69623ff3a115bf3c58d1f6c05f7489d6fbb822a2fd94b24412ba3beff6f19",
+      "configuration": "../../guide-26b5caba/configs/cpu-budget-cold.yaml",
+      "correct_queries": 22,
+      "iteration": 2,
+      "profile": "cold",
+      "scale_factor": 1000,
+      "source_archive": "g7e8-london-sf1k-guide-ktls-two-iterations-20261123",
+      "source_summary_sha256": "366d5cef3fa86d93dc7be913944879601680a84229079571d2d5be1a60987ef4",
+      "sql_threads": 24,
+      "sum_s": 118.017201
+    },
+    {
+      "config_sha256": "b0954b1d2670fcefda8d92c7fc9293a443e10335d17dbe71c2abd63f27a87247",
+      "configuration": "../../guide-26b5caba/configs/balanced-hot.yaml",
+      "correct_queries": 22,
+      "iteration": 2,
+      "profile": "hot",
+      "scale_factor": 3000,
+      "source_archive": "g7e8-london-sf3k-hot-sf10k-guide-two-iterations-20261123",
+      "source_summary_sha256": "49bf9a32c86daeca19fcc14ce52cb9123e2379281122b50771c20f8584c7c143",
+      "sql_threads": 24,
+      "sum_s": 273.535501
+    },
+    {
+      "config_sha256": "b33dc1f656ee5efd0c546fab6e3464cc6bb78c6b87884e95ea91811b75a6a776",
+      "configuration": "../../guide-26b5caba/configs/balanced-cold.yaml",
+      "correct_queries": 22,
+      "iteration": 2,
+      "profile": "cold",
+      "scale_factor": 10000,
+      "source_archive": "g7e8-london-sf10k-guide-ktls-two-iterations-20261123",
+      "source_summary_sha256": "d7bbb4ce5f5cb57a573acae20d37eb4d6f989fa43285770cb2e8223cbe8392f0",
+      "sql_threads": 24,
+      "sum_s": 1906.310348
+    }
+  ],
+  "selection": "best complete CPU-validated iteration; no mixed query minima"
+}

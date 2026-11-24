@@ -1,0 +1,40 @@
+{
+  "g7e8-london-guide-matrix-20261123": {
+    "campaign.py": "7c7845239c4f5c4b92d824f324e8ad7460e82580269de1d2864efd15c16a31ba",
+    "collect.py": "e0eb333966ed54cbea63327e4326f2adf84e5855e5c77e936ce58fe7aabf0c36",
+    "ktls_guard.py": "0369ef47f7de5d44bfcf4fb386aa8e412483fa90691fcc8e8e820c1b6d1184d1",
+    "supervisor.py": "103d90f892520f81b80a24dec31b31766e145b5c216c2706d94df18e1fe3cbda",
+    "validation.py": "986bfa121764ca90d1fc47185ca6502344e4f158c72bf0e34b3d434f1d813ae1",
+    "worker.py": "b97369afc3fd3a0288ec9c1dbadcd28206d734a6023371e07be1613df417cc8a"
+  },
+  "g7e8-london-sf10k-guide-ktls-two-iterations-20261123": {
+    "campaign.py": "6e5f3e39fd36cfa19799d15a7756e63455d3fb9ec4eb7cf4784971811b4244e8",
+    "collect.py": "e0eb333966ed54cbea63327e4326f2adf84e5855e5c77e936ce58fe7aabf0c36",
+    "ktls_guard.py": "0369ef47f7de5d44bfcf4fb386aa8e412483fa90691fcc8e8e820c1b6d1184d1",
+    "validation.py": "986bfa121764ca90d1fc47185ca6502344e4f158c72bf0e34b3d434f1d813ae1",
+    "worker.py": "b16458e8ccb78ed304d77cab23ae261a9175e42d49e4caf1b4e02b0f942fa1a9"
+  },
+  "g7e8-london-sf1k-guide-ktls-two-iterations-20261123": {
+    "campaign.py": "9ee5c80570f96e7c81dac370f657691914645816956f6c0dbc6c65af17a009d4",
+    "collect.py": "e0eb333966ed54cbea63327e4326f2adf84e5855e5c77e936ce58fe7aabf0c36",
+    "ktls_guard.py": "0369ef47f7de5d44bfcf4fb386aa8e412483fa90691fcc8e8e820c1b6d1184d1",
+    "validation.py": "986bfa121764ca90d1fc47185ca6502344e4f158c72bf0e34b3d434f1d813ae1",
+    "worker.py": "b16458e8ccb78ed304d77cab23ae261a9175e42d49e4caf1b4e02b0f942fa1a9"
+  },
+  "g7e8-london-sf3k-cold-sf10k-guide-one-iteration-20261123": {
+    "campaign.py": "5631c9205f430f0b6df6a961283d489b42341dc1f58e36f9d9dd2a1754a5a797",
+    "collect.py": "e0eb333966ed54cbea63327e4326f2adf84e5855e5c77e936ce58fe7aabf0c36",
+    "ktls_guard.py": "0369ef47f7de5d44bfcf4fb386aa8e412483fa90691fcc8e8e820c1b6d1184d1",
+    "supervisor.py": "c9244292c41f8e5fe0fb8e9d56a20b6d54a54357663d8ebcd3921ea33114eadb",
+    "validation.py": "986bfa121764ca90d1fc47185ca6502344e4f158c72bf0e34b3d434f1d813ae1",
+    "worker.py": "b16458e8ccb78ed304d77cab23ae261a9175e42d49e4caf1b4e02b0f942fa1a9"
+  },
+  "g7e8-london-sf3k-hot-sf10k-guide-two-iterations-20261123": {
+    "campaign.py": "9c5a09297d48dfc6f4a30e5e39b8460669a6ca4180862fa7ce30507705807962",
+    "collect.py": "e0eb333966ed54cbea63327e4326f2adf84e5855e5c77e936ce58fe7aabf0c36",
+    "ktls_guard.py": "0369ef47f7de5d44bfcf4fb386aa8e412483fa90691fcc8e8e820c1b6d1184d1",
+    "supervisor.py": "fdd767a3f8e4bde836870ee682ea9c0ac28a86e021dbc2c1b1253802d51a3cab",
+    "validation.py": "986bfa121764ca90d1fc47185ca6502344e4f158c72bf0e34b3d434f1d813ae1",
+    "worker.py": "b16458e8ccb78ed304d77cab23ae261a9175e42d49e4caf1b4e02b0f942fa1a9"
+  }
+}

@@ -17,6 +17,8 @@ bench/
     *-figures/               plotting code and saved figures
   g7e/
     configs/                 current G7e cold, hot, and pinned presets
+    guide-26b5caba/           exact guide presets and versioned reproduction adapter
+    results/guide-ktls-20261123/  selected London SF100–SF10000 sums and provenance
     results/baseline-20261111/  frozen older timings and exact measured configs
     replay.sh                G7e entry point
 ```
@@ -24,6 +26,12 @@ bench/
 See [GB300](gb300/README.md) and [G7e](g7e/README.md) for hardware requirements,
 selected results, config history, and limitations. These are read-only query
 experiments, not official TPC-H benchmark submissions.
+
+The [G7e guide reproduction adapter](g7e/guide-26b5caba/README.md) targets the
+saved `26b5caba` London measurements. It preserves their per-scale guide YAML,
+session settings, `--mode` behavior without harness profile overrides, and
+per-query process lifetimes. It reuses the shared planner and AWS/storage checks;
+the replay commands below retain their existing hardware-preset behavior.
 
 ## Plan and run
 
