@@ -96,6 +96,13 @@ struct rank_result {
   std::vector<std::unique_ptr<duckdb::DataChunk>> chunks;
 };
 
+/// One DDL log entry. `secret`: it carries credentials, so it is replayed, but neither saved nor
+/// shown.
+struct log_entry {
+  std::string sql;
+  bool secret = false;
+};
+
 /// Per-database gateway: the ranks, the FIFO of statements, the query number K and the DDL log.
 /// Every statement, and every start, stop and restart, takes the one turn in arrival order.
 class gateway_state {
@@ -147,7 +154,7 @@ class gateway_state {
                   std::string const& token,
                   std::string const& init_sql);
   uint64_t waiting();
-  std::vector<std::string> ddl_log();
+  std::vector<log_entry> ddl_log();
 
  private:
   class turn;
@@ -173,6 +180,15 @@ class gateway_state {
   /// `sirius_gateway_min_ranks` are registered, for at most `sirius_gateway_join_wait` seconds,
   /// or until the client interrupts. Registering takes the turn, so the wait must not hold it.
   void wait_for_ranks(duckdb::ClientContext& context, std::string const& sql);
+  struct rank_plan {
+    std::vector<rank> ranks;
+    std::string token;  ///< the spawned ranks' Quack token
+    std::string peers;  ///< every rank's exchange address, for sirius_exchange_peers
+  };
+  /// The ranks that a start with @p options runs: the spawned ones, then the registered ones by
+  /// name. Only checks and prepares.
+  /// @throws duckdb::InvalidInputException for options or registered ranks that a start refuses.
+  rank_plan plan_ranks(start_options const& options);
   void start_locked(duckdb::ClientContext& context,
                     start_options options,
                     bool discard_log = false);
@@ -242,10 +258,13 @@ class gateway_state {
   std::string reason_;
   uint64_t query_id_         = 0;
   uint64_t running_query_id_ = 0;
-  std::vector<std::string> ddl_log_;
+  std::vector<log_entry> ddl_log_;
   /// ddl_log_ was read from the state directory and no replay of it has finished: its entries
   /// may fail for reasons outside the log, and are then skipped rather than fatal.
   bool saved_log_pending_ = false;
+  /// A fresh start discarded the log and no start has succeeded since: the saved file is still
+  /// there, and is not loaded.
+  bool saved_log_discarded_ = false;
 };
 
 /// Fills @p options from the `sirius_gateway_*` settings of @p context.

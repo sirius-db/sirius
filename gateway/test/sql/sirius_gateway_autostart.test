@@ -152,3 +152,17 @@ statement error
 FROM sirius_gateway_run('SELECT 1');
 ----
 stopped: CALL sirius_gateway_start(<ranks>) or sirius_gateway_restart()
+
+# An explicit start of the registered ranks that fails is tried again by the next statement.
+statement ok
+SET GLOBAL sirius_gateway_rank_init = 'CREATE TABLE IF NOT EXISTS tries (i INT); INSERT INTO tries VALUES (1); SELECT CASE WHEN (SELECT count(*) FROM tries) < 2 THEN error(''first try'') END';
+
+statement error
+FROM sirius_gateway_start(0);
+----
+first try
+
+query I
+FROM sirius_gateway_run('SELECT count(*) FROM tries');
+----
+2

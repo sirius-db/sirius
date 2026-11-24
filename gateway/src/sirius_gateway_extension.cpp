@@ -10,6 +10,7 @@
 
 #include <unistd.h>
 
+#include <charconv>
 #include <filesystem>
 
 namespace duckdb {
@@ -116,12 +117,24 @@ unique_ptr<FunctionData> status_rows(gateway_state& gateway,
   return std::move(data);
 }
 
+/// A port argument; NULL and a number outside 1 to 65535 are refused.
+uint32_t port_of(char const* name, Value const& value)
+{
+  if (value.IsNull() || value.GetValue<int64_t>() < 1 || value.GetValue<int64_t>() > 65535) {
+    throw InvalidInputException("%s must be a port, 1 to 65535", name);
+  }
+  return value.GetValue<uint32_t>();
+}
+
 unique_ptr<FunctionData> start_bind(ClientContext& context,
                                     TableFunctionBindInput& input,
                                     vector<LogicalType>& types,
                                     vector<Identifier>& names)
 {
   sirius_gateway::start_options options;
+  if (input.inputs[0].IsNull()) {
+    throw InvalidInputException("sirius_gateway_start needs a number of ranks");
+  }
   options.ranks     = input.inputs[0].GetValue<uint32_t>();
   bool replay_saved = false;
   auto list         = [](Value const& value) {
@@ -138,9 +151,9 @@ unique_ptr<FunctionData> start_bind(ClientContext& context,
     if (key == "gpus") {
       options.gpus = list(value);
     } else if (key == "exchange_base_port") {
-      options.exchange_base_port = value.GetValue<uint32_t>();
+      options.exchange_base_port = port_of("exchange_base_port", value);
     } else if (key == "quack_base_port") {
-      options.quack_base_port = value.GetValue<uint32_t>();
+      options.quack_base_port = port_of("quack_base_port", value);
     } else if (key == "replay_saved") {
       replay_saved = !value.IsNull() && value.GetValue<bool>();
     }
@@ -176,11 +189,21 @@ unique_ptr<FunctionData> add_rank_bind(ClientContext& context,
     throw InvalidInputException("sirius_gateway_add_rank: '%s' is not host:port", address);
   }
   spec.quack_host = address.substr(0, colon);
-  spec.quack_port = std::stoul(address.substr(colon + 1));
+  auto const digits = address.substr(colon + 1);
+  auto const parsed =
+    std::from_chars(digits.data(), digits.data() + digits.size(), spec.quack_port);
+  if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size() ||
+      spec.quack_port < 1 || spec.quack_port > 65535) {
+    throw InvalidInputException("sirius_gateway_add_rank: '%s' is not host:port", address);
+  }
   for (auto const& [name, value] : input.named_parameters) {
     auto const key = StringUtil::Lower(name.GetIdentifierName());
+    if (value.IsNull()) {
+      throw InvalidInputException("sirius_gateway_add_rank: %s cannot be NULL", key);
+    }
     if (key == "exchange_port") {
-      spec.exchange_port = value.GetValue<uint32_t>();
+      // 0 is the default, for "not given".
+      if (value.GetValue<int64_t>() != 0) { spec.exchange_port = port_of("exchange_port", value); }
     } else if (key == "token") {
       spec.token = value.ToString();
     } else if (key == "fingerprint") {
@@ -265,7 +288,7 @@ unique_ptr<FunctionData> log_bind(ClientContext&,
   auto data = make_uniq<rows_data>();
   auto log  = gateway_of(input).ddl_log();
   for (idx_t i = 0; i < log.size(); ++i) {
-    data->rows.push_back({Value::UBIGINT(i + 1), Value(log[i])});
+    data->rows.push_back({Value::UBIGINT(i + 1), Value(log[i].sql)});
   }
   return std::move(data);
 }

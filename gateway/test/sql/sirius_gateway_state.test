@@ -105,5 +105,31 @@ SELECT count(*) FROM glob('{TEST_DIR}/sirius_gateway_state/state/*');
 ----
 0
 
+# A fresh start that fails does not bring the saved log back: the next statement starts the ranks
+# with an empty one.
+statement ok
+FROM sirius_gateway_run('CREATE VIEW saved AS SELECT 1');
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/sirius_gateway_state/state/*');
+----
+1
+
+statement ok
+SET GLOBAL sirius_gateway_rank_init = 'CREATE TABLE IF NOT EXISTS tries (i INT); INSERT INTO tries VALUES (1); SELECT CASE WHEN (SELECT count(*) FROM tries) < 2 THEN error(''first try'') END';
+
+statement error
+FROM sirius_gateway_start(0);
+----
+first try
+
+statement ok
+FROM sirius_gateway_run('SELECT 1');
+
+query II
+SELECT (SELECT count(*) FROM sirius_gateway_log()), (SELECT count(*) FROM glob('{TEST_DIR}/sirius_gateway_state/state/*'));
+----
+0	0
+
 statement ok
 FROM sirius_gateway_stop();
