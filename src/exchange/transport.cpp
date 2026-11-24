@@ -438,7 +438,9 @@ struct transport::engine {
 
   /// Stages the next frames of each peer's current batch into the send ring, while send frames
   /// last and the peer has less than a window (its credits) staged and not yet written. Staging
-  /// does not wait for credits, so a returned credit finds the next frames already copied.
+  /// does not wait for credits, so a returned credit finds the next frames already copied. Ahead
+  /// of its credits a peer stages only while over half the send ring is free: the rest stays for
+  /// peers that can write, so one peer that returns no credits cannot hold every send frame.
   bool stage(std::mutex& mutex)
   {
     bool progress    = false;
@@ -466,7 +468,8 @@ struct transport::engine {
       // few writes as the peer's consecutive credits allow.
       auto const run_frames = static_cast<std::uint32_t>(
         std::clamp<std::size_t>(fab.max_write_bytes(peer) / frame_bytes(), 1, max_write_frames));
-      while (p.next_k < p.frames && !free_send.empty() && p.unwritten < credits_per_peer) {
+      while (p.next_k < p.frames && !free_send.empty() && p.unwritten < credits_per_peer &&
+             (p.unwritten < p.credits.size() || free_send.size() > send_ring.frames() / 2)) {
         auto const sends = longest_run(free_send);
         auto const n =
           std::min({p.frames - p.next_k, run_frames, sends.length, credits_per_peer - p.unwritten});
