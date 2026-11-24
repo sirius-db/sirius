@@ -28,6 +28,13 @@ FROM sirius_gateway_run('SELECT 1');
 ----
 no ranks
 
+# With no ranks, a catalog read is answered from the gateway's own catalog; repeated column
+# names are renamed there as Quack renames them on the way from a rank.
+query II
+FROM sirius_gateway_run('SELECT 1 AS a, 2 AS a FROM duckdb_settings() LIMIT 1');
+----
+1	2
+
 query I
 SELECT count(*) FROM sirius_gateway_start(2, quack_base_port := 19500) WHERE state = 'up';
 ----
@@ -310,6 +317,23 @@ query I con2
 SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up';
 ----
 2
+
+# A plain SET on the console reaches the clients' sessions.
+statement error con2
+FROM sirius_gateway_drop_rank('nope');
+----
+can only be called on the gateway's console
+
+statement ok
+SET sirius_gateway_allow_join = true;
+
+statement error con2
+FROM sirius_gateway_drop_rank('nope');
+----
+no rank named nope was added
+
+statement ok
+SET sirius_gateway_allow_join = false;
 
 statement ok con2
 DISCONNECT;

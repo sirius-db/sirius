@@ -52,7 +52,18 @@ SELECT count(*) FROM sirius_gateway_log();
 ----
 4
 
-# Statements with credentials stay in memory only.
+# Statements with credentials are counted, not shown.
+query I
+SELECT count(*) FROM sirius_gateway_log() WHERE sql LIKE '%hidden%';
+----
+0
+
+query I
+SELECT count(*) FROM sirius_gateway_log() WHERE sql LIKE '-- not shown%';
+----
+2
+
+# They stay in memory only.
 query I
 SELECT content LIKE '%hidden%' FROM read_text('{TEST_DIR}/sirius_gateway_state/state/ddl.sql');
 ----
