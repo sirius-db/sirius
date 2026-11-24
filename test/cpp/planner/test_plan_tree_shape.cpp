@@ -2933,6 +2933,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(sort_partition->children.size() == 1);
     auto* sort_sample = sort_partition->children[0].get();
     REQUIRE(sort_sample->type == SiriusPhysicalOperatorType::SORT_SAMPLE);
+    CHECK(sort_sample->Cast<sirius::op::sirius_physical_sort_sample>().split_equal_keys());
     REQUIRE(sort_sample->children.size() == 1);
     REQUIRE(sort_sample->children[0]->type == SiriusPhysicalOperatorType::ORDER_BY);
     // ORDER_BY hands its sorted batches to the sample operator.

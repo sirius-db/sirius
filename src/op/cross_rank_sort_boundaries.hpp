@@ -25,6 +25,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 namespace sirius::op {
 
@@ -33,6 +34,8 @@ struct sort_boundaries {
   std::size_t num_partitions = 1;
   //! num_partitions - 1 rows of the sort key columns; null for one partition.
   std::unique_ptr<cudf::table> table;
+  //! Fraction of rows equal to each boundary that precede it; empty means all zero.
+  std::vector<double> equal_key_fractions;
 };
 
 /**

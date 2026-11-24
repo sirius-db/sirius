@@ -1536,6 +1536,7 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
       op_params.max_sort_partition_bytes,
       op_params.max_sort_partition_memory_fraction);
     auto* sample_ptr = sample.get();
+    sample->set_split_equal_keys(true);
     order_ptr->set_sort_sample(sample_ptr);
     sample->children.push_back(std::move(order_op));
 
