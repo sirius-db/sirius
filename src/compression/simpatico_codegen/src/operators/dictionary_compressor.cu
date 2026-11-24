@@ -403,6 +403,7 @@ __device__ int32_t key_length(int32_t const* koff, int32_t key)
   return key < 0 ? 0 : koff[key + 1] - koff[key];
 }
 
+// tile_bytes has num_tiles + 1 entries; the last is zeroed so its exclusive scan is the total.
 template <bool Vec>
 __global__ void __launch_bounds__(kSmallDictThreads)
   small_dict_tile_bytes(int32_t const* __restrict__ ix,
@@ -415,6 +416,7 @@ __global__ void __launch_bounds__(kSmallDictThreads)
   using block_reduce = cub::BlockReduce<int32_t, kSmallDictThreads>;
   __shared__ typename block_reduce::TempStorage reduce_storage;
   __shared__ int32_t koff[kSmallDictMaxKeys + 1];
+  if (blockIdx.x == 0 && threadIdx.x == 0) tile_bytes[num_tiles] = 0;
   load_key_offsets(key_offsets, num_keys, koff);
   __syncthreads();
   for (int64_t tile = blockIdx.x; tile < num_tiles; tile += gridDim.x) {
@@ -722,8 +724,10 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
   if (dict_column->size() == 0) {
     return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
   }
-  // The encoded column is null-free (validity lives in the plan tree's sidecar), so the
-  // constant-width fast path always applies when the keys allow it.
+  // Validity lives on the dictionary parent, not its indices, so the fast paths would gather a
+  // null row's code as a key. Plan-encoded columns are null-free; direct codec input may not be.
+  if (dict_column->null_count() > 0)
+    return cudf::dictionary::decode(dict_column->view(), stream, mr);
   cudf::dictionary_column_view dv(dict_column->view());
   if (auto output = try_decode_constant_width(
         cudf::strings_column_view(dv.keys()), dv.indices(), constant_key_width, frame))
