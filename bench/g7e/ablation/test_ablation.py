@@ -16,6 +16,43 @@ def read(name):
 
 
 class PinControls(unittest.TestCase):
+    def test_compressed_first_enables_only_the_requested_next_feature(self):
+        run = read("run")
+        stages = run.selected_stages("compressed-first")
+        self.assertEqual(
+            [s["label"] for s in stages],
+            [
+                "compressed_pin",
+                "type_narrow",
+                "build_probe",
+                "dynamic_filter",
+                "fused_decode",
+            ],
+        )
+        keys = (
+            "compressed_pin",
+            "type_narrow",
+            "build_probe",
+            "dynamic_filter",
+            "fused_decode",
+        )
+        for index, stage in enumerate(stages):
+            self.assertEqual([stage[k] for k in keys], [i <= index for i in range(5)])
+        base = {"sirius": {"memory": {"host": {"initial_number_pools": 1600}}}}
+        self.assertEqual(
+            run.stage_config(base, stages[0]),
+            run.stage_config(
+                base, run.selected_stages("build-first", compressed_pin_only=True)[0]
+            ),
+        )
+        self.assertEqual(
+            run.stage_config(base, stages[-1]),
+            run.stage_config(base, run.stage_spec(5)),
+        )
+        self.assertFalse(
+            run.selected_stages("compressed-first", True)[0]["compressed_pin"]
+        )
+
     def test_compressed_pin_only_disables_all_four_other_features(self):
         run = read("run")
         stages = run.selected_stages("build-first", compressed_pin_only=True)

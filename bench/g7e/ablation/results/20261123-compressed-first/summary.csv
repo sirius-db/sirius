@@ -1,0 +1,6 @@
+stage,label,correct_queries,complete,full_suite_sum_s,available_sum_s,change_from_prior_stage_pct
+0,compressed_pin,22,True,53.356745,53.356745,
+1,type_narrow,22,True,46.469744,46.469744,-12.907460903021729
+2,build_probe,22,True,41.308729,41.308729,-11.106183412587766
+3,dynamic_filter,22,True,30.712089,30.712089,-25.652302204698675
+4,fused_decode,22,True,29.408593,29.408593,-4.244244017396537

@@ -45,10 +45,7 @@ def main():
     build = next(
         s
         for s in stages
-        if s["build_probe"]
-        and s["dynamic_filter"]
-        and s["type_narrow"]
-        and not s["compressed_pin"]
+        if s["build_probe"] and s["dynamic_filter"] and s["type_narrow"]
     )
     fused = next(s for s in stages if s["fused_decode"])
     for label, spec, query in [("build_dynamic", build, 3), ("fused_decode", fused, 6)]:

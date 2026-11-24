@@ -1,0 +1,86 @@
+{
+  "all_staged_file_hashes_verified": true,
+  "archive": {
+    "all_payload_hashes_verified_after_download": true,
+    "bytes": 84858335,
+    "filename": "g7e8-london-sf1k-host-ablation-compressed-first-20261123-full-results.tar.gz",
+    "files": 623,
+    "payload_bytes": 313505669,
+    "sha256": "c36d8155b3e0a9bb1730bf8edd35c21b0c0ba227ef6630a818ab7c4b75f1677c"
+  },
+  "base_config_sha256": "a96d6e0715fddcd807c7b5e69fc8d0ecfcfd93c5ecf11f26a13556dad325e642",
+  "common_queries": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22
+  ],
+  "common_query_sums_s": {
+    "0": 53.356745,
+    "1": 46.469744,
+    "2": 41.308729,
+    "3": 30.712089,
+    "4": 29.408593
+  },
+  "compressed_pin_policy": "All five stages: only lineitem/orders compression=true with identical explicit Simpatico plans; every other table compression=false",
+  "config_sha256": {
+    "stage0-compressed_pin.yaml": "284fa987e19bfcf06e6621fe51b86849db8d6ede3a57a429c99947d05df321dd",
+    "stage1-type_narrow.yaml": "0f965fef604e4cd295c182c4647430e7a083a21cac180d546ca0a6074e38b561",
+    "stage2-build_probe.yaml": "bee7fb8fc56554cbda7af6faa7fe56fa8e7070b1e54032e32324a30d5d0340e2",
+    "stage3-dynamic_filter.yaml": "db6a9dac8a6734cd2b63cef5734da45279a47422156dd1e32b9a76b3170dffbf",
+    "stage4-fused_decode.yaml": "519d9758bd79b5aef99b019ec2b3e03aadaa1ef07b1c634c31c0f562480bc29c"
+  },
+  "dataset_manifest_sha256": "884a627553d7a3d0f5cc41bdf451b3d7353274cb2dabcf1555e5c8e17537785a",
+  "date_timezone": "America/Chicago",
+  "engine_commit": "26b5caba3e2c96290fdc63d4cf40ac42572eaab8",
+  "executed_source_sha256": {
+    "ablation/run.py": "80e7c7899415fe3d6b520d5c6a14936c6a94d434d19a3d96b23c9f8047132ad2",
+    "ablation/worker.py": "cc53c773bcd9f6af9ac60b968b4997632ac89ad16d50f0ebdba9732a0ce9b5af",
+    "guide-26b5caba/supervisor.py": "e42ffa05aa4b013ac5c69e273827ae4b69e0c9e7590165227a06263e2ce7422b",
+    "guide-26b5caba/worker.py": "9f7a673999444e4ea15b67a2b96e945948c39973a3ffa57d3afd57b18418810b"
+  },
+  "hardware": "g7e.8xlarge",
+  "lifecycle": "One fresh engine per stage; Q1-Q22 once; per-query host pin/unpin; startup cache clear only; no warmup/profile/mode override",
+  "native_library_sha256": "090f552314d37196b6c0509a261a9656034a287e03524531dd7e1af3ccc79236",
+  "protocol": "G7e compressed-first cumulative ablation",
+  "region": "eu-west-2",
+  "result_date": "2026-11-23",
+  "runner_package_sha256": "099672017a0878c4a588f95a912f3de3c1bfa79db1e932989dcbeb64329e6e7a",
+  "same_region_s3": {
+    "bucket": "sae-dataproc-aws-dev-sirius-scratch-eu-west-2",
+    "region": "eu-west-2",
+    "tables_present": [
+      "region",
+      "nation",
+      "supplier",
+      "customer",
+      "part",
+      "partsupp",
+      "orders",
+      "lineitem"
+    ]
+  },
+  "simpatico_plan_sha256": {
+    "lineitem": "288cd2b875e809bff33cea675eb5a6c676acbb81ffb5198d049b4e08ebcfb555",
+    "orders": "eb4b3be1de77fc613f84ebd454897668d8494c5e01e346f9047b3eeb227e8aeb"
+  },
+  "stage_plan_sha256": "6c7f1279b27080c675066f0a45be4b02db0c96006982d2914781ae192b8cd765"
+}

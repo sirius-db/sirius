@@ -7,6 +7,8 @@ The [all-on except compressed pinning case](results/20261123-all-on-uncompressed
 keeps the other four switches enabled and makes every pin explicitly uncompressed.
 The [compressed-pinning-only case](results/20261123-compressed-pin-only/RESULTS.md)
 enables compressed host pins while explicitly disabling the other four switches.
+The [compressed-first cumulative results](results/20261123-compressed-first/RESULTS.md)
+start with compressed pinning and then add the other four features in turn.
 
 This supports the corrected cumulative orders from the
 [GB300 study](../../gb300/ablation/RESULTS.md#corrected-build_probe-first-comparison)
@@ -27,6 +29,14 @@ type narrowing, BUILD_PROBE admission, dynamic filtering, compressed pinning,
 then fused filtering. The default is `--order build-first`. All other settings,
 pin controls and process boundaries are identical. A new output directory
 preserves the earlier order's measurements.
+
+Pass `--order compressed-first` for five cumulative stages: compressed host
+pinning alone, then type narrowing, BUILD_PROBE, dynamic filtering and fused
+scan/filter. Every stage compresses only `lineitem` and `orders` using the same
+plans. The baseline is measured again in a fresh stage engine; no all-off stage
+is rerun. Use a new output directory to preserve previous studies. Effects are
+conditional on the enabled features, and a single pass cannot establish a
+benefit from the order of enabling them.
 
 Pass `--all-on-uncompressed` to run a single additional case: type narrowing,
 BUILD_PROBE, dynamic filtering and fused scan/filter enabled, with every host

@@ -1,0 +1,23 @@
+[
+  {
+    "case": "compressed_pin_only",
+    "new_stage": 0,
+    "new_sum_s": 53.356745,
+    "previous_result": "../20261123-compressed-pin-only",
+    "previous_sum_s": 51.898669
+  },
+  {
+    "case": "all_except_fused",
+    "new_stage": 3,
+    "new_sum_s": 30.712089,
+    "previous_result": "../20261123-type-first",
+    "previous_sum_s": 30.713166
+  },
+  {
+    "case": "all_on",
+    "new_stage": 4,
+    "new_sum_s": 29.408593,
+    "previous_result": "../20261123-type-first",
+    "previous_sum_s": 29.425129
+  }
+]

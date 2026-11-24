@@ -1,0 +1,109 @@
+{
+  "all_completed_answers_correct": true,
+  "archive_sha256": "c36d8155b3e0a9bb1730bf8edd35c21b0c0ba227ef6630a818ab7c4b75f1677c",
+  "common_queries": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22
+  ],
+  "common_query_sums_s": {
+    "0": 53.356745,
+    "1": 46.469744,
+    "2": 41.308729,
+    "3": 30.712089,
+    "4": 29.408593
+  },
+  "date_timezone": "America/Chicago",
+  "failures": [],
+  "fresh_processes": 5,
+  "instance_lifecycle": "retained running",
+  "native_compressed_pin_counts": [
+    {
+      "native_compressed_events": 27,
+      "stage": 0
+    },
+    {
+      "native_compressed_events": 27,
+      "stage": 1
+    },
+    {
+      "native_compressed_events": 27,
+      "stage": 2
+    },
+    {
+      "native_compressed_events": 27,
+      "stage": 3
+    },
+    {
+      "native_compressed_events": 27,
+      "stage": 4
+    }
+  ],
+  "no_extra_diagnostic_queries": true,
+  "order": "compressed-first",
+  "pin_counts": [
+    {
+      "compressed_calls": 29,
+      "explicit_calls": 72,
+      "stage": 0
+    },
+    {
+      "compressed_calls": 29,
+      "explicit_calls": 72,
+      "stage": 1
+    },
+    {
+      "compressed_calls": 29,
+      "explicit_calls": 72,
+      "stage": 2
+    },
+    {
+      "compressed_calls": 29,
+      "explicit_calls": 72,
+      "stage": 3
+    },
+    {
+      "compressed_calls": 29,
+      "explicit_calls": 72,
+      "stage": 4
+    }
+  ],
+  "quent_contexts": 5,
+  "quent_executions": 110,
+  "query_attempts": 110,
+  "result_date": "2026-11-23",
+  "stage_query_counts": [
+    22,
+    22,
+    22,
+    22,
+    22
+  ],
+  "stage_sum_changes_pct": [
+    null,
+    -12.907460903021729,
+    -11.106183412587766,
+    -25.652302204698675,
+    -4.244244017396537
+  ],
+  "validated_timed_queries": 110
+}

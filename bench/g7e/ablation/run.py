@@ -37,14 +37,26 @@ TYPE_FIRST_STAGES = (
     ("compressed_pin", True, True, True, True, False),
     ("fused_decode", True, True, True, True, True),
 )
+COMPRESSED_FIRST_STAGES = (
+    ("compressed_pin", False, False, False, True, False),
+    ("type_narrow", False, False, True, True, False),
+    ("build_probe", True, False, True, True, False),
+    ("dynamic_filter", True, True, True, True, False),
+    ("fused_decode", True, True, True, True, True),
+)
+ORDERS = {
+    "build-first": (STAGES, 9),
+    "type-first": (TYPE_FIRST_STAGES, 15),
+    "compressed-first": (COMPRESSED_FIRST_STAGES, None),
+}
 
 
 def stage_spec(index, order="build-first"):
-    sequence = TYPE_FIRST_STAGES if order == "type-first" else STAGES
+    sequence, gb300_offset = ORDERS[order]
     label, build, dynamic, narrow, compressed, fused = sequence[index]
     return dict(
         stage=index,
-        gb300_stage=index + (15 if order == "type-first" else 9),
+        gb300_stage=index + gb300_offset if gb300_offset is not None else None,
         label=label,
         build_probe=build,
         dynamic_filter=dynamic,
@@ -71,18 +83,18 @@ def selected_stages(order, all_on_uncompressed=False, compressed_pin_only=False)
     if all_on_uncompressed and compressed_pin_only:
         raise ValueError("Select only one standalone case")
     if compressed_pin_only:
-        stage = stage_spec(0, order)
+        stage = stage_spec(0)
         stage.update(
             stage=0, gb300_stage=6, label="compressed_pin_only", compressed_pin=True
         )
         return [stage]
     if all_on_uncompressed:
-        stage = stage_spec(5, order)
+        stage = stage_spec(5)
         stage.update(
             stage=0, gb300_stage=7, label="all_on_uncompressed", compressed_pin=False
         )
         return [stage]
-    return [stage_spec(i, order) for i in range(6)]
+    return [stage_spec(i, order) for i in range(len(ORDERS[order][0]))]
 
 
 def coverage_table(label):
@@ -97,9 +109,7 @@ def main():
     parser.add_argument("--references", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument(
-        "--order", choices=("build-first", "type-first"), default="build-first"
-    )
+    parser.add_argument("--order", choices=tuple(ORDERS), default="build-first")
     cases = parser.add_mutually_exclusive_group()
     cases.add_argument(
         "--all-on-uncompressed",
@@ -429,7 +439,11 @@ def main():
                 else (
                     "GB300 all-on except compressed pinning"
                     if args.all_on_uncompressed
-                    else "corrected GB300 " + args.order
+                    else (
+                        "G7e compressed-first cumulative ablation"
+                        if args.order == "compressed-first"
+                        else "corrected GB300 " + args.order
+                    )
                 )
             ),
             totals=totals,

@@ -1,0 +1,1452 @@
+{
+  "0": [
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    }
+  ],
+  "1": [
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    }
+  ],
+  "2": [
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    }
+  ],
+  "3": [
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    }
+  ],
+  "4": [
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "region"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": false,
+      "table": "partsupp"
+    },
+    {
+      "compression": false,
+      "table": "part"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "supplier"
+    },
+    {
+      "compression": true,
+      "table": "lineitem"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    },
+    {
+      "compression": false,
+      "table": "nation"
+    },
+    {
+      "compression": false,
+      "table": "customer"
+    },
+    {
+      "compression": true,
+      "table": "orders"
+    }
+  ]
+}
