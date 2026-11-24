@@ -47,25 +47,29 @@ FROM sirius_gateway_run('CREATE SECRET s (TYPE s3, KEY_ID ''key'', SECRET ''hidd
 statement ok
 FROM sirius_gateway_run('SET s3_secret_access_key = ''hidden''');
 
+# An ATTACH with a token carries credentials too. The rank attaches to its own server here.
+statement ok
+FROM sirius_gateway_run('ATTACH ''quack:127.0.0.1:19950'' AS other (TOKEN ''statetoken'')');
+
 query I
 SELECT count(*) FROM sirius_gateway_log();
 ----
-4
+5
 
 # Statements with credentials are counted, not shown.
 query I
-SELECT count(*) FROM sirius_gateway_log() WHERE sql LIKE '%hidden%';
+SELECT count(*) FROM sirius_gateway_log() WHERE sql LIKE '%hidden%' OR sql LIKE '%statetoken%';
 ----
 0
 
 query I
 SELECT count(*) FROM sirius_gateway_log() WHERE sql LIKE '-- not shown%';
 ----
-2
+3
 
 # They stay in memory only.
 query I
-SELECT content LIKE '%hidden%' FROM read_text('{TEST_DIR}/sirius_gateway_state/state/ddl.sql');
+SELECT content LIKE '%hidden%' OR content LIKE '%statetoken%' FROM read_text('{TEST_DIR}/sirius_gateway_state/state/ddl.sql');
 ----
 false
 
