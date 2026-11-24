@@ -41,6 +41,16 @@ pixi run build/release/test/cpp/sirius_unittest "[path_utils]"
 pixi run build/release/test/cpp/sirius_unittest "strip_file_scheme folds dot, dot-dot and empty segments"
 ```
 
+## Performance benchmarks
+
+The [Python performance runner](tpch_performance/performance_test.py) supports
+TPC-H (the default) and `--benchmark scale_bench`. See the
+[scale_bench guide](tpch_performance/README.md#scale_bench) for named queries,
+existing Parquet input layout, `--temp-dir` preparation/cleanup, and fingerprint,
+row or Parquet result modes. The [run guide](tpch_performance/run.md) also covers
+the TPC-H-specific legacy shell and profiling workflows. TPC-DS retains its
+[separate benchmark script](tpcds_performance/benchmark_and_validate.sh).
+
 ## TPC-Havoc queries
 
 [TPC-Havoc](https://github.com/BenchBox-dev/BenchBox/blob/develop/docs/benchmarks/tpc-havoc.md)
