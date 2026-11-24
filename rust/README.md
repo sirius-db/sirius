@@ -13,7 +13,7 @@ Before [#2436](https://github.com/sirius-db/sirius/pull/2436), `sirius` and
 crates; the existing C++ bridge lives in `sirius-ffi`.
 
 CMake uses Corrosion to build `sirius-engine` as a single Rust static library
-for libSirius. It includes the Quent telemetry bridge and `sirius-substrait`,
+for libsirius. It includes the Quent telemetry bridge and `sirius-substrait`,
 the crate reserved for importing Substrait plans.
 
 ## Configuration
