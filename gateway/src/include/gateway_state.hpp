@@ -28,7 +28,8 @@ char const* to_string(cluster_state state);
 /// `sirius_gateway_*` settings.
 struct start_options {
   uint32_t ranks = 0;
-  /// `CUDA_VISIBLE_DEVICES` per rank; empty: rank i on GPU i.
+  /// `CUDA_VISIBLE_DEVICES` per rank; empty: rank i on entry i of the gateway's own
+  /// `CUDA_VISIBLE_DEVICES`, or on GPU i when that is not set.
   std::vector<std::string> gpus;
   uint32_t exchange_base_port = 27000;
   uint32_t quack_base_port    = 9500;
