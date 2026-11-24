@@ -1,0 +1,220 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "op/sort_key_sample.hpp"
+
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/contiguous_split.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/utilities/error.hpp>
+
+#include <rmm/resource_ref.hpp>
+
+#include <cuda_runtime.h>
+
+#include <cucascade/memory/memory_space.hpp>
+
+#include <algorithm>
+#include <stdexcept>
+
+namespace sirius::op {
+
+struct sort_key_sample::piece {
+  std::uint64_t batch_id = 0;
+  std::size_t rows       = 0;  //!< Rows of the batch.
+  std::size_t bytes      = 0;  //!< Bytes of the batch.
+  std::size_t stride     = 1;  //!< Stride the key rows were taken at.
+  std::size_t key_rows   = 0;
+  //! The key rows as cudf::pack() wrote them, the data copied to the host.
+  std::unique_ptr<std::vector<std::uint8_t>> metadata;
+  std::vector<std::uint8_t> data;
+};
+
+namespace {
+
+//! A device INT32 column holding first, first + step, ... below @p end.
+std::unique_ptr<cudf::column> row_indices(std::size_t first,
+                                          std::size_t step,
+                                          std::size_t end,
+                                          ::cuda::stream_ref stream,
+                                          rmm::device_async_resource_ref mr)
+{
+  std::vector<std::int32_t> indices;
+  if (end > first) { indices.reserve(1 + (end - first - 1) / step); }
+  for (auto row = first; row < end; row += step) {
+    indices.push_back(static_cast<std::int32_t>(row));
+  }
+  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          static_cast<cudf::size_type>(indices.size()),
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(column->mutable_view().data<std::int32_t>(),
+                                indices.data(),
+                                indices.size() * sizeof(std::int32_t),
+                                cudaMemcpyHostToDevice,
+                                stream.get()));
+  return column;
+}
+
+}  // namespace
+
+sort_key_sample::sort_key_sample(std::size_t max_key_rows) : _max_key_rows(max_key_rows)
+{
+  if (max_key_rows == 0) {
+    throw std::invalid_argument("[sort_key_sample] max_key_rows must be positive");
+  }
+}
+
+std::size_t sort_key_sample::kept_at(std::size_t stride, std::uint64_t const* skip_batch_id) const
+{
+  std::size_t kept = 0;
+  for (auto const& [id, entry] : _pieces) {
+    if (skip_batch_id != nullptr && id == *skip_batch_id) { continue; }
+    kept += key_row_count(entry->rows, stride);
+  }
+  return kept;
+}
+
+void sort_key_sample::add(std::uint64_t batch_id,
+                          cudf::table_view sorted_keys,
+                          std::size_t batch_bytes,
+                          cucascade::memory::memory_space& space,
+                          ::cuda::stream_ref stream)
+{
+  if (_closed.load(std::memory_order_acquire)) { return; }
+  auto const rows = static_cast<std::size_t>(sorted_keys.num_rows());
+
+  auto made      = std::make_shared<piece>();
+  made->batch_id = batch_id;
+  made->rows     = rows;
+  made->bytes    = batch_bytes;
+  {
+    std::lock_guard lock(_mutex);
+    // Never past the final stride: the rows counted here are a part of the final input.
+    made->stride = _stride;
+    while (kept_at(made->stride, &batch_id) + key_row_count(rows, made->stride) > _max_key_rows) {
+      made->stride *= 2;
+    }
+  }
+  made->key_rows = key_row_count(rows, made->stride);
+
+  if (made->key_rows != 0) {
+    auto const mr = space.get_default_allocator();
+    auto index    = row_indices(first_row(made->stride), made->stride, rows, stream, mr);
+    auto keys =
+      cudf::gather(sorted_keys, index->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+    auto packed    = cudf::pack(keys->view(), stream, mr);
+    made->metadata = std::move(packed.metadata);
+    made->data.resize(packed.gpu_data->size());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(made->data.data(),
+                                  packed.gpu_data->data(),
+                                  made->data.size(),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    // The copy ends before its source is freed and before other tasks read the rows.
+    stream.sync();
+  }
+
+  std::lock_guard lock(_mutex);
+  if (_closed.load(std::memory_order_acquire)) { return; }
+  auto& slot = _pieces[batch_id];
+  if (slot) {
+    --_seen.batches;
+    _seen.rows -= slot->rows;
+    _seen.bytes -= slot->bytes;
+  }
+  ++_seen.batches;
+  _seen.rows += rows;
+  _seen.bytes += batch_bytes;
+  slot = std::move(made);
+  while (kept_at(_stride, nullptr) > _max_key_rows) {
+    _stride *= 2;
+  }
+}
+
+sort_key_sample::totals sort_key_sample::seen() const
+{
+  std::lock_guard lock(_mutex);
+  return _seen;
+}
+
+std::size_t sort_key_sample::stride() const
+{
+  std::lock_guard lock(_mutex);
+  return _stride;
+}
+
+void sort_key_sample::clear()
+{
+  std::unordered_map<std::uint64_t, std::shared_ptr<piece const>> dropped;
+  {
+    std::lock_guard lock(_mutex);
+    dropped.swap(_pieces);
+  }
+}
+
+sort_key_sample::device_keys sort_key_sample::on_device(cucascade::memory::memory_space& space,
+                                                        ::cuda::stream_ref stream) const
+{
+  device_keys out;
+  {
+    std::lock_guard lock(_mutex);
+    out.stride = _stride;
+    out.input  = _seen;
+    out.pieces.reserve(_pieces.size());
+    for (auto const& [id, entry] : _pieces) {
+      out.pieces.push_back(entry);
+    }
+  }
+  std::sort(out.pieces.begin(), out.pieces.end(), [](auto const& a, auto const& b) {
+    return a->batch_id < b->batch_id;
+  });
+
+  auto const mr = space.get_default_allocator();
+  for (auto const& entry : out.pieces) {
+    if (key_row_count(entry->rows, out.stride) == 0) { continue; }
+    // out.pieces keeps the host copy alive while the device copy is in flight.
+    auto copied = std::make_unique<rmm::device_buffer>(entry->data.size(), stream, mr);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(copied->data(),
+                                  entry->data.data(),
+                                  entry->data.size(),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
+    auto view =
+      cudf::unpack(entry->metadata->data(), static_cast<std::uint8_t const*>(copied->data()));
+    if (entry->stride != out.stride) {
+      // Kept row i is input row first_row(entry->stride) + i * entry->stride.
+      auto const step  = out.stride / entry->stride;
+      auto const first = (first_row(out.stride) - first_row(entry->stride)) / entry->stride;
+      auto index       = row_indices(first, step, entry->key_rows, stream, mr);
+      auto thinned =
+        cudf::gather(view, index->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+      view = thinned->view();
+      out.thinned.push_back(std::move(thinned));
+      // Only the thinned rows stay on the GPU, so the copies never add up to more than the cap.
+      stream.sync();
+      copied.reset();
+    }
+    if (copied) { out.buffers.push_back(std::move(copied)); }
+    out.key_rows += static_cast<std::size_t>(view.num_rows());
+    out.tables.push_back(view);
+  }
+  return out;
+}
+
+}  // namespace sirius::op
