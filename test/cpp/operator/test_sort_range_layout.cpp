@@ -125,13 +125,15 @@ layout run_checked(std::vector<std::shared_ptr<cucascade::data_batch>> const& ba
                    duckdb::vector<duckdb::BoundOrderByNode> const& orders,
                    std::uint64_t sample_bytes,
                    std::uint64_t target_bytes,
-                   bool finished = true)
+                   bool finished                   = true,
+                   std::size_t max_sample_key_rows = 0)
 {
   std::size_t cardinality = 0;
   for (auto const& batch : batches) {
     cardinality += sirius::get_cudf_table_view(*batch).num_rows();
   }
-  auto result = run_layout(batches, orders, sample_bytes, target_bytes, cardinality, finished);
+  auto result = run_layout(
+    batches, orders, sample_bytes, target_bytes, cardinality, finished, max_sample_key_rows);
   check_layout(result, batches, orders);
   return result;
 }
@@ -274,7 +276,7 @@ TEST_CASE("Sort ranges count wide-row bytes", "[sort_range_layout]")
   CHECK(result.sample.complete_input);
 }
 
-TEST_CASE("Sort ranges cluster later batches in last range (current behaviour, #2579)",
+TEST_CASE("Sort ranges cluster later batches in last range when chosen after one batch",
           "[sort_range_layout]")
 {
   std::vector<std::vector<std::int32_t>> values(4, std::vector<std::int32_t>(100));
@@ -293,7 +295,7 @@ TEST_CASE("Sort ranges cluster later batches in last range (current behaviour, #
   }
 }
 
-TEST_CASE("Sort ranges cluster reversed arrival in first range (current behaviour, #2579)",
+TEST_CASE("Sort ranges cluster reversed arrival in first range when chosen after one batch",
           "[sort_range_layout]")
 {
   std::vector<std::vector<std::int32_t>> values(4, std::vector<std::int32_t>(100));
@@ -313,6 +315,26 @@ TEST_CASE("Sort ranges cluster reversed arrival in first range (current behaviou
   }
 }
 
+TEST_CASE("Sort ranges balance batches that arrive in key order when chosen after all input",
+          "[sort_range_layout]")
+{
+  std::vector<std::vector<std::int32_t>> values(4, std::vector<std::int32_t>(100));
+  for (int b = 0; b < 4; ++b) {
+    std::iota(values[b].begin(), values[b].end(), b * 100);
+  }
+  bool const reversed = GENERATE(false, true);
+  if (reversed) { std::reverse(values.begin(), values.end()); }
+  auto result = run_checked(int_batches(values), one_order(), 100000, 50);
+  CHECK(result.sample.complete_input);
+  CHECK(result.sample.sample_batches == 4);
+  REQUIRE(result.sample.num_ranges == 32);
+  for (auto const& range : result.counted) {
+    // 400 distinct keys in 32 ranges.
+    CHECK(range.rows >= 12);
+    CHECK(range.rows <= 13);
+  }
+}
+
 TEST_CASE("Sort ranges balance key-row samples with a stride above one", "[sort_range_layout]")
 {
   std::mt19937 rng(2579);
@@ -324,7 +346,7 @@ TEST_CASE("Sort ranges balance key-row samples with a stride above one", "[sort_
     }
     std::sort(batch.begin(), batch.end());
   }
-  auto result = run_checked(int_batches(values), one_order(), 1000000, 30000);
+  auto result = run_checked(int_batches(values), one_order(), 1000000, 30000, true, 4096);
   REQUIRE(result.sample.sample_stride > 1);
   REQUIRE(result.sample.num_ranges == 8);
   for (auto const& range : result.counted) {
@@ -349,7 +371,7 @@ TEST_CASE("Sort ranges weight unequal batches by their row counts", "[sort_range
   for (auto& batch : values) {
     std::sort(batch.begin(), batch.end());
   }
-  auto result = run_checked(int_batches(values), one_order(), 1000000, 22000);
+  auto result = run_checked(int_batches(values), one_order(), 1000000, 22000, true, 4096);
   REQUIRE(result.sample.sample_stride > 1);
   REQUIRE(result.sample.num_ranges == 8);
   for (auto const& range : result.counted) {
@@ -357,12 +379,13 @@ TEST_CASE("Sort ranges weight unequal batches by their row counts", "[sort_range
   }
 }
 
-TEST_CASE("Sort ranges retain rows in a batch shorter than half the sample stride",
-          "[sort_range_layout]")
+TEST_CASE("Sort ranges retain rows in a batch too short to give a key row", "[sort_range_layout]")
 {
   std::vector<std::int32_t> large(40000);
   std::iota(large.begin(), large.end(), 0);
-  auto result = run_checked(int_batches({large, {10, 11, 12}}), one_order(), 1000000, 20000);
+  auto result =
+    run_checked(int_batches({large, {10, 11, 12}}), one_order(), 1000000, 20000, true, 4096);
+  // The first key row of a batch is past its third row at this stride.
   REQUIRE(result.sample.sample_stride > 6);
   CHECK(result.sample.sample_key_rows < result.sample.sample_rows);
 }
