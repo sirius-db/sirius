@@ -58,6 +58,7 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 #include "transparent/read_view_registry.hpp"
 
 #include <cucascade/io/uri_parser.hpp>
@@ -553,7 +554,7 @@ void carry_as_dictionary(cudf::data_type& carrier,
                    id.GetPrimaryIndex());
 }
 
-// An unpinned DuckDB-native scan carries an unfiltered string column as DICTIONARY32
+// An unpinned Parquet or DuckDB-native scan carries an unfiltered string column as DICTIONARY32
 // when its storage dictionary-encodes it (@p dictionary_encoded, by table column index): the reader
 // then returns its codes and keys without gathering strings.
 std::vector<cudf::data_type> source_dictionary_schema(
@@ -586,14 +587,45 @@ std::vector<cudf::data_type> source_dictionary_schema(
 // strings, the carrier's STRING form.
 constexpr duckdb::idx_t native_dictionary_carrier_max_distinct = 1 << 16;
 
-// The table columns among @p ids that a DuckDB-native scan's storage dictionary-encodes.
+// The string columns among a Parquet scan's @p ids that every file's footer dictionary-encodes, or
+// none when a projected string column is stored plainly.
+std::unordered_set<std::size_t> parquet_dictionary_columns(
+  duckdb::ClientContext& context,
+  duckdb::LogicalGet& op,
+  const duckdb::vector<duckdb::ColumnIndex>& ids)
+{
+  std::unordered_set<std::size_t> result;
+  // A filtered Parquet scan becomes a reader row filter, under which cuDF skips the page-level
+  // dictionary transcode, so the read stays on strings and planning a carrier gains nothing.
+  if (op.table_filters.HasFilters() || op.table_filters.HasMultiColumnFilters()) { return result; }
+  auto const dictionary_bytes = sirius::transparent::parquet_dictionary_string_columns(context, op);
+  for (auto const& id : ids) {
+    if (!id.HasPrimaryIndex() || id.IsVirtualColumn()) { continue; }
+    auto const primary = id.GetPrimaryIndex();
+    if (primary >= op.returned_types.size() || primary >= op.names.size() ||
+        op.returned_types[primary].id() != duckdb::LogicalTypeId::VARCHAR) {
+      continue;
+    }
+    // Asked for one dictionary, cuDF returns every flat string column as one, hash-encoding those
+    // it cannot transcode from dictionary pages. A projected string column stored plainly would pay
+    // that encode and the decode back, which can cost more than the carriers save.
+    auto const found = dictionary_bytes.find(op.names[primary].GetIdentifierName());
+    if (found == dictionary_bytes.end()) { return {}; }
+    if (found->second <= sirius::transparent::parquet_dictionary_carrier_max_bytes) {
+      result.insert(primary);
+    }
+  }
+  return result;
+}
+
+// The table columns among @p ids that the scan's storage dictionary-encodes.
 std::unordered_set<std::size_t> source_dictionary_columns(
   duckdb::ClientContext& context,
   duckdb::LogicalGet& op,
   const duckdb::vector<duckdb::ColumnIndex>& ids)
 {
   std::unordered_set<std::size_t> result;
-  if (op.function.GetName() != "seq_scan") { return result; }
+  if (op.function.GetName() != "seq_scan") { return parquet_dictionary_columns(context, op, ids); }
   auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
   if (bind == nullptr || !bind->table.IsDuckTable()) { return result; }
   auto& table = bind->table.Cast<duckdb::DuckTableEntry>();

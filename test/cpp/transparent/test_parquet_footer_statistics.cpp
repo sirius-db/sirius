@@ -2421,3 +2421,107 @@ TEST_CASE_METHOD(FooterAdmissionFixture,
   CHECK_FALSE(footer_fix_rows(*uncovered));
   CHECK_FALSE(span_of(*uncovered));
 }
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - dictionary columns are the strings every row group "
+                 "dictionary-encodes",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]"
+                 "[dictionary_carrier]")
+{
+  using sirius::transparent::parquet_dictionary_carrier_max_bytes;
+  using sirius::transparent::parquet_dictionary_string_columns;
+  auto const file = dir / "strings.parquet";
+  // `low` repeats ten values; `distinct` never repeats, so the writer stores it plainly; `mixed`
+  // repeats in the first row group only.
+  auto const write = [&](std::string const& low) {
+    run_ok("SET threads = 1;");
+    run_ok("COPY (SELECT range AS x, " + low +
+           " AS low, 'u' || range AS distinct_values, CASE WHEN range < 50000 THEN 'k' || "
+           "(range % 10) ELSE 'u' || range END AS mixed FROM range(100000)) TO '" +
+           file.string() + "' (FORMAT parquet, ROW_GROUP_SIZE 50000);");
+    run_ok("RESET threads;");
+  };
+  write("'k' || (range % 10)");
+
+  run_ok("SET gpu_execution = false;");
+  auto layout = con->Query(
+    "SELECT path_in_schema, row_group_id, encodings, dictionary_page_offset IS NOT NULL FROM "
+    "parquet_metadata('" +
+    file.string() + "') ORDER BY ALL");
+  run_ok("SET gpu_execution = true;");
+  REQUIRE_FALSE(layout->HasError());
+  auto const rows = collect_rows(*layout, /*sort=*/false);
+  INFO(layout->ToString());
+  auto const dictionary_in = [&](std::string const& column, bool first_group) {
+    for (auto const& row : rows) {
+      if (row[0] == column && (row[1] == "0") == first_group) {
+        return row[3] == "true" && row[2].find("DICTIONARY") != std::string::npos;
+      }
+    }
+    return false;
+  };
+  REQUIRE(dictionary_in("low", true));
+  REQUIRE(dictionary_in("mixed", true));
+  REQUIRE_FALSE(dictionary_in("mixed", false));
+  REQUIRE_FALSE(dictionary_in("distinct_values", false));
+
+  auto const columns = [&] {
+    auto const plan = con->ExtractPlan("SELECT * FROM read_parquet('" + file.string() + "')");
+    auto const* get = first_get(*plan);
+    REQUIRE(get != nullptr);
+    run_ok("BEGIN TRANSACTION;");
+    auto found = parquet_dictionary_string_columns(*con->context, *get);
+    run_ok("ROLLBACK;");
+    return found;
+  };
+  auto const found = columns();
+  REQUIRE(found.contains("low"));
+  CHECK(found.at("low") > 0);
+  CHECK(found.at("low") <= parquet_dictionary_carrier_max_bytes);
+  CHECK_FALSE(found.contains("mixed"));
+  CHECK_FALSE(found.contains("distinct_values"));
+  CHECK_FALSE(found.contains("x"));
+
+  // A rewritten file is probed again rather than answered from the cache.
+  write("'u' || range");
+  CHECK_FALSE(columns().contains("low"));
+}
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - dictionary columns are kept for a bounded number "
+                 "of files",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]"
+                 "[dictionary_carrier]")
+{
+  using sirius::transparent::detail::dictionary_columns_cache_capacity;
+  using sirius::transparent::detail::dictionary_columns_cache_size;
+  for (std::size_t file = 0; file < dictionary_columns_cache_capacity + 8; ++file) {
+    auto const path = dir / ("strings" + std::to_string(file) + ".parquet");
+    run_ok("COPY (SELECT 'k' || (range % 10) AS low FROM range(100)) TO '" + path.string() +
+           "' (FORMAT parquet);");
+    auto const plan = con->ExtractPlan("SELECT * FROM read_parquet('" + path.string() + "')");
+    auto const* get = first_get(*plan);
+    REQUIRE(get != nullptr);
+    run_ok("BEGIN TRANSACTION;");
+    CHECK(
+      sirius::transparent::parquet_dictionary_string_columns(*con->context, *get).contains("low"));
+    run_ok("ROLLBACK;");
+  }
+  CHECK(dictionary_columns_cache_size() <= dictionary_columns_cache_capacity);
+}
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - a scan that is not of Parquet has no dictionary "
+                 "columns",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]"
+                 "[dictionary_carrier]")
+{
+  run_ok("CREATE TABLE native_strings AS SELECT 'k' || (range % 10) AS s FROM range(1000);");
+  auto const plan = con->ExtractPlan("SELECT s FROM native_strings");
+  auto const* get = first_get(*plan);
+  REQUIRE(get != nullptr);
+  run_ok("BEGIN TRANSACTION;");
+  CHECK(sirius::transparent::parquet_dictionary_string_columns(*con->context, *get).empty());
+  run_ok("ROLLBACK;");
+  run_ok("DROP TABLE native_strings;");
+}

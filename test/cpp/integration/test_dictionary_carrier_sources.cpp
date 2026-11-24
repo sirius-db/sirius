@@ -16,7 +16,7 @@
 
 /**
  * @file test_dictionary_carrier_sources.cpp
- * @brief enable_dictionary_carrier on DuckDB-native and compressed pinned scans.
+ * @brief enable_dictionary_carrier on Parquet, DuckDB-native, and compressed pinned scans.
  *
  * The planner carries a string column as DICTIONARY32 when its storage dictionary-encodes it with
  * keys under the carrier cap and the scan does not filter it, and every query over such a carrier
@@ -87,6 +87,8 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
       "range(100000);");
     run_ok("CREATE TABLE dim AS SELECT 'k' || range AS key, range AS w FROM range(5);");
     run_ok("CHECKPOINT;");
+    parquet = "read_parquet('" + (dir / "t.parquet").string() + "')";
+    run_ok("COPY t TO '" + (dir / "t.parquet").string() + "' (FORMAT parquet);");
     run_ok("SET enable_dictionary_carrier = true;");
   }
 
@@ -217,11 +219,31 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
   }
 
   fs::path dir;
+  std::string parquet;
   bool pinned       = false;
   bool pinned_mixed = false;
 };
 
 }  // namespace
+
+TEST_CASE_METHOD(DictionaryCarrierFixture,
+                 "dictionary carrier - an unfiltered Parquet scan carries its dictionary columns",
+                 "[integration][gpu_execution][dictionary_carrier]")
+{
+  CHECK(carried_dictionaries("SELECT low, count(*) FROM " + parquet + " GROUP BY low") == 1);
+  CHECK(carried_dictionaries("SELECT low, x FROM " + parquet) == 1);
+  CHECK(carried_dictionaries("SELECT low, nullable, \"group\" FROM " + parquet) == 3);
+  // cuDF would return the plainly stored `distinct_values` as a dictionary too, hash-encoding it.
+  CHECK(carried_dictionaries("SELECT low, distinct_values FROM " + parquet) == 0);
+  CHECK(carried_dictionaries("SELECT low, max(distinct_values) FROM " + parquet +
+                             " GROUP BY low") == 0);
+  CHECK(carried_dictionaries("SELECT wide, count(*) FROM " + parquet + " GROUP BY wide") == 0);
+  // The reader's row filter would turn off cuDF's dictionary transcode.
+  CHECK(carried_dictionaries("SELECT low, count(*) FROM " + parquet +
+                             " WHERE x > 10 GROUP BY low") == 0);
+  run_ok("SET enable_dictionary_carrier = false;");
+  CHECK(carried_dictionaries("SELECT low, count(*) FROM " + parquet + " GROUP BY low") == 0);
+}
 
 TEST_CASE_METHOD(DictionaryCarrierFixture,
                  "dictionary carrier - a DuckDB-native scan carries its low-cardinality strings",
@@ -334,6 +356,13 @@ TEST_CASE_METHOD(DictionaryCarrierFixture,
   REQUIRE(carried_dictionaries("SELECT low, count(*) FROM t GROUP BY low") == 1);
   run_ok("SET sirius_exchange_peers = '127.0.0.1:62998,127.0.0.1:62999';");
   CHECK(carried_dictionaries("SELECT low, count(*) FROM t GROUP BY low") == 0);
+}
+
+TEST_CASE_METHOD(DictionaryCarrierFixture,
+                 "dictionary carrier - queries over Parquet carriers match DuckDB",
+                 "[integration][gpu_execution][dictionary_carrier]")
+{
+  compare_all(parquet);
 }
 
 TEST_CASE_METHOD(DictionaryCarrierFixture,

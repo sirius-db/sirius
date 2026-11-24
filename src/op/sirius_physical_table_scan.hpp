@@ -164,7 +164,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Host-tier-backed and never-sidecared scans leave it false.
   bool sidecar_from_gpu_tier_pin = false;
 
-  //! The physical sidecar marks unpinned DuckDB-native columns the reader returns as
+  //! The physical sidecar marks unpinned Parquet or DuckDB-native columns the reader returns as
   //! DICTIONARY32. Like a GPU-tier pin's, such a carrier costs nothing to produce, so the tier
   //! narrowing policy decides which of them earn their keep; the reader is asked only for those
   //! that remain.

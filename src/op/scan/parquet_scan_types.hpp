@@ -129,6 +129,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// Schema (P-space) indices of value-delete keys, already reachable through @ref column_ids
   /// and @ref projection_ids. The plan gives those the query does not output the DELETE_KEY role.
   std::vector<std::size_t> delete_key_primary_indices;
+  /// Output ordinals the plan carries as DICTIONARY32. The reader then returns dictionary columns
+  /// (it can only do so for every flat string column at once); the scan core decodes the others.
+  std::vector<std::size_t> dictionary_outputs;
 
   parquet_ingestible_table_info() = default;
 

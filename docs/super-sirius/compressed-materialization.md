@@ -173,7 +173,7 @@ narrowing always shrinks, so host-tier-backed sidecars are never touched: only s
 pinned-native, and host-tier scans structurally invisible to the pass. A host-tier pin's
 [dictionary carriers](optimizations.md#dictionary-carrier) are the exception and are judged: its
 chunks upload the same compressed bytes whether or not the decode keeps the dictionary. So is a
-fresh DuckDB-native scan stamped `sidecar_from_source_dictionaries`, whose only targets
+fresh Parquet or DuckDB-native scan stamped `sidecar_from_source_dictionaries`, whose only targets
 are dictionary carriers and which has no upload term either. A GPU-tier serve has no
 upload term, so each narrow column must justify itself through the plan.
 
