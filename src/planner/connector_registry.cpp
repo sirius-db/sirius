@@ -56,7 +56,9 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
+#include <typeinfo>
 #include <unordered_set>
 
 extern "C" int32_t duckdb_extension_parquet_describe(duckdb_extension_descriptor*);
@@ -153,14 +155,18 @@ op::scan::certification_result supported_iceberg(op::scan::bound_table_scan cons
 }
 
 // A path scan carries no function_info, like the registered function. A catalog table's scan
-// carries the extension's scan info: accept it only on a binding the extension reports as a
-// catalog table. Lookup still compares the callbacks with the reference definition.
+// carries the extension's scan info: accept that type only, and only on a binding the extension
+// reports as a catalog table. Lookup calls this after the callbacks matched the reference
+// definition, so get_bind_info is the extension's. DuckDB's types cannot read the info's
+// content, and the GPU path does not use it: it reads the binding.
 bool verify_iceberg_binding(duckdb::BaseTableFunction const& function,
                             duckdb::FunctionData const* bind,
                             duckdb::ClientContext& context)
 {
   if (!function.function_info) return true;
   if (!function.get_bind_info || !bind) return false;
+  auto const& info = *function.function_info;
+  if (std::string_view(typeid(info).name()) != "N6duckdb15IcebergScanInfoE") return false;
   duckdb::TableFunctionGetBindInfoInput input(context, const_cast<duckdb::FunctionData*>(bind));
   return function.get_bind_info(input).type == duckdb::ScanType::TABLE;
 }
@@ -828,13 +834,15 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
       }
       return {nullptr, lookup_decline::no_trusted_reference};
     }
-    if (entry.verify_binding && !entry.verify_binding(function, bind, context))
-      return {nullptr, lookup_decline::bind_data_mismatch};
     for (auto const& reference : references) {
       verified_callbacks const callbacks(reference);
       if (!callbacks.matches(function, 0, entry.verify_binding != nullptr)) continue;
       for (auto const& registered : catalog_entry->functions.functions) {
-        if (callbacks.matches(*registered)) return {&entry, lookup_decline::none};
+        if (!callbacks.matches(*registered)) continue;
+        // The hook may call the candidate's callbacks: they are the trusted ones by now.
+        if (entry.verify_binding && !entry.verify_binding(function, bind, context))
+          return {nullptr, lookup_decline::bind_data_mismatch};
+        return {&entry, lookup_decline::none};
       }
     }
     return {nullptr, lookup_decline::callback_mismatch};

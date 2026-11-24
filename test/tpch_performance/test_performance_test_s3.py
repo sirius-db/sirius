@@ -175,10 +175,16 @@ class PerformanceTestS3Tests(unittest.TestCase):
     def test_runs_catalog_setup_before_loading_sirius(self):
         events = []
         con = Mock()
-        con.execute.side_effect = lambda sql: events.append(sql) or con
+        # The setup file is split by DuckDB, not at every ';'.
+        con.extract_statements.side_effect = (
+            benchmark.duckdb.connect().extract_statements
+        )
+        con.execute.side_effect = (
+            lambda sql: events.append(getattr(sql, "query", sql).strip()) or con
+        )
         with tempfile.NamedTemporaryFile("w", suffix=".sql") as setup:
             setup.write(
-                "CREATE SECRET c (TYPE ICEBERG, TOKEN 'synthetic-token');\n"
+                "CREATE SECRET c (TYPE ICEBERG, TOKEN 'synthetic;token'); -- one; two\n"
                 "ATTACH '' AS lake (TYPE ICEBERG, SECRET c);\n"
             )
             setup.flush()
@@ -196,7 +202,7 @@ class PerformanceTestS3Tests(unittest.TestCase):
         # Sirius logs statement text, so the setup file must be done before it loads.
         sirius = events.index("LOAD '/build/sirius.duckdb_extension'")
         self.assertTrue(events[sirius - 1].startswith("ATTACH "))
-        self.assertTrue(any("synthetic-token" in sql for sql in events[:sirius]))
+        self.assertIn("TOKEN 'synthetic;token')", events[sirius - 2])
         self.assertTrue(
             all(
                 sql.startswith("CREATE OR REPLACE VIEW ")

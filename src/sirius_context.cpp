@@ -474,6 +474,16 @@ unique_ptr<QueryResult> SiriusContext::internal_connection::Submit(const string&
   return impl_->connection.Submit(impl_->parse(sql));
 }
 
+void SiriusContext::internal_connection::read_catalog(
+  const std::function<void(ClientContext&)>& read)
+{
+  auto& context = *impl_->connection.context;
+  if (!context.transaction.HasActiveTransaction() || !MetaTransaction::Get(context).IsReadOnly()) {
+    throw InvalidInputException("Sirius internal connection lost its read-only transaction");
+  }
+  context.RunFunctionInTransaction([&] { read(context); });
+}
+
 SiriusContext::internal_connection SiriusContext::open_internal_connection(ClientContext& outer)
 {
   bool read_only = true;

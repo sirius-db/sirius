@@ -77,6 +77,13 @@ class mock_iceberg_rest_catalog {
     _tables["/v1/namespaces/" + schema + "/tables/" + name] = std::move(value);
   }
 
+  /// The table is replaced by @p value once its next loadTable has been answered.
+  void replace_after_next_load(std::string const& schema, std::string const& name, table value)
+  {
+    std::lock_guard lock(_mutex);
+    _replacements["/v1/namespaces/" + schema + "/tables/" + name] = std::move(value);
+  }
+
   [[nodiscard]] std::string uri() const { return "http://127.0.0.1:" + std::to_string(_port); }
   [[nodiscard]] std::size_t load_table_requests() const { return _load_table_requests; }
 
@@ -104,9 +111,12 @@ class mock_iceberg_rest_catalog {
     for (auto const& [key, value] : _vended) {
       config += (config.empty() ? "" : ",") + json_string(key) + ":" + json_string(value);
     }
-    return {200,
-            "{\"metadata-location\":" + json_string(found->second.metadata_location) +
-              ",\"metadata\":" + found->second.metadata_json + ",\"config\":{" + config + "}}"};
+    auto body = "{\"metadata-location\":" + json_string(found->second.metadata_location) +
+                ",\"metadata\":" + found->second.metadata_json + ",\"config\":{" + config + "}}";
+    if (auto replacement = _replacements.extract(path)) {
+      found->second = std::move(replacement.mapped());
+    }
+    return {200, std::move(body)};
   }
 
   void serve()
@@ -145,6 +155,7 @@ class mock_iceberg_rest_catalog {
   std::map<std::string, std::string> _vended;
   std::mutex _mutex;
   std::map<std::string, table> _tables;
+  std::map<std::string, table> _replacements;
   std::atomic<std::size_t> _load_table_requests{0};
   std::atomic<bool> _stop{false};
   int _listener{-1};

@@ -1076,7 +1076,8 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
                         sirius::op::scan::verdict_reason::iceberg_equality_key_unsupported,
                         sirius::op::scan::verdict_reason::iceberg_equality_budget,
                         sirius::op::scan::verdict_reason::iceberg_equality_multi_gpu,
-                        sirius::op::scan::verdict_reason::iceberg_equality_remote}) {
+                        sirius::op::scan::verdict_reason::iceberg_equality_remote,
+                        sirius::op::scan::verdict_reason::iceberg_equality_file_format}) {
       auto index = static_cast<std::size_t>(reason);
       CHECK(after.semantic_declines[index] == before.semantic_declines[index]);
     }
@@ -2114,22 +2115,37 @@ TEST_CASE("iceberg equality deletes are built on the configured GPU rather than 
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
-                 "gpu_execution iceberg - a remote equality delete declines before it is opened",
+                 "gpu_execution iceberg - an equality delete no reader serves declines unopened",
                  "[integration][gpu_execution][iceberg]")
 {
-  // Only the delete file's URI is remote, and nothing exists there. With the fallback off the
-  // refusal is the statement's error, so no reader goes on to open it.
-  auto path = table("iceberg_v2_eq_remote_delete");
-  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
-  auto before = sirius::test::get_transparent_execution_stats(*con);
-  auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(path));
-  REQUIRE(result);
-  REQUIRE(result->HasError());
-  CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("is not a local file"));
-  auto after = sirius::test::get_transparent_execution_stats(*con);
-  auto index = static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_remote);
-  CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
-  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+  // Only the delete file is out of reach, and nothing exists where the manifest puts it: under
+  // a URI no backend reads, or as an Avro file. With the fallback off the refusal is the
+  // statement's error, so no reader goes on to open it.
+  using reason = sirius::op::scan::verdict_reason;
+  struct unread {
+    char const* table;
+    reason declined;
+    char const* text;
+  };
+  for (auto const& [name, declined, text] :
+       {unread{"iceberg_v2_eq_remote_delete",
+               reason::iceberg_equality_remote,
+               "is remote and no Sirius backend reads its URI"},
+        unread{"iceberg_v2_eq_avro_delete",
+               reason::iceberg_equality_file_format,
+               "is stored as AVRO"}}) {
+    INFO(name);
+    sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(table(name)));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring(text));
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    auto index = static_cast<std::size_t>(declined);
+    CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
+    CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,

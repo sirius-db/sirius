@@ -448,10 +448,12 @@ namespace {
 std::shared_ptr<const sirius::op::scan::IcebergDeleteData> load_scan_delete_payload(
   duckdb::ClientContext& context,
   duckdb::SiriusContext& sirius_ctx,
-  std::string const& table_path,
+  sirius::op::scan::iceberg_ingestible_table_info const& info,
   sirius::op::scan::iceberg_delete_discovery const& discovery)
 {
-  auto const& ioctx = sirius_ctx.get_scan_manager().shared_io_ctx();
+  auto const& table_path = info.table_path;
+  auto& scan_manager     = sirius_ctx.get_scan_manager();
+  auto const& ioctx      = scan_manager.shared_io_ctx();
   if (discovery.equality_delete_entries.empty())
     return sirius::op::scan::load_delete_payload(context, table_path, ioctx, discovery);
   auto const spaces =
@@ -465,12 +467,23 @@ std::shared_ptr<const sirius::op::scan::IcebergDeleteData> load_scan_delete_payl
   auto const& space = *spaces.front();
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space.get_device_id()}};
   auto stream = sirius::memory::runtime_stream_pool::acquire(space);
+  // A remote delete file opens with the configuration this statement planned for it. A context
+  // built for a configuration its path has since left belongs to this load, so keep one each.
+  std::unordered_map<std::uint64_t, std::shared_ptr<cucascade::io::ioctx>> planned_ioctxs;
+  auto const remote_ioctx = [&](std::string const& path) -> std::shared_ptr<cucascade::io::ioctx> {
+    auto const planned = info.s3_configs.find(path);
+    if (planned == info.s3_configs.end()) { return nullptr; }
+    auto& io_ctx = planned_ioctxs[planned->second.id];
+    if (!io_ctx) { io_ctx = scan_manager.io_ctx_for(path, &planned->second); }
+    return io_ctx;
+  };
   return sirius::op::scan::load_delete_payload(
     context,
     table_path,
     ioctx,
     discovery,
-    sirius::op::scan::equality_build_resources{stream.get(), space.get_default_allocator()});
+    sirius::op::scan::equality_build_resources{
+      stream.get(), space.get_default_allocator(), remote_ioctx});
 }
 
 //! Build an `iceberg_ingestible_table_info`: the parquet bind data plus the table's delete
@@ -566,15 +579,20 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
       sirius::op::scan::iceberg_files_without_partition_values(context, inventory);
   auto discovery =
     sirius::op::scan::discover_from_manifests(context, info->table_path, std::move(inventory));
-  // A deletion vector is opened by path after planning. Install the credential this statement
-  // resolves for it now, as for the data files.
+  // Deletion vectors and equality-delete files are opened by path after this. Install the
+  // credential this statement resolves for them now, as for the data files.
   for (auto const& dv : discovery.deletion_vector_entries) {
     plan_s3_config(*info, dv.file_path, context, *sirius_ctx);
+  }
+  if (discovery.equality_plan) {
+    for (auto const& file : discovery.equality_plan->files) {
+      plan_s3_config(*info, file.file_path, context, *sirius_ctx);
+    }
   }
   if (supplied_discovery)
     *supplied_discovery = std::move(discovery);
   else
-    info->delete_data = load_scan_delete_payload(context, *sirius_ctx, info->table_path, discovery);
+    info->delete_data = load_scan_delete_payload(context, *sirius_ctx, *info, discovery);
   auto const delete_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - delete_started)
                                 .count();
@@ -845,10 +863,9 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   for (auto& c : scans) {
     if (!c.info->deferred) {
       duckdb::SiriusContext::InternalQueryGuard guard(context);
-      auto started = std::chrono::steady_clock::now();
-      c.info->delete_data =
-        load_scan_delete_payload(context, *sirius_ctx, c.info->table_path, *c.discovery);
-      auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+      auto started        = std::chrono::steady_clock::now();
+      c.info->delete_data = load_scan_delete_payload(context, *sirius_ctx, *c.info, *c.discovery);
+      auto us             = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - started)
                   .count();
       c.scan->read_views->record_delete_preparation(c.scan->contract_id, us);

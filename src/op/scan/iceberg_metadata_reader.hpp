@@ -31,6 +31,7 @@
 #include <duckdb/main/client_context.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -108,11 +109,16 @@ std::unordered_set<std::string> iceberg_files_without_partition_values(
   duckdb::ClientContext&, iceberg_delete_inventory const&);
 
 /// @p expected_table_uuid is checked by iceberg_metadata() when the loaded extension accepts it.
-inventory_result read_delete_inventory(duckdb::ClientContext&,
-                                       std::string const&,
-                                       std::optional<int64_t>,
-                                       std::string_view injection           = {},
-                                       std::string_view expected_table_uuid = {});
+/// When it does not and @p other_table is set, that runs first on the connection that reads the
+/// inventory, in the same transaction, and says why the table resolved there is not the bound
+/// one (empty when it is); a reason fails the read.
+inventory_result read_delete_inventory(
+  duckdb::ClientContext&,
+  std::string const&,
+  std::optional<int64_t>,
+  std::string_view injection                                            = {},
+  std::string_view expected_table_uuid                                  = {},
+  std::function<std::string(duckdb::ClientContext&)> const& other_table = {});
 
 /// Ceilings on the equality deletes one statement loads, charged from the manifests' record
 /// counts and file sizes before any delete file is opened; a table above them is declined. The
@@ -229,6 +235,9 @@ EqualityDeleteGroup build_equality_group(std::vector<int32_t> key_field_ids,
 struct equality_build_resources {
   ::cuda::stream_ref stream;
   rmm::device_async_resource_ref mr;
+  /// The context an `s3://` delete file is opened on, with its statement's credentials. Unset
+  /// or returning null, such a file fails the load.
+  std::function<std::shared_ptr<cucascade::io::ioctx>(std::string const& path)> remote_ioctx = {};
 };
 
 /**
@@ -240,8 +249,8 @@ struct equality_build_resources {
  * table has no deletes" and never "the deletes could not be read" — treating the second as the
  * first drops deletes silently and returns rows the table removed.
  *
- * @param metadata_ioctx Routes the equality-delete parquet and footer reads. Single-GPU is
- *                       sufficient (planning-time reads). Shared because every datasource
+ * @param metadata_ioctx Routes the local equality-delete parquet and footer reads. Single-GPU
+ *                       is sufficient (planning-time reads). Shared because every datasource
  *                       opened on it co-owns it; nullptr throws.
  * @param equality_resources Required when @p discovery has equality deletes; absent throws.
  * The caller supplies discovery from the scan's snapshot-scoped inventory.

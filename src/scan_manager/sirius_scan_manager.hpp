@@ -884,7 +884,9 @@ class sirius_scan_manager {
   [[nodiscard]] std::vector<std::shared_ptr<const pinned_entry>>
   find_pinned_entries_for_parquet_files(std::span<std::string const> resolved_file_paths) const;
 
-  parquet_bind_result describe_parquet(std::string const& uri);
+  /// @p planned, when set, is the S3 configuration to open with instead of the path's current one.
+  parquet_bind_result describe_parquet(std::string const& uri,
+                                       s3_config_snapshot const* planned = nullptr);
 
   /// \brief Pin @p file_paths' column-chunk bytes into the prefetching cache.
   ///
@@ -929,6 +931,14 @@ class sirius_scan_manager {
     return _io_ctx;
   }
 
+  /// The context that serves @p path, for a caller that opens datasources on it itself; null
+  /// when no backend supports the path. @p planned as in @ref create_datasource.
+  [[nodiscard]] std::shared_ptr<cucascade::io::ioctx> io_ctx_for(
+    std::string_view path, s3_config_snapshot const* planned = nullptr)
+  {
+    return ioctx_for_path(path, planned);
+  }
+
   /// Aggregate metadata-cache diagnostics across the default and routed ioctxs.
   [[nodiscard]] cucascade::io::cache::metadata_store::counters metadata_cache_statistics() const;
 
@@ -953,16 +963,23 @@ class sirius_scan_manager {
   ///        early-stop semantics are the backend's (@c rest_ioctx::list_objects_paged).
   ///        @p max_scanned unset → the backend's configured cap
   ///        (@c rest.list_max_scanned); a value overrides it.
+  ///        @p planned, when set, is the S3 configuration to list with instead of the
+  ///        prefix's current one.
   void list_objects_paged(
     std::string const& s3_prefix_uri,
     std::size_t page_size,
     std::function<bool(cucascade::io::rest::s3::list_objects_v2_page const&)> const& sink,
-    std::optional<std::size_t> max_scanned = std::nullopt);
+    std::optional<std::size_t> max_scanned = std::nullopt,
+    s3_config_snapshot const* planned      = nullptr);
 
   /// \brief The configured glob-match cap (@c rest.list_max_matches) for the
   ///        backend @p s3_uri routes to — the glob layer bounds its match set
   ///        with it. Throws a clear error for a non-object-store path.
-  [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
+  [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri,
+                                                s3_config_snapshot const* planned = nullptr);
+
+  /// REST contexts the manager keeps for S3 configurations, in use or idle.
+  [[nodiscard]] std::size_t rest_context_count() const;
 
   /// Resolve only the registered backend type for @p path. This is a planning
   /// query: it does not construct or start an ioctx, open an object, issue a
@@ -1189,7 +1206,8 @@ class sirius_scan_manager {
   /// Returns nullptr when the object store is not configured, i.e. the REST
   /// backend cannot be built. The caller shares ownership for the full LIST so
   /// credential rotation cannot retire the context while a request is in flight.
-  std::shared_ptr<cucascade::io::rest::rest_ioctx> rest_ioctx_for_list(std::string_view path);
+  std::shared_ptr<cucascade::io::rest::rest_ioctx> rest_ioctx_for_list(
+    std::string_view path, s3_config_snapshot const* planned = nullptr);
 
   exec::query_lifecycle_registry& _query_lifecycle;
   scan_manager_config _config;
@@ -1236,6 +1254,20 @@ class sirius_scan_manager {
   };
   std::unordered_map<routed_ioctx_key, std::shared_ptr<cucascade::io::ioctx>, routed_ioctx_key_hash>
     _routed_io_ctxs;
+  /// When each of `_routed_io_ctxs` was last handed out, on `_routed_io_ctx_clock`. Guarded by
+  /// `_routed_io_ctxs_mtx`.
+  std::unordered_map<routed_ioctx_key, std::uint64_t, routed_ioctx_key_hash>
+    _routed_io_ctx_last_use;
+  std::uint64_t _routed_io_ctx_clock = 0;
+  /// A config whose paths are never planned again keeps its context, so a catalog that vends
+  /// new credentials on every load would add one per load. Each holds reactor threads and
+  /// connections; a dropped one is rebuilt, on cold connections, when a path of its is opened.
+  static constexpr std::size_t kMaxIdleRestContexts = 32;
+  /// Removes the least recently used REST contexts that only `_routed_io_ctxs` holds, down to
+  /// `kMaxIdleRestContexts` of them. A read holds its context through its datasource, so none
+  /// in use is removed. Call with `_routed_io_ctxs_mtx` held and destroy the result after
+  /// releasing it: a context joins its reactors when it is destroyed.
+  [[nodiscard]] std::vector<std::shared_ptr<cucascade::io::ioctx>> evict_idle_rest_contexts();
   /// Backends that failed to build, keyed like `_routed_io_ctxs`; the value is
   /// `ioctx_failure::by_configuration`.  A failure the configuration explains is
   /// final for that key: a config snapshot is immutable, so a retry could only

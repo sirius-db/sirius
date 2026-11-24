@@ -282,15 +282,21 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
     sirius_ctx->throw_runtime_unavailable();
   }
 
+  std::optional<sirius::scan_manager::sirius_scan_manager::s3_config_snapshot> planned;
   if (sirius::io::s3::is_s3_path(uri)) {
     auto s3_config = sirius::io::s3::resolve_duckdb_s3_secret(
       context, uri, sirius_ctx->get_config().get_scan_manager_config().object_store);
-    sirius_ctx->get_scan_manager().install_s3_config(uri, std::move(s3_config));
+    planned = sirius_ctx->get_scan_manager().install_s3_config(uri, std::move(s3_config));
+  }
+  if (auto const counters = sirius_ctx->physical_counters();
+      counters->track_units && counters->s3_config_installed_for_testing) {
+    counters->s3_config_installed_for_testing(uri);
   }
 
-  auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
-  return_types     = std::move(bind_result.return_types);
-  names            = StringsToIdentifiers(bind_result.names);
+  auto bind_result =
+    sirius_ctx->get_scan_manager().describe_parquet(uri, planned ? &*planned : nullptr);
+  return_types = std::move(bind_result.return_types);
+  names        = StringsToIdentifiers(bind_result.names);
   return make_uniq<SiriusReadParquetBindData>(
     uri, bind_result.total_num_rows, return_types, IdentifiersToStrings(names));
 }

@@ -841,7 +841,10 @@ def _configure_connection(con, source, gpu_execution, data_source, s3_input, wor
         for extension in ("httpfs", "avro", "iceberg"):
             con.execute(f"LOAD {extension}")
         with open(CATALOG_SETUP_PATH) as f:
-            _execute_multi(con, f.read())
+            # DuckDB splits the file: a ';' inside a quoted value or a comment
+            # ends no statement.
+            for statement in con.extract_statements(f.read()):
+                con.execute(statement).fetchall()
 
     # Load Sirius before registering S3 views. GPU execution stays on while the
     # views bind: sirius_httpfs serves S3 only under gpu_execution=true.

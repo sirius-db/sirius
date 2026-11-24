@@ -211,7 +211,8 @@ enum class verdict_reason : uint16_t {
   iceberg_equality_key_unsupported,  // key is dropped, nested, or of an unsupported type
   iceberg_equality_budget,           // delete set above the plan-time budget
   iceberg_equality_multi_gpu,        // delete tables are built on one device only
-  iceberg_equality_remote,           // a delete file is not on the local file system
+  iceberg_equality_remote,           // a remote delete file has no backend that reads it
+  iceberg_equality_file_format,      // a delete file is not Parquet
   provider_admission_refused
 };
 
@@ -265,6 +266,10 @@ struct physical_check_counters {
   std::function<void(bool, bool)> parquet_positions_for_testing;
   std::function<void()> after_certify_for_testing;
   std::function<void(std::string const&, bool)> iceberg_dv_phase_for_testing;
+  // After a bind or a glob installed the S3 configuration for its path, before it reads.
+  std::function<void(std::string const&)> s3_config_installed_for_testing;
+  // Before an equality-delete file is opened.
+  std::function<void(std::string const&)> iceberg_equality_open_for_testing;
   std::function<void(scan_contract_id, bool)> iceberg_preparation_route_for_testing;
   std::function<void(std::string_view, scan_manager::admission_decision const&)>
     iceberg_statement_route_for_testing;
@@ -274,6 +279,7 @@ struct physical_check_counters {
   // Stands in for the number of configured GPUs at the equality-delete plan gate.
   std::optional<std::size_t> equality_gpu_count_for_testing;
   std::optional<std::size_t> equality_files_per_data_file_limit_for_testing;
+  std::optional<std::size_t> idle_rest_context_limit_for_testing;
   std::function<void(scan_manager::scan_envelope&)> preparation_envelope_for_testing;
   void parquet_phase(std::string const& file, bool footer) const
   {

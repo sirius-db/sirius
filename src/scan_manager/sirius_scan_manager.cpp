@@ -1542,22 +1542,25 @@ sirius_scan_manager::~sirius_scan_manager()
   }
 }
 
-parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
+parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri,
+                                                          s3_config_snapshot const* planned)
 {
   // Footer-probe only when we will actually read + parse the footer.  On a warm
   // re-bind the metadata_store already holds the parsed footer, so a suffix GET
   // would download footer bytes we won't reuse — a plain HEAD resolves the size.
   auto const cache_key     = normalize_path(uri);
-  auto const io_ctx        = ioctx_for_path(uri);
+  auto const io_ctx        = ioctx_for_path(uri, planned);
   bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
   auto const hint          = footer_cached ? cucascade::io::open_hint::generic
                                            : cucascade::io::open_hint::parquet_footer_probe;
 
-  auto datasource = create_datasource(uri, hint);
-  if (!datasource) {
+  if (!io_ctx) {
     throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
                              uri);
   }
+  // Opened on the context resolved above, so a planned configuration builds at most one.
+  std::shared_ptr<cucascade::io::datasource> datasource =
+    sirius::io::open_datasource(io_ctx, cache_key, hint);
 
   // Reuse a previously parsed footer when present — a prior bind or scan of the
   // same file parks it in the ioctx metadata store, which lives for the ioctx's
@@ -2380,7 +2383,8 @@ void sirius_scan_manager::list_objects_paged(
   std::string const& s3_prefix_uri,
   std::size_t page_size,
   std::function<bool(cucascade::io::rest::s3::list_objects_v2_page const&)> const& sink,
-  std::optional<std::size_t> max_scanned)
+  std::optional<std::size_t> max_scanned,
+  s3_config_snapshot const* planned)
 {
   // Hand-split rather than cucascade::io::parse — a LIST prefix URI legitimately
   // has an EMPTY key part (bucket-root glob: "s3://bucket/"), which parse()
@@ -2400,7 +2404,7 @@ void sirius_scan_manager::list_objects_paged(
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: malformed prefix URI '" +
                              s3_prefix_uri + "'");
   }
-  auto rest = rest_ioctx_for_list(s3_prefix_uri);
+  auto rest = rest_ioctx_for_list(s3_prefix_uri, planned);
   if (!rest) {
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -2408,14 +2412,15 @@ void sirius_scan_manager::list_objects_paged(
   rest->list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
 }
 
-std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
+std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri,
+                                                     s3_config_snapshot const* planned)
 {
   constexpr std::string_view k_scheme = "s3://";
   if (s3_uri.size() <= k_scheme.size() || s3_uri.compare(0, k_scheme.size(), k_scheme) != 0) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: malformed URI '" + s3_uri +
                              "'");
   }
-  auto rest = rest_ioctx_for_list(s3_uri);
+  auto rest = rest_ioctx_for_list(s3_uri, planned);
   if (!rest) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -2480,7 +2485,8 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
 
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find({type, config_id}); it != _routed_io_ctxs.end()) {
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
+      _routed_io_ctx_last_use[cache_key] = ++_routed_io_ctx_clock;
       return it->second;
     }
   }
@@ -2503,7 +2509,8 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   }
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find({type, config_id}); it != _routed_io_ctxs.end()) {
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
+      _routed_io_ctx_last_use[cache_key] = ++_routed_io_ctx_clock;
       return it->second;
     }
   }
@@ -2542,10 +2549,51 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   _failed_io_ctxs.erase(cache_key);
   init_cache_for(*io_ctx);
   if (!cached) { return std::move(io_ctx); }
+  std::shared_ptr<cucascade::io::ioctx> kept;
+  std::vector<std::shared_ptr<cucascade::io::ioctx>> retired;
+  {
+    std::lock_guard lk{_routed_io_ctxs_mtx};
+    kept = _routed_io_ctxs.emplace(cache_key, std::move(io_ctx)).first->second;
+    _routed_io_ctx_last_use[cache_key] = ++_routed_io_ctx_clock;
+    // The contexts grow in number only here.
+    if (type == cucascade::io::io_context_type::restful) { retired = evict_idle_rest_contexts(); }
+  }
+  build_lk.unlock();
+  return kept;
+}
+
+std::vector<std::shared_ptr<cucascade::io::ioctx>> sirius_scan_manager::evict_idle_rest_contexts()
+{
+  auto const limit = _physical_counters && _physical_counters->track_units &&
+                         _physical_counters->idle_rest_context_limit_for_testing
+                       ? *_physical_counters->idle_rest_context_limit_for_testing
+                       : kMaxIdleRestContexts;
+  std::vector<std::pair<std::uint64_t, routed_ioctx_key>> idle;
+  for (auto const& [key, io_ctx] : _routed_io_ctxs) {
+    if (key.type == cucascade::io::io_context_type::restful && io_ctx.use_count() == 1) {
+      idle.emplace_back(_routed_io_ctx_last_use[key], key);
+    }
+  }
+  std::vector<std::shared_ptr<cucascade::io::ioctx>> retired;
+  if (idle.size() <= limit) { return retired; }
+  std::ranges::sort(idle, {}, [](auto const& entry) { return entry.first; });
+  idle.resize(idle.size() - limit);
+  for (auto const& [last_use, key] : idle) {
+    auto const it = _routed_io_ctxs.find(key);
+    retired.push_back(std::move(it->second));
+    _routed_io_ctxs.erase(it);
+    _routed_io_ctx_last_use.erase(key);
+  }
+  SIRIUS_LOG_DEBUG("[sirius_scan_manager] dropped {} idle REST context(s)", retired.size());
+  return retired;
+}
+
+std::size_t sirius_scan_manager::rest_context_count() const
+{
   std::lock_guard lk{_routed_io_ctxs_mtx};
-  auto [it, inserted] =
-    _routed_io_ctxs.emplace(routed_ioctx_key{type, config_id}, std::move(io_ctx));
-  return it->second;
+  return static_cast<std::size_t>(std::ranges::count_if(_routed_io_ctxs, [](auto const& entry) {
+    return entry.first.type == cucascade::io::io_context_type::restful;
+  }));
 }
 
 sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
@@ -2625,9 +2673,9 @@ bool sirius_scan_manager::init_cache_for(cucascade::io::ioctx& io_ctx)
 }
 
 std::shared_ptr<cucascade::io::rest::rest_ioctx> sirius_scan_manager::rest_ioctx_for_list(
-  std::string_view path)
+  std::string_view path, s3_config_snapshot const* planned)
 {
-  auto io_ctx = ioctx_for_type(cucascade::io::io_context_type::restful, path);
+  auto io_ctx = ioctx_for_type(cucascade::io::io_context_type::restful, path, planned);
   return std::dynamic_pointer_cast<cucascade::io::rest::rest_ioctx>(io_ctx);
 }
 
@@ -2647,6 +2695,7 @@ std::optional<sirius_scan_manager::s3_config_snapshot> sirius_scan_manager::inst
   if (it != _routed_io_ctxs.end()) {
     retired.push_back(std::move(it->second));
     _routed_io_ctxs.erase(it);
+    _routed_io_ctx_last_use.erase(key);
   }
   return installed;
 }

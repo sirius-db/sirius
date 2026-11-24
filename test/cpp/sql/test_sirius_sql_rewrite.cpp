@@ -187,6 +187,9 @@ TEST_CASE("Statements whose literals are credentials are recognised by kind", "[
   CHECK(credential_statement_kind("create or replace\n persistent secret s (TYPE S3)") ==
         "CREATE SECRET");
   CHECK(credential_statement_kind("-- setup\n/* lake */ ATTACH '' AS c (TOKEN 'x')") == "ATTACH");
+  // DuckDB nests block comments, so the first "*/" does not end this one.
+  CHECK(credential_statement_kind("/* a /* b */ c */ CREATE SECRET s (TYPE S3, SECRET 'x')") ==
+        "CREATE SECRET");
   // Everything else keeps its text in the log.
   CHECK(credential_statement_kind("CREATE TABLE secret (attach INT)").empty());
   CHECK(credential_statement_kind("SELECT 'ATTACH', secret FROM t").empty());

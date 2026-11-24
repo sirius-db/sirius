@@ -65,6 +65,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -1578,7 +1579,103 @@ TEST_CASE("S3 planned read opens with its own config after the path's is replace
   std::weak_ptr<cucascade::io::ioctx> context = opened->io_ctx();
   opened.reset();
   CHECK(context.expired());
+
+  // The bind-time footer read and the LIST of a glob take the caller's config the same way.
+  CHECK_THROWS(manager.describe_parquet(path));
+  CHECK(manager.describe_parquet(path, &*planned).total_num_rows == 25);
+  auto const pattern = s3_uri(env->bucket, "parquet/nation*.parquet");
+  auto const listed  = manager.install_s3_config(pattern, own);
+  REQUIRE(listed);
+  manager.install_s3_config(pattern, other);
+  CHECK_THROWS(sirius::io::s3::expand_glob(pattern, manager));
+  CHECK_FALSE(sirius::io::s3::expand_glob(pattern, manager, std::nullopt, &*listed).empty());
+  manager.install_s3_config(pattern, fixture.config_env.object_store());
   manager.install_s3_config(path, fixture.config_env.object_store());
+
+  // The same through SQL. Between the bind's or the glob's install and its read, another
+  // connection resolves the path to the credentials that cannot read it.
+  set_gpu_execution(fixture.con, true);
+  auto const glob_query =
+    "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const glob_rows = collect_rows(*require_query_ok(fixture.con, glob_query));
+  auto const counters  = sirius_ctx->physical_counters();
+  std::vector<std::string> replaced;
+  counters->s3_config_installed_for_testing = [&](std::string const& installed) {
+    replaced.push_back(installed);
+    manager.install_s3_config(installed, other);
+  };
+  auto bound = fixture.con.Query("SELECT count(*) FROM " + s3_sirius_parquet_scan(*env, "nation"));
+  auto globbed                              = fixture.con.Query(glob_query);
+  counters->s3_config_installed_for_testing = {};
+  for (auto const& installed : replaced)
+    manager.install_s3_config(installed, fixture.config_env.object_store());
+  CHECK(std::ranges::count(replaced, path) > 0);
+  CHECK(std::ranges::count(replaced, s3_uri(env->bucket, "glob/multi/nation_*.parquet")) > 0);
+  REQUIRE_FALSE(bound->HasError());
+  CHECK(collect_rows(*bound) == std::vector<std::vector<std::string>>{{"25"}});
+  INFO((globbed->HasError() ? globbed->GetError() : ""));
+  REQUIRE_FALSE(globbed->HasError());
+  CHECK(collect_rows(*globbed) == glob_rows);
+}
+
+TEST_CASE("S3 idle REST contexts are bounded while credentials rotate",
+          "[s3][integration][filesystem][secret][rotation]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto sirius_ctx =
+    fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& manager = sirius_ctx->get_scan_manager();
+  // A planned query latches the counters' test hooks.
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con,
+                   "SELECT count(*) FROM read_parquet(" +
+                     sql_quote(s3_uri(env->bucket, "parquet/nation.parquet")) + ")");
+  auto const counters = sirius_ctx->physical_counters();
+  struct reset_limit {
+    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
+    ~reset_limit() { counters->idle_rest_context_limit_for_testing.reset(); }
+  } reset{counters};
+  counters->idle_rest_context_limit_for_testing = 1;
+
+  // Four configurations that all reach the store, each for a path of its own that is opened
+  // once and not again: what a catalog vending new credentials on every load leaves behind.
+  using signing = cucascade::io::object_store_config::signing_mode;
+  std::vector<cucascade::io::object_store_config> rotated;
+  for (auto const mode : {signing::presigned, signing::header}) {
+    for (bool const verify : {true, false}) {
+      rotated.push_back(fixture.config_env.object_store());
+      rotated.back().s3_signing_mode = mode;
+      rotated.back().tls_verify      = verify;
+    }
+  }
+  std::array<std::uint8_t, 1> const byte{0};
+  auto const open = [&](std::size_t index) {
+    auto const key = "rotation/object-" + std::to_string(index);
+    REQUIRE(sirius::test::put_s3_test_object(key, byte));
+    auto const path = s3_uri(env->bucket, key);
+    manager.install_s3_config(path, rotated.at(index));
+    auto source = manager.create_datasource(path);
+    REQUIRE(source);
+    return source;
+  };
+
+  auto const in_flight                           = open(0);
+  std::weak_ptr<cucascade::io::ioctx> first_idle = open(1)->io_ctx();
+  open(2);
+  open(3);
+  // The read in flight, the context just built, and one idle context. Without the bound every
+  // configuration keeps its own.
+  CHECK(manager.rest_context_count() <= 3);
+  CHECK(first_idle.expired());
+  // The read in flight kept its context in the manager: the same one serves its path again.
+  CHECK(manager.create_datasource(s3_uri(env->bucket, "rotation/object-0"))->io_ctx() ==
+        in_flight->io_ctx());
+  // A dropped context is rebuilt when one of its paths is opened again.
+  CHECK(manager.create_datasource(s3_uri(env->bucket, "rotation/object-1")));
 }
 
 TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
@@ -4506,22 +4603,26 @@ TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credenti
       return;
   }
 
-  // The committed local table, relocated under the bucket by rewriting its paths.
+  // A committed local table, relocated under the bucket by rewriting its paths and uploaded.
+  auto const relocate = [&](std::string const& table, fs::path const& out, std::string const& to) {
+    auto const command = "python3 -B test/cpp/integration/data/generate_remote_table_fixture.py " +
+                         table + " '" + out.string() + "' '" + to + "'";
+    REQUIRE(std::system(command.c_str()) == 0);
+    for (auto const& entry : fs::recursive_directory_iterator(out)) {
+      if (!entry.is_regular_file()) continue;
+      auto const key = to.substr(("s3://" + env->bucket + "/").size()) + "/" +
+                       fs::relative(entry.path(), out).generic_string();
+      if (!sirius::test::put_s3_test_object(key, read_binary_file(entry.path()))) return false;
+    }
+    return true;
+  };
   auto const source = std::string{"test/cpp/integration/data/iceberg_v1"};
-  auto const prefix = std::string{"catalog-form/fruit"};
-  auto const remote = "s3://" + env->bucket + "/" + prefix;
+  auto const remote = "s3://" + env->bucket + "/catalog-form/fruit";
   sirius::test::scratch_dir directory("s3_catalog");
-  auto const command = "python3 -B test/cpp/integration/data/generate_remote_table_fixture.py " +
-                       source + " '" + directory.path().string() + "' '" + remote + "'";
-  REQUIRE(std::system(command.c_str()) == 0);
-  for (auto const& entry : fs::recursive_directory_iterator(directory.path())) {
-    if (!entry.is_regular_file()) continue;
-    auto const key = prefix + "/" + fs::relative(entry.path(), directory.path()).generic_string();
-    if (sirius::test::s3::skip_or_fail_unless(
-          sirius::test::put_s3_test_object(key, read_binary_file(entry.path())),
-          "managed S3 backend required for the catalog table upload"))
-      return;
-  }
+  if (sirius::test::s3::skip_or_fail_unless(
+        relocate(source, directory.path(), remote),
+        "managed S3 backend required for the catalog table upload"))
+    return;
 
   std::map<std::string, std::string> vended{{"s3.access-key-id", env->access_key},
                                             {"s3.secret-access-key", env->secret_key},
@@ -4546,7 +4647,8 @@ TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credenti
     // secret is more specific and must win, for the statement and for connections reading on
     // its behalf.
     require_query_ok(con,
-                     "CREATE SECRET broad (TYPE S3, KEY_ID 'wrong', SECRET 'wrong', REGION " +
+                     "/* setup /* nested */ still a comment */ CREATE SECRET broad (TYPE S3, "
+                     "KEY_ID 'wrong', SECRET 'synthetic-credential-5e1f', REGION " +
                        sql_quote(env->region) + ", ENDPOINT " + sql_quote(env->endpoint) +
                        ", URL_STYLE 'path', USE_SSL " +
                        (env->endpoint.rfind("https://", 0) == 0 ? "true" : "false") + ")");
@@ -4560,7 +4662,7 @@ TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credenti
     CHECK(logged("SQL: ATTACH <text withheld"));
     CHECK(logged("SQL: CREATE SECRET <text withheld"));
     CHECK_FALSE(logged("AUTHORIZATION_TYPE"));
-    CHECK_FALSE(logged("KEY_ID"));
+    CHECK_FALSE(logged("synthetic-credential-5e1f"));
   }
 
   using rows_t = std::vector<std::vector<std::string>>;
@@ -4682,6 +4784,109 @@ TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credenti
     CHECK(cpu_rows("test/cpp/integration/data/iceberg_v3_deletion_vector") == kept);
   }
 
+  // Equality deletes on S3. Both delete files are read while planning, with the credentials
+  // this statement resolved for them.
+  {
+    auto const eq_source = std::string{"test/cpp/integration/data/iceberg_v2_eq_multi_delete_file"};
+    auto const eq_remote = "s3://" + env->bucket + "/catalog-form-eq";
+    sirius::test::scratch_dir eq_directory("s3_catalog_eq");
+    REQUIRE(relocate(eq_source, eq_directory.path(), eq_remote));
+    // No manifest lists this object. Opening it would fail the statement.
+    std::array<std::uint8_t, 4> const not_parquet{'P', 'A', 'R', '1'};
+    REQUIRE(sirius::test::put_s3_test_object("catalog-form-eq/data/delete-eq-unlisted.parquet",
+                                             not_parquet));
+    auto const eq_metadata = [&](char const* name) {
+      return sirius::test::mock_iceberg_rest_catalog::table{
+        eq_remote + "/metadata/" + name, read_text_file(eq_directory.path() / "metadata" / name)};
+    };
+    catalog.put("ns", "eq", eq_metadata("v1.metadata.json"));
+    rows_t const kept{{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}};
+    auto const eq_query = std::string{"SELECT fruit, count FROM lake.ns.eq ORDER BY count"};
+    auto const eq_data =
+      eq_remote + "/data/00000-0-e5f6a7b8-0005-0005-0005-000000000001-00001.parquet";
+    auto const eq_delete =
+      std::string{"data/delete-eq-1-e5f6a7b8-0005-0005-0005-000000000002-00001.parquet"};
+    auto const remote_declines = [&] {
+      return stats().semantic_declines[static_cast<size_t>(
+        sirius::op::scan::verdict_reason::iceberg_equality_remote)];
+    };
+
+    // Just before each delete file is opened, a second connection resolves its path to the
+    // broad secret, which cannot read it. The statement opens it with what it planned with.
+    auto const sirius_ctx =
+      con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx);
+    auto const counters = sirius_ctx->physical_counters();
+    duckdb::Connection other(db);
+    std::vector<std::string> replaced_with;
+    counters->iceberg_equality_open_for_testing = [&](std::string const& path) {
+      auto config = sirius::io::s3::resolve_duckdb_s3_secret(*other.context, path, {});
+      replaced_with.push_back(config.access_key);
+      sirius_ctx->get_scan_manager().install_s3_config(path, std::move(config));
+    };
+    auto const before          = stats();
+    auto const declines_before = remote_declines();
+    auto const eq_loads_before = catalog.load_table_requests();
+    expect_gpu(eq_query, kept, 1, eq_data);
+    counters->iceberg_equality_open_for_testing = {};
+    CHECK(replaced_with == std::vector<std::string>{"wrong", "wrong"});
+    CHECK(stats().iceberg_delete_payload_loads == before.iceberg_delete_payload_loads + 2);
+    CHECK(remote_declines() == declines_before);
+    // The binding and the delete lookup each ask the catalog once. Checking that the lookup
+    // resolved the bound table asks it nothing more.
+    CHECK(catalog.load_table_requests() - eq_loads_before == 2);
+    CHECK(cpu_rows(eq_source) == kept);
+
+    // The path form reads the same files with a static secret.
+    require_query_ok(con,
+                     "CREATE SECRET eq_static (TYPE S3, KEY_ID " + sql_quote(env->access_key) +
+                       ", SECRET " + sql_quote(env->secret_key) + ", REGION " +
+                       sql_quote(env->region) + ", ENDPOINT " + sql_quote(env->endpoint) +
+                       ", URL_STYLE 'path', USE_SSL " +
+                       (env->endpoint.rfind("https://", 0) == 0 ? "true" : "false") + ", SCOPE " +
+                       sql_quote(eq_remote + "/") + ")");
+    expect_gpu("SELECT fruit, count FROM iceberg_scan('" + eq_remote +
+                 "/metadata/v1.metadata.json') ORDER BY count",
+               kept,
+               1,
+               eq_data);
+    require_query_ok(con, "DROP SECRET eq_static");
+
+    // A delete file that is not the size its manifest records is refused before its keys are
+    // decoded. The statement fails: the rows that file removes are not returned.
+    auto const intact = read_binary_file(eq_directory.path() / eq_delete);
+    REQUIRE(sirius::test::put_s3_test_object("catalog-form-eq/" + eq_delete,
+                                             std::span(intact).first(intact.size() - 1)));
+    auto truncated = con.Query(eq_query);
+    REQUIRE(truncated);
+    REQUIRE(truncated->HasError());
+    CHECK(truncated->GetError().find("size differs from its manifest entry") != std::string::npos);
+    REQUIRE(sirius::test::put_s3_test_object("catalog-form-eq/" + eq_delete, intact));
+    expect_gpu(eq_query, kept, 1, eq_data);
+
+    // The table replaced under its name once the statement has bound it: another table UUID, a
+    // snapshot of the same ID over the same data file, and no deletes. The delete lookup
+    // resolves the name to the replacement on its own connection. Its inventory would return
+    // the rows the bound table deleted, so the statement is refused instead.
+    auto const unverified = static_cast<size_t>(sirius::op::scan::verdict_reason::evidence_missing);
+    catalog.replace_after_next_load("ns", "eq", eq_metadata("replaced.metadata.json"));
+    auto const before_replaced = stats();
+    auto replaced              = con.Query(eq_query);
+    auto const after_replaced  = stats();
+    REQUIRE(replaced);
+    REQUIRE(replaced->HasError());
+    CHECK(replaced->GetError().find("Table UUID mismatch") != std::string::npos);
+    CHECK(after_replaced.semantic_declines[unverified] ==
+          before_replaced.semantic_declines[unverified] + 1);
+    CHECK(after_replaced.executions == before_replaced.executions);
+    // Bound afresh, the replacement is a table of its own, without deletes.
+    expect_gpu(
+      eq_query,
+      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}},
+      1,
+      eq_data);
+  }
+
   // An internal connection reads by path with the secret of the statement that opened it; an
   // ordinary second connection has no credential for the same path.
   auto const manifest = remote + "/metadata/a1b2c3d4-0001-0001-0001-000000000002-m0.avro";
@@ -4727,6 +4932,23 @@ TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credenti
   get.function.get_table_entry = nullptr;
   CHECK(sirius::planner::lookup_connector(get, *con.context) == nullptr);
   get.function.get_table_entry = table_entry;
+  // A callback that is not the extension's is compared with the registered one, never called.
+  static int foreign_bind_info_calls = 0;
+  auto const bind_info               = get.function.get_bind_info;
+  get.function.get_bind_info         = [](duckdb::TableFunctionGetBindInfoInput&) {
+    ++foreign_bind_info_calls;
+    return duckdb::BindInfo(duckdb::ScanType::TABLE);
+  };
+  CHECK(sirius::planner::lookup_connector(get, *con.context) == nullptr);
+  CHECK(foreign_bind_info_calls == 0);
+  get.function.get_bind_info = bind_info;
+  // Scan info of another type on a genuine table binding: the scan kind alone would accept it.
+  struct foreign_info : duckdb::TableFunctionInfo {};
+  auto const scan_info       = get.function.function_info;
+  get.function.function_info = duckdb::make_shared_ptr<foreign_info>();
+  CHECK(sirius::planner::lookup_connector(get, *con.context) == nullptr);
+  get.function.function_info = scan_info;
+  CHECK(sirius::planner::lookup_connector(get, *con.context) != nullptr);
   logical.reset();
   con.Rollback();
   con.BeginTransaction();
@@ -4737,8 +4959,7 @@ TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credenti
     node = node->children.front().get();
   auto& path_get = node->Cast<duckdb::LogicalGet>();
   CHECK(sirius::planner::lookup_connector(path_get, *con.context) != nullptr);
-  struct foreign_info : duckdb::TableFunctionInfo {};
-  path_get.function.function_info = duckdb::make_shared_ptr<foreign_info>();
+  path_get.function.function_info = scan_info;
   CHECK(sirius::planner::lookup_connector(path_get, *con.context) == nullptr);
   by_path_plan.reset();
   con.Rollback();

@@ -17,13 +17,17 @@
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -61,6 +65,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -85,13 +90,18 @@ pre_decline iceberg_decline(scan_reason reason,
   return {verdict, reason, "iceberg_scan declines the GPU scan path: " + std::move(text)};
 }
 
-bool names_remote_object(std::string const& path)
+// The scheme of @p path when it names a remote object, else nullopt.
+std::optional<std::string> remote_scheme(std::string const& path)
 {
   try {
-    return cucascade::io::parse(path).scheme != "file";
+    auto scheme = cucascade::io::parse(path).scheme;
+    if (scheme == "file") { return std::nullopt; }
+    return scheme;
   } catch (std::invalid_argument const&) {
     // A bare relative path is not a URI; only an explicit scheme marker makes one remote.
-    return path.find("://") != std::string::npos;
+    auto const marker = path.find("://");
+    if (marker == std::string::npos) { return std::nullopt; }
+    return path.substr(0, marker);
   }
 }
 
@@ -117,6 +127,18 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
       "GPU only");
   }
 
+  // The spec also allows Avro and ORC delete files. The format is in the inventory, so no
+  // manifest or delete file is opened to find out.
+  for (auto const& entry : inventory.entries) {
+    if (entry.content == "EQUALITY_DELETES" &&
+        !duckdb::StringUtil::CIEquals(entry.file_format, "parquet")) {
+      return iceberg_decline(scan_reason::iceberg_equality_file_format,
+                             "equality delete '" + entry.file_path + "' is stored as " +
+                               entry.file_format +
+                               "; the GPU scan path reads Parquet equality deletes only");
+    }
+  }
+
   auto const files_limit =
     counters && counters->track_units && counters->equality_files_per_data_file_limit_for_testing
       ? *counters->equality_files_per_data_file_limit_for_testing
@@ -127,13 +149,16 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
   } catch (op::scan::equality_plan_error const& e) {
     return iceberg_decline(scan_reason::iceberg_equality_plan_unproven, e.what());
   }
-  // Delete files are opened on the scan manager's local I/O context.
+  // A remote delete file is read through the REST backend. Whether one serves it is decided
+  // from the URI and the registered backends, without building a context or opening anything.
   for (auto const& file : plan.files) {
-    if (names_remote_object(file.file_path)) {
-      return iceberg_decline(scan_reason::iceberg_equality_remote,
-                             "equality delete '" + file.file_path +
-                               "' is not a local file; the GPU scan path reads equality "
-                               "deletes from the local file system only");
+    auto const scheme = remote_scheme(file.file_path);
+    if (!scheme) { continue; }
+    auto const backend = sirius_ctx.get_scan_manager().planning_io_backend(file.file_path);
+    if (*scheme != "s3" || backend != cucascade::io::io_context_type::restful) {
+      return iceberg_decline(
+        scan_reason::iceberg_equality_remote,
+        "equality delete '" + file.file_path + "' is remote and no Sirius backend reads its URI");
     }
   }
 
@@ -231,6 +256,7 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
   std::string_view injection)
 {
   std::string table_path;
+  std::optional<duckdb::QualifiedName> catalog_name;
   bool const catalog_table = op.parameters.empty() || op.parameters.front().IsNull();
   if (catalog_table) {
     // A catalog table's scan has no path argument. Address the table by its quoted qualified
@@ -252,6 +278,7 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
     table_path = quoted(table->ParentCatalog().GetName().GetIdentifierName()) + "." +
                  quoted(table->ParentSchema().name.GetIdentifierName()) + "." +
                  quoted(table->name.GetIdentifierName());
+    catalog_name.emplace(table->ParentCatalog().GetName(), table->ParentSchema().name, table->name);
   } else {
     try {
       // GetValue<string>() calls ToString() even for INTEGER at this DuckDB pin.
@@ -379,12 +406,37 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
       }
       ~probe_timer() { stop(); }
     } timer{delete_time_us};
+    // The catalog resolves the name again on the connection that reads the inventory, and the
+    // first lookup pins the table for that transaction. The table bound there under the same
+    // name is therefore the one the inventory is read from: its UUID must be the bound one.
+    std::function<std::string(duckdb::ClientContext&)> other_table;
+    if (catalog_name && bound) {
+      other_table = [&](duckdb::ClientContext& inner) -> std::string {
+        duckdb::EntryLookupInfo lookup(duckdb::CatalogType::TABLE_ENTRY, *catalog_name);
+        auto entry = duckdb::Catalog::GetEntry(inner, lookup, duckdb::OnEntryNotFound::RETURN_NULL);
+        std::optional<op::scan::iceberg_snapshot_binding> resolved;
+        if (entry && entry->type == duckdb::CatalogType::TABLE_ENTRY) {
+          duckdb::unique_ptr<duckdb::FunctionData> bind;
+          auto const function =
+            entry->Cast<duckdb::TableCatalogEntry>().GetScanFunction(inner, bind, lookup);
+          if (lookup_connector(function, bind.get(), inner)) {
+            resolved = op::scan::capture_iceberg_snapshot(
+              duckdb::BoundTableFunction(function), bind.get(), inner);
+          }
+        }
+        if (resolved && resolved->table_uuid == bound->table_uuid) { return {}; }
+        return "Table UUID mismatch: " + table_path + " was bound as table " + bound->table_uuid +
+               " and now resolves to " +
+               (resolved ? "table " + resolved->table_uuid : "a table whose identity is unknown");
+      };
+    }
     auto result = op::scan::read_delete_inventory(
       context,
       table_path,
       snapshot_id,
       injection,
-      bound ? std::string_view(bound->table_uuid) : std::string_view{});
+      bound ? std::string_view(bound->table_uuid) : std::string_view{},
+      other_table);
     auto const n_delete_files = result.equality_count;
     if (n_delete_files > 0) {
       if (!result.inventory) {
