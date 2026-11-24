@@ -107,6 +107,15 @@ FROM sirius_gateway_run('SELECT sum(i) FROM range(1000000000000) r(i)');
 ----
 timed out
 
+# A timeout too long for the clock is clamped, not wrapped into the past.
+statement ok
+SET sirius_gateway_statement_timeout = 18446744073709551615;
+
+query I
+FROM sirius_gateway_run('SELECT 1');
+----
+1
+
 statement ok
 SET sirius_gateway_statement_timeout = 0;
 
