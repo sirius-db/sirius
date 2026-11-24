@@ -67,7 +67,15 @@ def stage_config(base, stage):
     return doc
 
 
-def selected_stages(order, all_on_uncompressed=False):
+def selected_stages(order, all_on_uncompressed=False, compressed_pin_only=False):
+    if all_on_uncompressed and compressed_pin_only:
+        raise ValueError("Select only one standalone case")
+    if compressed_pin_only:
+        stage = stage_spec(0, order)
+        stage.update(
+            stage=0, gb300_stage=6, label="compressed_pin_only", compressed_pin=True
+        )
+        return [stage]
     if all_on_uncompressed:
         stage = stage_spec(5, order)
         stage.update(
@@ -92,10 +100,16 @@ def main():
     parser.add_argument(
         "--order", choices=("build-first", "type-first"), default="build-first"
     )
-    parser.add_argument(
+    cases = parser.add_mutually_exclusive_group()
+    cases.add_argument(
         "--all-on-uncompressed",
         action="store_true",
         help="Run only the all-on case with compression=false on every host pin",
+    )
+    cases.add_argument(
+        "--compressed-pin-only",
+        action="store_true",
+        help="Run only compressed host pinning, with the other four switches off",
     )
     parser.add_argument(
         "--resume",
@@ -103,13 +117,16 @@ def main():
         help="Collect existing workers without repeating them",
     )
     args = parser.parse_args()
-    stages = selected_stages(args.order, args.all_on_uncompressed)
+    stages = selected_stages(
+        args.order, args.all_on_uncompressed, args.compressed_pin_only
+    )
     if args.dry_run:
         print(
             json.dumps(
                 dict(
                     order=args.order,
                     all_on_uncompressed=args.all_on_uncompressed,
+                    compressed_pin_only=args.compressed_pin_only,
                     stages=stages,
                     queries=list(range(1, 23)),
                     iterations=1,
@@ -163,6 +180,7 @@ def main():
         prior = json.loads((root / "preflight.json").read_text())
         prior_plan = json.loads((root / "plan.json").read_text())
         assert prior_plan.get("all_on_uncompressed", False) == args.all_on_uncompressed
+        assert prior_plan.get("compressed_pin_only", False) == args.compressed_pin_only
         assert prior_plan.get("order", "build-first") == args.order
         assert (
             prior["input_hashes_verified"]
@@ -210,6 +228,7 @@ def main():
         dict(
             order=args.order,
             all_on_uncompressed=args.all_on_uncompressed,
+            compressed_pin_only=args.compressed_pin_only,
             stages=stages,
             iterations=1,
             queries=list(range(1, 23)),
@@ -405,9 +424,13 @@ def main():
             source_commit=guide.PIN,
             scale_factor=1000,
             protocol=(
-                "GB300 all-on except compressed pinning"
-                if args.all_on_uncompressed
-                else "corrected GB300 " + args.order
+                "GB300 compressed pinning only"
+                if args.compressed_pin_only
+                else (
+                    "GB300 all-on except compressed pinning"
+                    if args.all_on_uncompressed
+                    else "corrected GB300 " + args.order
+                )
             ),
             totals=totals,
             proofs=rows,

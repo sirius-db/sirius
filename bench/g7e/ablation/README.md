@@ -5,6 +5,8 @@ The November 23 [BUILD_PROBE-first results](results/20261123/RESULTS.md) and
 complete stages, partial sums and allocation failures separately.
 The [all-on except compressed pinning case](results/20261123-all-on-uncompressed/RESULTS.md)
 keeps the other four switches enabled and makes every pin explicitly uncompressed.
+The [compressed-pinning-only case](results/20261123-compressed-pin-only/RESULTS.md)
+enables compressed host pins while explicitly disabling the other four switches.
 
 This supports the corrected cumulative orders from the
 [GB300 study](../../gb300/ablation/RESULTS.md#corrected-build_probe-first-comparison)
@@ -33,6 +35,13 @@ matches the all-on compressed stage; only the per-call pin compression policy
 differs. The fused switch remains enabled, but there is no compressed pinned
 input for fused decode to operate on. Use a new output directory. Compare only
 matching completed queries if raw pins exceed host capacity.
+
+Pass `--compressed-pin-only` for a single stage with only compressed host
+pinning enabled (GB300 stage 6). Type narrowing, BUILD_PROBE, dynamic filtering
+and fused scan/filter are explicitly disabled. This uses the all-off stage's
+YAML, with only `lineitem` and `orders` pinned using `compression=true` and the
+same checked Simpatico plans; every other table pin is explicitly uncompressed.
+The two standalone case flags are mutually exclusive.
 
 As on GB300, each stage starts one fresh engine, clears caches at startup, and
 runs Q1–Q22 once. Each query pins only its referenced host columns, executes,

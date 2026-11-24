@@ -1,0 +1,78 @@
+{
+  "all_staged_file_hashes_verified": true,
+  "archive": {
+    "all_payload_hashes_verified_after_download": true,
+    "bytes": 27611971,
+    "filename": "g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123-full-results.tar.gz",
+    "files": 211,
+    "payload_bytes": 97066107,
+    "sha256": "2967b8eebba00e28094e0e76ad8bfed7281174db7b14f920bda1fd0944c47911"
+  },
+  "base_config_sha256": "a96d6e0715fddcd807c7b5e69fc8d0ecfcfd93c5ecf11f26a13556dad325e642",
+  "common_queries": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22
+  ],
+  "common_query_sums_s": {
+    "all_on_compressed_previous": 29.425129,
+    "compressed_pin_only_new": 51.898669
+  },
+  "compressed_pin_policy": "Only lineitem/orders compression=true, explicit saved Simpatico plans; all other tables compression=false; all four other ablation switches off",
+  "config_sha256": "284fa987e19bfcf06e6621fe51b86849db8d6ede3a57a429c99947d05df321dd",
+  "dataset_manifest_sha256": "884a627553d7a3d0f5cc41bdf451b3d7353274cb2dabcf1555e5c8e17537785a",
+  "date_timezone": "America/Chicago",
+  "engine_commit": "26b5caba3e2c96290fdc63d4cf40ac42572eaab8",
+  "executed_source_sha256": {
+    "ablation/run.py": "db3eec604e1a155261bcfcaa79ec762324de80ca7f02a7e7e46566789cf58d6d",
+    "ablation/worker.py": "cc53c773bcd9f6af9ac60b968b4997632ac89ad16d50f0ebdba9732a0ce9b5af",
+    "guide-26b5caba/supervisor.py": "e42ffa05aa4b013ac5c69e273827ae4b69e0c9e7590165227a06263e2ce7422b",
+    "guide-26b5caba/worker.py": "9f7a673999444e4ea15b67a2b96e945948c39973a3ffa57d3afd57b18418810b"
+  },
+  "hardware": "g7e.8xlarge",
+  "lifecycle": "One fresh engine for the stage, one iteration Q1-Q22, host pin/unpin per query, startup cache clear only, no warmup or profile/mode override",
+  "native_library_sha256": "090f552314d37196b6c0509a261a9656034a287e03524531dd7e1af3ccc79236",
+  "prior_comparison": "../20261123-type-first/RESULTS.md",
+  "protocol": "GB300 compressed pinning only",
+  "region": "eu-west-2",
+  "result_date": "2026-11-23",
+  "runner_package_sha256": "a438d35a2357b85cade040c84dbffdee9a698947510974740d22ff4b1d8feb36",
+  "same_region_s3": {
+    "bucket": "sae-dataproc-aws-dev-sirius-scratch-eu-west-2",
+    "region": "eu-west-2",
+    "tables_present": [
+      "region",
+      "nation",
+      "supplier",
+      "customer",
+      "part",
+      "partsupp",
+      "orders",
+      "lineitem"
+    ]
+  },
+  "simpatico_plan_sha256": {
+    "lineitem": "288cd2b875e809bff33cea675eb5a6c676acbb81ffb5198d049b4e08ebcfb555",
+    "orders": "eb4b3be1de77fc613f84ebd454897668d8494c5e01e346f9047b3eeb227e8aeb"
+  },
+  "stage_plan_sha256": "81251cad3ce6fd5e3702ce9f04bb92d4f09e4c1a0c21b5fb36dda4b00dc2be05"
+}

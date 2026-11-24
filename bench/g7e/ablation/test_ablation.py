@@ -16,6 +16,22 @@ def read(name):
 
 
 class PinControls(unittest.TestCase):
+    def test_compressed_pin_only_disables_all_four_other_features(self):
+        run = read("run")
+        stages = run.selected_stages("build-first", compressed_pin_only=True)
+        self.assertEqual(len(stages), 1)
+        stage = stages[0]
+        self.assertEqual(stage["gb300_stage"], 6)
+        self.assertTrue(stage["compressed_pin"])
+        for key in ("type_narrow", "build_probe", "dynamic_filter", "fused_decode"):
+            self.assertFalse(stage[key])
+        base = {"sirius": {"memory": {"host": {"initial_number_pools": 1600}}}}
+        self.assertEqual(
+            run.stage_config(base, stage), run.stage_config(base, run.stage_spec(0))
+        )
+        with self.assertRaises(ValueError):
+            run.selected_stages("build-first", True, True)
+
     def test_all_on_uncompressed_changes_only_pin_policy(self):
         run = read("run")
         stages = run.selected_stages("build-first", True)

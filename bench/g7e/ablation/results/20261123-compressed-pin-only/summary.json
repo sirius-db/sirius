@@ -1,0 +1,829 @@
+{
+  "complete": true,
+  "no_source_or_data_changes": true,
+  "proofs": [
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q1/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496346224420441,
+        "query_end_ns": 1795496348131137390
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "lineitem"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "lineitem"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 1,
+      "seconds": 1.905511,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q2/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496349538812439,
+        "query_end_ns": 1795496350155562726
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "nation",
+          "part",
+          "partsupp",
+          "region",
+          "supplier"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "nation",
+          "part",
+          "partsupp",
+          "region",
+          "supplier"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 2,
+      "seconds": 0.615514,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "correct ordered answer including legal LIMIT-boundary ties",
+        "expanded_cpu_rows": 10,
+        "rows": 10
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q3/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496362192354939,
+        "query_end_ns": 1795496364541419402
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "customer",
+          "lineitem",
+          "orders"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "customer",
+          "lineitem",
+          "orders"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 3,
+      "seconds": 2.347787,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q4/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496370925037014,
+        "query_end_ns": 1795496372073380370
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "lineitem",
+          "orders"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "lineitem",
+          "orders"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 4,
+      "seconds": 1.147243,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q5/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496387372501421,
+        "query_end_ns": 1795496391398742006
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "customer",
+          "lineitem",
+          "nation",
+          "orders",
+          "region",
+          "supplier"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "customer",
+          "lineitem",
+          "nation",
+          "orders",
+          "region",
+          "supplier"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 5,
+      "seconds": 4.024957,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q6/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496401634081636,
+        "query_end_ns": 1795496402528352006
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "lineitem"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "lineitem"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 6,
+      "seconds": 0.893301,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q7/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496420092759082,
+        "query_end_ns": 1795496421950723939
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "customer",
+          "lineitem",
+          "nation",
+          "orders",
+          "supplier"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "customer",
+          "lineitem",
+          "nation",
+          "orders",
+          "supplier"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 7,
+      "seconds": 1.856754,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q8/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496444422219369,
+        "query_end_ns": 1795496450310851401
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "customer",
+          "lineitem",
+          "nation",
+          "orders",
+          "part",
+          "region",
+          "supplier"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "customer",
+          "lineitem",
+          "nation",
+          "orders",
+          "part",
+          "region",
+          "supplier"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 8,
+      "seconds": 5.887215,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q9/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496474007166373,
+        "query_end_ns": 1795496482503201217
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "lineitem",
+          "nation",
+          "orders",
+          "part",
+          "partsupp",
+          "supplier"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "lineitem",
+          "nation",
+          "orders",
+          "part",
+          "partsupp",
+          "supplier"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 9,
+      "seconds": 8.494345,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q10/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496495602687223,
+        "query_end_ns": 1795496497467933816
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "customer",
+          "lineitem",
+          "nation",
+          "orders"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "customer",
+          "lineitem",
+          "nation",
+          "orders"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 10,
+      "seconds": 1.863149,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "matches pinned harness tolerance (float abs=1e-10, other values exact)",
+        "rows": 936989
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q11/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496498656921485,
+        "query_end_ns": 1795496500319225646
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "nation",
+          "partsupp",
+          "supplier"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "nation",
+          "partsupp",
+          "supplier"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 11,
+      "seconds": 0.630441,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q12/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496510251239646,
+        "query_end_ns": 1795496511980703309
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "lineitem",
+          "orders"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "lineitem",
+          "orders"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 12,
+      "seconds": 1.7265,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q13/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496521682509459,
+        "query_end_ns": 1795496524144496843
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "customer",
+          "orders"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "customer",
+          "orders"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 13,
+      "seconds": 2.460944,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q14/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496540220358402,
+        "query_end_ns": 1795496541518314565
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "lineitem",
+          "part"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "lineitem",
+          "part"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 14,
+      "seconds": 1.296682,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q15/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496556448427047,
+        "query_end_ns": 1795496557549804401
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "lineitem",
+          "supplier"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "lineitem",
+          "supplier"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 15,
+      "seconds": 1.100443,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q16/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496558316192771,
+        "query_end_ns": 1795496558930180072
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "part",
+          "partsupp",
+          "supplier"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "part",
+          "partsupp",
+          "supplier"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 16,
+      "seconds": 0.599603,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q17/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496572460070962,
+        "query_end_ns": 1795496575273704759
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "lineitem",
+          "part"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "lineitem",
+          "part"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 17,
+      "seconds": 2.812401,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "correct ordered answer including legal LIMIT-boundary ties",
+        "expanded_cpu_rows": 100,
+        "rows": 100
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q18/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496580917579337,
+        "query_end_ns": 1795496583224514468
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "customer",
+          "lineitem",
+          "orders"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "customer",
+          "lineitem",
+          "orders"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 18,
+      "seconds": 2.305281,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q19/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496599119621382,
+        "query_end_ns": 1795496601552357983
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "lineitem",
+          "part"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "lineitem",
+          "part"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 19,
+      "seconds": 2.431422,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q20/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496619817509403,
+        "query_end_ns": 1795496621472603868
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "lineitem",
+          "nation",
+          "part",
+          "partsupp",
+          "supplier"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "lineitem",
+          "nation",
+          "part",
+          "partsupp",
+          "supplier"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 20,
+      "seconds": 1.604479,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q21/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496633456130731,
+        "query_end_ns": 1795496638875273291
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "lineitem",
+          "nation",
+          "orders",
+          "supplier"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "lineitem",
+          "nation",
+          "orders",
+          "supplier"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 21,
+      "seconds": 5.417356,
+      "stage": 0
+    },
+    {
+      "answer": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "answer_path": "/home/ec2-user/g7e8-london-sf1k-host-ablation-compressed-pin-only-20261123/run/stage0-compressed_pin_only/runs/sf1000/pinned/suite/benchmark/tpch_20261124_045847_default_gpu_iter1/iterations/iteration1/sirius/q22/result.txt",
+      "config_and_quent": true,
+      "correct": true,
+      "gpu": {
+        "correct": true,
+        "gpu_completions": 1,
+        "gpu_plans": 1,
+        "query_begin_ns": 1795496640486471891,
+        "query_end_ns": 1795496640964765889
+      },
+      "label": "compressed_pin_only",
+      "pid": 1203267,
+      "pin": {
+        "assigned_tables": [
+          "customer",
+          "orders"
+        ],
+        "correct": true,
+        "expected_tables": [
+          "customer",
+          "orders"
+        ],
+        "fallback_messages": [],
+        "host_pin_calls_verified": true
+      },
+      "query": 22,
+      "seconds": 0.477341,
+      "stage": 0
+    }
+  ],
+  "protocol": "GB300 compressed pinning only",
+  "scale_factor": 1000,
+  "source_commit": "26b5caba3e2c96290fdc63d4cf40ac42572eaab8",
+  "totals": [
+    {
+      "available_sum_s": 51.898669,
+      "complete": true,
+      "correct_queries": 22,
+      "label": "compressed_pin_only",
+      "measured_queries": 22,
+      "stage": 0,
+      "sum_s": 51.898669
+    }
+  ]
+}

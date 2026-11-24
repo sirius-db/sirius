@@ -1,0 +1,3 @@
+case,completed_queries,full_suite_sum_s,available_sum_s,common_query_sum_s
+compressed_pin_only,22,51.898669,51.898669,51.898669
+previous_all_on_compressed,22,29.425129,29.425129,29.425129

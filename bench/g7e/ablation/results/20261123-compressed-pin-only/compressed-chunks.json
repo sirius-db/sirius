@@ -1,0 +1,164 @@
+[
+  {
+    "chunks": 111,
+    "compressed_chunks": 111,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 13,
+    "compressed_chunks": 13,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/orders/part.0.parquet",
+    "table": "orders"
+  },
+  {
+    "chunks": 68,
+    "compressed_chunks": 68,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 15,
+    "compressed_chunks": 15,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/orders/part.0.parquet",
+    "table": "orders"
+  },
+  {
+    "chunks": 39,
+    "compressed_chunks": 39,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 10,
+    "compressed_chunks": 10,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/orders/part.0.parquet",
+    "table": "orders"
+  },
+  {
+    "chunks": 68,
+    "compressed_chunks": 68,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 68,
+    "compressed_chunks": 68,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 78,
+    "compressed_chunks": 78,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 8,
+    "compressed_chunks": 8,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/orders/part.0.parquet",
+    "table": "orders"
+  },
+  {
+    "chunks": 78,
+    "compressed_chunks": 78,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 10,
+    "compressed_chunks": 10,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/orders/part.0.parquet",
+    "table": "orders"
+  },
+  {
+    "chunks": 98,
+    "compressed_chunks": 98,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 8,
+    "compressed_chunks": 8,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/orders/part.0.parquet",
+    "table": "orders"
+  },
+  {
+    "chunks": 10,
+    "compressed_chunks": 10,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/orders/part.0.parquet",
+    "table": "orders"
+  },
+  {
+    "chunks": 70,
+    "compressed_chunks": 70,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 13,
+    "compressed_chunks": 13,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/orders/part.0.parquet",
+    "table": "orders"
+  },
+  {
+    "chunks": 69,
+    "compressed_chunks": 69,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 59,
+    "compressed_chunks": 59,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 59,
+    "compressed_chunks": 59,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 49,
+    "compressed_chunks": 49,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 15,
+    "compressed_chunks": 15,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/orders/part.0.parquet",
+    "table": "orders"
+  },
+  {
+    "chunks": 39,
+    "compressed_chunks": 39,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 126,
+    "compressed_chunks": 126,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 49,
+    "compressed_chunks": 49,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 49,
+    "compressed_chunks": 49,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/lineitem/part.0.parquet",
+    "table": "lineitem"
+  },
+  {
+    "chunks": 8,
+    "compressed_chunks": 8,
+    "source_label": "/mnt/datasets/pinned-inputs/sf1000/orders/part.0.parquet",
+    "table": "orders"
+  }
+]
