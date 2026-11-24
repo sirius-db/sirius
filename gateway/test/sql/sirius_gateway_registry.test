@@ -135,6 +135,73 @@ SELECT rank, name, state FROM sirius_gateway_status() ORDER BY rank;
 0	127.0.0.1:19910	up
 1	c	up
 
+# A registered rank that stops answering has no process the gateway can kill: after the grace
+# period and 10 s more its call is abandoned, the rank counts as lost, and the next statement
+# restarts the ranks.
+statement ok
+SET sirius_gateway_statement_timeout = 1;
+
+statement ok
+SET sirius_gateway_cancel_grace = 1;
+
+statement ok
+FROM sirius_gateway_test_signal(1, 19);
+
+statement error
+FROM sirius_gateway_run('SELECT 1');
+----
+rank 1 did not stop within 1 s of the cancel
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE cluster = 'failed';
+----
+2
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE name = 'c' AND last_error LIKE 'lost in query%abandoned';
+----
+1
+
+statement ok
+FROM sirius_gateway_test_signal(1, 18);
+
+statement ok
+SET sirius_gateway_statement_timeout = 3600;
+
+statement ok
+SET sirius_gateway_cancel_grace = 30;
+
+query I
+FROM sirius_gateway_run('FROM v');
+----
+42
+
+# A start refused for a loopback exchange address next to one that is not changes nothing: the
+# ranks and the log stay.
+statement ok
+FROM sirius_gateway_test_serve(19913, 'regtoken', 'CREATE TABLE boot AS SELECT ''d'' AS id');
+
+statement ok
+FROM sirius_gateway_add_rank('127.0.0.1:19913', exchange_port := 27213, token := 'regtoken', name := 'd', exchange_host := '10.255.255.1');
+
+statement error
+FROM sirius_gateway_start(0);
+----
+is a loopback address
+
+query II
+SELECT (SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up'), (SELECT count(*) FROM sirius_gateway_log());
+----
+2	1
+
+statement ok
+FROM sirius_gateway_drop_rank('d');
+
+query I
+FROM sirius_gateway_run('FROM v');
+----
+42
+
 # Ranks the gateway spawns come first, then the registered ones.
 query ITT
 SELECT rank, name, registered FROM sirius_gateway_start(1, quack_base_port := 19920) ORDER BY rank;
