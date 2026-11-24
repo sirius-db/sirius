@@ -138,6 +138,7 @@ class sort_key_sample {
   [[nodiscard]] std::size_t held_key_rows() const;
 
   //! Thin the rows taken at a smaller stride than the current one until the held rows fit the cap.
+  //! One caller thins at a time; the others return and leave the rows they added to it.
   void thin_held_rows(cucascade::memory::memory_space& space, ::cuda::stream_ref stream);
 
   std::size_t _max_key_rows;
@@ -145,6 +146,7 @@ class sort_key_sample {
   std::unordered_map<std::uint64_t, std::shared_ptr<piece const>> _pieces;
   totals _seen;
   std::size_t _stride = 1;
+  bool _thinning      = false;  //!< A caller is in thin_held_rows(). Guarded by _mutex.
   std::atomic<bool> _closed{false};
 };
 

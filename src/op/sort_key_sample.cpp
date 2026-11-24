@@ -193,41 +193,58 @@ std::size_t sort_key_sample::held_key_rows() const
 void sort_key_sample::thin_held_rows(cucascade::memory::memory_space& space,
                                      ::cuda::stream_ref stream)
 {
-  auto const mr = space.get_default_allocator();
-  while (true) {
-    std::size_t stride = 1;
-    std::vector<std::shared_ptr<piece const>> dense;
-    {
-      std::lock_guard lock(_mutex);
-      // At the current stride the rows fit, so past the cap some piece is denser than that.
-      if (_closed.load(std::memory_order_acquire) || held_key_rows() <= _max_key_rows) { return; }
-      stride = _stride;
-      for (auto const& [id, entry] : _pieces) {
-        if (entry->stride < stride) { dense.push_back(entry); }
+  {
+    std::lock_guard lock(_mutex);
+    // The caller that is thinning checks the cap again before it stops, so it sees these rows.
+    if (_thinning) { return; }
+    _thinning = true;
+  }
+  try {
+    auto const mr = space.get_default_allocator();
+    while (true) {
+      std::size_t stride = 1;
+      std::vector<std::shared_ptr<piece const>> dense;
+      {
+        std::lock_guard lock(_mutex);
+        // At the current stride the rows fit, so past the cap some piece is denser than that.
+        if (!_closed.load(std::memory_order_acquire) && held_key_rows() > _max_key_rows) {
+          stride = _stride;
+          for (auto const& [id, entry] : _pieces) {
+            if (entry->stride < stride) { dense.push_back(entry); }
+          }
+        }
+        // Stops in the step that finds nothing to thin, so no rows added meanwhile are missed.
+        if (dense.empty()) {
+          _thinning = false;
+          return;
+        }
       }
-    }
-    if (dense.empty()) { return; }
 
-    for (auto const& old : dense) {
-      auto thinned      = std::make_shared<piece>();
-      thinned->batch_id = old->batch_id;
-      thinned->rows     = old->rows;
-      thinned->bytes    = old->bytes;
-      thinned->stride   = stride;
-      thinned->key_rows = key_row_count(old->rows, stride);
-      if (thinned->key_rows != 0) {
-        auto copied = to_device(old->data, stream, mr);
-        auto view =
-          cudf::unpack(old->metadata->data(), static_cast<std::uint8_t const*>(copied->data()));
-        auto keys         = thin(view, old->stride, stride, stream, mr);
-        thinned->metadata = pack_to_host(keys->view(), thinned->data, stream, mr);
-      }
-      std::lock_guard lock(_mutex);
-      // A retried task or another thinning pass may have replaced the piece meanwhile.
-      if (auto slot = _pieces.find(old->batch_id); slot != _pieces.end() && slot->second == old) {
-        slot->second = std::move(thinned);
+      for (auto const& old : dense) {
+        auto thinned      = std::make_shared<piece>();
+        thinned->batch_id = old->batch_id;
+        thinned->rows     = old->rows;
+        thinned->bytes    = old->bytes;
+        thinned->stride   = stride;
+        thinned->key_rows = key_row_count(old->rows, stride);
+        if (thinned->key_rows != 0) {
+          auto copied = to_device(old->data, stream, mr);
+          auto view =
+            cudf::unpack(old->metadata->data(), static_cast<std::uint8_t const*>(copied->data()));
+          auto keys         = thin(view, old->stride, stride, stream, mr);
+          thinned->metadata = pack_to_host(keys->view(), thinned->data, stream, mr);
+        }
+        std::lock_guard lock(_mutex);
+        // A retried task may have replaced the piece meanwhile.
+        if (auto slot = _pieces.find(old->batch_id); slot != _pieces.end() && slot->second == old) {
+          slot->second = std::move(thinned);
+        }
       }
     }
+  } catch (...) {
+    std::lock_guard lock(_mutex);
+    _thinning = false;
+    throw;
   }
 }
 

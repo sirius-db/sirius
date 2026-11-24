@@ -18,12 +18,16 @@
 
 #include <cudf/utilities/default_stream.hpp>
 
+#include <rmm/cuda_stream.hpp>
+
 #include <catch.hpp>
 #include <data/data_batch_utils.hpp>
 #include <op/sort_key_sample.hpp>
 
 #include <algorithm>
+#include <exception>
 #include <numeric>
+#include <thread>
 #include <vector>
 
 using namespace sirius::op;
@@ -46,13 +50,14 @@ std::shared_ptr<cucascade::data_batch> sorted_batch(cucascade::memory::memory_sp
 
 void add(sort_key_sample& sample,
          cucascade::data_batch& batch,
-         cucascade::memory::memory_space& space)
+         cucascade::memory::memory_space& space,
+         ::cuda::stream_ref stream = cudf::get_default_stream())
 {
   sample.add(batch.get_batch_id(),
              sirius::get_cudf_table_view(batch),
              batch.to_read_only().get_data()->get_size_in_bytes(),
              space,
-             cudf::get_default_stream());
+             stream);
 }
 
 std::vector<std::int32_t> kept(sort_key_sample const& sample,
@@ -187,6 +192,47 @@ TEST_CASE("Sort key sample holds at most its cap of key rows in host memory", "[
 
   auto const stride = smallest_stride(runs, max_key_rows);
   REQUIRE(stride > 16);
+  CHECK(sample.stride() == stride);
+  CHECK(kept(sample, *space) == rows_at(runs, stride));
+}
+
+TEST_CASE("Sort key sample holds its cap when several threads add batches", "[sort_key_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  constexpr std::size_t max_key_rows = 64;
+  constexpr std::size_t num_threads  = 4;
+  std::vector<run> runs;
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (std::int32_t i = 0; i < 32; ++i) {
+    runs.push_back({i * 10000, 1024});
+    batches.push_back(sorted_batch(*space, runs.back()));
+  }
+
+  sort_key_sample sample(max_key_rows);
+  std::vector<std::exception_ptr> errors(num_threads);
+  std::vector<std::thread> threads;
+  for (std::size_t t = 0; t < num_threads; ++t) {
+    threads.emplace_back([&, t] {
+      try {
+        rmm::cuda_stream stream;
+        for (auto i = t; i < batches.size(); i += num_threads) {
+          add(sample, *batches[i], *space, stream.view());
+        }
+      } catch (...) {
+        errors[t] = std::current_exception();
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  for (auto const& error : errors) {
+    if (error) { std::rethrow_exception(error); }
+  }
+
+  auto const stride = smallest_stride(runs, max_key_rows);
+  CHECK(sample.host_key_rows() <= max_key_rows);
   CHECK(sample.stride() == stride);
   CHECK(kept(sample, *space) == rows_at(runs, stride));
 }
