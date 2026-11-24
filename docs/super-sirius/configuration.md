@@ -4,7 +4,7 @@ This document covers Super Sirius configuration: the `sirius_config` class, oper
 
 ## `sirius_config`
 
-**File:** `src/include/sirius_config.hpp`
+**File:** `src/sirius_config.hpp`
 
 The `sirius_config` class loads configuration from a YAML file or uses built-in defaults. It provides:
 
@@ -34,7 +34,7 @@ the maintenance, error and multi-GPU contracts.
 
 ### `SIRIUS_DISABLE`
 
-Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
+Set `SIRIUS_DISABLE` to any value other than `0` (for example `SIRIUS_DISABLE=1`) to prevent Super Sirius from initializing: it reads no config file and claims no GPU or pinned host memory, but still registers its functions and settings. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
 
 ```bash
 export SIRIUS_DISABLE=1
@@ -304,7 +304,7 @@ sirius:
 
 ## Executor Configuration
 
-**Files:** `src/include/exec/config.hpp`, `src/include/creator/config.hpp`
+**Files:** `src/exec/config.hpp`, `src/creator/config.hpp`
 
 The `sirius.executor` block configures the thread pools and task scheduling. It has four
 per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`. The
@@ -745,7 +745,7 @@ S3 credentials are not YAML-loadable. Use `CREATE SECRET (TYPE SIRIUS_S3, ...)` 
 
 ## Operator Parameters
 
-**File:** `src/include/sirius_config.hpp` — `operator_params` struct
+**File:** `src/sirius_config.hpp` — `operator_params` struct
 
 The five batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
 `concat_batch_bytes`, `cross_join_task_bytes`, `sort_sample_bytes`) share one built-in default. Without an
@@ -785,14 +785,14 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing filters or accumulated partials, skip an eligible key when the complete build covers at least this fraction of its unfiltered row domain. Native scans use catalog bounds and genuine uniqueness proofs; matching materialized Parquet pins may supply exact row counts and per-column `unique_cols` usefulness hints. Unknown/zero domains and builds exceeding the domain disable the gate. Values above 1.0 disable it; exactly 1.0 fires only at full coverage. `0.45` is an explicit measurement profile, not the production default. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
-| `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
+| `enable_runtime_distinct_build_probe` | false | Internal: not accepted in YAML, and settable with `SET` only when `SIRIUS_ENABLE_TEST_OPTIONS=1`; see the note below. For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
 | `use_hw_decompression` | false | Startup-only opt-in to cuDF hardware (on-GPU) decompression for compressed Parquet scans. When set and every GPU reports support, Sirius exports `LIBCUDF_HW_DECOMPRESSION=ON` for the lifetime of the context. Enable only on GPUs known to support it: the support probe is also true on some GPUs (e.g. T4) where the runtime path fails. |
 | `enable_dense_count_join` | true | Fuse `COUNT(col \| *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join into the `DENSE_COUNT_JOIN` operator (TPC-H q13 shape): a direct-address count histogram over the preserved key domain replaces the join build, output materialization, and re-aggregation. |
 | `enable_delim_aggregate_reuse` | true | Compute a decorrelated subquery's MIN/MAX/AVG from the delim CTE's outer rows instead of rescanning the subquery's tables, when the outer rows provably hold every subquery row for their key (TPC-H q2 and q17 shapes). See [Subquery Aggregates from the Delim CTE's Rows](optimizations.md#subquery-aggregates-from-the-delim-ctes-rows). |
 | `enable_partial_aggregate_below_join` | true | Compute `SUM`/`MIN`/`MAX` per join key below an inner join whose other side only adds variable-width columns the aggregate groups by, and combine the partial results above it (TPC-H q10 shape). See [Partial Aggregate Below a Payload Join](optimizations.md#partial-aggregate-below-a-payload-join). |
 | `enable_subquery_key_carry` | true | Restrict every table a correlated subquery ties to its correlation column by an equality to the outer rows' keys, before DuckDB orders the joins (TPC-Havoc Q05 shape). See [Subquery Keys Carried Across an Equality](optimizations.md#subquery-keys-carried-across-an-equality). |
 | `enable_exists_from_aggregate` | true | Drop a correlated `EXISTS` whose rows a scalar aggregate subquery of the same query also reads, and keep the outer rows that have a group. See [EXISTS Answered from an Aggregate Subquery](optimizations.md#exists-answered-from-an-aggregate-subquery). |
-| `dense_count_join_max_bytes` | 2 GiB | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Must be greater than zero. |
+| `dense_count_join_max_bytes` | 0 (auto) | Internal: not accepted in YAML, and settable with `SET` only when `SIRIUS_ENABLE_TEST_OPTIONS=1`. Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Auto = 10% of the smallest GPU memory space, or 2 GiB when that capacity is unknown. |
 | `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and disables the probe, so late materialization also gets no group-by-rowid ride or rider. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values a pin retains, across all columns together, for the pin-time exact uniqueness check, which sorts a whole column when its chunks overlap in range. Each retained chunk holds a GPU reservation, and integer columns, then earlier columns, take priority when the cap, free GPU memory or a reservation is short; the check's peak GPU use is about three times the cap. A column that no longer fits stays unproven. `0` uses 10% of the capacity of the GPU memory space the pin runs on. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
@@ -1135,11 +1135,12 @@ rejected as unknown, and the old `SET` variables no longer exist.
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 
-Accumulation holds each GPU's arrays, at most the cap, until safe release after build tasks drain; published filters can remain until query teardown. The arrays are not spillable. Publication also allocates short-lived scratch on the final PARTITION task's allocator: at most two transfer chunks (8 MiB each at most) per contributing non-root GPU. The task's ignore-limit policy may admit that scratch beyond its reservation against global capacity. Initialization admission failure or safely recoverable scratch OOM skips the optional filter. The multi-partition switch and byte cap are YAML settings; like the other switches in this section, their `SET` variables exist only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`.
+Accumulation holds each GPU's arrays, at most four times `scan_task_batch_size`, until safe release after build tasks drain; published filters can remain until query teardown. The arrays are not spillable. Publication also allocates short-lived scratch on the final PARTITION task's allocator: at most two transfer chunks (8 MiB each at most) per contributing non-root GPU. The task's ignore-limit policy may admit that scratch beyond its reservation against global capacity. Initialization admission failure or safely recoverable scratch OOM skips the optional filter. The multi-partition switch is a YAML setting; like the other switches in this section, its `SET` variable exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 
-The direct DuckDB session overrides are registered only when the process
-explicitly enables Sirius test options; they are not part of the normal user
-surface.
+The `SET` variables `enable_dynamic_filter`, `enable_dynamic_zone_map_filter` and
+`enable_dynamic_filter_multi_partition` are registered only when the process explicitly enables
+Sirius test options; they are not part of the normal user surface. The three thresholds are always
+registered.
 
 ### Distributed Execution
 
@@ -1278,11 +1279,15 @@ SET enable_runtime_size_estimation = true;   -- off by default
 |----------|---------|-------------|
 | `gpu_execution` | true | Enable transparent GPU execution for plain SQL queries. When enabled, supported queries are automatically intercepted and executed on the GPU. When disabled, only explicit `CALL gpu_execution('...')` uses the GPU. |
 
+When `LOAD sirius` cannot load a CUDA backend, the loader registers `gpu_execution` with default
+`false` and rejects `SET gpu_execution = true` and `CALL gpu_execution(...)` with the reason, which
+`SELECT fallback_reason FROM sirius_status()` also shows.
+
 ### Debug
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates plan-time fallback (unsupported operator/type) and runtime fallback for transparent SELECT, plus explicit `CALL gpu_execution(...)`. Unsupported COPY options can fall back during planning; transparent [Parquet COPY](parquet-output.md#failure-and-cleanup) never replays runtime failures because files may already be visible. Set to `false` to surface Sirius errors instead of falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates plan-time fallback (unsupported operator/type) and runtime fallback for transparent SELECT, plus explicit `CALL gpu_execution(...)`. Unsupported COPY options can fall back during planning; transparent [Parquet COPY](parquet-output.md#failure-and-cleanup) never replays runtime failures because files may already be visible. Set to `false` to surface Sirius errors instead of falling back. Queries that read `s3://` never fall back. |
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
