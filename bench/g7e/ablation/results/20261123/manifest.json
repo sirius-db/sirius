@@ -1,0 +1,93 @@
+{
+  "all_staged_file_hashes_verified": true,
+  "archive": {
+    "all_payload_hashes_verified_after_download": true,
+    "bytes": 52463728,
+    "filename": "g7e8-london-sf1k-host-ablation-20261123-with-diagnostics-full-results.tar.gz",
+    "files": 661,
+    "payload_bytes": 189672941,
+    "sha256": "1748233f45c6d0d13660a5fcb629498c5b07e032f086d471801048dc6ecf1e48"
+  },
+  "base_config": "../../../guide-26b5caba/configs/cpu-budget-pinned.yaml",
+  "base_config_sha256": "a96d6e0715fddcd807c7b5e69fc8d0ecfcfd93c5ecf11f26a13556dad325e642",
+  "collector_fix": {
+    "cause": "Native compression coverage labels are Parquet paths, not aliases",
+    "new_stage_after_fix": 5,
+    "no_timed_queries_repeated": true,
+    "original_controller_sha256": "014eddc44a13ed712737fd303b2d8352afa60d60523097ce7e01b65326fea654",
+    "resumed_controller_sha256": "46f52216b8e2b8695d2c1512a010b63db92cbd5c4413c428031bfed6da2d9e5d",
+    "retained_stages": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "complete_stages": [
+    4,
+    5
+  ],
+  "dataset_manifest_sha256": "884a627553d7a3d0f5cc41bdf451b3d7353274cb2dabcf1555e5c8e17537785a",
+  "date_timezone": "America/Chicago",
+  "engine_commit": "26b5caba3e2c96290fdc63d4cf40ac42572eaab8",
+  "hardware": "g7e.8xlarge",
+  "incomplete_stages": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "native_library_sha256": "090f552314d37196b6c0509a261a9656034a287e03524531dd7e1af3ccc79236",
+  "no_total_speedup_without_all_off_baseline": true,
+  "os": "Amazon Linux 2023",
+  "pin_control": "Global pin_table_compression=false; every pin call explicitly compression=false in stages0-3; only lineitem/orders compression=true in stages4-5.",
+  "protocol": "corrected GB300 BUILD_PROBE-first; fresh engine per stage; per-query host pin/unpin; one iteration; startup cache clear only",
+  "reference_protocol": "../../../../gb300/ablation/RESULTS.md#corrected-build_probe-first-comparison",
+  "region": "eu-west-2",
+  "result_date": "2026-11-23",
+  "same_region_s3": {
+    "bucket": "sae-dataproc-aws-dev-sirius-scratch-eu-west-2",
+    "region": "eu-west-2",
+    "tables_present": [
+      "region",
+      "nation",
+      "supplier",
+      "customer",
+      "part",
+      "partsupp",
+      "orders",
+      "lineitem"
+    ]
+  },
+  "simpatico_plan_sha256": {
+    "lineitem": "288cd2b875e809bff33cea675eb5a6c676acbb81ffb5198d049b4e08ebcfb555",
+    "orders": "eb4b3be1de77fc613f84ebd454897668d8494c5e01e346f9047b3eeb227e8aeb"
+  },
+  "sql_threads": 24,
+  "stage_config_sha256": {
+    "stage0-all_off.yaml": "284fa987e19bfcf06e6621fe51b86849db8d6ede3a57a429c99947d05df321dd",
+    "stage1-build_probe.yaml": "09536ada0651c7a1649ec858aa5dca4451f8a534ea85eda3609ee7899cf68c45",
+    "stage2-dynamic_filter.yaml": "756af780e66ab7fecfaed0b85e6fcdf3a46a66503c081a6cfc55c8b6ae1f6fad",
+    "stage3-type_narrow.yaml": "db6a9dac8a6734cd2b63cef5734da45279a47422156dd1e32b9a76b3170dffbf",
+    "stage4-compressed_pin.yaml": "db6a9dac8a6734cd2b63cef5734da45279a47422156dd1e32b9a76b3170dffbf",
+    "stage5-fused_decode.yaml": "519d9758bd79b5aef99b019ec2b3e03aadaa1ef07b1c634c31c0f562480bc29c"
+  },
+  "stage_plan": "stage-plan.json",
+  "stage_plan_sha256": "d965a597dfbca6defc98054ae8cdd9b054f9541cb70a5110969c213a845bc0c3",
+  "stage_query_counts": [
+    0,
+    0,
+    0,
+    18,
+    22,
+    22
+  ],
+  "stage_timeout_s": 600,
+  "untimed_diagnostics": {
+    "build_probe": 2,
+    "dynamic_filter": 2,
+    "fused_decode": 68
+  },
+  "validated_measurements": 62
+}

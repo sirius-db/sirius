@@ -1,0 +1,55 @@
+{
+  "all_completed_answers_correct": true,
+  "archive_sha256": "1748233f45c6d0d13660a5fcb629498c5b07e032f086d471801048dc6ecf1e48",
+  "common_q1_q18_sums_s": {
+    "3": 40.348261,
+    "4": 24.082372,
+    "5": 25.446269
+  },
+  "date_timezone": "America/Chicago",
+  "diagnostics_correct": true,
+  "failed_pin_stages": [
+    {
+      "error": "_duckdb.Error: std::bad_alloc: out_of_memory: Not enough free blocks available in fixed_size_host_memory_resource. total_bytes: 2495610880, upstream_tracked_bytes: 2495610880, only 62 free blocks available from 2380 requested blocks.",
+      "phase": "host pinning",
+      "query": 1,
+      "stage": 0
+    },
+    {
+      "error": "_duckdb.Error: std::bad_alloc: out_of_memory: Not enough free blocks available in fixed_size_host_memory_resource. total_bytes: 2495610880, upstream_tracked_bytes: 2495610880, only 62 free blocks available from 2380 requested blocks.",
+      "phase": "host pinning",
+      "query": 1,
+      "stage": 1
+    },
+    {
+      "error": "_duckdb.Error: std::bad_alloc: out_of_memory: Not enough free blocks available in fixed_size_host_memory_resource. total_bytes: 2495610880, upstream_tracked_bytes: 2495610880, only 62 free blocks available from 2380 requested blocks.",
+      "phase": "host pinning",
+      "query": 1,
+      "stage": 2
+    },
+    {
+      "error": "_duckdb.Error: std::bad_alloc: out_of_memory: Not enough free blocks available in fixed_size_host_memory_resource. total_bytes: 1929379840, upstream_tracked_bytes: 1929379840, only 113 free blocks available from 1840 requested blocks.",
+      "phase": "host pinning",
+      "query": 19,
+      "stage": 3
+    }
+  ],
+  "fresh_stage_processes": 6,
+  "fused_change_pct": 3.407298254185953,
+  "instance_lifecycle": "retained running",
+  "quent_contexts": 6,
+  "quent_timed_executions": 62,
+  "result_date": "2026-11-23",
+  "stage4_sum_s": 30.634477,
+  "stage5_sum_s": 31.678285,
+  "stage_query_counts": [
+    0,
+    0,
+    0,
+    18,
+    22,
+    22
+  ],
+  "untimed_diagnostic_queries": 2,
+  "validated_timed_queries": 62
+}

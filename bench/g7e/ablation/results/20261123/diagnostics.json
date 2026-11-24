@@ -1,0 +1,23 @@
+{
+  "build_probe": {
+    "count": 2,
+    "sample_log_lines": [
+      "[2026-11-24 03:34:23.306] [debug] [sirius_physical_hash_join.cpp:2172] sirius_physical_hash_join id 8: using distinct_hash_join (BUILD_PROBE, proven unique)",
+      "[2026-11-24 03:34:25.163] [debug] [sirius_physical_hash_join.cpp:2172] sirius_physical_hash_join id 15: using distinct_hash_join (BUILD_PROBE, proven unique)"
+    ]
+  },
+  "dynamic_filter": {
+    "count": 2,
+    "sample_log_lines": [
+      "[2026-11-24 03:34:22.895] [info] [dynamic_filter_publisher.cpp:1383] [publish_dynamic_filters] dynamic-filter publication: pushed 1 dynamic filter(s) across 1 active target(s) of 1 wired target(s) (30003569 build rows, 1 bound keys of 1 admitted).",
+      "[2026-11-24 03:34:23.361] [info] [dynamic_filter_publisher.cpp:1383] [publish_dynamic_filters] dynamic-filter publication: pushed 1 dynamic filter(s) across 1 active target(s) of 1 wired target(s) (147060214 build rows, 1 bound keys of 1 admitted)."
+    ]
+  },
+  "fused_decode": {
+    "count": 68,
+    "sample_log_lines": [
+      "[2026-11-24 03:34:47.478] [info] [compressed_scan.cpp:549] [decompression-pushdown] decode APPLIED (status=1 generation=0): ranges=3 equalities=0 join_filters=0 survivors=1701635/89358786 column(s)=2 covers_whole_filter=true row_filtered=true selection_unprofitable=false filter_only_columns_dropped=true",
+      "[2026-11-24 03:34:47.479] [info] [compressed_scan.cpp:549] [decompression-pushdown] decode APPLIED (status=1 generation=0): ranges=3 equalities=0 join_filters=0 survivors=1699119/89375404 column(s)=2 covers_whole_filter=true row_filtered=true selection_unprofitable=false filter_only_columns_dropped=true"
+    ]
+  }
+}

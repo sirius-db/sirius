@@ -88,7 +88,16 @@ def worker_environment(sf, kind, effective=None):
     return env
 
 
-def run_worker(sf, kind, selected, config, *, output_root=None):
+def run_worker(
+    sf,
+    kind,
+    selected,
+    config,
+    *,
+    output_root=None,
+    allow_pinned_suite=False,
+    stage_timeout_s=None,
+):
     label = "suite" if len(selected) > 1 else f"q{selected[0]:02}"
     out = (output_root or ROOT) / "runs" / f"sf{sf}" / kind / label
     out.mkdir(parents=True, exist_ok=False)
@@ -136,7 +145,8 @@ def run_worker(sf, kind, selected, config, *, output_root=None):
         "started_utc": datetime.now(timezone.utc).isoformat(),
     }
     save(out / "worker-record.json", record)
-    assert kind in ("cold", "hot", "pinned") and len(selected) == 1
+    assert kind in ("cold", "hot", "pinned")
+    assert len(selected) == 1 or (allow_pinned_suite and kind == "pinned")
     assert not subprocess.check_output(
         ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True
     ).strip()
@@ -180,6 +190,9 @@ def run_worker(sf, kind, selected, config, *, output_root=None):
     reader_thread = threading.Thread(target=reader, daemon=True)
     reader_thread.start()
     deadline = time.monotonic() + 1800
+    stage_deadline = (
+        time.monotonic() + stage_timeout_s if stage_timeout_s is not None else None
+    )
     timed_out = False
     last_event = None
     try:
@@ -225,7 +238,9 @@ def run_worker(sf, kind, selected, config, *, output_root=None):
                             json.dumps({"scale_factor": sf, "kind": kind, **item}),
                             flush=True,
                         )
-                if time.monotonic() > deadline:
+                if time.monotonic() > deadline or (
+                    stage_deadline is not None and time.monotonic() > stage_deadline
+                ):
                     timed_out = True
                     os.killpg(process.pid, signal.SIGTERM)
                     try:

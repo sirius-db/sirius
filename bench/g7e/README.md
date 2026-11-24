@@ -51,6 +51,11 @@ best complete CPU-validated sums from SF100 through SF10000, both contributing
 iterations, exact config hashes and retained archive checksums. SF3000 cold is
 362.445844 s; hot sums are 371.765623 / 273.535501 s.
 
+The separate [SF1000 host-pin cumulative ablation](ablation/results/20261123/RESULTS.md)
+follows the corrected GB300 study's stage-level process lifecycle. It saves
+complete-stage sums, per-query results, exact configs and the earlier stages'
+host-pin allocation failures; failed stages are not assigned suite sums.
+
 The older custom presets and historical custom-config snapshots are retained
 locally outside this guide-only publication. The selected table and reproducer
 refer to the same guide-derived configuration family and process protocol.
