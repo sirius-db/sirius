@@ -120,12 +120,8 @@ pixi run -e browser quent-browser-bundle                                  # tele
 pixi run -e browser quent-browser-bundle /path/to/telemetry_data out.quent-browser
 ```
 
-The `browser` environment contains only a Rust toolchain, so it avoids installing the CUDA
-dependencies of the default environment. The input must contain exactly one Sirius engine. The command prints the bundle's `model_name`
-(`sirius`), `schema_digest`, and `format_version`. A host selects the browser analyzer from that
-triple, so upload the file with a `quent-browser` role and keep the archival Quent ZIP as a separate
-asset. See the [browser crate README](../../rust/crates/telemetry/browser/README.md) for the analyzer
-build and hosting contract.
+See the [browser crate README](../../rust/crates/telemetry/browser/README.md)
+for the analyzer build and hosting contract.
 
 ## Example Screenshots
 
