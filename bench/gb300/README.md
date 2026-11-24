@@ -35,3 +35,4 @@ Additional studies:
 - [Scale figures](scale-figures/README.md)
 - [Concurrency and ablation figures](analysis-figures/README.md)
 - [Spill figures](spill-figures/README.md)
+- [Parquet, Simpatico and Vortex ingestion comparison](ingest-compare/README.md)

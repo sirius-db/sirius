@@ -1,0 +1,2 @@
+column,dtype,rows,bytes,compressed_bytes,ratio,decode_ms_min,decode_ms_median,decode_ms_mean,decode_gbps_median,metadata_ms,decode_only_ms_median,decode_only_gbps_median
+TOTAL,(all),99999964,11690055031,3489941380,3.34964,100.192,100.535,100.494,116.278,2.85764,97.6778,119.68

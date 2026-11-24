@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="760" viewBox="0 0 1500 760">
+<rect width="1500" height="760" fill="white"/>
+<g font-family="DejaVu Sans, Arial, sans-serif">
+<text x="112.0" y="73.0" fill="#5d6670" font-size="15" font-weight="normal" text-anchor="start" >SF1000 • one partition per table • median of 10 measured runs</text>
+<circle cx="745.00" cy="68.00" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>Parquet</title></circle>
+<text x="759.0" y="74.0" fill="#252d36" font-size="16" font-weight="normal" text-anchor="start" >Parquet</text>
+<circle cx="900.00" cy="68.00" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>Simpatico</title></circle>
+<text x="914.0" y="74.0" fill="#252d36" font-size="16" font-weight="normal" text-anchor="start" >Simpatico</text>
+<circle cx="1055.00" cy="68.00" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>Vortex</title></circle>
+<text x="1069.0" y="74.0" fill="#252d36" font-size="16" font-weight="normal" text-anchor="start" >Vortex</text>
+<path d="M1255.00,59.00 L1264.00,68.00 L1255.00,77.00 L1246.00,68.00 Z" fill="white" stroke="#69727c" stroke-width="3.5"><title>whole table</title></path>
+<text x="1270.0" y="74.0" fill="#252d36" font-size="15" font-weight="normal" text-anchor="start" >whole table</text>
+<text x="112.0" y="137.0" fill="#252d36" font-size="21" font-weight="bold" text-anchor="start" >lineitem</text>
+<line x1="112" x2="697" y1="622.00" y2="622.00" stroke="#e9edf1" stroke-width="1"/>
+<text x="99.0" y="627.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="end" >20</text>
+<line x1="112" x2="697" y1="554.77" y2="554.77" stroke="#e9edf1" stroke-width="1"/>
+<line x1="112" x2="697" y1="503.91" y2="503.91" stroke="#e9edf1" stroke-width="1"/>
+<text x="99.0" y="508.9" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="end" >100</text>
+<line x1="112" x2="697" y1="453.05" y2="453.05" stroke="#e9edf1" stroke-width="1"/>
+<line x1="112" x2="697" y1="385.81" y2="385.81" stroke="#e9edf1" stroke-width="1"/>
+<line x1="112" x2="697" y1="334.95" y2="334.95" stroke="#e9edf1" stroke-width="1"/>
+<text x="99.0" y="340.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="end" >1,000</text>
+<line x1="112" x2="697" y1="284.09" y2="284.09" stroke="#e9edf1" stroke-width="1"/>
+<line x1="112" x2="697" y1="216.86" y2="216.86" stroke="#e9edf1" stroke-width="1"/>
+<line x1="112" x2="697" y1="166.00" y2="166.00" stroke="#e9edf1" stroke-width="1"/>
+<text x="99.0" y="171.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="end" >10,000</text>
+<line x1="154.05" x2="154.05" y1="166" y2="622" stroke="#e9edf1" stroke-width="1"/>
+<text x="154.1" y="649.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="middle" >1×</text>
+<line x1="425.53" x2="425.53" y1="166" y2="622" stroke="#e9edf1" stroke-width="1"/>
+<text x="425.5" y="649.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="middle" >10×</text>
+<line x1="697.00" x2="697.00" y1="166" y2="622" stroke="#e9edf1" stroke-width="1"/>
+<text x="697.0" y="649.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="middle" >100×</text>
+<path d="M112,166 V622 H697" fill="none" stroke="#5d6670" stroke-width="1.25"/>
+<circle cx="536.64" cy="529.41" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_orderkey — Parquet: 25.66×, 70.6 GB/s</title></circle>
+<circle cx="163.35" cy="518.01" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_partkey — Parquet: 1.08×, 82.5 GB/s</title></circle>
+<circle cx="182.98" cy="543.54" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_suppkey — Parquet: 1.28×, 58.3 GB/s</title></circle>
+<circle cx="474.69" cy="540.18" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_linenumber — Parquet: 15.17×, 61.0 GB/s</title></circle>
+<circle cx="432.52" cy="489.17" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_quantity — Parquet: 10.61×, 122.2 GB/s</title></circle>
+<circle cx="267.60" cy="458.15" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_extendedprice — Parquet: 2.62×, 186.6 GB/s</title></circle>
+<circle cx="480.09" cy="496.97" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_discount — Parquet: 15.89×, 109.9 GB/s</title></circle>
+<circle cx="480.09" cy="477.31" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_tax — Parquet: 15.89×, 143.7 GB/s</title></circle>
+<circle cx="509.44" cy="566.58" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_returnflag — Parquet: 20.37×, 42.6 GB/s</title></circle>
+<circle cx="561.91" cy="516.34" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_linestatus — Parquet: 31.80×, 84.4 GB/s</title></circle>
+<circle cx="268.67" cy="532.40" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_shipdate — Parquet: 2.64×, 67.8 GB/s</title></circle>
+<circle cx="268.69" cy="500.07" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_commitdate — Parquet: 2.64×, 105.4 GB/s</title></circle>
+<circle cx="268.66" cy="516.07" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_receiptdate — Parquet: 2.64×, 84.7 GB/s</title></circle>
+<circle cx="642.74" cy="453.75" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_shipinstruct — Parquet: 63.11×, 198.1 GB/s</title></circle>
+<circle cx="517.90" cy="508.70" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_shipmode — Parquet: 21.89×, 93.7 GB/s</title></circle>
+<circle cx="266.81" cy="504.28" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_comment — Parquet: 2.60×, 99.5 GB/s</title></circle>
+<circle cx="450.82" cy="234.84" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_orderkey — Simpatico: 12.39×, 3,913.1 GB/s</title></circle>
+<circle cx="169.50" cy="265.58" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_partkey — Simpatico: 1.14×, 2,573.8 GB/s</title></circle>
+<circle cx="187.62" cy="263.83" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_suppkey — Simpatico: 1.33×, 2,636.0 GB/s</title></circle>
+<circle cx="430.40" cy="239.44" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_linenumber — Simpatico: 10.42×, 3,675.5 GB/s</title></circle>
+<circle cx="341.06" cy="238.81" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_quantity — Simpatico: 4.88×, 3,707.4 GB/s</title></circle>
+<circle cx="269.19" cy="246.67" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_extendedprice — Simpatico: 2.66×, 3,330.5 GB/s</title></circle>
+<circle cx="477.98" cy="218.56" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_discount — Simpatico: 15.60×, 4,885.6 GB/s</title></circle>
+<circle cx="477.98" cy="218.39" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_tax — Simpatico: 15.60×, 4,897.1 GB/s</title></circle>
+<circle cx="503.17" cy="285.79" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_returnflag — Simpatico: 19.32×, 1,954.4 GB/s</title></circle>
+<circle cx="580.96" cy="285.56" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_linestatus — Simpatico: 37.37×, 1,960.5 GB/s</title></circle>
+<circle cx="269.00" cy="254.88" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_shipdate — Simpatico: 2.65×, 2,978.0 GB/s</title></circle>
+<circle cx="269.00" cy="255.13" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_commitdate — Simpatico: 2.65×, 2,968.1 GB/s</title></circle>
+<circle cx="269.00" cy="255.39" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_receiptdate — Simpatico: 2.65×, 2,957.5 GB/s</title></circle>
+<circle cx="640.30" cy="423.95" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_shipinstruct — Simpatico: 61.82×, 297.3 GB/s</title></circle>
+<circle cx="193.70" cy="304.32" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_shipmode — Simpatico: 1.40×, 1,518.1 GB/s</title></circle>
+<circle cx="259.59" cy="486.58" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_comment — Simpatico: 2.45×, 126.6 GB/s</title></circle>
+<circle cx="303.19" cy="371.89" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_orderkey — Vortex: 3.54×, 604.5 GB/s</title></circle>
+<circle cx="169.79" cy="261.22" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_partkey — Vortex: 1.14×, 2,731.6 GB/s</title></circle>
+<circle cx="187.97" cy="257.30" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_suppkey — Vortex: 1.33×, 2,881.5 GB/s</title></circle>
+<circle cx="433.13" cy="229.90" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_linenumber — Vortex: 10.67×, 4,185.7 GB/s</title></circle>
+<circle cx="433.13" cy="296.40" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_quantity — Vortex: 10.67×, 1,691.2 GB/s</title></circle>
+<circle cx="269.69" cy="273.19" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_extendedprice — Vortex: 2.67×, 2,320.6 GB/s</title></circle>
+<circle cx="480.93" cy="246.29" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_discount — Vortex: 16.00×, 3,348.1 GB/s</title></circle>
+<circle cx="480.93" cy="246.17" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_tax — Vortex: 16.00×, 3,353.5 GB/s</title></circle>
+<circle cx="507.22" cy="481.14" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_returnflag — Vortex: 20.00×, 136.4 GB/s</title></circle>
+<circle cx="588.91" cy="480.09" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_linestatus — Vortex: 39.98×, 138.4 GB/s</title></circle>
+<circle cx="269.69" cy="242.11" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_shipdate — Vortex: 2.67×, 3,544.2 GB/s</title></circle>
+<circle cx="269.69" cy="242.00" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_commitdate — Vortex: 2.67×, 3,549.7 GB/s</title></circle>
+<circle cx="269.69" cy="241.46" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_receiptdate — Vortex: 2.67×, 3,575.6 GB/s</title></circle>
+<circle cx="322.18" cy="380.97" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_shipinstruct — Vortex: 4.16×, 534.1 GB/s</title></circle>
+<circle cx="437.25" cy="428.24" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_shipmode — Vortex: 11.05×, 280.5 GB/s</title></circle>
+<circle cx="296.42" cy="382.68" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>lineitem.l_comment — Vortex: 3.35×, 521.8 GB/s</title></circle>
+<path d="M327.76,454.91 L336.76,463.91 L327.76,472.91 L318.76,463.91 Z" fill="white" stroke="#2978b8" stroke-width="3.5"><title>lineitem whole table — Parquet: 4.36×, 172.5 GB/s</title></path>
+<path d="M301.80,393.79 L310.80,402.79 L301.80,411.79 L292.80,402.79 Z" fill="white" stroke="#db6c27" stroke-width="3.5"><title>lineitem whole table — Simpatico: 3.50×, 396.7 GB/s</title></path>
+<path d="M316.50,365.93 L325.50,374.93 L316.50,383.93 L307.50,374.93 Z" fill="white" stroke="#258d69" stroke-width="3.5"><title>lineitem whole table — Vortex: 3.97×, 579.9 GB/s</title></path>
+<text x="404.5" y="687.0" fill="#252d36" font-size="16" font-weight="normal" text-anchor="middle" >Compression ratio (×, log scale)</text>
+<text x="830.0" y="137.0" fill="#252d36" font-size="21" font-weight="bold" text-anchor="start" >orders</text>
+<line x1="830" x2="1415" y1="622.00" y2="622.00" stroke="#e9edf1" stroke-width="1"/>
+<line x1="830" x2="1415" y1="554.77" y2="554.77" stroke="#e9edf1" stroke-width="1"/>
+<line x1="830" x2="1415" y1="503.91" y2="503.91" stroke="#e9edf1" stroke-width="1"/>
+<line x1="830" x2="1415" y1="453.05" y2="453.05" stroke="#e9edf1" stroke-width="1"/>
+<line x1="830" x2="1415" y1="385.81" y2="385.81" stroke="#e9edf1" stroke-width="1"/>
+<line x1="830" x2="1415" y1="334.95" y2="334.95" stroke="#e9edf1" stroke-width="1"/>
+<line x1="830" x2="1415" y1="284.09" y2="284.09" stroke="#e9edf1" stroke-width="1"/>
+<line x1="830" x2="1415" y1="216.86" y2="216.86" stroke="#e9edf1" stroke-width="1"/>
+<line x1="830" x2="1415" y1="166.00" y2="166.00" stroke="#e9edf1" stroke-width="1"/>
+<line x1="844.72" x2="844.72" y1="166" y2="622" stroke="#e9edf1" stroke-width="1"/>
+<text x="844.7" y="649.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="middle" >1×</text>
+<line x1="939.77" x2="939.77" y1="166" y2="622" stroke="#e9edf1" stroke-width="1"/>
+<text x="939.8" y="649.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="middle" >10×</text>
+<line x1="1034.82" x2="1034.82" y1="166" y2="622" stroke="#e9edf1" stroke-width="1"/>
+<text x="1034.8" y="649.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="middle" >100×</text>
+<line x1="1129.86" x2="1129.86" y1="166" y2="622" stroke="#e9edf1" stroke-width="1"/>
+<text x="1129.9" y="649.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="middle" >1,000×</text>
+<line x1="1224.91" x2="1224.91" y1="166" y2="622" stroke="#e9edf1" stroke-width="1"/>
+<text x="1224.9" y="649.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="middle" >10,000×</text>
+<line x1="1319.95" x2="1319.95" y1="166" y2="622" stroke="#e9edf1" stroke-width="1"/>
+<text x="1320.0" y="649.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="middle" >100,000×</text>
+<line x1="1415.00" x2="1415.00" y1="166" y2="622" stroke="#e9edf1" stroke-width="1"/>
+<text x="1415.0" y="649.0" fill="#5d6670" font-size="13" font-weight="normal" text-anchor="middle" >1,000,000×</text>
+<path d="M830,166 V622 H1415" fill="none" stroke="#5d6670" stroke-width="1.25"/>
+<circle cx="1071.31" cy="471.50" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_orderkey — Parquet: 242.09×, 155.5 GB/s</title></circle>
+<circle cx="843.64" cy="540.21" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_custkey — Parquet: 0.97×, 61.0 GB/s</title></circle>
+<circle cx="967.77" cy="519.32" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_orderstatus — Parquet: 19.71×, 81.0 GB/s</title></circle>
+<circle cx="881.26" cy="471.18" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_totalprice — Parquet: 2.42×, 156.2 GB/s</title></circle>
+<circle cx="884.91" cy="515.91" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_orderdate — Parquet: 2.65×, 84.9 GB/s</title></circle>
+<circle cx="988.76" cy="456.20" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_orderpriority — Parquet: 32.76×, 191.6 GB/s</title></circle>
+<circle cx="884.18" cy="550.87" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_clerk — Parquet: 2.60×, 52.7 GB/s</title></circle>
+<circle cx="1171.10" cy="488.97" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_shippriority — Parquet: 2715.77×, 122.6 GB/s</title></circle>
+<circle cx="888.89" cy="499.11" r="5.1" fill="#2978b8" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_comment — Parquet: 2.92×, 106.8 GB/s</title></circle>
+<circle cx="948.63" cy="232.98" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_orderkey — Simpatico: 12.39×, 4,014.1 GB/s</title></circle>
+<circle cx="850.13" cy="265.66" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_custkey — Simpatico: 1.14×, 2,571.2 GB/s</title></circle>
+<circle cx="966.95" cy="286.15" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_orderstatus — Simpatico: 19.32×, 1,944.7 GB/s</title></circle>
+<circle cx="881.74" cy="247.53" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_totalprice — Simpatico: 2.45×, 3,291.8 GB/s</title></circle>
+<circle cx="884.97" cy="253.56" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_orderdate — Simpatico: 2.65×, 3,032.1 GB/s</title></circle>
+<circle cx="988.18" cy="433.51" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_orderpriority — Simpatico: 32.31×, 261.0 GB/s</title></circle>
+<circle cx="927.04" cy="383.53" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_clerk — Simpatico: 7.35×, 515.8 GB/s</title></circle>
+<circle cx="1097.37" cy="218.87" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_shippriority — Simpatico: 455.10×, 4,864.7 GB/s</title></circle>
+<circle cx="841.69" cy="256.33" r="5.1" fill="#db6c27" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_comment — Simpatico: 0.93×, 2,919.8 GB/s</title></circle>
+<circle cx="881.90" cy="237.93" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_orderkey — Vortex: 2.46×, 3,751.8 GB/s</title></circle>
+<circle cx="850.23" cy="260.86" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_custkey — Vortex: 1.14×, 2,744.8 GB/s</title></circle>
+<circle cx="968.37" cy="479.81" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_orderstatus — Vortex: 20.00×, 138.9 GB/s</title></circle>
+<circle cx="881.90" cy="273.99" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_totalprice — Vortex: 2.46×, 2,295.2 GB/s</title></circle>
+<circle cx="885.21" cy="241.96" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_orderdate — Vortex: 2.67×, 3,551.6 GB/s</title></circle>
+<circle cx="968.04" cy="404.67" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_orderpriority — Vortex: 19.84×, 386.7 GB/s</title></circle>
+<circle cx="888.09" cy="402.55" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_clerk — Vortex: 2.86×, 398.0 GB/s</title></circle>
+<circle cx="1379.73" cy="368.84" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_shippriority — Vortex: 425531.76×, 630.1 GB/s</title></circle>
+<circle cx="904.99" cy="373.86" r="5.1" fill="#258d69" fill-opacity="0.79" stroke="white" stroke-width="1.1"><title>orders.o_comment — Vortex: 4.31×, 588.5 GB/s</title></circle>
+<path d="M894.62,481.72 L903.62,490.72 L894.62,499.72 L885.62,490.72 Z" fill="white" stroke="#2978b8" stroke-width="3.5"><title>orders whole table — Parquet: 3.35×, 119.7 GB/s</title></path>
+<path d="M866.69,323.29 L875.69,332.29 L866.69,341.29 L857.69,332.29 Z" fill="white" stroke="#db6c27" stroke-width="3.5"><title>orders whole table — Simpatico: 1.70×, 1,037.0 GB/s</title></path>
+<path d="M899.23,368.16 L908.23,377.16 L899.23,386.16 L890.23,377.16 Z" fill="white" stroke="#258d69" stroke-width="3.5"><title>orders whole table — Vortex: 3.75×, 562.6 GB/s</title></path>
+<path d="M1370.7,361.8 L1334.7,342.8" fill="none" stroke="#58636e" stroke-width="1"/>
+<text x="1329.7" y="339.8" fill="#58636e" font-size="13" font-weight="normal" text-anchor="end" >o_shippriority</text>
+<text x="1122.5" y="687.0" fill="#252d36" font-size="16" font-weight="normal" text-anchor="middle" >Compression ratio (×, log scale)</text>
+<text x="33.0" y="394.0" fill="#252d36" font-size="16" font-weight="normal" text-anchor="middle" transform="rotate(-90 33 394)">Decode throughput (GB/s, log scale)</text>
+<text x="112.0" y="730.0" fill="#5d6670" font-size="14" font-weight="normal" text-anchor="start" >Dots: individual columns; diamonds: whole-table result. Rates use decoded logical bytes.</text>
+</g></svg>
