@@ -288,7 +288,9 @@ unique_ptr<FunctionData> log_bind(ClientContext&,
   auto data = make_uniq<rows_data>();
   auto log  = gateway_of(input).ddl_log();
   for (idx_t i = 0; i < log.size(); ++i) {
-    data->rows.push_back({Value::UBIGINT(i + 1), Value(log[i].sql)});
+    data->rows.push_back(
+      {Value::UBIGINT(i + 1),
+       Value(log[i].secret ? "-- not shown: this statement carries credentials" : log[i].sql)});
   }
   return std::move(data);
 }
@@ -306,6 +308,9 @@ unique_ptr<FunctionData> run_bind(ClientContext& context,
   for (auto const& name : data->result->names) {
     names.emplace_back(name);
   }
+  // Quack renames repeated names on the way from a rank; the gateway's own catalog answer, with
+  // no ranks, has them as written.
+  QueryResult::DeduplicateColumns(names);
   if (types.empty()) {
     types = {LogicalType::BOOLEAN};
     names = {"Success"};
@@ -318,7 +323,7 @@ void scan_run(ClientContext&, TableFunctionInput& input, DataChunk& output)
   auto& chunks = input.bind_data->Cast<run_data>().result->chunks;
   auto& state  = input.global_state->Cast<scan_state>();
   if (state.offset < chunks.size()) {
-    chunks[state.offset++]->Copy(output);
+    output.Reference(*chunks[state.offset++]);
   } else {
     output.SetCardinality(0);
   }
@@ -392,73 +397,79 @@ void LoadInternal(ExtensionLoader& loader)
   route.SetFallible();
   loader.RegisterFunction(route);
 
+  // Global, as Quack's own options are: the router and each statement read them in the client's
+  // session, which a plain SET on the console would otherwise not reach.
   auto& config = DBConfig::GetConfig(db);
-  config.AddExtensionOption("sirius_gateway_duckdb_binary",
+  auto option  = [&](char const* name, char const* description, LogicalType type, Value fallback) {
+    config.AddExtensionOption(
+      name, description, std::move(type), fallback, nullptr, SetScope::GLOBAL);
+  };
+  option("sirius_gateway_duckdb_binary",
                             "DuckDB binary that runs each rank",
                             LogicalType::VARCHAR,
                             Value(""));
-  config.AddExtensionOption("sirius_gateway_sirius_extension",
+  option("sirius_gateway_sirius_extension",
                             "Sirius extension each rank loads; empty runs CPU ranks without Sirius",
                             LogicalType::VARCHAR,
                             Value(""));
-  config.AddExtensionOption("sirius_gateway_rank_init",
+  option("sirius_gateway_rank_init",
                             "SQL each rank's session runs after the exchange settings",
                             LogicalType::VARCHAR,
                             Value(""));
-  config.AddExtensionOption("sirius_gateway_log_dir",
+  option("sirius_gateway_log_dir",
                             "Directory for rank init files and logs; empty uses a temporary one",
                             LogicalType::VARCHAR,
                             Value(""));
   // A rank waiting on a peer that never ran the query has no bound of its own, so 0 can hold
   // the gateway's one turn forever.
-  config.AddExtensionOption(
+  option(
     "sirius_gateway_statement_timeout",
     "Seconds one statement may run before it is cancelled on every rank; 0 is none. Raise it "
     "for long queries",
     LogicalType::UBIGINT,
     Value::UBIGINT(3600));
-  config.AddExtensionOption(
+  option(
     "sirius_gateway_allow_join",
     "Let clients call sirius_gateway_add_rank and sirius_gateway_drop_rank, "
     "so that ranks register themselves",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(false));
-  config.AddExtensionOption("sirius_gateway_min_ranks",
+  option("sirius_gateway_min_ranks",
                             "Registered ranks the gateway waits for before the first statement "
                             "starts them",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(1));
-  config.AddExtensionOption("sirius_gateway_join_wait",
+  option("sirius_gateway_join_wait",
                             "Seconds a statement waits for sirius_gateway_min_ranks ranks to "
                             "register before it fails; 0 fails at once",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(600));
-  config.AddExtensionOption("sirius_gateway_state_dir",
+  option("sirius_gateway_state_dir",
                             "Directory where the gateway keeps its DDL log (ddl.sql) across its "
                             "own restarts; empty keeps it in memory only",
                             LogicalType::VARCHAR,
                             Value(""));
-  config.AddExtensionOption("sirius_gateway_cancel_grace",
+  option("sirius_gateway_cancel_grace",
                             "Seconds a cancelled statement may keep running on a rank before the "
                             "gateway kills the rank and restarts every rank",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(30));
-  config.AddExtensionOption("sirius_gateway_rank_boot_id_sql",
+  option("sirius_gateway_rank_boot_id_sql",
                             "Query that names a registered rank's process; it changes when the "
                             "rank restarts",
                             LogicalType::VARCHAR,
                             Value("SELECT boot_id FROM sirius_rank_info()"));
-  config.AddExtensionOption("sirius_gateway_rank_joined_sql",
+  option("sirius_gateway_rank_joined_sql",
                             "Query that says whether a registered rank's process has joined a set "
                             "of ranks, so must restart to join another; empty restarts every time",
                             LogicalType::VARCHAR,
                             Value("SELECT joined FROM sirius_rank_info()"));
-  config.AddExtensionOption("sirius_gateway_rank_exit_sql",
+  option("sirius_gateway_rank_exit_sql",
                             "Statement that ends a registered rank's process, for its launcher to "
                             "start it again",
                             LogicalType::VARCHAR,
                             Value("CALL sirius_rank_exit()"));
-  config.AddExtensionOption("sirius_gateway_query_id_setting",
+  option("sirius_gateway_query_id_setting",
                             "Setting that carries the query number to each rank; empty sends none",
                             LogicalType::VARCHAR,
                             Value("sirius_distributed_query_id"));
