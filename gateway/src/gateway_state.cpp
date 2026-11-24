@@ -1245,6 +1245,10 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
     if (state_ == cluster_state::ready) { reason_ = save_error; }
   }
 
+  // Only rank 0's answer is returned: the others are released before it is collected.
+  for (std::size_t i = 1; i < outcomes.size(); ++i) {
+    outcomes[i].result.reset();
+  }
   return collect(*outcomes[0].result);
 }
 
