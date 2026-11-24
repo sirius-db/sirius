@@ -273,6 +273,41 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   return out;
 }
 
+// The scan's own filter evaluates on the decoded batch, before normalization, so a filtered column
+// keeps its native carrier.
+bool scan_filters_column(duckdb::LogicalGet const& op, std::size_t ids_position)
+{
+  if (op.table_filters.HasMultiColumnFilters()) { return true; }
+  for (auto const& filter : op.table_filters) {
+    if (filter.GetIndex() == ids_position) { return true; }
+  }
+  return false;
+}
+
+// The position in the scan's column ids that feeds output column @p output_idx, if any.
+std::optional<std::size_t> scan_ids_position(duckdb::LogicalGet const& op,
+                                             std::size_t output_idx,
+                                             std::size_t ids_size)
+{
+  std::size_t ids_position = output_idx;
+  if (!op.projection_ids.empty()) {
+    if (output_idx >= op.projection_ids.size()) { return std::nullopt; }
+    ids_position = op.projection_ids[output_idx];
+  }
+  if (ids_position >= ids_size) { return std::nullopt; }
+  return ids_position;
+}
+
+void carry_as_dictionary(cudf::data_type& carrier,
+                         std::size_t output_idx,
+                         duckdb::ColumnIndex const& id)
+{
+  carrier = cudf::data_type{cudf::type_id::DICTIONARY32};
+  SIRIUS_LOG_DEBUG("[sirius_plan_get] scan output {} (table column {}) carried as DICTIONARY32",
+                   output_idx,
+                   id.GetPrimaryIndex());
+}
+
 std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
                                                   duckdb::SiriusContext* state,
                                                   bool compressed_materialization_on,
@@ -280,7 +315,9 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
                                                   const duckdb::vector<duckdb::ColumnIndex>& ids,
                                                   sirius::scan_manager::pinned_entry const* entry)
 {
-  if (!state || !compressed_materialization_on || entry == nullptr) { return {}; }
+  if (!state || (!compressed_materialization_on && !dictionary_carrier_on) || entry == nullptr) {
+    return {};
+  }
 
   // Install a narrow sidecar only when the pinned cache can serve this scan. Each target comes from
   // recorded stored-column metadata, so compressed and uncompressed chunks use the same path. A
@@ -301,37 +338,25 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
     result.push_back(*native);
     bool const dictionary_candidate =
       native->id() == cudf::type_id::STRING && dictionary_carrier_on;
-    if (!sirius::is_narrowable_numeric_type(logical) && !dictionary_candidate) { continue; }
+    bool const numeric_candidate =
+      compressed_materialization_on && sirius::is_narrowable_numeric_type(logical);
+    if (!numeric_candidate && !dictionary_candidate) { continue; }
 
-    std::size_t ids_position = output_idx;
-    if (!op.projection_ids.empty()) {
-      if (output_idx >= op.projection_ids.size()) { continue; }
-      ids_position = op.projection_ids[output_idx];
-    }
-    if (ids_position >= ids.size()) { continue; }
+    auto const ids_position = scan_ids_position(op, output_idx, ids.size());
+    if (!ids_position) { continue; }
 
     if (dictionary_candidate) {
-      // The scan's own filter evaluates on the decoded batch, before normalization, so a filtered
-      // column keeps its native carrier.
-      bool filtered = op.table_filters.HasMultiColumnFilters();
-      for (auto const& filter : op.table_filters) {
-        filtered = filtered || filter.GetIndex() == ids_position;
-      }
-      if (filtered) { continue; }
-      if (sirius::scan_manager::pinned_column_dictionary_in_all_chunks(*entry,
-                                                                       projection[ids_position])) {
-        result.back() = cudf::data_type{cudf::type_id::DICTIONARY32};
-        changed       = true;
-        SIRIUS_LOG_DEBUG(
-          "[sirius_plan_get] scan output {} (table column {}) carried as DICTIONARY32",
-          output_idx,
-          ids[ids_position].GetPrimaryIndex());
+      if (!scan_filters_column(op, *ids_position) &&
+          sirius::scan_manager::pinned_column_dictionary_in_all_chunks(*entry,
+                                                                       projection[*ids_position])) {
+        carry_as_dictionary(result.back(), output_idx, ids[*ids_position]);
+        changed = true;
       }
       continue;
     }
 
-    auto const target =
-      sirius::scan_manager::pinned_column_narrow_carrier(*entry, projection[ids_position], *native);
+    auto const target = sirius::scan_manager::pinned_column_narrow_carrier(
+      *entry, projection[*ids_position], *native);
     if (!target) { continue; }
     result.back() = *target;
     changed       = true;
@@ -552,12 +577,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
                         : nullptr;
 
   // Resolved once for this plan against the connection being planned for, so the parquet
-  // identity probe and the residency gate below cannot disagree about whether narrowing is on.
+  // identity probe and the residency gate below cannot disagree about which carriers are on.
   bool const compressed_materialization_on = duckdb::compressed_materialization_enabled(context);
+  bool const dictionary_carrier_on         = duckdb::dictionary_carrier_enabled(context);
 
   // One pinned-entry probe per scan: the compressed-materialization residency gate and
   // the seq_scan MVCC cache-or-CPU guard below share the result. The parquet identity
-  // feeds only the gate, so its file resolution runs only when the feature is on.
+  // feeds only the gate, so its file resolution runs only when a carrier setting is on.
   // Both probes are OWNING: the shared_ptr holds the entry alive across the guards below, so a
   // concurrent UNPIN on another connection cannot invalidate it mid-check. `pinned` is the
   // shared raw view over whichever probe matched.
@@ -603,7 +629,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         serves_insert_deltas = true;
       }
     }
-  } else if (!marked_decline && sirius_state && compressed_materialization_on) {
+  } else if (!marked_decline && sirius_state &&
+             (compressed_materialization_on || dictionary_carrier_on)) {
     auto const files = resolve_parquet_scan_file_paths(
       op.function.GetName().GetIdentifierName(), op.bind_data.get(), op.parameters);
     if (!files.empty()) {
@@ -615,7 +642,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   auto physical_types = scan_physical_schema(op,
                                              sirius_state.get(),
                                              compressed_materialization_on,
-                                             duckdb::dictionary_carrier_enabled(context),
+                                             dictionary_carrier_on,
                                              column_ids,
                                              serves_insert_deltas ? nullptr : pinned);
 

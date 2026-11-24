@@ -4058,9 +4058,8 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
 
   config.AddExtensionOption(
     "enable_dictionary_carrier",
-    "Keep VARCHAR columns whose GPU-tier pin is dictionary-encoded as DICTIONARY32 carriers past "
-    "the scan, so grouped aggregates group on the codes; needs enable_compressed_materialization "
-    "(off by default)",
+    "Keep VARCHAR columns whose Simpatico pin is dictionary-encoded as DICTIONARY32 carriers past "
+    "the scan, so grouped aggregates group on the codes (off by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_dictionary_carrier),
     SetEnableDictionaryCarrier);

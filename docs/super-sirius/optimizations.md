@@ -338,7 +338,7 @@ The aggregate has a group for a key exactly when `S` has a row for it, which is 
 3. For up to 8 groups, `group_ids_kernel` writes a one-byte group id per row and `aggregate_columns_kernel<MaxGroups>` aggregates one column at a time with per-thread register accumulators and predicated adds (no atomics), followed by 128-bit warp and block reductions. 9 to 64 groups use per-warp shared-memory accumulators instead.
 4. Per-block totals are combined into DECIMAL128 sums and INT64 counts, and the keys are gathered from the representative rows.
 
-It applies only to one or two non-null one-character STRING keys, at most 64 groups, and SUM, COUNT or COUNT(*) over non-null DECIMAL64 or INT64 columns whose values are small enough for 64-bit partial sums (checked per row). Anything else returns `nullptr` and the cuDF path runs unchanged.
+It applies only to one or two non-null keys that are one-character STRINGs or [dictionary carriers](#dictionary-carrier) of at most 256 keys (whose codes stand in for the character), at most 64 groups, and SUM, COUNT or COUNT(*) over non-null DECIMAL64 or INT64 columns whose values are small enough for 64-bit partial sums (checked per row). Anything else returns `nullptr` and the cuDF path runs unchanged.
 
 **Code path:**
 - `src/cuda/low_cardinality_groupby.cu` — kernels and host orchestration
@@ -572,6 +572,24 @@ result materialization restore native carriers.
 - `src/compression/simpatico_codegen/src/decode/jit/renderer.cpp` — `out_dtype` rendering
 
 **Config:** Always on. TPC-H SF1000 on a GB300: q1 0.769 s → 0.752 s (−17 ms); the other queries are unchanged within noise.
+
+### Dictionary Carrier
+
+**Motivation:** Many group-by keys are low-cardinality strings that a Simpatico pin already stores as a dictionary. Decoding them to a cuDF STRING column materializes every row's bytes, and the grouped aggregate then hashes those bytes (or dictionary-encodes them again for long keys).
+
+**Mechanism:** The planner marks such a VARCHAR scan output as a DICTIONARY32 carrier (keys plus INT32 codes) in the compressed-materialization sidecar. A column the scan filters on is never carried. The pin's decode then returns the keys and codes of the column's `dictionary` plan instead of gathering strings. The pin records which columns have a `dictionary` value root in its `column_storage` matrix (`pinned_column_storage_meta::string_dictionary`), and a column qualifies when every chunk does. Both tiers qualify; the tier narrowing policy judges a host-tier pin's dictionary carriers but leaves its narrow numeric columns alone.
+
+The grouped aggregate groups on the codes and rewraps the output codes with the carrier's keys. COUNT requests over a carrier read its codes, since cuDF's hash group-by rejects dictionary value columns and would send the whole batch down the sort path. The low-cardinality kernel keys on the codes of a dictionary with at most 256 keys. Anything else that reads the column (expressions, join keys, results) restores it to STRING through `cast_through_rep`.
+
+**Code path:**
+- `src/planner/sirius_plan_get.cpp` — `scan_physical_schema()`
+- `src/pin_table.cpp` — `record_string_dictionaries()`
+- `src/compression/simpatico_codegen/src/plan/decompress.cpp` — dictionary output of the decode
+- `src/op/aggregate/gpu_aggregate_impl.cpp`, `src/cuda/low_cardinality_groupby.cu` — grouping on codes
+
+**Config:** `enable_dictionary_carrier` (default: `false`), independent of `enable_compressed_materialization`. See [Configuration](configuration.md#scan). TPC-H SF1000 on one GB300, medians of 4 timed iterations after a warm-up, carrier off vs on:
+- GPU-tier pins: Q1 248 ms → 226 ms, Q4 106 ms → 95 ms, the suite −1.0%.
+- Host-tier pins: Q1 325 ms → 309 ms, Q4 138 ms → 117 ms, the suite about −1%.
 
 ### Late Materialization
 

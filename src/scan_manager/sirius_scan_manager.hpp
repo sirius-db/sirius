@@ -405,10 +405,10 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 [[nodiscard]] bool pinned_column_nulls_restorable(pinned_entry const& entry,
                                                   std::size_t column_position);
 
-/// True when @p entry is a GPU-tier pin whose every chunk is Simpatico-compressed and stores the
-/// cached column at @p entry_position with a string `dictionary` value root, so each chunk can
-/// decode it straight to a DICTIONARY32 carrier. False for any other tier, an uncompressed chunk,
-/// another plan shape, a zero-chunk entry, or an out-of-range position.
+/// True when every chunk of @p entry is Simpatico-compressed and stores the cached column at
+/// @p entry_position with a string `dictionary` value root, so each chunk can decode it straight
+/// to a DICTIONARY32 carrier. Either tier qualifies. False for an uncompressed chunk, another plan
+/// shape, a zero-chunk entry, or an out-of-range position.
 [[nodiscard]] bool pinned_column_dictionary_in_all_chunks(pinned_entry const& entry,
                                                           std::size_t entry_position);
 

@@ -3978,15 +3978,11 @@ std::optional<cudf::data_type> pinned_column_narrow_carrier(pinned_entry const& 
 
 bool pinned_column_dictionary_in_all_chunks(pinned_entry const& entry, std::size_t entry_position)
 {
-  if (entry.device_chunks.empty() || entry_position >= entry.cache_info.column_ids.size()) {
-    return false;
-  }
-  return std::ranges::all_of(entry.device_chunks, [&](sirius::device_pin_chunk const& chunk) {
-    if (!chunk.compressed || !chunk.compressed->has_table()) { return false; }
-    auto const& columns = chunk.compressed->table().columns;
-    if (entry_position >= columns.size() || !columns[entry_position].plan_tree) { return false; }
-    return simpatico::probe_column(*columns[entry_position].plan_tree).can_answer_equality;
-  });
+  if (entry.column_storage.empty()) { return false; }
+  return std::ranges::all_of(
+    entry.column_storage, [&](std::vector<pinned_column_storage_meta> const& row) {
+      return entry_position < row.size() && row[entry_position].string_dictionary;
+    });
 }
 
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
