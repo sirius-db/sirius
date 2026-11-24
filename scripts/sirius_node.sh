@@ -102,9 +102,14 @@ conf=$HOME/.sirius/gateways/$cluster/gateway.conf
 case $gpus in
   slurm) ranks=(slurm) ;;
   all)
-    count=$(nvidia-smi -L 2> /dev/null | grep -c '^GPU' || true)
-    ranks=()
-    for ((i = 0; i < count; i++)); do ranks+=("$i"); done
+    # nvidia-smi -L lists every GPU of the node, also those outside CUDA_VISIBLE_DEVICES.
+    if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+      IFS=, read -r -a ranks <<< "$CUDA_VISIBLE_DEVICES"
+    else
+      count=$(nvidia-smi -L 2> /dev/null | grep -c '^GPU' || true)
+      ranks=()
+      for ((i = 0; i < count; i++)); do ranks+=("$i"); done
+    fi
     ;;
   *) IFS=, read -r -a ranks <<< "$gpus" ;;
 esac
@@ -149,7 +154,13 @@ check_gpus()
     fi
   else
     for gpu in "${ranks[@]}"; do
-      if ! [[ $gpu =~ ^[0-9]+$ ]] || [ "$gpu" -ge "$count" ]; then
+      if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        # Matched as written: an entry may be a UUID.
+        if [[ ",$CUDA_VISIBLE_DEVICES," != *",$gpu,"* ]]; then
+          fail "GPU $gpu is outside CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" "--gpus all, or GPUs from that list"
+          return
+        fi
+      elif ! [[ $gpu =~ ^[0-9]+$ ]] || [ "$gpu" -ge "$count" ]; then
         fail "no GPU $gpu: this node has $count" "--gpus all, or a list of GPUs from 0 to $((count - 1))"
         return
       fi
