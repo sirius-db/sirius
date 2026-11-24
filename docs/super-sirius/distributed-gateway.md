@@ -163,6 +163,19 @@ runs alone.
 `sirius_rank_exit` replies, shuts the exchange down (freeing its port and shared-memory mirrors)
 and exits with code 0; a watchdog ends it with code 1 if that hangs.
 
+**CPUs.** `sirius_rank_node.sh` runs each rank on CPUs of its own (`node.cpus`, default `auto`):
+the rank's GPU's share of the cores next to that GPU, divided among the GPUs there. A rank
+started with fewer CPUs than the host has keeps those instead, and ranks started together inside
+one such set share it. The rank's DuckDB gets that many threads and does not bind them to single
+CPUs (`pin_threads`). Ranks that share CPUs while DuckDB binds its threads stall: with 143 bound
+threads per rank on the 144 CPUs of a GB200 node, a thread of one rank waited behind a busy
+thread of another on the same CPU, and 8 of 13 TPC-H runs at scale factor 3000 on 8 ranks had a
+query take 1 to 13 minutes instead of seconds. With `auto`, 0 of 14 runs did. `all` leaves the
+host's CPUs shared and only stops the binding: 0 of 14 runs stalled, and the warm run took
+85.5 s against 68.6 s. Spawned ranks, and those of `scripts/distributed_run_sql.sh`, get neither
+their own CPUs nor unbound threads: on a host with 64 CPUs or more, start several ranks with the
+node script.
+
 Joins run in parallel. The first join that fails ends the others' retries, and its error is the
 one reported.
 
@@ -340,6 +353,7 @@ The query-number rules, and `sirius_rank_info`'s boot id and `joined`, are unit-
 | `scripts/sirius_client.sh` | A DuckDB shell attached to the gateway (`pixi run sirius-client`), through `~/.sirius/gateways/<cluster>/client.init.sql` (mode 600, with the token) |
 | `scripts/sirius_slurm.sbatch` | A gateway and one rank per task in a Slurm job |
 | `scripts/sirius_distributed_config.py` | Reads `sirius.distributed` from `sirius.yaml` for the scripts |
+| `scripts/sirius_rank_cpus.py` | Picks the CPUs a rank runs on, for `sirius_rank_node.sh` |
 | `scripts/sirius_rank_node.sh` | Runs a registered rank, restarts it when it exits, and registers it with the gateway by feeding `<dir>/register.sql` (mode 600, with both tokens) to DuckDB on stdin |
 | `scripts/sirius_rank_node.conf.example` | A config file for one rank; `sirius_node.sh` writes these |
 | `scripts/sirius_net.sh` | Picks this host's address and interface in `priority_networks` |
