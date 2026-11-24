@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -136,9 +137,9 @@ class nixl_fabric : public fabric {
   /// Writes @p bytes from the start of the send ring to offset @p dst of @p peer's receive ring,
   /// with no notification, and waits until it is done. Not for a host-staged peer, nor while a
   /// transport uses the fabric.
-  /// @return the seconds the write took.
-  /// @throws sirius::internal_exception when the write fails or takes more than ten seconds.
-  [[nodiscard]] double timed_write(rank_t peer, std::size_t dst, std::size_t bytes);
+  /// @return the seconds the write took; empty when it is not done after ten seconds.
+  /// @throws sirius::internal_exception when the write fails.
+  [[nodiscard]] std::optional<double> timed_write(rank_t peer, std::size_t dst, std::size_t bytes);
 
  private:
   struct lane;

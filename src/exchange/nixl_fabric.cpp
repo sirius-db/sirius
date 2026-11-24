@@ -72,15 +72,16 @@ constexpr std::uint32_t host_lanes = 16;
 // The main agent's metadata, for the peer's writer: kind | the metadata.
 constexpr char metadata_kind = '\x7c';
 
-// kind | u32 rank | u32 device | u64 receive ring base | u64 receive ring bytes | u32 pid |
-// PCI bus id of the GPU, NUL-padded (names the receive mirror and decides host staging) |
-// u32 receive ring in fabric memory | u32 NVLink clique id | 16-byte NVLink cluster UUID (all
-// zero: no NVLink domain) | the host's boot id, NUL-padded (tells ranks on other hosts apart)
+// kind | u32 rank | u32 device | u64 receive ring base | u64 receive ring bytes | u64 frame
+// bytes | u32 pid | PCI bus id of the GPU, NUL-padded (names the receive mirror and decides host
+// staging) | u32 receive ring in fabric memory | u32 NVLink clique id | 16-byte NVLink cluster UUID
+// (all zero: no NVLink domain) | the host's boot id, NUL-padded (tells ranks on other hosts apart)
 struct hello {
   rank_t rank;
   std::uint32_t device;
   std::uint64_t base;
   std::uint64_t bytes;
+  std::uint64_t frame_bytes;
   std::uint32_t pid;
   char pci_bus_id[pci_bus_id_bytes];
   std::uint32_t fabric_ring;
@@ -219,6 +220,10 @@ std::string boot_id()
   std::ifstream in{"/proc/sys/kernel/random/boot_id"};
   std::string id;
   std::getline(in, id);
+  if (id.empty()) {
+    SIRIUS_LOG_WARN(
+      "exchange: cannot read the kernel boot id; every peer is taken to be on this host");
+  }
   return id;
 }
 
@@ -608,6 +613,7 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
              static_cast<std::uint32_t>(_device),
              reinterpret_cast<std::uint64_t>(_recv.base()),
              _recv.bytes(),
+             _recv.frame_bytes(),
              // 0: no mirror, which map_mirror() on a peer reports.
              _mirror != nullptr ? _peers[_rank].pid : 0u,
              {},
@@ -950,15 +956,17 @@ void nixl_fabric::take(rank_t from, std::string const& agent, std::string body)
     }
     std::memcpy(&h, body.data() + 1, sizeof(h));
     auto& p = _peers[from];
-    if (h.rank != from || h.bytes != _recv.bytes()) {
+    if (h.rank != from || h.bytes != _recv.bytes() || h.frame_bytes != _recv.frame_bytes()) {
       throw sirius::invalid_input_exception(
-        "exchange NIXL: {} says it is rank {} with a {}-byte receive ring; expected rank {} "
-        "with {} bytes",
+        "exchange NIXL: {} says it is rank {} with a {}-byte receive ring of {}-byte frames; "
+        "expected rank {} with {} bytes of {}-byte frames",
         agent,
         h.rank,
         h.bytes,
+        h.frame_bytes,
         from,
-        _recv.bytes());
+        _recv.bytes(),
+        _recv.frame_bytes());
     }
     p.recv_base  = h.base;
     p.recv_bytes = h.bytes;
@@ -1104,7 +1112,7 @@ std::uint64_t nixl_fabric::write(
   return _next_write++;
 }
 
-double nixl_fabric::timed_write(rank_t peer, std::size_t dst, std::size_t bytes)
+std::optional<double> nixl_fabric::timed_write(rank_t peer, std::size_t dst, std::size_t bytes)
 {
   auto const& p = _peers.at(peer);
   if (host_staged(peer) || bytes > _send.bytes() || dst + bytes > p.recv_bytes) {
@@ -1132,10 +1140,7 @@ double nixl_fabric::timed_write(rank_t peer, std::size_t dst, std::size_t bytes)
   }
   auto const seconds =
     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  if (s == NIXL_IN_PROG) {
-    throw sirius::internal_exception(
-      "exchange NIXL: a timed {}-byte write to rank {} took over ten seconds", bytes, peer);
-  }
+  if (s == NIXL_IN_PROG) { return std::nullopt; }
   check(s, "timed write");
   return seconds;
 }

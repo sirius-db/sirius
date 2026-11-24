@@ -24,4 +24,9 @@ namespace sirius::exchange {
 /// peer. remote: TCP lanes to every peer, even on this host (for tests).
 enum class host_staging { automatic, always, never, remote };
 
+/// Whether the rings go in fabric memory, so that peers on other nodes of this NVLink domain
+/// write them over NVLink (MNNVL). automatic: where the GPU and driver allow it; require: every
+/// peer must be reached that way; off: cudaMalloc rings.
+enum class mnnvl_mode { automatic, require, off };
+
 }  // namespace sirius::exchange

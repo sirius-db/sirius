@@ -59,7 +59,7 @@ TEST_CASE("a peer in the same NVLink domain, both rings in fabric memory, gets t
       CHECK(choose_path(me, peer, staging, mnnvl, false) == path::nvlink_fabric);
     }
   }
-  // always still stages every peer through shared memory, as before.
+  // always stages a same-host peer through shared memory, even on the fabric.
   CHECK(choose_path(me, peer, host_staging::always, mnnvl_mode::automatic, true) ==
         path::shared_memory);
 }
@@ -134,6 +134,11 @@ TEST_CASE("a peer on another host gets TCP lanes unless the NVLink fabric reache
         path::shared_memory);
   CHECK_THROWS_WITH(choose_path(me, far, host_staging::automatic, mnnvl_mode::require, true),
                     Catch::Matchers::ContainsSubstring("cannot write rank 1"));
+  // require cannot hold where every peer is staged, even for a peer the fabric reaches.
+  for (auto const staging : {host_staging::always, host_staging::remote}) {
+    CHECK_THROWS_WITH(choose_path(me, far_fab, staging, mnnvl_mode::require, true),
+                      Catch::Matchers::ContainsSubstring("stages every peer"));
+  }
   CHECK(std::string{describe(path::tcp_lanes)} == "host-staged over TCP lanes");
 }
 

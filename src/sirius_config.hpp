@@ -280,7 +280,7 @@ struct operator_params {
   exchange::host_staging exchange_host_staging = exchange::host_staging::automatic;
   /// Distributed execution: "auto", "require" or "off" put the exchange's rings in fabric memory,
   /// so that GPUs on other nodes of the NVLink domain write them over NVLink.
-  std::string exchange_mnnvl = "auto";
+  exchange::mnnvl_mode exchange_mnnvl = exchange::mnnvl_mode::automatic;
   /// Distributed execution: the exchange's frame size; a positive multiple of 256.
   uint64_t exchange_frame_bytes = 16ull << 20;
   /// Distributed execution: send frames, shared by all peers.
