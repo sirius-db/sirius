@@ -55,6 +55,7 @@ exchange_service::exchange_service(fabric& fabric,
                                    cucascade::memory::memory_space& gpu,
                                    cucascade::memory::memory_space* host,
                                    transport::options opts)
+  : _rank{fabric.rank()}, _world_size{fabric.world_size()}
 {
   transport::callbacks cb{[this](stream_id stream,
                                  rank_t from,
@@ -63,9 +64,13 @@ exchange_service::exchange_service(fabric& fabric,
                             if (from != _rank && data) {
                               auto const bytes = bytes_of(*data);
                               std::lock_guard lock{_mutex};
-                              auto& t = _traffic[query_of(stream)];
-                              t.received_bytes += bytes;
-                              ++t.received_batches;
+                              // A batch that arrives after its query retired would start a
+                              // traffic entry that nothing drops.
+                              if (!retired(query_of(stream))) {
+                                auto& t = _traffic[query_of(stream)];
+                                t.received_bytes += bytes;
+                                ++t.received_batches;
+                              }
                             }
                             if (auto r = receiver_of(stream, {from, batch, data})) {
                               r->on_batch(from, batch, std::move(data));
@@ -98,8 +103,6 @@ exchange_service::exchange_service(fabric& fabric,
                                 "exchange: query {} failed on rank {}: {}", query, from, what)));
                           }};
   auto started = std::make_unique<transport>(fabric, send, recv, gpu, host, std::move(cb), opts);
-  _rank        = started->rank();
-  _world_size  = started->world_size();
   // Under the lock: the engine thread may already be in a callback that reads _transport.
   std::lock_guard lock{_mutex};
   _transport = std::move(started);

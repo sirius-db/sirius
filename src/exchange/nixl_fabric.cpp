@@ -485,11 +485,12 @@ struct nixl_fabric::lane {
             break;
           }
         }
-        // Spin while busy; once idle, poll the sockets every 50 us instead of burning a core.
+        // Spin while busy; once idle, poll the sockets at the engine's idle interval instead of
+        // burning a core. A lane frame takes milliseconds, so 200 us adds nothing visible.
         if (progress) {
           idle = 0;
         } else if (++idle > 2000) {
-          std::this_thread::sleep_for(std::chrono::microseconds{50});
+          std::this_thread::sleep_for(std::chrono::microseconds{200});
         }
       }
       for (auto const& f : in_flight) {
@@ -1154,7 +1155,8 @@ fabric::write_status nixl_fabric::status(std::uint64_t id)
     auto const copied = cudaEventQuery(w.copied);
     if (copied == cudaErrorNotReady) { return write_status::pending; }
     _free_events.push_back(w.copied);
-    auto& l = *_lanes[w.lane];
+    w.copied = nullptr;
+    auto& l  = *_lanes[w.lane];
     if (copied != cudaSuccess) {
       static_cast<void>(cudaGetLastError());
       SIRIUS_LOG_ERROR(
