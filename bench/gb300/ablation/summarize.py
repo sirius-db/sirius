@@ -66,6 +66,11 @@ def main() -> None:
         action="store_true",
         help="summarize the narrowing, BUILD_PROBE, dynamic filter, compression, fused-decode order",
     )
+    comparison.add_argument(
+        "--compressed-first-order",
+        action="store_true",
+        help="summarize the compression, narrowing, BUILD_PROBE, dynamic filter, fused-decode order",
+    )
     args = parser.parse_args()
     root = args.output.resolve()
     if not root.is_dir():
@@ -92,6 +97,15 @@ def main() -> None:
             (18, "dynamic_filter"),
             (19, "compressed_pin"),
             (20, "fused_decode"),
+        )
+    elif args.compressed_first_order:
+        stages = (
+            (21, "all_off"),
+            (22, "compressed_pin"),
+            (23, "type_narrow"),
+            (24, "build_probe"),
+            (25, "dynamic_filter"),
+            (26, "fused_decode"),
         )
     else:
         stages = tuple(enumerate(STAGES))

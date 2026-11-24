@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Render the saved GB300 concurrency and corrected ablation studies."""
 
+import argparse
 import csv
 from pathlib import Path
 
@@ -14,21 +15,21 @@ from matplotlib.ticker import MultipleLocator
 SCALES = (100, 300, 1000)
 STREAMS = (1, 2, 4, 8, 10)
 COLORS = {100: "#0072B2", 300: "#009E73", 1000: "#D55E00"}
-ABLATION_SOURCE = "join-first-corrected-summary.csv"
+ABLATION_SOURCE = "compressed-first-figure-summary.csv"
 ABLATION_STAGES = (
     "all_off",
+    "compressed_pin",
+    "type_narrow",
     "build_probe",
     "dynamic_filter",
-    "type_narrow",
-    "compressed_pin",
     "fused_decode",
 )
 ABLATION_LABELS = (
     "All off",
+    "+ Compression",
+    "+ Type\nNarrowing",
     "+ Adaptive\nJoin",
     "+ Dynamic\nFilter",
-    "+ Type\nNarrowing",
-    "+ Compression",
     "+ Operating on\nCompressed Data",
 )
 
@@ -179,15 +180,27 @@ def ablation_figure(times: list[float], stem: Path) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--ablation-only",
+        action="store_true",
+        help="regenerate only the ablation figure",
+    )
+    args = parser.parse_args()
     repo = Path(__file__).resolve().parents[3]
     destination = Path(__file__).resolve().parent
-    by_scale = check_concurrency(repo / "bench/gb300/results/concurrency/summary.csv")
     result = check_ablation(
         repo / "bench/gb300/ablation/results" / ABLATION_SOURCE, ABLATION_STAGES
     )
-    concurrency_figure(by_scale, destination / "gb300-concurrency")
+    if not args.ablation_only:
+        by_scale = check_concurrency(
+            repo / "bench/gb300/results/concurrency/summary.csv"
+        )
+        concurrency_figure(by_scale, destination / "gb300-concurrency")
     ablation_figure(result, destination / "gb300-cumulative-ablation")
-    print(f"Saved concurrency and ablation figures to {destination}")
+    print(
+        f"Saved {'ablation' if args.ablation_only else 'concurrency and ablation'} figures to {destination}"
+    )
 
 
 if __name__ == "__main__":

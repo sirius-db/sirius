@@ -8,6 +8,7 @@ comparison=false
 all_on_comparison=false
 join_first_order=false
 narrow_first_order=false
+compressed_first_order=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=true ;;
@@ -15,11 +16,12 @@ for arg in "$@"; do
     --all-on-vs-simpatico) all_on_comparison=true ;;
     --join-first-order) join_first_order=true ;;
     --narrow-first-order) narrow_first_order=true ;;
-    *) echo "usage: $0 [--dry-run] [--baseline-vs-simpatico|--all-on-vs-simpatico|--join-first-order|--narrow-first-order] (set ABLATION_OUTPUT to choose the output directory)" >&2; exit 2 ;;
+    --compressed-first-order) compressed_first_order=true ;;
+    *) echo "usage: $0 [--dry-run] [--baseline-vs-simpatico|--all-on-vs-simpatico|--join-first-order|--narrow-first-order|--compressed-first-order] (set ABLATION_OUTPUT to choose the output directory)" >&2; exit 2 ;;
   esac
 done
 selected_modes=0
-for selected in "$comparison" "$all_on_comparison" "$join_first_order" "$narrow_first_order"; do
+for selected in "$comparison" "$all_on_comparison" "$join_first_order" "$narrow_first_order" "$compressed_first_order"; do
   if [[ "$selected" == true ]]; then ((selected_modes+=1)); fi
 done
 if (( selected_modes > 1 )); then
@@ -74,6 +76,7 @@ if [[ "$comparison" == true ]]; then stages=(0 6); fi
 if [[ "$all_on_comparison" == true ]]; then stages=(7 8); fi
 if [[ "$join_first_order" == true ]]; then stages=(9 10 11 12 13 14); fi
 if [[ "$narrow_first_order" == true ]]; then stages=(15 16 17 18 19 20); fi
+if [[ "$compressed_first_order" == true ]]; then stages=(21 22 23 24 25 26); fi
 for stage in "${stages[@]}"; do
   case "$stage" in
     0) label=all_off;       narrow=false; compress=false; fused=false; build_probe=false; dynamic=false ;;
@@ -97,6 +100,12 @@ for stage in "${stages[@]}"; do
     18) label=dynamic_filter; narrow=true;  compress=false; fused=false; build_probe=true;  dynamic=true ;;
     19) label=compressed_pin; narrow=true;  compress=true;  fused=false; build_probe=true;  dynamic=true ;;
     20) label=fused_decode;   narrow=true;  compress=true;  fused=true;  build_probe=true;  dynamic=true ;;
+    21) label=all_off;        narrow=false; compress=false; fused=false; build_probe=false; dynamic=false ;;
+    22) label=compressed_pin; narrow=false; compress=true;  fused=false; build_probe=false; dynamic=false ;;
+    23) label=type_narrow;    narrow=true;  compress=true;  fused=false; build_probe=false; dynamic=false ;;
+    24) label=build_probe;    narrow=true;  compress=true;  fused=false; build_probe=true;  dynamic=false ;;
+    25) label=dynamic_filter; narrow=true;  compress=true;  fused=false; build_probe=true;  dynamic=true ;;
+    26) label=fused_decode;   narrow=true;  compress=true;  fused=true;  build_probe=true;  dynamic=true ;;
   esac
   stage_dir="$output/stage${stage}-${label}"
   sql="SET enable_duckdb_fallback = false;"

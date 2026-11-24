@@ -77,6 +77,11 @@ dynamic filters, compressed pinning, and fused filtering during decode after a
 fresh all-off baseline. Pass the same switch to `summarize.py` and the untimed
 path checks.
 
+For compressed pinning first, use `--compressed-first-order`. This runs a fresh
+all-off baseline, then enables compressed pinning for `lineitem` and `orders`,
+type narrowing, BUILD_PROBE admission, dynamic filters, and fused filtering
+during decode. Pass the same switch to `summarize.py` and the untimed path checks.
+
 After the run, generate a six-stage total and a per-query comparison with:
 
 ```bash

@@ -14,8 +14,12 @@ elif (( $# == 2 )) && [[ "$1" == --narrow-first-order ]]; then
   output_arg="$2"
   uncompressed_join_stages=true
   specs=(build_probe:17:3 dynamic_filter:18:3 fused_decode:20:6)
+elif (( $# == 2 )) && [[ "$1" == --compressed-first-order ]]; then
+  output_arg="$2"
+  uncompressed_join_stages=false
+  specs=(build_probe:24:3 dynamic_filter:25:3 fused_decode:26:6)
 else
-  echo "usage: $0 [--join-first-order|--narrow-first-order] ABLATION_OUTPUT" >&2
+  echo "usage: $0 [--join-first-order|--narrow-first-order|--compressed-first-order] ABLATION_OUTPUT" >&2
   exit 2
 fi
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"

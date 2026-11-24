@@ -186,3 +186,42 @@ with the [run manifest](results/join-first-corrected-manifest.json). Untimed
 diagnostics for each corrected order found two BUILD_PROBE selections and two
 dynamic-filter publications for Q3, plus 32 filtered decodes for Q6. These
 diagnostic runs do not contribute to the timing tables.
+
+## Corrected compressed-pinning-first cumulative order
+
+The six-stage SF1000 host-pin run started with all five optimizations off, then
+enabled compressed pinning, type narrowing, BUILD_PROBE admission, dynamic
+filters, and fused filtering during decode. Each stage ran Q1–Q22 once in a
+fresh Sirius process with the same GB300 pin config, Sirius binary, and hot
+profile as the corrected comparisons above. Only `lineitem` and `orders` were
+compressed in stages 22–26; stage 21 pinned every table raw. Pinning and
+unpinning time is excluded.
+
+| Stage | Optimization added | 22-query total | Change from prior stage |
+| ---: | :--- | ---: | ---: |
+| 21 | All five off (repeat) | 22.121 s | — |
+| 22 | Compressed pinning | 11.879 s | −10.241 s (−46.3%) |
+| 23 | Type narrowing | 11.041 s | −0.839 s (−7.1%) |
+| 24 | BUILD_PROBE admission | 9.993 s | −1.048 s (−9.5%) |
+| 25 | Dynamic filters | 8.636 s | −1.356 s (−13.6%) |
+| 26 | Fused filtering during decode | 7.016 s | −1.621 s (−18.8%) |
+
+The first completed baseline measured 37.216 s, with Q9 taking 20.843 s;
+another attempt stopped during Q9 without an exit code. A standalone repeat
+of the identical all-off stage measured 22.121 s, with Q9 at 6.736 s, in line
+with the earlier corrected all-off baselines of 22.141 and 22.152 s. The table
+and paper figure use the repeat; the [raw first-pass summary](results/compressed-first-summary.csv),
+[repeat per-query timings](results/compressed-first-baseline-repeat.csv),
+[figure summary](results/compressed-first-figure-summary.csv), and
+[six-stage per-query timings](results/compressed-first-per-query.csv) preserve
+both observations. The first-step percentage is sensitive to the all-off Q9
+variation, so it should not be interpreted as a precise compression effect.
+
+All six timed stages and the baseline repeat exited successfully. All query
+results matched; Q11 only reordered rows with tied sort keys. The baseline
+logged zero compressed pins; each later stage made 29 explicit
+`compression=true` calls for `lineitem` and `orders`, with 27 pins actually
+compressing at least one chunk. Untimed diagnostics found two BUILD_PROBE
+selections and two dynamic-filter publications in Q3, plus 32 filtered
+decodes in Q6. The [run manifest](results/compressed-first-manifest.json)
+records hashes, stage settings, and the local log directory.
