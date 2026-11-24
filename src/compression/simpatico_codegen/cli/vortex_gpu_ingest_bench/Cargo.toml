@@ -1,0 +1,35 @@
+[package]
+name = "vortex_gpu_ingest_bench"
+description = "GPU decode throughput of Vortex, methodology-matched to parquet_ingest_bench"
+edition = "2024"
+publish = false
+
+# Standalone: not a member of any enclosing workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+arrow-array = "59.2"
+arrow-schema = "59.2"
+arrow-select = "59.2"
+bytes = "1.11"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+mimalloc = "0.1.42"
+parquet = "59.2"
+tokio = { version = "1.52", features = ["full"] }
+# Built from source at a pinned revision. To build against a local checkout
+# instead, pass --config 'patch."https://github.com/vortex-data/vortex".<crate>.path="<checkout>/<crate dir>"'
+# for each of the three crates.
+vortex = { git = "https://github.com/vortex-data/vortex", rev = "c84e489aa3f8c1d2e5477890be7ae2cb479066f7", default-features = false, features = [
+    "files",
+    "tokio",
+    "zstd",
+] }
+vortex-cuda = { git = "https://github.com/vortex-data/vortex", rev = "c84e489aa3f8c1d2e5477890be7ae2cb479066f7" }
+vortex-cuda-driver = { git = "https://github.com/vortex-data/vortex", rev = "c84e489aa3f8c1d2e5477890be7ae2cb479066f7" }
+
+# Vortex's own release profile, which its published benchmark numbers are built with.
+[profile.release]
+codegen-units = 1
+lto = "off"
