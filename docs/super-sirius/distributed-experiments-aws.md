@@ -105,7 +105,7 @@ EOF
 . "$WORK/env.sh"
 curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path      # the dataset generator needs cargo
 
-cd "$WORK" && git clone --branch experimental/distributed-sirius https://github.com/sirius-db/sirius.git
+cd "$WORK" && git clone https://github.com/sirius-db/sirius.git
 cd sirius && git submodule update --init --depth=1 --jobs 5 \
   duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 tmux new-session -d -s build "pixi run build-distributed > $WORK/logs/build.log 2>&1; echo \$? > $WORK/logs/build.rc"
@@ -177,7 +177,7 @@ sirius:
     host: { capacity_bytes: ${host}Gi }
     disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "$WORK/spill" }
   executor:
-    pipeline: { num_threads: 4 }
+    pipeline: { num_threads: $(( ranks <= 2 ? 16 : 4 )) }
     scan_manager: { num_threads: 32, uring_n_reactors: 4, cache: { mode: none } }
   operator_params:
     max_dynamic_filter_bloom_bytes_per_gpu: 2Gi
@@ -215,8 +215,8 @@ tmux new-session -d -s run ". $WORK/env.sh; export CHECKOUT=$CHECKOUT DATA=$DATA
   cd $CHECKOUT && pixi run bash $OUT/run.sh > $OUT/run.out 2>&1; echo \$? > $OUT/run.rc"
 ```
 
-The run is over when `$OUT/run.rc` exists; it holds 0 unless the script stopped early, and
-`run.out` says why. What the script writes to `$OUT` is listed in the other document.
+The run is over when `$OUT/run.rc` exists; it holds 0 unless the script stopped early or the
+client failed, and `run.out` says why. What the script writes to `$OUT` is listed in the other document.
 
 - **Fewer GPUs**, to compare GPU counts on one machine: see
   [Variations](distributed-experiments-no-slurm.md#variations), and set `ranks` to match before
@@ -252,7 +252,7 @@ the instance's network interface.
 
 **Reference answers.** They come from the plain DuckDB on the CPU, same data and query texts,
 while no rank is running. Compute them once per dataset, one process per query, so that one
-failure does not lose the rest:
+failure does not lose the rest. A query that fails leaves no CSV file:
 
 ```bash
 frac=0.0000000333333                                    # as in run.sql
@@ -266,7 +266,7 @@ cd "$CHECKOUT" && for n in $(seq 1 22); do
     done
     echo ".output $WORK/ref/q$n.csv"
     sed "s/\* 0\.00001$/* $frac/" "$q/q$n.sql"
-  } | pixi run sirius-duckdb/build/release/duckdb -no-agent
+  } | pixi run sirius-duckdb/build/release/duckdb -no-agent -bail || rm -f "$WORK/ref/q$n.csv"
 done
 python3 scripts/compare_answers.py "$OUT/client.txt" --ref-dir "$WORK/ref" --ref-pattern "q{n}.csv" \
   --ties 3:revenue,o_orderdate --ties 18:o_totalprice,o_orderdate
@@ -295,8 +295,8 @@ Each reading moves under 4 GB, so repeat it; single readings as low as 12 GB/s w
 ## Reference numbers
 
 `g7e.24xlarge`, TPC-H SF3000, lineitem in 180 files with row groups of about 1.06 million rows,
-the config above (`pipeline.num_threads: 4`, `cache.mode: none`), one run each, every answer
-checked against DuckDB.
+the config above with `cache.mode: none` and `pipeline.num_threads: 4` in every row, the 2-rank
+one too, one run each, every answer checked against DuckDB.
 
 | Ranks | Queries | Cold s | Warm s |
 |---|---|---|---|

@@ -23,7 +23,7 @@ GPU fails. Steps 3 to 6 were run on 2026-11-10 at SF100, on one machine and on t
 
 ```bash
 export CHECKOUT=<where the checkout goes> DATA=<the dataset> OUT=<a new run folder>
-git clone --branch experimental/distributed-sirius https://github.com/sirius-db/sirius.git "$CHECKOUT"
+git clone https://github.com/sirius-db/sirius.git "$CHECKOUT"
 cd "$CHECKOUT" && git submodule update --init --depth=1 --jobs 5 \
   duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run build-distributed            # once: Sirius and the gateway
@@ -58,7 +58,7 @@ sirius:
       usage_limit_fraction: 0.8841
       downgrade_trigger_fraction: 0.9089
       downgrade_stop_fraction: 0.6786
-    host: { capacity_bytes: 200Gi }
+    host: { capacity_bytes: 200Gi }    # per rank: about 0.6 x RAM / the machine's ranks
     disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "$OUT/spill" }
   executor:
     pipeline: { num_threads: 7 }
@@ -86,7 +86,7 @@ The config was tuned at SF10000 on GB200 nodes with 4 ranks each, and runs SF100
 `run.sql` creates a view per table and runs each query twice, here five queries:
 
 ```bash
-frac=0.00000001                                         # Q11's fraction, 0.0001 / SF: SF100 0.000001
+frac=0.000001                                           # Q11's fraction, 0.0001 / SF: this is SF100
 q=$CHECKOUT/test/tpch_performance/tpch_queries/orig
 {
   printf '.mode csv\n.timer on\n'
@@ -122,8 +122,12 @@ if ss -ltn | grep -E ':(9494|950[0-9]|2700[0-9]) '; then   # an old gateway or r
   echo "ports in use"; exit 1
 fi
 cd "$CHECKOUT" && git log -1 --oneline > "$OUT/env.txt"
+if [ -e "$state/lock" ] && ! flock -n "$state/lock" true; then   # a running gateway holds it
+  echo "a gateway still runs"; exit 1
+fi
 rm -rf "$state"                                           # or the gateway replays the last run's views
-on_node="cd $CHECKOUT && env $(env | grep '^SIRIUS_' | tr '\n' ' ') $(command -v pixi) run scripts/sirius_node.sh"
+mapfile -t vars < <(env | grep '^SIRIUS_')                # %q: a ; or a space in a value cannot split the command
+on_node="cd $CHECKOUT && env $(printf '%q ' "${vars[@]}")$(command -v pixi) run scripts/sirius_node.sh"
 stop()
 {
   for n in $NODES; do ssh "$n" "pkill -u \$USER -f '$CHECKOUT/script[s]/'"; done
@@ -133,17 +137,18 @@ trap 'exit 1' INT TERM
 trap stop EXIT                                            # stops everything, also on Ctrl-C
 scripts/sirius_gateway.sh --serve > "$OUT/gateway.out" 2>&1 &
 gateway=$!
-until [ -s "$state/gateway.conf" ]; do
+until (. "$state/gateway.conf" && exec 3<> "/dev/tcp/${gateway%:*}/${gateway##*:}") 2> /dev/null; do
   kill -0 $gateway 2> /dev/null || { echo "no gateway: see $OUT/gateway.out"; exit 1; }
-  sleep 1
+  sleep 1                                                 # the file is there before the port listens
 done
 scripts/sirius_node.sh --check --data "$DATA" || exit 1
 for n in $NODES; do ssh "$n" "$on_node --check --data $DATA" || exit 1; done
 scripts/sirius_node.sh > "$OUT/node.out" 2>&1 &           # one rank per GPU
 for n in $NODES; do ssh "$n" "$on_node" > "$OUT/node-$n.out" 2>&1 & done
 scripts/sirius_client.sh -bail < "$OUT/run.sql" > "$OUT/client.txt" 2>&1 &
-wait $! || echo "the client failed: see $OUT/client.txt"  # waited for, so that Ctrl-C stops the script at once
+wait $!; rc=$?                                            # waited for, so that Ctrl-C stops the script at once
 sleep 5                                                   # the ranks flush their logs every 3 s
+[ $rc -eq 0 ] || { echo "the client failed: see $OUT/client.txt"; exit 1; }
 ```
 
 Run it in a shell that has `CHECKOUT`, `DATA` and `OUT` exported:
@@ -154,8 +159,8 @@ cd "$CHECKOUT" && pixi run bash "$OUT/run.sh"
 
 The script prints the node check (`ok` lines, then `node ready for gateway bench`) and returns
 when the client is done; the ranks need about 10 s to start. `-bail` stops the client at the
-first failed statement. Ctrl-C, or `kill` of the script, stops the gateway and every rank within
-seconds.
+first failed statement, and the script then exits 1. Ctrl-C, or `kill` of the script, stops the
+gateway and every rank within seconds.
 
 | File in `$OUT` | What |
 |---|---|
@@ -220,14 +225,16 @@ FROM (SELECT DISTINCT file_name, row_group_id, row_group_num_rows
   GPUs each). The script then checks each machine, starts its ranks over `ssh`, and stops them
   at the end. It needs `ssh` without a password, and on every machine the same `$HOME`, and the
   checkout, the data, `$OUT` and Pixi at the same paths. A machine with another `$HOME` takes
-  `--gateway` and `--token-file` instead ([Quick Start](distributed-quickstart.md#prerequisites)).
+  `--gateway`, `--token-file` and `--fingerprint` instead
+  ([Quick Start](distributed-quickstart.md#prerequisites)).
 
 ## When it goes wrong
 
 | Symptom | Cause and fix |
 |---|---|
 | `ports in use`, after `LISTEN` lines | A gateway or rank of an earlier run that was killed, or another user. Yours: [stop them](#stop-what-a-killed-run-left). Another user's: other ports |
-| `no gateway: see .../gateway.out` | That file says why: `config.yaml` is not valid YAML, `gateway bench already runs`, or `port 9494 on ... is in use` (another gateway holds it) |
+| `a gateway still runs` | A gateway named `bench` holds `~/.sirius/gateways/bench/lock`: [stop it](#stop-what-a-killed-run-left) |
+| `no gateway: see .../gateway.out` | That file says why: `config.yaml` is not valid YAML, `gateway bench already runs`, `another gateway of yours is starting or serving on port 9494`, or `port 9494 on ... is in use` (another user's gateway or another program holds it) |
 | A `FAIL` line from the node check | The line under it names the fix |
 | `client.txt`: `the gateway starts once 4 ranks are registered ...; 3 are` | Fewer ranks than `SIRIUS_GATEWAY_MIN_RANKS` joined within `SIRIUS_GATEWAY_JOIN_WAIT`. `rank exited` in `node.out` means a rank dies at start (usually the config): read `/tmp/sirius_node_<user>_bench/rank_<port>/rank.log` |
 | The script was killed with `kill -9` | Its gateway and ranks still run and hold the GPUs: [stop them](#stop-what-a-killed-run-left) |

@@ -34,7 +34,7 @@ pixi run sirius-client            # a DuckDB shell whose statements go to the ga
 |---|---|
 | The same Sirius checkout at the same path on every machine, built there with `pixi run build-distributed` | Every rank runs the same build. A checkout on a shared file system is built once. The Slurm script starts every node from the submit directory |
 | The data at the same path on every machine | Every rank runs the same SQL, so `read_parquet('/data/...')` must resolve on each |
-| A shared `$HOME`, or `pixi run sirius-node --gateway HOST:PORT --token-file FILE` on a node without it (or export `SIRIUS_GATEWAY_TOKEN` instead of `--token-file`) | Nodes and clients read the gateway's address, token and TLS fingerprint from `~/.sirius/gateways/<cluster>/gateway.conf` |
+| A shared `$HOME`, or `pixi run sirius-node --gateway HOST:PORT --token-file FILE --fingerprint F` on a node without it (or export `SIRIUS_GATEWAY_TOKEN` instead of `--token-file`) | Nodes and clients read the gateway's address, token and TLS fingerprint from `~/.sirius/gateways/<cluster>/gateway.conf`. For a node without it, `FILE` holds that file's `gateway_token` and `F` is its `gateway_fingerprint` |
 | Free TCP ports, open between the machines | The gateway listens on 9494. The rank on a node's i-th GPU listens on 9500 + i (Quack) and 27000 + i (exchange) |
 
 `pixi run build-distributed` builds Sirius, which includes NIXL, and the gateway
@@ -45,7 +45,8 @@ pixi run sirius-client            # a DuckDB shell whose statements go to the ga
 One file, `~/.sirius/sirius.yaml`, configures every machine when `$HOME` is shared. The launch
 scripts read its `sirius.distributed` section; Sirius ignores that section, and the rest of the
 file configures Sirius on each rank as usual. The scripts look for the file where Sirius does:
-`$SIRIUS_CONFIG_FILE`, then `./sirius.yaml`, then `~/.sirius/sirius.yaml`. Every key is optional.
+`$SIRIUS_CONFIG_FILE` when it is set, and a missing file there is an error; otherwise
+`./sirius.yaml`, then `~/.sirius/sirius.yaml`. Every key is optional.
 
 ```yaml
 sirius:
@@ -81,7 +82,7 @@ number or list, stops the scripts before they apply any of it. `gateway.min_rank
 | `gateway.statement_timeout` | `SIRIUS_GATEWAY_STATEMENT_TIMEOUT` | 3600 | `sirius_gateway_statement_timeout`: seconds a statement runs before the gateway cancels it on every rank; 0 is none. Clients cannot set it |
 | `gateway.host` | `SIRIUS_GATEWAY_HOST` | | The address the gateway listens on |
 | `gateway.networks` | `SIRIUS_GATEWAY_PRIORITY_NETWORKS` | | Or this host's first address in these CIDRs (`;` or `,` between them). Without either, the address of the default route's interface; with ranks spawned on this host, 127.0.0.1 |
-| `node.gpus` | `SIRIUS_NODE_GPUS` | `all` | The GPUs that get a rank: `all`, a list, or `slurm` (the GPU Slurm gave the task) |
+| `node.gpus` | `SIRIUS_NODE_GPUS` | `all` | The GPUs that get a rank: `all` (the entries of `CUDA_VISIBLE_DEVICES` when that is set), a list, or `slurm` (the GPU Slurm gave the task) |
 | `node.networks` | `SIRIUS_NODE_NETWORKS` | the gateway's subnet | Each rank listens on this node's first address in these CIDRs, and UCX uses that address's interface |
 | `node.quack_port` | `SIRIUS_NODE_QUACK_PORT` | 9500 | First rank's Quack port |
 | `node.exchange_port` | `SIRIUS_NODE_EXCHANGE_PORT` | 27000 | First rank's exchange port |
@@ -102,8 +103,9 @@ pixi run sirius-gateway
 It prints its address and what to run next, then opens its console, a DuckDB shell where
 `FROM sirius_gateway_status()` shows the ranks. It serves until the console's stdin closes
 (Ctrl-D). `pixi run sirius-gateway --serve` has no console and serves until it is killed.
-`pixi run sirius-gateway N` instead starts N ranks on this machine, rank i on GPU i; it also
-replays the saved DDL log when it restarts.
+`pixi run sirius-gateway N` instead starts N ranks on this machine, rank i on GPU i, or on
+entry i of the gateway's `CUDA_VISIBLE_DEVICES` when that is set; it also replays the saved DDL
+log when it restarts.
 
 **2. Nodes.** On each GPU machine, check it, then start its ranks:
 
@@ -120,6 +122,13 @@ with the gateway. Ranks started before the gateway wait for its `gateway.conf`. 
 `/tmp/sirius_node_<user>_<cluster>/rank_<port>/rank.log` and `register.log`. Ctrl-C stops the
 node's ranks. If one rank's script exits on an error it cannot retry, the node stops all its
 ranks.
+
+Each rank sizes its host memory on its own. By default it takes 0.9 of the RAM of its GPU's NUMA
+node (`memory.host.capacity_fraction`), so several ranks on one machine together ask for more
+than the machine has, and the kernel can kill ranks. With N ranks on a machine, set
+`memory.host.capacity_bytes` to about `0.6 x RAM / N` in `sirius.yaml`. Do not divide by the
+machine's NUMA nodes as well: a rank has a host memory space only for the NUMA node of its own
+GPU.
 
 **3. Client**, on any machine with the build and the shared `$HOME`:
 
@@ -160,12 +169,17 @@ To run another cluster, set `SIRIUS_CLUSTER=<name>` for the gateway, and pass
 | `client.init.sql` | Mode 600: the `ATTACH` with the token that `sirius-client` passes to DuckDB with `-init` |
 | `lock` | Held by the running gateway, so a second one with the same name refuses to start |
 
+The gateway also holds `~/.sirius/gateways/port_<hostname>_<port>.lock`, so a second gateway of
+yours on the same machine and port refuses to start, whatever its name.
+
 Rank init files and the logs of spawned ranks are in `/tmp/sirius_gateway_<user>_<cluster>`,
-or the gateway script's third argument. Each node keeps its rank configs and state in
+mode 700, or the gateway script's third argument, whose mode the script leaves as it is. Each
+node keeps its rank configs and state in
 `/tmp/sirius_node_<user>_<cluster>/`, mode 700. Each rank's directory, `rank_<port>/`, holds
 `rank.log`, `register.log`, the rank's token, and `register.sql` (mode 600): the
 `sirius_gateway_add_rank` call that registers the rank, which `sirius_rank_node.sh` feeds to
-DuckDB on stdin so that no token is on a command line.
+DuckDB on stdin so that no token is on a command line. Its `lock` is held by the rank's
+`sirius_rank_node.sh`, so a second one on the same directory refuses to start.
 
 ## Recovery
 
@@ -207,7 +221,7 @@ and TPC-H Q12 were correct, and cancelling the gateway's step ended the job with
 | `FAIL no Sirius build at ...` | Run `pixi run build-distributed` on that machine |
 | `FAIL no GPU visible to nvidia-smi -L`, `FAIL no GPU N: this node has M` | Run on a GPU machine, and give `--gpus` (or `node.gpus`) GPUs that exist |
 | `FAIL --gpus slurm, but Slurm gave this task no GPU` | Ask Slurm for `--gpus-per-task=1` |
-| `FAIL no ~/.sirius/gateways/<cluster>/gateway.conf`, `no ... gateway.conf: start the gateway first` | Start the gateway on a host that shares `$HOME`, with the same cluster name; or pass `--gateway` and `--token-file` to `sirius-node` |
+| `FAIL no ~/.sirius/gateways/<cluster>/gateway.conf`, `no ... gateway.conf: start the gateway first` | Start the gateway on a host that shares `$HOME`, with the same cluster name; or pass `--gateway`, `--token-file` and `--fingerprint` to `sirius-node` |
 | `--token would show the token to every user in ps` | `sirius-node` has no `--token`: use `--token-file FILE`, or export `SIRIUS_GATEWAY_TOKEN` |
 | `bad --gateway HOST:PORT, token ...`, `bad gateway token`, `bad rank token` | Tokens are letters, digits, `_` and `-` only |
 | `SIRIUS_GATEWAY_MIN_RANKS, SIRIUS_GATEWAY_JOIN_WAIT and SIRIUS_GATEWAY_STATEMENT_TIMEOUT take a number` | Give whole numbers for `gateway.min_ranks`, `gateway.join_wait` and `gateway.statement_timeout` |
