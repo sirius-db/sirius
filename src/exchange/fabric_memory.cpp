@@ -102,7 +102,15 @@ std::optional<fabric_memory> fabric_memory::try_allocate(int device,
   prop.location.type        = CU_MEM_LOCATION_TYPE_DEVICE;
   prop.location.id          = device;
   prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-  std::size_t granularity   = 0;
+  // Where the device has the attribute, VMM memory needs the flag to be used for GPUDirect RDMA,
+  // which a NIC registration of the rings (UCX_TLS=all on the rail NICs) asks for.
+  if (int rdma = 0; d.device_attribute(&rdma,
+                                       CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
+                                       device) == CUDA_SUCCESS &&
+                    rdma != 0) {
+    prop.allocFlags.gpuDirectRDMACapable = 1;
+  }
+  std::size_t granularity = 0;
   if (auto const r = d.granularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED);
       r != CUDA_SUCCESS || granularity == 0) {
     why = "cuMemGetAllocationGranularity: " + name_of(r);
