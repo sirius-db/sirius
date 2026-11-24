@@ -152,6 +152,19 @@ bool accepts_connections(std::string const& host, uint32_t port, std::chrono::mi
   return open;
 }
 
+namespace {
+
+/// A rank that crashed or was killed never unlinked its exchange's receive mirror (nixl_fabric's
+/// shared memory /sirius-exchange-<pid>-<rank>). Called once waitpid has reaped that process.
+/// By its path, as sirius_rank_node.sh does: shm_unlink needs librt with the sysroot's glibc.
+void unlink_mirror(pid_t pid, uint32_t index)
+{
+  unlink(
+    ("/dev/shm/sirius-exchange-" + std::to_string(pid) + "-" + std::to_string(index)).c_str());
+}
+
+}  // namespace
+
 bool rank_exited(rank& r)
 {
   if (r.registered) { return false; }
@@ -159,6 +172,7 @@ bool rank_exited(rank& r)
   int status    = 0;
   auto const rc = waitpid(r.pid, &status, WNOHANG);
   if (rc == 0) { return false; }
+  if (rc == r.pid) { unlink_mirror(r.pid, r.index); }
   r.pid = -1;
   return true;
 }
@@ -176,6 +190,7 @@ void end_rank(rank& r)
   if (r.pid >= 0) {
     kill(r.pid, SIGKILL);
     waitpid(r.pid, nullptr, 0);
+    unlink_mirror(r.pid, r.index);
     r.pid = -1;
   }
 }

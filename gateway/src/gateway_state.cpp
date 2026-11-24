@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -588,6 +589,18 @@ gateway_state::rank_plan gateway_state::plan_ranks(start_options const& options)
                                 options.ranks);
   }
 
+  // With no gpus argument, Sirius ranks stay inside the gateway's own CUDA_VISIBLE_DEVICES.
+  std::vector<std::string> visible;
+  if (auto const* mask = std::getenv("CUDA_VISIBLE_DEVICES");
+      options.gpus.empty() && !options.sirius_extension.empty() && mask != nullptr &&
+      *mask != '\0') {
+    visible = duckdb::StringUtil::Split(mask, ',');
+    if (visible.size() < options.ranks) {
+      throw InvalidInputException(
+        "CUDA_VISIBLE_DEVICES lists %d GPUs for %d ranks", visible.size(), options.ranks);
+    }
+  }
+
   rank_plan plan;
   plan.token  = random_token();
   auto& ranks = plan.ranks;
@@ -597,7 +610,7 @@ gateway_state::rank_plan gateway_state::plan_ranks(start_options const& options)
     r.index         = i;
     r.name          = "rank_" + std::to_string(i);
     r.token         = plan.token;
-    r.gpu           = options.gpus.empty() ? std::to_string(i) : options.gpus[i];
+    r.gpu = !options.gpus.empty() ? options.gpus[i] : !visible.empty() ? visible[i] : std::to_string(i);
     r.host          = "127.0.0.1";
     r.quack_host    = r.host;
     r.quack_port    = options.quack_base_port + i;

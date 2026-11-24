@@ -81,7 +81,9 @@ gateway="$here/../gateway/build/release/duckdb"
 umask 077
 state=$HOME/.sirius/gateways/$cluster
 mkdir -p "$state" "$logs"
-chmod 700 "$state" "$logs"
+chmod 700 "$state"
+# A log dir given as an argument may be shared: only the default one is made private.
+[ -n "${args[2]:-}" ] || chmod 700 "$logs"
 # The lock is fd 9, which the gateway inherits through exec: it holds the lock for its whole life.
 exec 9> "$state/lock"
 flock -n 9 || {
@@ -110,7 +112,14 @@ host=${host:-127.0.0.1}
 # Nodes pick their own address in the gateway's subnet; empty if the host is a name.
 networks=$(sirius_address_network "$host") || networks=
 # The server binds with SO_REUSEPORT, so a second gateway on a port in use would start, and the
-# kernel would then hand each client and rank to one gateway or the other.
+# kernel would then hand each client and rank to one gateway or the other. The probe below does
+# not see a gateway that has not bound yet, and the cluster lock does not cover another cluster
+# name: a lock per port does. fd 8 is inherited through exec, as fd 9 is.
+exec 8> "$HOME/.sirius/gateways/port_$(hostname)_$port.lock"
+flock -n 8 || {
+  echo "another gateway of yours is starting or serving on port $port: stop it, or set SIRIUS_GATEWAY_PORT" >&2
+  exit 1
+}
 # shellcheck disable=SC2016 # $0 and $1 expand in the inner bash
 if timeout 3 bash -c 'exec 3<> "/dev/tcp/$0/$1"' "$host" "$port" 2> /dev/null; then
   echo "port $port on $host is in use, by another gateway or another program: stop it, or set SIRIUS_GATEWAY_PORT" >&2
@@ -155,6 +164,10 @@ esac
 mv -f "$state/gateway.conf.tmp" "$state/gateway.conf"
 
 allow_join=${SIRIUS_GATEWAY_ALLOW_JOIN:-$([ "$ranks" -eq 0 ] && echo 1 || echo 0)}
+[[ $allow_join =~ ^[01]$ ]] || {
+  echo "SIRIUS_GATEWAY_ALLOW_JOIN takes 0 or 1" >&2
+  exit 2
+}
 init="$logs/gateway.init.sql"
 {
   echo "SET GLOBAL sirius_gateway_duckdb_binary = '$build/duckdb';"

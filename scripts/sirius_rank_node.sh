@@ -18,7 +18,7 @@
 # Once the rank listens, the script writes the sirius_gateway_add_rank call that registers it to
 # <dir>/add_rank.sql. With a gateway, it runs that call itself after every start of the rank,
 # retrying until it succeeds, and again whenever gateway.conf names a new gateway_id; the gateway
-# must SET sirius_gateway_allow_join = true. Without one, it prints the call, for the gateway's
+# must SET GLOBAL sirius_gateway_allow_join = true. Without one, it prints the call, for the gateway's
 # console.
 # SIRIUS_RANK_TOKEN sets the rank's token; otherwise a random one is kept in <dir>/token. On a
 # listen host other than this machine's loopback, Quack serves TLS with a key pair kept in
@@ -84,6 +84,13 @@ duckdb="$build/duckdb"
 [ "$gpu" = slurm ] || export CUDA_VISIBLE_DEVICES=$gpu
 mkdir -p "$dir"
 chmod 700 "$dir"
+# One launcher per directory. The rank inherits fd 8, so one that outlives this script keeps
+# the lock.
+exec 8> "$dir/lock"
+flock -n 8 || {
+  echo "a rank already runs from $dir" >&2
+  exit 1
+}
 
 token=${SIRIUS_RANK_TOKEN:-}
 if [ -z "$token" ]; then
