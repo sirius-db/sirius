@@ -834,20 +834,35 @@ std::unordered_map<int32_t, std::string> top_level_leaves_by_field_id(
 /// Reads the key columns of one equality-delete file onto the device, in @p key_field_ids order
 /// and normalized to the bound key types. No other column is read.
 std::unique_ptr<cudf::table> read_equality_delete_file(
-  std::string const& delete_file_path,
+  iceberg_equality_delete_file const& file,
   std::shared_ptr<cucascade::io::ioctx> const& ioctx,
   std::vector<int32_t> const& key_field_ids,
   iceberg_equality_plan const& plan,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
-  // One datasource for both passes: its io_object opens 2 fds, so reusing avoids a reopen.
+  auto const& delete_file_path = file.file_path;
+  // Check the file against the manifest values charged during planning before decoding keys.
   std::vector<std::unique_ptr<cudf::io::datasource>> sources;
   sources.push_back(sirius::io::open_datasource(ioctx, delete_file_path));
+  if (file.file_size_in_bytes < 0 ||
+      sources.front()->size() != static_cast<uint64_t>(file.file_size_in_bytes))
+    throw std::runtime_error("[iceberg] equality-delete file '" + delete_file_path +
+                             "' size differs from its manifest entry");
   auto footers = cudf::io::read_parquet_footers(sources);
   if (footers.size() != 1)
     throw std::runtime_error("[iceberg] Failed to read equality-delete footer: " +
                              delete_file_path);
+  auto rows_remaining = file.record_count;
+  for (auto const& group : footers.front().row_groups) {
+    if (group.num_rows < 0 || group.num_rows > rows_remaining)
+      throw std::runtime_error("[iceberg] equality-delete file '" + delete_file_path +
+                               "' row count differs from its manifest entry");
+    rows_remaining -= group.num_rows;
+  }
+  if (rows_remaining != 0 || footers.front().num_rows != file.record_count)
+    throw std::runtime_error("[iceberg] equality-delete file '" + delete_file_path +
+                             "' row count differs from its manifest entry");
   auto const leaves = top_level_leaves_by_field_id(footers[0]);
 
   // Keys are found by field ID, never by name: a renamed key keeps its ID and changes its name.
@@ -865,10 +880,8 @@ std::unique_ptr<cudf::table> read_equality_delete_file(
     throw std::runtime_error("[iceberg] equality-delete file '" + delete_file_path +
                              "' maps two key field ids to one column name");
 
-  auto opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{sources[0].get()})
-                .column_names(names)
-                .build();
-  auto result = cudf::io::read_parquet(opts, stream, mr);
+  auto opts   = cudf::io::parquet_reader_options::builder().column_names(names).build();
+  auto result = cudf::io::read_parquet(std::move(sources), std::move(footers), opts, stream, mr);
   if (!result.tbl || result.metadata.schema_info.size() != names.size() ||
       static_cast<std::size_t>(result.tbl->num_columns()) != names.size())
     throw std::runtime_error("[iceberg] Failed to read equality-delete file: " + delete_file_path);
@@ -1054,7 +1067,7 @@ void materialize_equality_deletes(duckdb::ClientContext& context,
     for (auto file : group_files[group_index]) {
       if (auto counters = iceberg_counters(context)) ++counters->iceberg_delete_payload_loads;
       tables.push_back(read_equality_delete_file(
-        plan.files[file].file_path, ioctx, ids, plan, resources.stream, resources.mr));
+        plan.files[file], ioctx, ids, plan, resources.stream, resources.mr));
       views.push_back(tables.back()->view());
     }
     data.equality_delete_groups[group_index] =

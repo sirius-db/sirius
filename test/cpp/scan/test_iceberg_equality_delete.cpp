@@ -43,6 +43,7 @@
 #include <utils/parquet_fixture_utils.hpp>
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -440,7 +441,7 @@ TEST_CASE("iceberg equality delete - each ceiling refuses the charge", "[iceberg
   CHECK_FALSE(charge_equality_deletes(plan_of({{2, 1}}), total, 3));
 }
 
-TEST_CASE("iceberg equality delete - a delete file that cannot supply its keys is refused",
+TEST_CASE("iceberg equality delete - a delete file must match its manifest and key types",
           "[iceberg][scan]")
 {
   sirius::test::scoped_sirius_disable disable;
@@ -456,11 +457,13 @@ TEST_CASE("iceberg equality delete - a delete file that cannot supply its keys i
   cuda::mr::any_resource<cuda::mr::device_accessible> const upstream{
     cudf::get_current_device_resource_ref()};
   rmm::mr::statistics_resource_adaptor handed{upstream};
-  auto load = [&](int32_t field_id, duckdb::LogicalTypeId bound) {
+  auto const path  = directory.file("delete.parquet");
+  auto const bytes = static_cast<int64_t>(std::filesystem::file_size(path));
+  auto load = [&](int32_t field_id, duckdb::LogicalTypeId bound, int64_t rows, int64_t size) {
     iceberg_delete_discovery discovery;
     discovery.equality_delete_entries.emplace_back();
     auto& plan = discovery.equality_plan.emplace();
-    plan.files.push_back({directory.file("delete.parquet"), {field_id}, 1, 1});
+    plan.files.push_back({path, {field_id}, rows, size});
     plan.by_data_file.emplace("data.parquet", std::vector<uint32_t>{0});
     plan.keys.emplace(field_id, iceberg_equality_plan::key{0, bound});
     return load_delete_payload(
@@ -470,14 +473,19 @@ TEST_CASE("iceberg equality delete - a delete file that cannot supply its keys i
       discovery,
       equality_build_resources{test_stream(), rmm::device_async_resource_ref{handed}});
   };
+  CHECK_THROWS_WITH(load(1, duckdb::LogicalTypeId::INTEGER, 1, bytes - 1),
+                    Catch::Matchers::ContainsSubstring("size differs from its manifest entry"));
+  CHECK_THROWS_WITH(
+    load(1, duckdb::LogicalTypeId::INTEGER, 0, bytes),
+    Catch::Matchers::ContainsSubstring("row count differs from its manifest entry"));
   // The manifest lists a key the delete file does not store.
-  CHECK_THROWS_WITH(load(3, duckdb::LogicalTypeId::INTEGER),
+  CHECK_THROWS_WITH(load(3, duckdb::LogicalTypeId::INTEGER, 1, bytes),
                     Catch::Matchers::ContainsSubstring("has no top-level column with field id 3"));
   CHECK(handed.get_allocations_counter().total == 0);
   // A string stored for a BIGINT key: the join would compare unrelated bytes. Nothing is built
   // from it, so the allocations made so far are the file reader's own.
   CHECK_THROWS_WITH(
-    load(2, duckdb::LogicalTypeId::BIGINT),
+    load(2, duckdb::LogicalTypeId::BIGINT, 1, bytes),
     Catch::Matchers::ContainsSubstring("which cannot be compared with the bound BIGINT column"));
   CHECK(handed.get_allocations_counter().total > 0);
   // Equality deletes without a stream and an allocator to build them with are refused.
@@ -488,7 +496,7 @@ TEST_CASE("iceberg equality delete - a delete file that cannot supply its keys i
     load_delete_payload(*con.context, "table", sirius::test::make_test_local_ioctx(), unbuilt),
     Catch::Matchers::ContainsSubstring("no stream and allocator"));
   // INT32 stored for a BIGINT key is the one accepted difference.
-  auto const data = load(1, duckdb::LogicalTypeId::BIGINT);
+  auto const data = load(1, duckdb::LogicalTypeId::BIGINT, 1, bytes);
   REQUIRE(data->equality_delete_groups.size() == 1);
   CHECK(data->equality_delete_groups[0].delete_table->view().column(0).type().id() ==
         cudf::type_id::INT64);
