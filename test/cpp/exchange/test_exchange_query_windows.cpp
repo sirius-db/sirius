@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "exchange/rank_control.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
@@ -114,8 +113,19 @@ TEST_CASE("sirius_rank_info names this process, one boot id for its life, and wh
   auto const refused = conn.Query("CALL sirius_rank_exit()");
   REQUIRE(refused->HasError());
   CHECK(refused->GetError().find("has not joined an exchange") != std::string::npos);
+  // A prepared statement binds once and runs many times: every run returns the row.
+  REQUIRE_FALSE(conn.Query("PREPARE rank_info AS SELECT pid FROM sirius_rank_info()")->HasError());
+  for (int run = 0; run < 2; ++run) {
+    auto result = conn.Query("EXECUTE rank_info");
+    REQUIRE_FALSE(result->HasError());
+    auto chunk = result->Fetch();
+    REQUIRE(chunk);
+    CHECK(chunk->size() == 1);
+  }
   // A gateway reuses a process that never joined; one that has must restart to join again.
-  sirius::exchange::note_exchange_joined();
+  // Its only rank connects to no peer, and still counts as joined once it is set up as a rank.
+  REQUIRE_FALSE(conn.Query("SET SESSION sirius_exchange_peers = '127.0.0.1:27000'")->HasError());
+  REQUIRE_FALSE(conn.Query("SET SESSION sirius_exchange_rank = 0")->HasError());
   auto const after = info();
   CHECK(std::get<1>(after) == boot_id);
   CHECK(std::get<2>(after));

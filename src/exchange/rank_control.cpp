@@ -36,7 +36,8 @@ namespace {
 
 using namespace duckdb;
 
-/// Set once this process's exchange connects: its peers are then fixed for its life.
+/// Set once this process's exchange connects, or once it is set up as a gateway's only rank:
+/// its peers are then fixed for its life.
 std::atomic<bool> exchange_joined{false};
 
 std::string const& boot_id()
@@ -54,9 +55,15 @@ std::string const& boot_id()
   return id;
 }
 
-struct one_row : TableFunctionData {
+/// Per execution, not per bind: a prepared statement binds once and runs many times.
+struct one_row : GlobalTableFunctionState {
   bool done = false;
 };
+
+unique_ptr<GlobalTableFunctionState> one_row_init(ClientContext&, TableFunctionInitInput&)
+{
+  return make_uniq<one_row>();
+}
 
 unique_ptr<FunctionData> info_bind(ClientContext&,
                                    TableFunctionBindInput&,
@@ -65,12 +72,12 @@ unique_ptr<FunctionData> info_bind(ClientContext&,
 {
   types = {LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BOOLEAN};
   names = {"pid", "boot_id", "joined"};
-  return make_uniq<one_row>();
+  return make_uniq<TableFunctionData>();
 }
 
 void info_scan(ClientContext&, TableFunctionInput& input, DataChunk& output)
 {
-  auto& data = input.bind_data->CastNoConst<one_row>();
+  auto& data = input.global_state->Cast<one_row>();
   if (data.done) { return; }
   output.data[0].Append(Value::BIGINT(getpid()));
   output.data[1].Append(Value(boot_id()));
@@ -84,15 +91,15 @@ unique_ptr<FunctionData> exit_bind(ClientContext&,
                                    vector<LogicalType>& types,
                                    vector<Identifier>& names)
 {
-  // The function exists in every Sirius process. Only one that joined an exchange has a reason
-  // to restart, so no client can end a process that runs alone.
+  // The function exists in every Sirius process. Only one that joined a set of ranks has a
+  // reason to restart, so no client can end a process that runs alone.
   if (!exchange_joined.load()) {
     throw InvalidInputException(
       "sirius_rank_exit: this process has not joined an exchange, so it does not restart");
   }
   types = {LogicalType::BIGINT, LogicalType::BOOLEAN};
   names = {"pid", "exiting"};
-  return make_uniq<one_row>();
+  return make_uniq<TableFunctionData>();
 }
 
 /// Ends the process once the reply has left. shutdown_exchange() frees the exchange's listener
@@ -121,7 +128,7 @@ void exit_soon(shared_ptr<SiriusContext> context)
 
 void exit_scan(ClientContext& context, TableFunctionInput& input, DataChunk& output)
 {
-  auto& data = input.bind_data->CastNoConst<one_row>();
+  auto& data = input.global_state->Cast<one_row>();
   if (data.done) { return; }
   static std::atomic<bool> exiting{false};
   if (!exiting.exchange(true)) {
@@ -141,10 +148,10 @@ void register_rank_control_functions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
-  TableFunction info("sirius_rank_info", {}, info_scan, info_bind);
+  TableFunction info("sirius_rank_info", {}, info_scan, info_bind, one_row_init);
   CreateTableFunctionInfo info_info(info);
   catalog.CreateTableFunction(transaction, info_info);
-  TableFunction exit("sirius_rank_exit", {}, exit_scan, exit_bind);
+  TableFunction exit("sirius_rank_exit", {}, exit_scan, exit_bind, one_row_init);
   CreateTableFunctionInfo exit_info(exit);
   catalog.CreateTableFunction(transaction, exit_info);
 }
