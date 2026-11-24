@@ -386,7 +386,7 @@ pixi run build-distributed
 
 | Variable | Default | Why |
 |---|---|---|
-| `UCX_TLS`, `UCX_NET_DEVICES` | `all` on the GPU rail NICs, if the host has them; else `cuda_copy,cuda_ipc,tcp,self` | Rail NICs (`sirius_rail_devices` in `scripts/sirius_net.sh`: active RDMA ports in no bond, at the highest link speed) carry UCX's notifications over RC, which the exchange over NVLink needs at full speed: 4 GPU pairs both ways moved 5.9 TB/s, against 5.2 with tcp on bond0. `UCX_NET_DEVICES=rails` asks for them. Without rail NICs, the transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout") |
+| `UCX_TLS`, `UCX_NET_DEVICES` | `cuda_copy,cuda_ipc,tcp,self` on the interface of the rank's address | The transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout"). `UCX_NET_DEVICES=rails` takes every UCX transport on the GPU rail NICs (`sirius_rail_devices` in `scripts/sirius_net.sh`: active RDMA ports in no bond, at the highest link speed). They carry UCX's notifications over RC, which the exchange over NVLink needs at full speed: 4 GPU pairs both ways moved 5.9 TB/s, against 5.2 with tcp on bond0 |
 | `DUCKDB_AGENT_MODE` | 0 | DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse that output |
 
 ## Running TPC-H Q12 on 4 GPUs
@@ -457,9 +457,9 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   [gateway](distributed-gateway.md) does this restart.
 - **Hosts:** two hosts, one GPU each, ran TPC-H Q12 at SF100 through the gateway, with UCX on
   TCP (`UCX_TLS` with `tcp`, `UCX_NET_DEVICES` set to the hosts' shared interface). The launch
-  scripts set both by default (`launcher_env.sh`, [quick start](distributed-quickstart.md)): the
-  GPU rail NICs with every UCX transport on a host that has them, else `tcp` on the interface of
-  the rank's address.
+  scripts set both by default (`launcher_env.sh`, [quick start](distributed-quickstart.md)):
+  `tcp` on the interface of the rank's address, or with `UCX_NET_DEVICES=rails` the GPU rail NICs
+  with every UCX transport.
   Between nodes of one NVLink domain the data goes over the
   [NVLink fabric](#nvlink-between-nodes-mnnvl), which two and four GB200 nodes with 4 GPUs each
   ran for all of TPC-H at SF30000, and between other hosts over TCP lanes (#2372).
