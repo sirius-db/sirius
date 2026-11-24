@@ -97,7 +97,8 @@ For each query, it saves:
   the optimizers Sirius disables, read from the extension. `timeout_seconds` and
   `CUDA_VISIBLE_DEVICES` are the run's limits. `result_validation`,
   `validation_float_abs_tol`, `validation_float_rel_tol` and `validation_row_order`
-  describe the validation, `null` without `--validate`.
+  describe the validation. Without `--validate`, `result_validation` is
+  `"not performed"` and the other three are `null`.
 - `sirius.yaml`: a copy of the Sirius config.
 - `probe_log/`: the Sirius log of the load that reads the disabled optimizers.
 - `summary.md`: counts by outcome (per base query for `tpch-havoc`) and the first
@@ -249,10 +250,12 @@ def compare_result_rows(schema, expected, actual, float_tolerance, float_rel_tol
                 continue
             if i not in floats or a is None or b is None:
                 return False
-            if not (
-                (math.isnan(a) and math.isnan(b))
-                or abs(a - b) <= max(float_tolerance, float_rel_tolerance * abs(a))
-            ):
+            if math.isnan(a) and math.isnan(b):
+                continue
+            # Equal infinities matched above, any other non-finite pair differs.
+            if not (math.isfinite(a) and math.isfinite(b)):
+                return False
+            if abs(a - b) > max(float_tolerance, float_rel_tolerance * abs(a)):
                 return False
         return True
 
