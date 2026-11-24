@@ -7,8 +7,10 @@ if(NOT TARGET Paimon::paimon_shared)
       "Paimon SDK components require the shared Paimon::paimon_shared target")
 endif()
 
-find_path(SIRIUS_PAIMON_ARROW_INCLUDE_DIR NAMES arrow/c/abi.h
-          DOC "Include root for the Arrow C Data Interface used by Paimon")
+find_path(
+  SIRIUS_PAIMON_ARROW_INCLUDE_DIR
+  NAMES arrow/c/abi.h
+  DOC "Include root for the Arrow C Data Interface used by Paimon")
 if(NOT EXISTS "${SIRIUS_PAIMON_ARROW_INCLUDE_DIR}/arrow/c/abi.h")
   message(
     FATAL_ERROR
@@ -16,10 +18,8 @@ if(NOT EXISTS "${SIRIUS_PAIMON_ARROW_INCLUDE_DIR}/arrow/c/abi.h")
   )
 endif()
 
-target_sources(
-  sirius_objects
-  PRIVATE src/op/scan/paimon/paimon_batch_cursor.cpp
-          src/op/scan/paimon/paimon_native_read.cpp)
+target_sources(sirius_objects PRIVATE src/op/scan/paimon/paimon_batch_cursor.cpp
+                                      src/op/scan/paimon/paimon_native_read.cpp)
 target_include_directories(sirius_objects SYSTEM
                            PRIVATE "${SIRIUS_PAIMON_ARROW_INCLUDE_DIR}")
 target_link_libraries(sirius_objects PRIVATE Paimon::paimon_shared)
