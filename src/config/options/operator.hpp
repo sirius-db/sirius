@@ -137,10 +137,12 @@ struct operator_options : block_base<operator_options> {
       .mark_production()
       .describe("target output size of each cross product task")
       .build();
+  /// 0 = all the sorted input.
   config_option<ubytes> sort_sample_bytes =
     option<ubytes>("sort_sample_bytes")
+      .fallback(ubytes(defaults().sort_sample_bytes))
       .mark_production()
-      .describe("bytes sampled to compute sort partition boundaries")
+      .describe("bytes of sorted input seen before choosing sort range boundaries")
       .build();
   /// 0 turns BUILD_PROBE off, MARK joins included.
   config_option<ubytes> max_build_hash_table_bytes =

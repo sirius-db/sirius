@@ -4033,7 +4033,8 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             SetHashPartitionBytes);
 
   config.AddExtensionOption("sort_sample_bytes",
-                            "Target bytes to sample before computing sort partition boundaries",
+                            "Bytes of sorted input to see before choosing sort range boundaries "
+                            "(0 = all input)",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(operator_defaults.sort_sample_bytes),
                             SetSortSampleBytes);

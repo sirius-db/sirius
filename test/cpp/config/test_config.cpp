@@ -33,10 +33,24 @@ TEST_CASE("operator parameters start with hardware-independent defaults", "[conf
   CHECK(params.scan_task_batch_size == config::DEFAULT_BATCH_SIZE);
   CHECK(params.hash_partition_bytes == config::DEFAULT_BATCH_SIZE);
   CHECK(params.concat_batch_bytes == config::DEFAULT_BATCH_SIZE);
-  CHECK(params.sort_sample_bytes == config::DEFAULT_BATCH_SIZE);
+  CHECK(params.sort_sample_bytes == 0);
   CHECK(params.max_build_hash_table_bytes == 8 * config::DEFAULT_BATCH_SIZE);
   CHECK(params.max_build_probe_resident_bytes == 8 * config::DEFAULT_BATCH_SIZE);
   CHECK(params.max_dynamic_filter_bloom_bytes_per_gpu() == 4 * params.scan_task_batch_size);
+}
+
+TEST_CASE("a distributed sort left at all input samples one scan batch", "[config_opt][defaults]")
+{
+  operator_params params;
+  params.scan_task_batch_size = 4096;
+  CHECK(params.effective_sort_sample_bytes() == 0);
+  params.sort_sample_bytes = 512;
+  CHECK(params.effective_sort_sample_bytes() == 512);
+
+  params.exchange_peers = {"a:1", "b:2"};
+  CHECK(params.effective_sort_sample_bytes() == 512);
+  params.sort_sample_bytes = 0;
+  CHECK(params.effective_sort_sample_bytes() == 4096);
 }
 
 TEST_CASE("Footer reads start bounded with no per-file or reference cache capacity",

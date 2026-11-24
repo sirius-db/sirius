@@ -107,7 +107,6 @@ constexpr batch_setting batch_settings[] = {
   {"hash_partition_bytes", &operator_params::hash_partition_bytes, 1},
   {"concat_batch_bytes", &operator_params::concat_batch_bytes, 1},
   {"cross_join_task_bytes", &operator_params::cross_join_task_bytes, 1},
-  {"sort_sample_bytes", &operator_params::sort_sample_bytes, 1},
   {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 8},
   {"max_build_probe_resident_bytes", &operator_params::max_build_probe_resident_bytes, 8}};
 
@@ -119,7 +118,6 @@ auto& batch_option(Options& op, const batch_setting& setting)
                            &op.hash_partition_bytes,
                            &op.concat_batch_bytes,
                            &op.cross_join_task_bytes,
-                           &op.sort_sample_bytes,
                            &op.max_build_hash_table_bytes,
                            &op.max_build_probe_resident_bytes};
   static_assert(std::tuple_size_v<decltype(options)> == std::size(batch_settings));
@@ -676,6 +674,7 @@ try {
   ops.fused_scan.max_membership_sources        = op.fused_scan_max_membership_sources.get();
   ops.max_sort_partition_bytes                 = op.max_sort_partition_bytes.get().count();
   ops.max_sort_partition_memory_fraction       = op.max_sort_partition_memory_fraction.get();
+  ops.sort_sample_bytes                        = op.sort_sample_bytes.get().count();
   ops.max_broadcast_join_size                  = op.max_broadcast_join_size.get().count();
   ops.mark_join_build_switch_ratio             = op.mark_join_build_switch_ratio.get();
   ops.enable_dynamic_filter                    = op.enable_dynamic_filter.get();

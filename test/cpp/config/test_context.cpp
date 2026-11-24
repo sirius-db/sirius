@@ -1150,7 +1150,7 @@ void require_shared_operator_defaults(const sirius::operator_params& params, uin
   REQUIRE(params.hash_partition_bytes == batch);
   REQUIRE(params.concat_batch_bytes == batch);
   REQUIRE(params.cross_join_task_bytes == batch);
-  REQUIRE(params.sort_sample_bytes == batch);
+  REQUIRE(params.sort_sample_bytes == 0);
   REQUIRE(params.max_build_hash_table_bytes == 8 * batch);
   REQUIRE(params.max_build_probe_resident_bytes == 8 * batch);
   REQUIRE(params.max_dynamic_filter_bloom_bytes_per_gpu() == 4 * batch);
@@ -1451,7 +1451,7 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   REQUIRE(settings->Collection().GetValue(0, 0).GetValue<uint64_t>() == expected_batch);
   REQUIRE(settings->Collection().GetValue(1, 0).GetValue<uint64_t>() == expected_batch);
   REQUIRE(settings->Collection().GetValue(2, 0).GetValue<uint64_t>() == expected_batch);
-  REQUIRE(settings->Collection().GetValue(3, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->Collection().GetValue(3, 0).GetValue<uint64_t>() == 0);
   REQUIRE(settings->Collection().GetValue(4, 0).GetValue<uint64_t>() == 8 * expected_batch);
   REQUIRE(settings->Collection().GetValue(5, 0).GetValue<uint64_t>() == 8 * expected_batch);
 

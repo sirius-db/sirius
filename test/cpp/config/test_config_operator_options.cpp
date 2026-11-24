@@ -76,6 +76,7 @@ TEST_CASE("absent operator options take operator_params' defaults", "[config][co
   REQUIRE(op.late_materialization_min_boundaries.get() == 4);
   REQUIRE(op.fused_scan_max_selectivity.get() == 0.35);
   REQUIRE(op.max_sort_partition_bytes.get() == 0_B);
+  REQUIRE(op.sort_sample_bytes.get() == 0_B);
   REQUIRE(op.max_broadcast_join_size.get() == 256_MiB);
   REQUIRE(op.mark_join_build_switch_ratio.get() == 8.0);
   REQUIRE(op.dynamic_filter_domain_coverage_threshold.get() == 0.9);
@@ -87,7 +88,6 @@ TEST_CASE("absent operator options take operator_params' defaults", "[config][co
                              &op.hash_partition_bytes,
                              &op.concat_batch_bytes,
                              &op.cross_join_task_bytes,
-                             &op.sort_sample_bytes,
                              &op.max_build_hash_table_bytes,
                              &op.max_build_probe_resident_bytes}) {
     INFO(option->key());
@@ -231,7 +231,7 @@ TEST_CASE("every operator option's fallback and audience", "[config][config_oper
   check(op.hash_partition_bytes, false);
   check(op.concat_batch_bytes, false);
   check(op.cross_join_task_bytes, false);
-  check(op.sort_sample_bytes, false);
+  check(op.sort_sample_bytes, true);
   check(op.max_build_hash_table_bytes, false);
   check(op.max_build_probe_resident_bytes, false);
   check(op.max_broadcast_join_size, true);

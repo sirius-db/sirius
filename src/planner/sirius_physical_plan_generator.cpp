@@ -1684,7 +1684,7 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
 
     auto sample = duckdb::make_uniq<sirius::op::sirius_physical_sort_sample>(
       order_ptr,
-      op_params.sort_sample_bytes,
+      op_params.effective_sort_sample_bytes(),
       op_params.max_sort_partition_bytes,
       op_params.max_sort_partition_memory_fraction);
     auto* sample_ptr = sample.get();
