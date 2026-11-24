@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -51,7 +52,7 @@ class AdmissionTest(unittest.TestCase):
         self.delta = self.root / "manifest" / snapshot["deltaManifestList"]
         self.calls = pathlib.Path(scratch.name) / "reader-calls"
 
-    def run_check(self, expected_status):
+    def run_check(self, expected_status, **environment):
         # The sentinel observes whether the caller enters the reader stage.
         code = "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()"
         result = subprocess.run(
@@ -68,6 +69,7 @@ class AdmissionTest(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=10,
+            env=os.environ | environment,
         )
         self.assertEqual(
             result.returncode, expected_status, result.stdout + result.stderr
@@ -130,6 +132,10 @@ class AdmissionTest(unittest.TestCase):
         rows[0]["_FILE_SIZE"] = entry.stat().st_size
         write_ocf(self.delta, schema, rows)
         self.assertEqual(self.run_check(2)["reason"], "unknown-decoded-size")
+
+    def test_missing_zstd_is_an_error_before_reader(self):
+        result = self.run_check(3, PAIMON_PROBE_ZSTD=str(self.root / "missing-libzstd"))
+        self.assertEqual(result["admission"], "error")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,9 @@ python3 -m unittest -v test_check.py
 python3 check.py ../warehouse/reference.db/append_basic
 ```
 
+If library discovery fails, set `PAIMON_PROBE_ZSTD` to the absolute path of
+libzstd. The library must export `ZSTD_getFrameHeader`.
+
 To chain a stock SDK probe after admission, add `-- /path/to/reader` after
 the fixture path. Configure the reader to select snapshot 2 explicitly. The
 diagnostic passes the table path and the reader owns snapshot selection. The

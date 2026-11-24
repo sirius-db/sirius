@@ -78,9 +78,12 @@ class FrameHeader(C.Structure):
 
 
 def zstd_library():
-    library = C.CDLL(
-        os.environ.get("PAIMON_PROBE_ZSTD") or ctypes.util.find_library("zstd")
-    )
+    name = os.environ.get("PAIMON_PROBE_ZSTD") or ctypes.util.find_library("zstd")
+    if not name:
+        raise OSError("libzstd was not found; set PAIMON_PROBE_ZSTD to its path")
+    library = C.CDLL(name)
+    if not hasattr(library, "ZSTD_getFrameHeader"):
+        raise OSError("libzstd does not export ZSTD_getFrameHeader")
     library.ZSTD_getFrameHeader.argtypes = [
         C.POINTER(FrameHeader),
         C.c_void_p,
