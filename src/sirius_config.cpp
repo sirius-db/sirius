@@ -92,7 +92,6 @@ constexpr batch_setting batch_settings[] = {
   {"hash_partition_bytes", &operator_params::hash_partition_bytes, 1},
   {"concat_batch_bytes", &operator_params::concat_batch_bytes, 1},
   {"cross_join_task_bytes", &operator_params::cross_join_task_bytes, 1},
-  {"sort_sample_bytes", &operator_params::sort_sample_bytes, 1},
   {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 8},
   {"max_build_probe_resident_bytes", &operator_params::max_build_probe_resident_bytes, 8}};
 
