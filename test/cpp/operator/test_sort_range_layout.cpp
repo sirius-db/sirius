@@ -379,6 +379,22 @@ TEST_CASE("Sort ranges weight unequal batches by their row counts", "[sort_range
   }
 }
 
+TEST_CASE("Sort ranges are no more than the sampled key rows", "[sort_range_layout]")
+{
+  std::vector<std::int32_t> keys(4096);
+  std::iota(keys.begin(), keys.end(), 0);
+  // The byte target asks for many more ranges than the 16 key rows kept.
+  auto result = run_checked(int_batches({keys}), one_order(), 1000000, 64, true, 16);
+  REQUIRE(result.sample.sample_key_rows == 16);
+  CHECK(result.sample.num_ranges == 16);
+  REQUIRE(result.sample.repeated_boundaries.has_value());
+  CHECK(*result.sample.repeated_boundaries == 0);
+  REQUIRE(result.counted.size() == 16);
+  for (auto const& range : result.counted) {
+    CHECK(range.rows > 0);
+  }
+}
+
 TEST_CASE("Sort ranges retain rows in a batch too short to give a key row", "[sort_range_layout]")
 {
   std::vector<std::int32_t> large(40000);

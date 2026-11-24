@@ -106,8 +106,10 @@ sort_boundaries sirius_physical_sort_sample::local_boundaries(
   ::cuda::stream_ref stream)
 {
   auto const rows = sample_keys.num_rows();
+  // More partitions than key rows would take a key row twice and leave partitions empty.
+  num_parts = std::min(num_parts, static_cast<std::size_t>(rows));
   // Single partition — no boundaries needed
-  if (num_parts <= 1 || rows == 0) { return {}; }
+  if (num_parts <= 1) { return {}; }
   return {num_parts,
           evenly_spaced(sample_keys, 0, rows, num_parts, stream, space->get_default_allocator())};
 }

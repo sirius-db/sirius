@@ -201,7 +201,7 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
  private:
   //! Evenly spaced boundaries for @p num_parts partitions from this operator's own sorted
-  //! @p sample_keys.
+  //! @p sample_keys, with at most one partition per key row.
   sort_boundaries local_boundaries(cudf::table_view sample_keys,
                                    std::size_t num_parts,
                                    cucascade::memory::memory_space* space,
