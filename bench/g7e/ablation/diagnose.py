@@ -41,13 +41,20 @@ def main():
 
     runner.worker_environment = debug_env
     records, evidence = [], {}
-    for label, stage, query in [
-        ("build_dynamic", "stage3-type_narrow", 3),
-        ("fused_decode", "stage5-fused_decode", 6),
-    ]:
+    stages = json.loads((args.run / "plan.json").read_text())["stages"]
+    build = next(
+        s
+        for s in stages
+        if s["build_probe"]
+        and s["dynamic_filter"]
+        and s["type_narrow"]
+        and not s["compressed_pin"]
+    )
+    fused = next(s for s in stages if s["fused_decode"])
+    for label, spec, query in [("build_dynamic", build, 3), ("fused_decode", fused, 6)]:
         directory = root / label
         directory.mkdir()
-        source = args.run / stage
+        source = args.run / f"stage{spec['stage']}-{spec['label']}"
         (directory / "stage-spec.json").write_bytes(
             (source / "stage-spec.json").read_bytes()
         )

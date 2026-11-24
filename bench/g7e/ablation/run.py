@@ -1,5 +1,5 @@
 # Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
-"""Corrected GB300 BUILD_PROBE-first protocol on the G7e SF1k host preset."""
+"""Corrected GB300 cumulative ablation orders on the G7e SF1k host preset."""
 import argparse
 import copy
 import csv
@@ -29,13 +29,22 @@ STAGES = (
     ("compressed_pin", True, True, True, True, False),
     ("fused_decode", True, True, True, True, True),
 )
+TYPE_FIRST_STAGES = (
+    ("all_off", False, False, False, False, False),
+    ("type_narrow", False, False, True, False, False),
+    ("build_probe", True, False, True, False, False),
+    ("dynamic_filter", True, True, True, False, False),
+    ("compressed_pin", True, True, True, True, False),
+    ("fused_decode", True, True, True, True, True),
+)
 
 
-def stage_spec(index):
-    label, build, dynamic, narrow, compressed, fused = STAGES[index]
+def stage_spec(index, order="build-first"):
+    sequence = TYPE_FIRST_STAGES if order == "type-first" else STAGES
+    label, build, dynamic, narrow, compressed, fused = sequence[index]
     return dict(
         stage=index,
-        gb300_stage=index + 9,
+        gb300_stage=index + (15 if order == "type-first" else 9),
         label=label,
         build_probe=build,
         dynamic_filter=dynamic,
@@ -71,16 +80,20 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--order", choices=("build-first", "type-first"), default="build-first"
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Collect existing workers without repeating them",
     )
     args = parser.parse_args()
-    stages = [stage_spec(i) for i in range(6)]
+    stages = [stage_spec(i, args.order) for i in range(6)]
     if args.dry_run:
         print(
             json.dumps(
                 dict(
+                    order=args.order,
                     stages=stages,
                     queries=list(range(1, 23)),
                     iterations=1,
@@ -133,6 +146,10 @@ def main():
     if args.resume:
         prior = json.loads((root / "preflight.json").read_text())
         assert (
+            json.loads((root / "plan.json").read_text()).get("order", "build-first")
+            == args.order
+        )
+        assert (
             prior["input_hashes_verified"]
             and prior["ec2"]["instanceId"] == identity["instanceId"]
         )
@@ -176,6 +193,7 @@ def main():
     save(
         root / "plan.json",
         dict(
+            order=args.order,
             stages=stages,
             iterations=1,
             queries=list(range(1, 23)),
@@ -370,7 +388,7 @@ def main():
         dict(
             source_commit=guide.PIN,
             scale_factor=1000,
-            protocol="corrected GB300 BUILD_PROBE-first",
+            protocol="corrected GB300 " + args.order,
             totals=totals,
             proofs=rows,
             complete=all(t["complete"] for t in totals),

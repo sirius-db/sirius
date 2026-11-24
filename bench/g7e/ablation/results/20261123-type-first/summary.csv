@@ -1,0 +1,7 @@
+stage,label,complete,correct_queries,sum_s,available_sum_s
+0,all_off,False,0,,0.0
+1,type_narrow,False,8,,24.924423
+2,build_probe,False,8,,22.314597
+3,dynamic_filter,False,18,,40.405679
+4,compressed_pin,True,22,30.713166,30.713166
+5,fused_decode,True,22,29.425129,29.425129

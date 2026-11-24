@@ -1,0 +1,109 @@
+{
+  "all_staged_file_hashes_verified": true,
+  "archive": {
+    "all_payload_hashes_verified_after_download": true,
+    "bytes": 54031334,
+    "filename": "g7e8-london-sf1k-host-ablation-type-first-20261123-full-results.tar.gz",
+    "files": 664,
+    "payload_bytes": 207819143,
+    "sha256": "3138c888db881059a1fe624f9281c6db4dd9714dd9d33455bf6a6d16f24d2d87"
+  },
+  "base_config": "../../../guide-26b5caba/configs/cpu-budget-pinned.yaml",
+  "base_config_sha256": "a96d6e0715fddcd807c7b5e69fc8d0ecfcfd93c5ecf11f26a13556dad325e642",
+  "common_query_subset": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "common_subset_sums_s": {
+    "1": 24.924423,
+    "2": 22.314597,
+    "3": 18.283847,
+    "4": 9.408622,
+    "5": 8.686649000000001
+  },
+  "complete_stages": [
+    4,
+    5
+  ],
+  "dataset_manifest_sha256": "884a627553d7a3d0f5cc41bdf451b3d7353274cb2dabcf1555e5c8e17537785a",
+  "date_timezone": "America/Chicago",
+  "earlier_build_first_results": "../20261123/manifest.json",
+  "engine_commit": "26b5caba3e2c96290fdc63d4cf40ac42572eaab8",
+  "executed_source_sha256": {
+    "ablation/run.py": "a9fbb6b2815b8d0dcb106cdfdf6dbf9bee6f9786a702a5840c9130d1b1c5a190",
+    "ablation/worker.py": "cc53c773bcd9f6af9ac60b968b4997632ac89ad16d50f0ebdba9732a0ce9b5af",
+    "guide-26b5caba/supervisor.py": "e42ffa05aa4b013ac5c69e273827ae4b69e0c9e7590165227a06263e2ce7422b",
+    "guide-26b5caba/worker.py": "9f7a673999444e4ea15b67a2b96e945948c39973a3ffa57d3afd57b18418810b"
+  },
+  "failed_timed_query_attempts": 2,
+  "hardware": "g7e.8xlarge",
+  "incomplete_stages": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "native_library_sha256": "090f552314d37196b6c0509a261a9656034a287e03524531dd7e1af3ccc79236",
+  "no_total_speedup_without_all_off_baseline": true,
+  "order": "type-first",
+  "os": "Amazon Linux 2023",
+  "pin_control": "Global pin_table_compression=false; every pin call explicitly compression=false in stages0-3; only lineitem/orders compression=true in stages4-5.",
+  "protocol": "corrected GB300 type-narrowing-first; fresh engine per stage; per-query host pin/unpin; one iteration; startup cache clear only",
+  "quent_contexts": 6,
+  "quent_query_executions": 80,
+  "reference_protocol": "../../../../gb300/ablation/RESULTS.md#corrected-type-narrowing-first-cumulative-order",
+  "region": "eu-west-2",
+  "result_date": "2026-11-23",
+  "runner_package_sha256": "d918f9d64e15e1b76f3ee34418f46b5b0bfe3bd7b4d4ddb00f577b91f458bd53",
+  "same_region_s3": {
+    "bucket": "sae-dataproc-aws-dev-sirius-scratch-eu-west-2",
+    "region": "eu-west-2",
+    "tables_present": [
+      "region",
+      "nation",
+      "supplier",
+      "customer",
+      "part",
+      "partsupp",
+      "orders",
+      "lineitem"
+    ]
+  },
+  "simpatico_plan_sha256": {
+    "lineitem": "288cd2b875e809bff33cea675eb5a6c676acbb81ffb5198d049b4e08ebcfb555",
+    "orders": "eb4b3be1de77fc613f84ebd454897668d8494c5e01e346f9047b3eeb227e8aeb"
+  },
+  "sql_threads": 24,
+  "stage_config_sha256": {
+    "stage0-all_off.yaml": "284fa987e19bfcf06e6621fe51b86849db8d6ede3a57a429c99947d05df321dd",
+    "stage1-type_narrow.yaml": "0f965fef604e4cd295c182c4647430e7a083a21cac180d546ca0a6074e38b561",
+    "stage2-build_probe.yaml": "bee7fb8fc56554cbda7af6faa7fe56fa8e7070b1e54032e32324a30d5d0340e2",
+    "stage3-dynamic_filter.yaml": "db6a9dac8a6734cd2b63cef5734da45279a47422156dd1e32b9a76b3170dffbf",
+    "stage4-compressed_pin.yaml": "db6a9dac8a6734cd2b63cef5734da45279a47422156dd1e32b9a76b3170dffbf",
+    "stage5-fused_decode.yaml": "519d9758bd79b5aef99b019ec2b3e03aadaa1ef07b1c634c31c0f562480bc29c"
+  },
+  "stage_plan": "stage-plan.json",
+  "stage_plan_sha256": "ca2539237705acce0f807a98f944abe0b416bf8e9d338a7d4461c163dfb25ddb",
+  "stage_query_counts": [
+    0,
+    8,
+    8,
+    18,
+    22,
+    22
+  ],
+  "stage_timeout_s": 600,
+  "timed_query_attempts": 80,
+  "untimed_diagnostics": {
+    "build_probe": 2,
+    "dynamic_filter": 2,
+    "fused_decode": 68
+  },
+  "validated_measurements": 78
+}

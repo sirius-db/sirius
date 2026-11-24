@@ -1,0 +1,73 @@
+{
+  "all_completed_answers_correct": true,
+  "archive_sha256": "3138c888db881059a1fe624f9281c6db4dd9714dd9d33455bf6a6d16f24d2d87",
+  "common_queries": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "common_subset_sums_s": {
+    "1": 24.924423,
+    "2": 22.314597,
+    "3": 18.283847,
+    "4": 9.408622,
+    "5": 8.686649000000001
+  },
+  "date_timezone": "America/Chicago",
+  "diagnostics_correct": true,
+  "failed_stages": [
+    {
+      "error": "_duckdb.Error: std::bad_alloc: out_of_memory: Not enough free blocks available in fixed_size_host_memory_resource. total_bytes: 2495610880, upstream_tracked_bytes: 2495610880, only 62 free blocks available from 2380 requested blocks.",
+      "phase": "host pinning",
+      "query": 1,
+      "stage": 0,
+      "timed_out": false
+    },
+    {
+      "error": "_duckdb.Error: Sirius GPU execution failed: GPU pipeline task exceeded maximum retry limit (100) for original task 2086: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory",
+      "phase": "query execution",
+      "query": 9,
+      "stage": 1,
+      "timed_out": false
+    },
+    {
+      "error": "_duckdb.Error: Sirius GPU execution failed: GPU pipeline task exceeded maximum retry limit (100) for original task 2079: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory",
+      "phase": "query execution",
+      "query": 9,
+      "stage": 2,
+      "timed_out": false
+    },
+    {
+      "error": "_duckdb.Error: std::bad_alloc: out_of_memory: Not enough free blocks available in fixed_size_host_memory_resource. total_bytes: 1929379840, upstream_tracked_bytes: 1929379840, only 113 free blocks available from 1840 requested blocks.",
+      "phase": "host pinning",
+      "query": 19,
+      "stage": 3,
+      "timed_out": false
+    }
+  ],
+  "fresh_stage_processes": 6,
+  "fused_change_pct": -4.193761724206491,
+  "gpu_query_attempts": 80,
+  "instance_lifecycle": "retained running",
+  "order": "type-first",
+  "quent_contexts": 6,
+  "quent_timed_executions": 80,
+  "result_date": "2026-11-23",
+  "stage4_sum_s": 30.713166,
+  "stage5_sum_s": 29.425129,
+  "stage_query_counts": [
+    0,
+    8,
+    8,
+    18,
+    22,
+    22
+  ],
+  "untimed_diagnostic_queries": 2,
+  "validated_timed_queries": 78
+}

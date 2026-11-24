@@ -16,6 +16,29 @@ def read(name):
 
 
 class PinControls(unittest.TestCase):
+    def test_corrected_type_first_order_matches_gb300(self):
+        run = read("run")
+        stages = [run.stage_spec(i, "type-first") for i in range(6)]
+        self.assertEqual(
+            [s["label"] for s in stages],
+            [
+                "all_off",
+                "type_narrow",
+                "build_probe",
+                "dynamic_filter",
+                "compressed_pin",
+                "fused_decode",
+            ],
+        )
+        self.assertEqual([s["gb300_stage"] for s in stages], list(range(15, 21)))
+        self.assertTrue(stages[1]["type_narrow"])
+        self.assertFalse(stages[1]["build_probe"])
+        self.assertFalse(stages[2]["dynamic_filter"])
+        self.assertTrue(stages[3]["dynamic_filter"])
+        self.assertFalse(stages[3]["compressed_pin"])
+        self.assertTrue(stages[4]["compressed_pin"])
+        self.assertFalse(stages[4]["fused_decode"])
+
     def test_native_coverage_paths_identify_the_logical_table(self):
         run = read("run")
         self.assertEqual(

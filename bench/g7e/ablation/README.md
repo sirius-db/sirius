@@ -1,9 +1,10 @@
 # G7e SF1000 host-pin cumulative ablation
 
-The [November 23 results](results/20261123/RESULTS.md) preserve both complete
-stages and the pin-capacity failures in the earlier stages.
+The November 23 [BUILD_PROBE-first results](results/20261123/RESULTS.md) and
+[type-narrowing-first results](results/20261123-type-first/RESULTS.md) preserve
+complete stages, partial sums and allocation failures separately.
 
-This uses the corrected BUILD_PROBE-first order from the
+This supports the corrected cumulative orders from the
 [GB300 study](../../gb300/ablation/RESULTS.md#corrected-build_probe-first-comparison)
 on the existing G7e guide SF1000 host-pinned benchmark. The engine stays at main
 `26b5caba`; the [saved pinned preset](../guide-26b5caba/configs/cpu-budget-pinned.yaml)
@@ -16,6 +17,12 @@ BUILD_PROBE admission, dynamic filtering, type narrowing, compressed host
 pinning, and fused filtering during decode. BUILD_PROBE is disabled with both
 build/probe byte limits set to zero; enabling it restores the pinned engine's
 defaults. Every other setting stays fixed.
+
+Pass `--order type-first` for the corrected alternative GB300 order: all off,
+type narrowing, BUILD_PROBE admission, dynamic filtering, compressed pinning,
+then fused filtering. The default is `--order build-first`. All other settings,
+pin controls and process boundaries are identical. A new output directory
+preserves the earlier order's measurements.
 
 As on GB300, each stage starts one fresh engine, clears caches at startup, and
 runs Q1–Q22 once. Each query pins only its referenced host columns, executes,

@@ -55,6 +55,8 @@ The separate [SF1000 host-pin cumulative ablation](ablation/results/20261123/RES
 follows the corrected GB300 study's stage-level process lifecycle. It saves
 complete-stage sums, per-query results, exact configs and the earlier stages'
 host-pin allocation failures; failed stages are not assigned suite sums.
+The [type-narrowing-first order](ablation/results/20261123-type-first/RESULTS.md)
+is saved separately with the same base configuration and process protocol.
 
 The older custom presets and historical custom-config snapshots are retained
 locally outside this guide-only publication. The selected table and reproducer

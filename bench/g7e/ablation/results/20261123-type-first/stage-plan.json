@@ -1,0 +1,94 @@
+{
+  "cache_clear": "stage startup only",
+  "fresh_process": "per stage",
+  "iterations": 1,
+  "order": "type-first",
+  "pin": "host per query",
+  "queries": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22
+  ],
+  "stage_timeout_s": 600,
+  "stages": [
+    {
+      "build_probe": false,
+      "compressed_pin": false,
+      "dynamic_filter": false,
+      "fused_decode": false,
+      "gb300_stage": 15,
+      "label": "all_off",
+      "stage": 0,
+      "type_narrow": false
+    },
+    {
+      "build_probe": false,
+      "compressed_pin": false,
+      "dynamic_filter": false,
+      "fused_decode": false,
+      "gb300_stage": 16,
+      "label": "type_narrow",
+      "stage": 1,
+      "type_narrow": true
+    },
+    {
+      "build_probe": true,
+      "compressed_pin": false,
+      "dynamic_filter": false,
+      "fused_decode": false,
+      "gb300_stage": 17,
+      "label": "build_probe",
+      "stage": 2,
+      "type_narrow": true
+    },
+    {
+      "build_probe": true,
+      "compressed_pin": false,
+      "dynamic_filter": true,
+      "fused_decode": false,
+      "gb300_stage": 18,
+      "label": "dynamic_filter",
+      "stage": 3,
+      "type_narrow": true
+    },
+    {
+      "build_probe": true,
+      "compressed_pin": true,
+      "dynamic_filter": true,
+      "fused_decode": false,
+      "gb300_stage": 19,
+      "label": "compressed_pin",
+      "stage": 4,
+      "type_narrow": true
+    },
+    {
+      "build_probe": true,
+      "compressed_pin": true,
+      "dynamic_filter": true,
+      "fused_decode": true,
+      "gb300_stage": 20,
+      "label": "fused_decode",
+      "stage": 5,
+      "type_narrow": true
+    }
+  ]
+}
