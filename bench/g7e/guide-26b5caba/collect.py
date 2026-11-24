@@ -2,6 +2,7 @@
 """Read measured timings, GPU boundaries, immutable configs and saved answers."""
 import csv
 from datetime import datetime, timezone
+import json
 import math
 import re
 

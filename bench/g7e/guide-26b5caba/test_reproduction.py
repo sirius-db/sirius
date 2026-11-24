@@ -21,6 +21,24 @@ spec.loader.exec_module(reproduction)
 
 
 class Recipes(unittest.TestCase):
+    def test_completed_worker_events_are_read_from_saved_journal(self):
+        spec = importlib.util.spec_from_file_location(
+            "guide_collect", HERE / "collect.py"
+        )
+        collector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(collector)
+        events = [
+            {"event": "query_begin", "query": 1, "iteration": 1},
+            {"event": "query_end", "query": 1, "iteration": 1},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = Path(tmp)
+            self.assertEqual(collector.events(worker), [])
+            (worker / "events.jsonl").write_text(
+                "".join(json.dumps(event) + "\n" for event in events)
+            )
+            self.assertEqual(collector.events(worker), events)
+
     def test_sf3k_uses_sf10k_config_and_threads(self):
         cold, session = reproduction.recipe(3000, "cold")
         self.assertEqual(cold, reproduction.recipe(10000, "cold")[0])
