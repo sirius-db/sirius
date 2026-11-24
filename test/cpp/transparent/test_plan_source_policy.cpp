@@ -204,8 +204,8 @@ TEST_CASE("Registered replay veto survives local MultiFile classification and ca
   CHECK(policy.scans.front().reason == "connector policy forbids CPU replay");
   CHECK_THROWS_WITH(
     require_cpu_replay(policy, "", "forced GPU failure"),
-    "CPU fallback is not supported: parquet_scan: connector policy forbids CPU replay. "
-    "Underlying GPU error: forced GPU failure");
+    "Underlying GPU error: forced GPU failure. "
+    "CPU fallback is not supported: parquet_scan: connector policy forbids CPU replay");
 
   auto const view = sirius::op::scan::capture_bound_read_view(get, *fixture.con.context);
   CHECK(view.replay_policy.source == declared_source);
@@ -376,8 +376,9 @@ TEST_CASE("Source policy treats failed node extraction as incomplete",
                                                   : "inventory extraction failed";
   REQUIRE_THROWS_AS(require_cpu_replay(policy, "", "GPU scan unsupported"), std::runtime_error);
   REQUIRE_THROWS_WITH(require_cpu_replay(policy, "", "GPU scan unsupported"),
-                      "CPU fallback is not supported: source discovery failed: " +
-                        discovery_message + ". Underlying GPU error: GPU scan unsupported");
+                      "Underlying GPU error: GPU scan unsupported. CPU fallback is not "
+                      "supported: source discovery failed: " +
+                        discovery_message);
 }
 
 TEST_CASE("Source policy does not wrap retained interrupts", "[transparent][policy]")
@@ -417,8 +418,8 @@ TEST_CASE("Source policy preserves DuckDB error types and metadata", "[transpare
       CHECK(error.ExtraInfo().at("position") == "7");
     }
     CHECK(error.RawMessage() ==
-          "CPU fallback is not supported: source discovery failed: "
-          "typed discovery failure. Underlying GPU error: GPU scan unsupported");
+          "Underlying GPU error: GPU scan unsupported. CPU fallback is not supported: source "
+          "discovery failed: typed discovery failure");
   }
 }
 
@@ -505,17 +506,17 @@ TEST_CASE("Source policy preserves S3 error text and stream reason", "[transpare
     {"sirius_stream_source", byte_source_class::stream, false, "stream source has no CPU body"}};
   REQUIRE_THROWS_WITH(
     require_cpu_replay(policy, "", mismatch_message),
-    "CPU fallback is not supported: sirius_stream_source: stream source has no CPU body. "
     "Underlying GPU error: read-view mismatch: reason=no_correspondence, correspondence=none, "
     "original_count=0, candidate_count=0, different_total=0, different_original=0, "
     "different_candidate=0, "
     "original_hash=none, candidate_hash=none, original_depth=none, candidate_depth=none, "
-    "only_original=[], only_candidate=[]");
+    "only_original=[], only_candidate=[]. "
+    "CPU fallback is not supported: sirius_stream_source: stream source has no CPU body");
   policy.scans.clear();
   policy.discovery_complete = false;
   REQUIRE_THROWS_WITH(
     require_cpu_replay(policy, "", "boom"),
-    "CPU fallback is not supported: source discovery incomplete. Underlying GPU error: boom");
+    "Underlying GPU error: boom. CPU fallback is not supported: source discovery incomplete");
 }
 
 TEST_CASE("Source policy retains known S3 evidence after a sibling extraction failure",

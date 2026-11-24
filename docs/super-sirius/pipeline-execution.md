@@ -476,6 +476,8 @@ The GPU executor catches the **base** `task_reschedule_exception` and:
 
 If max retries are exceeded, the error propagates and terminates the query.
 
+Before an OOM retry is created, the executor releases the input's read-only locks and calls `operator_data::shrink_for_retry()`; an input that makes its next attempt smaller (the windowed merge input halves its window and output target) is retried without raising the reservation floor. See [Shrink Before Retry](memory-management.md#shrink-before-retry).
+
 ## Error Handling and Draining
 
 **File:** `src/sirius_context.cpp` — `retire_query_work(query_id, mode)`

@@ -37,11 +37,20 @@
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "expression/aggregate_id.hpp"
+#include "expression/ast/aggregate.hpp"
+#include "expression/ast/cast.hpp"
+#include "expression/ast/coalesce.hpp"
+#include "expression/ast/constant.hpp"
+#include "expression/ast/node.hpp"
+#include "expression/ast/reference.hpp"
 #include "expression/ast/utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/cudf_sort_order.hpp"
+#include "op/discard_copy_function.hpp"
 #include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "op/partition/consumer_partition_policy.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -54,6 +63,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
+#include "op/sirius_physical_discard_sink.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_gpu_values.hpp"
@@ -1502,14 +1512,75 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
   });
 }
 
+//! The limits of a coalesced ORDER_BY run for this engine and these settings
+//! (`sirius::op::make_sort_run_limits`), or nullopt without an engine context to size a run from.
+std::optional<sirius::op::sort_run_limits> engine_sort_run_limits(
+  const sirius::operator_params& op_params, duckdb::SiriusContext* sirius_ctx)
+{
+  if (sirius_ctx == nullptr || !sirius_ctx->is_initialized()) { return std::nullopt; }
+  // A task may land on any GPU: size a run for the smallest one.
+  std::size_t gpu_bytes = 0;
+  auto const gpu_spaces =
+    sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  for (auto const* space : gpu_spaces) {
+    if (gpu_bytes == 0 || space->get_max_memory() < gpu_bytes) {
+      gpu_bytes = space->get_max_memory();
+    }
+  }
+  auto const threads = static_cast<std::size_t>(
+    std::max(1, sirius_ctx->get_config().get_gpu_pipeline_executor_config().num_threads));
+  return sirius::op::make_sort_run_limits(gpu_bytes,
+                                          gpu_spaces.size(),
+                                          threads,
+                                          op_params.sort_coalesce_memory_fraction,
+                                          op_params.sort_coalesce_concurrent_runs,
+                                          op_params.sort_input_backpressure);
+}
+
+//! The limits of one coalesced ORDER_BY run, or nullopt when the local sort should stay per batch:
+//! the setting is off, there is no engine context to size a run from, a column is nested (only
+//! fixed-width and string columns are concatenated), a sort key is not a plain column, or a sort
+//! key is a string and either `sort_coalesce_string_keys` or `sort_key_encoding` is off (large
+//! runs of string keys pay only with the encoded sort; cuDF's comparison sort gets slower per
+//! row as a run grows).
+std::optional<sirius::op::sort_run_limits> order_by_run_limits(
+  sirius::op::sirius_physical_order const& order,
+  duckdb::vector<sirius::logical_type> const& input_types,
+  const sirius::operator_params& op_params,
+  duckdb::SiriusContext* sirius_ctx)
+{
+  if (!op_params.sort_coalesce_runs || sirius_ctx == nullptr || !sirius_ctx->is_initialized()) {
+    return std::nullopt;
+  }
+  for (auto const& type : input_types) {
+    if (!type.is_fixed_width() && !type.is_varchar()) { return std::nullopt; }
+  }
+  for (auto const& key : order.orders) {
+    if (key.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+      return std::nullopt;
+    }
+    auto const index = key.expression->Cast<duckdb::BoundReferenceExpression>().Index();
+    if (index >= input_types.size()) { return std::nullopt; }
+    if (input_types[index].is_varchar() &&
+        !(op_params.sort_coalesce_string_keys && op_params.sort_key_encoding)) {
+      return std::nullopt;
+    }
+  }
+  return engine_sort_run_limits(op_params, sirius_ctx);
+}
+
 //! Replace an ORDER_BY slot with `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY →
-//! original_input`. Destructive: ORDER_BY's
+//! original_input`. When runs are coalesced (see `order_by_run_limits`) the input is terminated
+//! with a PASSTHROUGH_SINK, `… → ORDER_BY → PASSTHROUGH_SINK → original_input`: ORDER_BY then
+//! starts its own pipeline and reads its producer's batches from a port, which is what lets one
+//! sort task claim several of them. Destructive: ORDER_BY's
 //! `projections`/`types` are overwritten with the identity over the input's types so every
 //! column stays visible to SORT_SAMPLE / SORT_PARTITION; a non-identity original projection is
 //! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
 //! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape, matching legacy).
 void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
-                   const sirius::operator_params& op_params)
+                   const sirius::operator_params& op_params,
+                   duckdb::SiriusContext* sirius_ctx)
 {
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> order_op) {
     auto* order_ptr = &order_op->Cast<sirius::op::sirius_physical_order>();
@@ -1529,12 +1600,59 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
     order_ptr->projections = std::move(identity_proj);
     order_ptr->types       = child_types;
 
+    if (auto const limits = order_by_run_limits(*order_ptr, child_types, op_params, sirius_ctx)) {
+      order_ptr->enable_run_coalescing(*limits, order_ptr->children[0]->get_physical_types());
+      wrap_child(*order_ptr, 0, [](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child) {
+        auto sink = duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(
+          child->types, child->estimated_cardinality, "default");
+        if (child->has_physical_overrides()) {
+          sink->set_physical_types(child->get_physical_types());
+        }
+        sink->children.push_back(std::move(child));
+        return sink;
+      });
+    }
+
     auto sample = duckdb::make_uniq<sirius::op::sirius_physical_sort_sample>(
       order_ptr,
       op_params.sort_sample_bytes,
       op_params.max_sort_partition_bytes,
       op_params.max_sort_partition_memory_fraction);
     auto* sample_ptr = sample.get();
+    {
+      // What the partition count is derived from besides the data size: how many GPUs there are
+      // and how many merge tasks each runs at once, and which merge every partition takes (a
+      // one-shot merge must hold a whole partition on one GPU).
+      sirius::op::sort_partition_policy policy;
+      policy.auto_sizing   = op_params.sort_partition_auto_sizing;
+      policy.one_shot_only = op_params.sort_merge_mode_setting == sirius::sort_merge_mode::one_shot;
+      policy.windowed_only = op_params.sort_merge_mode_setting == sirius::sort_merge_mode::windowed;
+      if (sirius_ctx != nullptr && sirius_ctx->is_initialized()) {
+        policy.merge_concurrency = static_cast<std::size_t>(
+          std::max(1, sirius_ctx->get_config().get_gpu_pipeline_executor_config().num_threads));
+        policy.num_gpus =
+          std::max<std::size_t>(sirius_ctx->get_memory_manager()
+                                  .get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)
+                                  .size(),
+                                1);
+        if (!policy.one_shot_only && !policy.windowed_only) {
+          // 'auto': MERGE_SORT takes the one-shot merge when partition + output fit this share of
+          // the GPU (merge::choose_route); the output is as large as the partition.
+          auto const budget = sirius::op::sirius_physical_merge_sort::make_device_budget_provider(
+            sirius_ctx->get_memory_manager(), policy.merge_concurrency)(nullptr);
+          auto const merge_config = sirius::op::merge::derive_merge_config(
+            sirius::op::merge::merge_settings::from(op_params), budget, 1, 1);
+          policy.auto_one_shot_partition_bytes = static_cast<std::size_t>(
+            merge_config.one_shot_fraction * static_cast<double>(budget.gpu_total_bytes) / 2.0);
+        }
+      }
+      sample->set_partition_policy(policy);
+    }
+    // Sorted runs waiting to be partitioned are bounded like the unsorted input of a coalescing
+    // sort, whichever mode the local sort is in.
+    if (auto const limits = engine_sort_run_limits(op_params, sirius_ctx)) {
+      sample->set_input_backlog_bytes(limits->max_backlog_bytes);
+    }
     sample->children.push_back(std::move(order_op));
 
     auto partition = duckdb::make_uniq<sirius::op::sirius_physical_sort_partition>(order_ptr);
@@ -1542,6 +1660,15 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
     partition->children.push_back(std::move(sample));
 
     auto merge = duckdb::make_uniq<sirius::op::sirius_physical_merge_sort>(order_ptr);
+    merge->set_merge_settings(sirius::op::merge::merge_settings::from(op_params));
+    if (sirius_ctx != nullptr && sirius_ctx->is_initialized()) {
+      // Windows are sized from the real GPU memory spaces and the configured executor width.
+      merge->set_device_budget_provider(
+        sirius::op::sirius_physical_merge_sort::make_device_budget_provider(
+          sirius_ctx->get_memory_manager(),
+          static_cast<std::size_t>(
+            std::max(1, sirius_ctx->get_config().get_gpu_pipeline_executor_config().num_threads))));
+    }
 
     bool is_identity = (original_projections.size() == order_ptr->types.size());
     if (is_identity) {
@@ -1948,7 +2075,9 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
       wrap_ungrouped_aggregate(slot);
       break;
-    case sirius::op::SiriusPhysicalOperatorType::ORDER_BY: wrap_order_by(slot, op_params); break;
+    case sirius::op::SiriusPhysicalOperatorType::ORDER_BY:
+      wrap_order_by(slot, op_params, compressed_materialization_observer);
+      break;
     case sirius::op::SiriusPhysicalOperatorType::TOP_N: wrap_top_n(slot); break;
     case sirius::op::SiriusPhysicalOperatorType::HASH_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:
@@ -2503,6 +2632,89 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   return plan;
 }
 
+namespace {
+
+//! The order check of a discard sink placed on @p root: the ORDER BY keys as columns of @p root's
+//! output. The check is left off (and the reason logged at WARN, since the user asked for it)
+//! when @p root is not an ORDER BY, or a key is an expression or a column the ORDER BY does not
+//! output. The sink then reports `order_checked=0`.
+sirius::op::discard_sink_options discard_order_check(
+  const sirius::op::sirius_physical_operator& root)
+{
+  if (root.type != sirius::op::SiriusPhysicalOperatorType::ORDER_BY) {
+    SIRIUS_LOG_WARN("sirius_discard: check_order disabled, the query's root is {} and not ORDER BY",
+                    sirius::op::SiriusPhysicalOperatorToString(root.type));
+    return {};
+  }
+  auto const& order = root.Cast<sirius::op::sirius_physical_order>();
+  sirius::op::discard_sink_options options;
+  for (auto const& key : order.orders) {
+    std::optional<std::size_t> output_column;
+    if (key.expression->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      auto const input_column = key.expression->Cast<duckdb::BoundReferenceExpression>().Index();
+      if (order.projections.empty()) {
+        output_column = input_column;
+      } else {
+        auto const it = std::find(order.projections.begin(), order.projections.end(), input_column);
+        if (it != order.projections.end()) { output_column = it - order.projections.begin(); }
+      }
+    }
+    if (!output_column) {
+      SIRIUS_LOG_WARN(
+        "sirius_discard: check_order disabled, ORDER BY key {} is not a column of the output",
+        key.expression->ToString());
+      return {};
+    }
+    options.key_columns.push_back(static_cast<cudf::size_type>(*output_column));
+    options.column_order.push_back(sirius::op::to_cudf_order(key.type));
+    options.null_precedence.push_back(sirius::op::to_cudf_null_order(key.type, key.null_order));
+  }
+  options.check_order = !options.key_columns.empty();
+  return options;
+}
+
+//! `COPY (query) TO … (FORMAT sirius_discard)`: @p query → DISCARD_SINK → SUM of the per-batch
+//! row counts → the COPY result, one BIGINT row.
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_discard_copy(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> query, bool check_order)
+{
+  auto const bigint  = sirius::from_duckdb(duckdb::LogicalType::BIGINT);
+  auto const hugeint = sirius::from_duckdb(duckdb::LogicalType::HUGEINT);
+
+  auto sink = duckdb::make_uniq<sirius::op::sirius_physical_discard_sink>(
+    query->types,
+    check_order ? discard_order_check(*query) : sirius::op::discard_sink_options{},
+    query->estimated_cardinality);
+  sink->children.push_back(std::move(query));
+
+  // SUM(BIGINT) is HUGEINT, as DuckDB binds it.
+  std::vector<std::unique_ptr<sirius::ast::node>> count;
+  count.push_back(std::make_unique<sirius::ast::node>(sirius::ast::reference{0, bigint}));
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> aggregates;
+  aggregates.push_back(std::make_unique<sirius::ast::node>(
+    sirius::ast::aggregate{sirius::aggregate_id::sum, std::move(count), hugeint, false}));
+  auto sum = duckdb::make_uniq<sirius::op::sirius_physical_ungrouped_aggregate>(
+    duckdb::vector<sirius::logical_type>{hugeint},
+    std::move(aggregates),
+    1,
+    duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+  sum->children.push_back(std::move(sink));
+
+  // COPY returns a BIGINT, and 0 for a query without rows, where the SUM is NULL.
+  std::vector<std::unique_ptr<sirius::ast::node>> alternatives;
+  alternatives.push_back(std::make_unique<sirius::ast::node>(sirius::ast::cast{
+    std::make_unique<sirius::ast::node>(sirius::ast::reference{0, hugeint}), bigint}));
+  alternatives.push_back(std::make_unique<sirius::ast::node>(
+    sirius::ast::constant{sirius::value{std::int64_t{0}}, bigint}));
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
+  select_list.push_back(
+    std::make_unique<sirius::ast::node>(sirius::ast::coalesce{std::move(alternatives), bigint}));
+  return push_projection(
+    std::move(sum), duckdb::vector<sirius::logical_type>{bigint}, std::move(select_list), 1);
+}
+
+}  // namespace
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
 {
@@ -2557,9 +2769,23 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
     case duckdb::LogicalOperatorType::LOGICAL_TOP_N:
       plan = create_plan(op.Cast<duckdb::LogicalTopN>());
       break;
-    case duckdb::LogicalOperatorType::LOGICAL_COPY_TO_FILE:
-      plan = create_plan(op.Cast<duckdb::LogicalCopyToFile>());
+    case duckdb::LogicalOperatorType::LOGICAL_COPY_TO_FILE: {
+      // The discard format writes nothing and ends the query in a discard sink; every other
+      // format goes to the Parquet export, which refuses what it cannot write.
+      auto& copy = op.Cast<duckdb::LogicalCopyToFile>();
+      if (!(copy.function.name == sirius::op::kDiscardCopyFormat)) {
+        plan = create_plan(copy);
+        break;
+      }
+      if (!copy.bind_data || op.children.size() != 1 || op.types.size() != 1 ||
+          op.types[0].id() != duckdb::LogicalTypeId::BIGINT) {
+        throw duckdb::NotImplementedException("Copy to file not supported");
+      }
+      plan =
+        plan_discard_copy(create_plan(*op.children[0]),
+                          copy.bind_data->Cast<sirius::op::discard_copy_bind_data>().check_order);
       break;
+    }
     case duckdb::LogicalOperatorType::LOGICAL_DUMMY_SCAN:
       plan = create_plan(op.Cast<duckdb::LogicalDummyScan>());
       break;

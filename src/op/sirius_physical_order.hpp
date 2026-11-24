@@ -19,6 +19,17 @@
 #include "duckdb/planner/bound_query_node.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <cudf/types.hpp>
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
 namespace sirius {
 namespace op {
 
@@ -34,6 +45,86 @@ inline duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
   return result;
 }
 
+/**
+ * @brief Limits of one sort unit (one sorted run) of a coalescing ORDER_BY.
+ *
+ * A zero limit means "no limit of that kind".
+ */
+struct sort_run_limits {
+  /// Decoded bytes of the batches sorted as one run. Planning closes a group before it would
+  /// exceed this, so a run is at most this large unless a single batch already is.
+  std::size_t max_run_bytes = 0;
+  /// Rows of one run. cuDF addresses rows with a 32-bit signed index.
+  std::size_t max_run_rows = static_cast<std::size_t>(std::numeric_limits<int32_t>::max());
+  /// Character bytes of any one string column of a run. A cuDF string column with 32-bit offsets
+  /// holds less than 2^31 bytes; concatenating past that would switch the column to 64-bit
+  /// offsets, which the operators downstream of the sort are not written for.
+  std::size_t max_string_column_bytes = static_cast<std::size_t>(std::numeric_limits<int32_t>::max());
+  /// Decoded input bytes of the runs one GPU sorts at the same time. A group is not claimed while
+  /// it would take the runs being sorted on its GPU past this, unless nothing is being sorted
+  /// there. 0: any number of runs is sorted at once.
+  std::size_t max_concurrent_bytes = 0;
+  /// Decoded bytes of unsorted input at which the producer is given no further task: the parked
+  /// batches plus, at the average batch size seen so far, the producer's tasks that have not
+  /// finished. 0: the producer is never held back.
+  std::size_t max_backlog_bytes = 0;
+};
+
+/**
+ * @brief The limits of one coalesced run from the engine's sizes and the sort settings.
+ *
+ * `fraction x gpu_bytes` is what the inputs of the sorts running at once on one GPU may add up
+ * to. With @p concurrent_runs positive a run is that divided by @p concurrent_runs and a GPU
+ * starts another sort only within the total; with 0 a run is the total divided by
+ * @p executor_threads and every thread may sort one. With @p backpressure the producer is held
+ * back while twice the total of every GPU is waiting unsorted, which is more than the groups
+ * still being filled can hold, so a complete group exists whenever the producer is stopped.
+ *
+ * @param gpu_bytes Memory limit of the smallest GPU.
+ * @param num_gpus GPUs the query runs on.
+ * @param executor_threads GPU executor threads per GPU.
+ * @return The limits, or nullopt when a run would be empty.
+ */
+[[nodiscard]] std::optional<sort_run_limits> make_sort_run_limits(std::size_t gpu_bytes,
+                                                                  std::size_t num_gpus,
+                                                                  std::size_t executor_threads,
+                                                                  double fraction,
+                                                                  std::size_t concurrent_runs,
+                                                                  bool backpressure);
+
+/**
+ * @brief What the local sorts of ORDER_BY operators did, for tests and the stats log line.
+ */
+struct order_by_counters {
+  uint64_t tasks              = 0;  ///< execute() calls
+  uint64_t input_batches      = 0;  ///< Input batches sorted
+  uint64_t runs               = 0;  ///< Sorted runs produced
+  uint64_t concatenated_bytes = 0;  ///< Bytes of the runs built by concatenating several batches
+};
+
+/**
+ * @brief Local sort: sorts its input into runs for SORT_PARTITION and MERGE_SORT.
+ *
+ * Two modes:
+ *
+ * - **Per batch** (default, and the only mode of an operator built outside the planner). The
+ *   operator is the sink of its producer's pipeline and sorts every input batch of a task on its
+ *   own, so every input batch becomes one sorted run.
+ * - **Coalescing** (`enable_run_coalescing()`, set by the planner when `sort_coalesce_runs` is on
+ *   and the schema and the sort keys allow it, see `order_by_run_limits()` in the plan generator). The planner puts a PASSTHROUGH_SINK below the operator, so the
+ *   operator starts its own pipeline and reads the producer's batches from an input port. A task
+ *   then claims a group of batches of up to `sort_run_limits::max_run_bytes`, concatenates them
+ *   and sorts the concatenation as ONE run. A range partition therefore receives one run per
+ *   group instead of one per input batch, which is what decides how many passes MERGE_SORT needs
+ *   (see docs/super-sirius/operators.md). `sort_run_limits::max_concurrent_bytes` bounds the
+ *   input of the runs one GPU sorts at once, so a run can be large without every executor thread
+ *   holding one, and `sort_run_limits::max_backlog_bytes` holds the producer back while that
+ *   much unsorted input is waiting (`input_backlogged()`), so unsorted batches are sorted before
+ *   they have to be spilled.
+ *
+ * Coalescing changes which rows share a run, never the rows or how a unit is sorted: every unit
+ * still goes through `gpu_order_impl::local_order_by`.
+ */
 class sirius_physical_order : public sirius_physical_operator {
  public:
   [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
@@ -60,6 +151,164 @@ class sirius_physical_order : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
+
+  //! Switch the operator to coalescing mode. Call before the pipelines are built: the operator
+  //! must have its own input port (a PASSTHROUGH_SINK child). @p limits.max_run_bytes must be
+  //! positive. @p physical_types is the physical schema of the input when it differs from the
+  //! logical one (`get_physical_types()` of the producer), empty otherwise.
+  void enable_run_coalescing(sort_run_limits limits,
+                             const std::vector<cudf::data_type>& physical_types = {});
+
+  //! Whether tasks sort groups of input batches as one run each.
+  [[nodiscard]] bool run_coalescing_enabled() const noexcept { return _coalesce; }
+
+  //! The limits of one run; meaningful only when `run_coalescing_enabled()`.
+  [[nodiscard]] const sort_run_limits& run_limits() const noexcept { return _limits; }
+
+  //! PARTIAL for the PASSTHROUGH_SINK feeding a coalescing operator, so groups are sorted while
+  //! the producer is still running; the base rule otherwise.
+  [[nodiscard]] MemoryBarrierType input_barrier_for(
+    sirius_physical_operator const& producer) const override;
+
+  //! Coalescing mode: unsorted input waiting for a sort is the last data of the query worth
+  //! spilling, since the next task reads all of it back.
+  [[nodiscard]] port_residency_policy input_residency_policy(std::string_view port_id) const override;
+
+  //! Coalescing mode: READY when a group is complete (or the producer finished and batches
+  //! remain) and its GPU may sort another run, otherwise WAITING on the producer, or no hint
+  //! once the producer has finished. Per-batch mode: the base rule.
+  std::optional<task_creation_hint> get_next_task_hint() override;
+
+  //! Coalescing mode with `sort_run_limits::max_backlog_bytes`: whether that much unsorted input
+  //! is waiting while the producer is still running.
+  [[nodiscard]] bool input_backlogged(std::string_view port_id) override;
+
+  //! Whether the operator's pipeline is scheduled ahead of the one producing its input.
+  [[nodiscard]] bool runs_ahead_of_producer() const noexcept override
+  {
+    return _coalesce && _limits.max_backlog_bytes != 0;
+  }
+
+  //! Coalescing mode: claims the next complete group under the same policy as the hint.
+  //! Per-batch mode: the base rule (one batch per port).
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  //! A coalesced task holds its inputs, their concatenation, the sort's scratch and the output.
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(const input_stats& stats) const override;
+
+  /**
+   * @brief One parked input batch as group planning sees it.
+   */
+  struct parked_batch {
+    uint64_t id = 0;                  ///< Batch id in the input repository
+    std::size_t bytes = 0;            ///< Decoded bytes
+    std::optional<std::size_t> rows;  ///< Row count, empty when the representation has none
+    /// GPU device holding the batch, or -1 when it is not on a GPU (spilled, or being moved).
+    int device = -1;
+    /// Upper bound of the character bytes of any one string column, empty when only `bytes`
+    /// bounds them.
+    std::optional<std::size_t> string_bytes;
+  };
+
+  //! Decoded input bytes of the runs being sorted, by the device of their group (`run_device()`).
+  using sorting_bytes_by_device = std::unordered_map<int, std::size_t>;
+
+  /**
+   * @brief Chooses the batches of the next run from the parked batches, in repository order.
+   *
+   * Batches are grouped per GPU device so that a run is built from batches that are already on
+   * the GPU that will sort them; batches that are not on a GPU form one more group. A group is
+   * complete when the next batch of its device would take it past `max_run_bytes` or
+   * `max_run_rows` (that batch then starts the next group), or when it reaches `max_run_bytes`.
+   * A batch that is larger than the limit by itself is a group of one. When the schema has a
+   * string column a group is also kept below `max_string_column_bytes`, counting for each batch
+   * its `string_bytes` or, without one, its decoded bytes: a safe bound for every string column
+   * in it.
+   *
+   * A complete group is returned only if its device may sort another run: nothing is being
+   * sorted there, or the group fits in what `max_concurrent_bytes` leaves beside @p sorting.
+   * Otherwise the group stays parked and the groups of the other devices are considered.
+   *
+   * When @p producer_finished is true nothing more will arrive: if no group is complete, the
+   * remaining batches are grouped in repository order regardless of device, under the same
+   * limits, so the tail costs as few runs as possible.
+   *
+   * Pure function of its arguments; exposed for tests.
+   *
+   * @param parked Parked batches in repository order.
+   * @param limits Limits of one run.
+   * @param has_string_column Whether any column of the schema is a string.
+   * @param producer_finished Whether the producer pipeline has finished.
+   * @param sorting Input bytes of the runs being sorted, by device.
+   * @return Indices into @p parked of the next group, empty when no group is ready.
+   */
+  [[nodiscard]] static std::vector<std::size_t> plan_next_run(
+    const std::vector<parked_batch>& parked,
+    const sort_run_limits& limits,
+    bool has_string_column,
+    bool producer_finished,
+    const sorting_bytes_by_device& sorting = {});
+
+  //! The device a group counts against: the GPU holding most of its bytes, -1 when none of its
+  //! batches is on a GPU.
+  [[nodiscard]] static int run_device(const std::vector<parked_batch>& parked,
+                                      const std::vector<std::size_t>& members);
+
+  //! Bytes per row that are not string characters: the fixed-width columns and the 32-bit offset
+  //! of every string column. A physical type narrower than the logical one counts at its own
+  //! width. What a batch holds beyond this per row bounds the characters of its string columns.
+  [[nodiscard]] static std::size_t non_character_row_bytes(
+    const duckdb::vector<sirius::logical_type>& types,
+    const std::vector<cudf::data_type>& physical_types);
+
+  //! This operator's counters.
+  [[nodiscard]] order_by_counters counters() const noexcept;
+
+  //! Counters summed over every ORDER_BY of the process since the last reset; for tests.
+  [[nodiscard]] static order_by_counters process_counters() noexcept;
+  static void reset_process_counters() noexcept;
+
+ protected:
+  //! Logs one `[order_by][stats]` line at INFO when the operator's pipeline finishes.
+  void on_finalize_operator() override;
+
+ private:
+  //! Snapshot of the input port's parked batches. The caller holds `lock`.
+  [[nodiscard]] std::vector<parked_batch> snapshot_parked(
+    ::cucascade::shared_data_repository& repo);
+
+  //! Ends the claim of the task whose first input batch is @p first_batch_id and asks the task
+  //! creator for the next task. The caller must not hold `lock`.
+  void finish_claim(uint64_t first_batch_id);
+
+  bool _coalesce = false;
+  sort_run_limits _limits{};
+  bool _has_string_column = false;
+  std::size_t _non_character_row_bytes = 0;
+  //! Input bytes of the claimed groups whose task has not finished, by device, and each claim by
+  //! the id of its first batch. Guarded by `lock`.
+  sorting_bytes_by_device _sorting_bytes;
+  struct claim {
+    int device        = -1;
+    std::size_t bytes = 0;
+  };
+  std::unordered_map<uint64_t, claim> _claims;
+  //! Batches seen on the input port and their decoded bytes, for the average batch size.
+  //! Guarded by `lock`.
+  std::size_t _seen_batches = 0;
+  std::size_t _seen_bytes   = 0;
+  //! Rows and decoded bytes of parked batches by batch id: neither changes when a batch moves
+  //! between tiers, so each batch is measured once. Guarded by `lock`.
+  struct cached_stats {
+    std::size_t bytes = 0;
+    std::optional<std::size_t> rows;
+  };
+  std::unordered_map<uint64_t, cached_stats> _stats_cache;
+
+  std::atomic<uint64_t> _tasks{0};
+  std::atomic<uint64_t> _input_batches{0};
+  std::atomic<uint64_t> _runs{0};
+  std::atomic<uint64_t> _concatenated_bytes{0};
 };
 
 }  // namespace op

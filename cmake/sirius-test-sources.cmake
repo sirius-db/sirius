@@ -30,17 +30,24 @@ set(TEST_SOURCES
     test/cpp/scan/test_scan_contracts.cpp
     test/cpp/scan/test_scan_verdicts.cpp
     test/cpp/scan/test_certification_cost.cpp
+    test/cpp/scan/test_generator_distributions.cpp
+    test/cpp/scan/test_generator_strings.cpp
+    test/cpp/scan/test_generate_bind.cpp
     test/cpp/integration/test_transparent_verdicts.cpp
     test/cpp/compression/test_compression.cpp
     test/cpp/compression/test_decode_reservation.cpp
     test/cpp/compression/test_spill_compression.cpp
+    test/cpp/compression/test_compressed_payload_sources.cpp
+    test/cpp/compression/test_compressed_row_range_readers.cpp
     test/cpp/config/test_c_api_config.cpp
     test/cpp/plan/test_c_api_plan.cpp
     test/cpp/config/test_config.cpp
+    test/cpp/config/test_sort_merge_settings.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
     test/cpp/config/test_scan_manager_config.cpp
     test/cpp/config/test_topology_config.cpp
+    test/cpp/config/test_memory_defaults.cpp
     test/cpp/creator/test_task_creator_query_state.cpp
     test/cpp/creator/test_task_creator_schedule_validation.cpp
     test/cpp/memory/test_pool_peer_access.cpp
@@ -51,11 +58,13 @@ set(TEST_SOURCES
     test/cpp/data/test_spill_converter_ordering.cpp
     test/cpp/data/test_data_repository_manager_registry.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
+    test/cpp/data/test_row_range_reader_registry.cpp
     test/cpp/downgrade/test_downgrade_disk.cpp
     test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/downgrade/test_fs_cache_reclaim.cpp
+    test/cpp/downgrade/test_spill_io_stats.cpp
     test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exchange/test_distributed_session.cpp
     test/cpp/exchange/test_exchange_batch_io.cpp
@@ -125,6 +134,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_cross_product.cpp
     test/cpp/integration/test_gpu_execution_scalar_subquery.cpp
     test/cpp/integration/test_gpu_execution_cte.cpp
+    test/cpp/integration/test_gpu_execution_copy_discard.cpp
     test/cpp/integration/test_gpu_execution_decimal_avg.cpp
     test/cpp/integration/test_gpu_execution_decimal_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_decimal_integer_cast.cpp
@@ -155,6 +165,9 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_nested_loop_join_batches.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_gpu_execution_order_by_coalesce.cpp
+    test/cpp/integration/test_gpu_execution_order_by_windowed.cpp
+    test/cpp/integration/test_gpu_execution_order_by_key_encoding.cpp
     test/cpp/integration/test_gpu_execution_regexp_replace.cpp
     test/cpp/integration/test_gpu_execution_size_estimation.cpp
     test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
@@ -243,6 +256,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
+    test/cpp/operator/test_physical_sort_partition_mgpu.cpp
     test/cpp/operator/test_task_scheduler_routing.cpp
     test/cpp/operator/test_physical_union.cpp
     test/cpp/operator/test_physical_union_mgpu.cpp
@@ -273,18 +287,39 @@ set(TEST_SOURCES
     test/cpp/operator/test_crc32_partition_hash.cpp
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
+    test/cpp/operator/test_input_residency_policy.cpp
     test/cpp/operator/test_physical_concat.cpp
     test/cpp/operator/test_physical_dense_count_join.cpp
     test/cpp/operator/test_physical_sort_sample.cpp
     test/cpp/operator/test_physical_filter.cpp
+    test/cpp/operator/test_physical_generator.cpp
     test/cpp/operator/test_physical_gpu_values.cpp
     test/cpp/operator/test_output_order.cpp
     test/cpp/operator/test_physical_limit.cpp
+    test/cpp/operator/test_physical_discard_sink.cpp
     test/cpp/operator/test_physical_mark_join.cpp
     test/cpp/operator/test_physical_single_join.cpp
     test/cpp/operator/test_physical_mixed_filter_join.cpp
     test/cpp/operator/test_physical_merge_sort.cpp
+    test/cpp/operator/merge/test_merge_config.cpp
+    test/cpp/operator/merge/test_windowed_merge_input.cpp
+    test/cpp/operator/merge/test_kway_comparator.cpp
+    test/cpp/operator/merge/test_kway_corank.cpp
+    test/cpp/operator/merge/test_kway_tile_merge.cpp
+    test/cpp/operator/merge/test_kway_gather.cpp
+    test/cpp/operator/merge/test_bounded_kway_merge.cpp
+    test/cpp/operator/merge/test_window_buffer.cpp
+    test/cpp/operator/merge/test_windowed_merger.cpp
+    test/cpp/operator/merge/test_run_fallback.cpp
+    test/cpp/operator/merge/test_merge_sort_arming.cpp
+    test/cpp/operator/merge/test_windowed_merge_differential.cpp
+    test/cpp/operator/merge/test_merge_sort_continuation.cpp
+    test/cpp/operator/merge/test_merge_sort_faults.cpp
+    test/cpp/operator/merge/test_windowed_merge_compressed.cpp
+    test/cpp/operator/merge/test_merger_stats.cpp
+    test/cpp/operator/merge/test_merge_sort_stats_log.cpp
     test/cpp/operator/test_physical_order.cpp
+    test/cpp/operator/order/test_encoded_sort_order.cpp
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_replicate.cpp
@@ -314,6 +349,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_delim_aggregate_reuse.cpp
     test/cpp/planner/test_delim_cte_rewrites.cpp
     test/cpp/planner/test_exists_minmax_rewrite.cpp
+    test/cpp/planner/test_generator_plan.cpp
     test/cpp/planner/test_distributed_scan_refusals.cpp
     test/cpp/planner/test_one_rank_parity.cpp
     test/cpp/planner/test_partial_aggregate_pushdown.cpp
@@ -322,6 +358,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_build_filter_evidence.cpp
     test/cpp/planner/test_copy_logical_plan.cpp
+    test/cpp/planner/test_discard_copy_plan.cpp
     test/cpp/planner/test_decimal_sum_input_bounds.cpp
     test/cpp/planner/test_duckdb_host_reference_symbols.cpp
     test/cpp/planner/test_duckdb_host_static_symbol.cpp
@@ -350,6 +387,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_in_task_publication.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
+    test/cpp/pipeline/test_reservation_wait.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_data_size_estimator.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
@@ -395,6 +433,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_byte_range.cpp
+    test/cpp/scan/test_cufile_scan.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp
@@ -417,6 +456,8 @@ set(TEST_SOURCES
     test/cpp/scan/test_scan_schema_normalization.cpp
     test/cpp/scan/test_stream_lineage_item5.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
+    test/cpp/sirius_extension/test_sirius_generate.cpp
+    test/cpp/sirius_extension/test_discard_copy_function.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/vss/test_brute_force_search.cpp

@@ -18,6 +18,7 @@
 
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/scan/generator/generate_function.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
 #include "sirius_registration.hpp"
@@ -91,6 +92,34 @@ void number(std::string& out, uint64_t value)
 }
 
 void boolean(std::string& out, bool value) { append(out, 'b', value ? "1" : "0"); }
+
+// Hashes the canonical, length-delimited encoding of the spec, so the result depends only on
+// the spec's values. Doubles contribute their bit pattern.
+uint64_t generator_spec_hash(generator::generator_spec const& spec)
+{
+  auto real = [](std::string& out, double value) {
+    uint64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    number(out, bits);
+  };
+  std::string text;
+  append(text, 'v', "sirius.generate.spec.1");
+  number(text, spec.num_batches);
+  number(text, spec.rows_per_batch);
+  number(text, spec.seed);
+  number(text, spec.columns.size());
+  for (auto const& column : spec.columns) {
+    append(text, 's', column.name);
+    number(text, static_cast<uint8_t>(column.type));
+    number(text, static_cast<uint8_t>(column.dist));
+    real(text, column.p1);
+    real(text, column.p2);
+    real(text, column.cardinality);
+    real(text, column.null_fraction);
+  }
+  return duckdb::Hash(text.data(), text.size());
+}
 
 template <typename MAP, typename VALUE>
 void append_sorted_map(std::string& out, MAP const& map, VALUE&& encode_value)
@@ -391,6 +420,16 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     identity.bound_types = sirius::to_duckdb_vec(binding.types);
     identity.bound_names = duckdb::vector<std::string>(binding.names.begin(), binding.names.end());
     identity.data_view   = stream_identity{typed->stream_id};
+  } else if (source->kind == source_kind::generator) {
+    auto const* typed = dynamic_cast<generator::GenerateFunctionData const*>(input.bind_data);
+    if (!typed) throw std::runtime_error("generator capture has no GenerateFunctionData");
+    auto const& spec = typed->spec;
+    for (auto const& column : spec.columns) {
+      identity.bound_types.push_back(generator::to_logical_type(column.type));
+      identity.bound_names.push_back(column.name);
+    }
+    identity.data_view = generator_identity{
+      generator_spec_hash(spec), spec.num_batches, spec.rows_per_batch, spec.seed};
   } else if (source->kind == source_kind::parquet_s3) {
     auto const* typed = dynamic_cast<duckdb::SiriusReadParquetBindData const*>(input.bind_data);
     if (!typed) throw std::runtime_error("Sirius S3 capture has no typed bind data");
@@ -524,7 +563,9 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
   }
   if (!view.replay_policy.permits_cpu_replay) {
     switch (view.replay_policy.source) {
-      case transparent::byte_source_class::stream: view.replay_policy.reason = "stream"; break;
+      case transparent::byte_source_class::stream:
+        view.replay_policy.reason = source->kind == source_kind::generator ? "generator" : "stream";
+        break;
       case transparent::byte_source_class::sirius_owned_s3: view.replay_policy.reason = "s3"; break;
       default: view.replay_policy.reason = "connector policy"; break;
     }
@@ -668,6 +709,12 @@ std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
   } else if (auto stream = std::get_if<stream_identity>(&identity.data_view)) {
     if (!paths.empty()) throw std::invalid_argument("Stream read view has file inventory");
     number(text, stream->stream_id);
+  } else if (auto const* generated = std::get_if<generator_identity>(&identity.data_view)) {
+    if (!paths.empty()) throw std::invalid_argument("Generator read view has file inventory");
+    number(text, generated->spec_hash);
+    number(text, generated->num_batches);
+    number(text, generated->rows_per_batch);
+    number(text, generated->seed);
   } else {
     auto const& provider = std::get<provider_read_identity>(identity.data_view);
     if (!paths.empty() || provider.key.empty())

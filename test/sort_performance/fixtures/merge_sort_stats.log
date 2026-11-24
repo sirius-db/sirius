@@ -1,0 +1,9 @@
+[2026-11-12 10:15:01.104] [info] [140213] Pipeline 3: starting merge sort
+[2026-11-12 10:15:02.310] [info] [140213] [merge_sort][stats] op=7 windowed_partitions=4 one_shot_partitions=1 windowed_tasks=12 intermediate_tasks=3 mergers_built=5 rounds=40 rows_out=1000000 round_rows_min=1000 round_rows_max=50000 refill_rows=900000 refill_bytes=7200000 refill_bytes_host=4000000 refill_bytes_disk=3200000 refill_bytes_compressed=1000000 runs_read_compressed=6 window_growths=2 compacted_rows=1234 fallback_conversions=0 shrinks=1
+[2026-11-12 10:15:02.311] [debug] [140214] [merge_sort] op=7 partition 2 finished
+[2026-11-12 10:15:03.870] [info] [140215] [merge_sort][stats] op=9 windowed_partitions=2 one_shot_partitions=0 windowed_tasks=6 intermediate_tasks=0 mergers_built=2 rounds=10 rows_out=500000 round_rows_min=250 round_rows_max=80000 refill_rows=400000 refill_bytes=3200000 refill_bytes_host=3200000 refill_bytes_disk=0 refill_bytes_compressed=0 runs_read_compressed=0 window_growths=0 compacted_rows=0 fallback_conversions=2 shrinks=0 future_counter=11
+[2026-11-12 10:15:03.871] [info] [140215] [merge_sort][stats] op=11 windowed_partitions=0 one_shot_partitions=3 windowed_tasks=0 intermediate_tasks=0 mergers_built=0 rounds=0 rows_out=300 round_rows_min=0 round_rows_max=0 refill_rows=0 refill_bytes=0 refill_bytes_host=0 refill_bytes_disk=0 refill_bytes_compressed=0 runs_read_compressed=0 window_growths=0 compacted_rows=0 fallback_conversions=0 shrinks=0
+[2026-11-12 10:15:03.900] [info] [140215] [merge_sort][stats] op=13 windowed_partitions=abc rounds=5
+[2026-11-12 10:15:03.901] [info] [140215] [merge_sort][stats] windowed_partitions=1 rounds=5
+[2026-11-12 10:15:03.902] [info] [140215] [merge_sort][stats] op=15 rounds
+[2026-11-12 10:15:03.903] [info] [140215] [merge_sort][stats]

@@ -11,7 +11,20 @@ target_sources(
           window/ranking.cpp
           window/whole_partition.cpp
           merge/gpu_merge_impl.cpp
+          merge/merge_config.cpp
+          merge/merge_sort_stats_log.cpp
+          merge/windowed_merge_input.cpp
+          merge/detail/run_fallback.cpp
+          merge/bounded_kway_merge.cu
+          merge/windowed_merge.cu
+          merge/detail/kway_comparator.cu
+          merge/detail/kway_corank.cu
+          merge/detail/kway_tile_merge.cu
+          merge/detail/kway_gather.cu
+          merge/detail/window_buffer.cu
+          discard_copy_function.cpp
           order/gpu_order_impl.cpp
+          order/encoded_sort_order.cu
           partition/gpu_partition_impl.cpp
           partition/partition_exchange.cpp
           partition/consumer_partition_policy.cpp
@@ -47,6 +60,9 @@ target_sources(
           scan/row_lineage.cu
           scan/positional_visibility.cpp
           scan/positional_visibility.cu
+          scan/generator/generator_batch.cu
+          scan/generator/generator_strings.cu
+          scan/generator/generate_function.cpp
           scan/field_id_mapping.cpp
           scan/arrow_materializer.cpp
           scan/parquet_materialize.cpp
@@ -82,6 +98,7 @@ target_sources(
           sirius_physical_dummy_scan.cpp
           sirius_physical_empty_result.cpp
           sirius_physical_filter.cpp
+          sirius_physical_generator.cpp
           sirius_physical_gpu_values.cpp
           sirius_physical_grouped_aggregate.cpp
           sirius_physical_grouped_aggregate_merge.cpp
@@ -96,6 +113,7 @@ target_sources(
           sirius_physical_partition.cpp
           sirius_physical_partition_consumer_operator.cpp
           sirius_physical_passthrough_sink.cpp
+          sirius_physical_discard_sink.cpp
           sirius_physical_projection.cpp
           sirius_physical_replicate.cpp
           sirius_physical_parquet_sink.cpp

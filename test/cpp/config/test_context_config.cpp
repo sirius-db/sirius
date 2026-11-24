@@ -568,9 +568,20 @@ TEST_CASE("configuration resolver applies YAML GPU limits", "[context_config][co
       YAML::Load("sirius: {topology: {num_gpus: 1}, memory: {gpu: {usage_limit_bytes: "
                  "18446744073709551615}}}"),
       "capacity.yaml");
-    REQUIRE_THROWS_WITH(parsed.resolve(topology),
-                        Catch::Matchers::ContainsSubstring("capacity.yaml") &&
-                          Catch::Matchers::ContainsSubstring("usage_limit_bytes exceeds"));
+    REQUIRE_THROWS_WITH(
+      parsed.resolve(topology),
+      Catch::Matchers::ContainsSubstring("capacity.yaml") &&
+        Catch::Matchers::ContainsSubstring("usage_limit_bytes exceeds") &&
+        // Both numbers, so the largest limit the device accepts is not a guess.
+        Catch::Matchers::ContainsSubstring("requested 18446744073709551615 bytes, capacity ") &&
+        Catch::Matchers::ContainsSubstring(
+          std::to_string(gpu_space(sirius::parsed_sirius_config::from_node(
+                                     YAML::Load("sirius: {topology: {num_gpus: "
+                                                "1}, memory: {gpu: "
+                                                "{usage_limit_fraction: 1.0}}}"))
+                                     .resolve(topology))
+                           .memory_capacity) +
+          " bytes"));
   }
   SECTION("fraction limits use physical capacity")
   {
@@ -616,6 +627,118 @@ TEST_CASE("dynamic-filter Bloom budget always follows resolved scan size",
   params["max_dynamic_filter_bloom_bytes_per_gpu"] = "17MiB";
   CHECK_THROWS_WITH(sirius::parsed_sirius_config::from_node(root),
                     Catch::Matchers::ContainsSubstring("always 4x scan_task_batch_size"));
+}
+
+TEST_CASE("disk spill I/O settings are read per disk space", "[context_config][config][disk_io]")
+{
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                             /*with_runtime_attributes=*/true));
+  auto const& topology = discovery.get_topology();
+  auto const resolve   = [&](const std::string& yaml) {
+    return sirius::parsed_sirius_config::from_node(YAML::Load(yaml)).resolve(topology);
+  };
+
+  SECTION("a disk space without an io block gets the defaults")
+  {
+    auto const config = resolve(R"(sirius:
+  topology: {num_gpus: 1}
+  memory:
+    disk: {downgrade_root_dirs: /tmp/sirius_disk_io_test}
+)");
+    auto const io     = config.get_disk_io_config(0);
+    CHECK(io == sirius::disk_io_config{});
+    CHECK_FALSE(io.backend.has_value());
+    CHECK_FALSE(io.direct_io);
+    CHECK(io.reactors == 8);
+
+    auto const options = sirius::to_disk_io_context_options(io);
+    CHECK_FALSE(options.io.uring.use_odirect);
+    CHECK(options.io.uring_n_reactors == 8);
+#ifdef CUCASCADE_HAS_CUFILE
+    CHECK(sirius::effective_disk_io_backend(io) == sirius::disk_io_backend::CUFILE);
+    CHECK(options.backend == cucascade::disk_io_backend::cufile);
+    CHECK_FALSE(options.io.cufile.use_odirect);
+    CHECK(options.io.cufile_n_reactors == 8);
+    CHECK(options.io.cufile.staging_mode == cucascade::io::cufile::staging::never);
+#else
+    CHECK(sirius::effective_disk_io_backend(io) == sirius::disk_io_backend::AUTOMATIC);
+    CHECK(options.backend == cucascade::disk_io_backend::automatic);
+#endif
+  }
+  SECTION("sirius.memory.disk.io overrides every setting")
+  {
+    auto const config = resolve(R"(sirius:
+  topology: {num_gpus: 1}
+  memory:
+    disk:
+      disk_id: 3
+      downgrade_root_dirs: /tmp/sirius_disk_io_test
+      io: {backend: uring, direct_io: true, reactors: 3}
+)");
+    auto const io     = config.get_disk_io_config(3);
+    CHECK(io.backend == sirius::disk_io_backend::URING);
+    CHECK(io.direct_io);
+    CHECK(io.reactors == 3);
+    // Another disk id has no block of its own.
+    CHECK(config.get_disk_io_config(0) == sirius::disk_io_config{});
+
+    auto const options = sirius::to_disk_io_context_options(io);
+    CHECK(options.backend == cucascade::disk_io_backend::uring);
+    CHECK(options.io.uring.use_odirect);
+    CHECK(options.io.uring_n_reactors == 3);
+  }
+  SECTION("sirius.space.disk[] entries carry their own io block")
+  {
+    auto const config = resolve(R"(sirius:
+  space:
+    gpu:
+      - {device_id: 0, memory_capacity: 256Mi}
+    host:
+      - {numa_id: 0, memory_capacity: 1Gi}
+    disk:
+      - {disk_id: 0, mount_path: /tmp/sirius_disk_io_test_a}
+      - {disk_id: 1, mount_path: /tmp/sirius_disk_io_test_b, io: {backend: automatic, reactors: 2}}
+)");
+    CHECK(config.get_disk_io_config(0) == sirius::disk_io_config{});
+    auto const io = config.get_disk_io_config(1);
+    CHECK(io.backend == sirius::disk_io_backend::AUTOMATIC);
+    CHECK_FALSE(io.direct_io);
+    CHECK(io.reactors == 2);
+    CHECK(sirius::to_disk_io_context_options(io).backend == cucascade::disk_io_backend::automatic);
+  }
+  SECTION("cuCascade's own default can be asked for")
+  {
+    auto const config   = resolve(R"(sirius:
+  topology: {num_gpus: 1}
+  memory:
+    disk:
+      downgrade_root_dirs: /tmp/sirius_disk_io_test
+      io: {backend: automatic, direct_io: true, reactors: 0}
+)");
+    auto const options  = sirius::to_disk_io_context_options(config.get_disk_io_config(0));
+    auto const upstream = cucascade::disk_io_context_options{};
+    CHECK(options.backend == upstream.backend);
+    CHECK(options.io.uring.use_odirect == upstream.io.uring.use_odirect);
+    CHECK(options.io.uring_n_reactors == upstream.io.uring_n_reactors);
+#ifdef CUCASCADE_HAS_CUFILE
+    CHECK(options.io.cufile.use_odirect == upstream.io.cufile.use_odirect);
+    CHECK(options.io.cufile_n_reactors == upstream.io.cufile_n_reactors);
+    CHECK(options.io.cufile.staging_mode == upstream.io.cufile.staging_mode);
+#endif
+  }
+  SECTION("invalid io blocks are rejected")
+  {
+    auto const load = [](const std::string& io) {
+      return sirius::parsed_sirius_config::from_node(YAML::Load(
+        "sirius: {topology: {num_gpus: 1}, memory: {disk: {downgrade_root_dirs: /tmp/x, io: " + io +
+        "}}}"));
+    };
+    CHECK_THROWS_WITH(load("{backend: kvikio}"),
+                      Catch::Matchers::ContainsSubstring("valid values: automatic, uring, cufile"));
+    CHECK_THROWS(load("{reactors: -1}"));
+    CHECK_THROWS(load("{threads: 4}"));
+  }
 }
 
 TEST_CASE("resolved startup CPUs preserve the rank boundary across pinned callers",

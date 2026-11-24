@@ -1,0 +1,607 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "compression/compressed_row_range_readers.hpp"
+
+#include "compression/compressed_disk_representation.hpp"
+#include "compression/compressed_payload_sources.hpp"
+#include "compression/compressed_representation.hpp"
+#include "compression/spill_compression.hpp"
+#include "downgrade/spill_io_stats.hpp"
+#include "log/logging.hpp"
+
+#include <cudf/types.hpp>
+#include <cudf/utilities/traits.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+#include <rmm/resource_ref.hpp>
+
+#include <cuda_runtime.h>
+
+#include <cucascade/error.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <new>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <typeindex>
+#include <typeinfo>
+#include <utility>
+#include <vector>
+
+namespace sirius::compression {
+
+namespace {
+
+using cucascade::row_range_unsupported_error;
+
+/// The payload source of a reader state, tagged with the batch it reads.
+///
+/// compressed_reader_state has no slot for the batch's identity, so it travels with the
+/// source. `storage` addresses the batch's shared backing store (device blob, pinned blob,
+/// file). The wrapped source owns a share of that store, so the address cannot be reused by
+/// another batch while this state lives.
+///
+/// It also records the stream and the memory resource of the state's cursors (see
+/// cursors_built_otherwise), and keeps the payload alive for the reads enqueued from it. A read
+/// leaves copies and kernels on its stream that still read the payload (pinned host blocks, the
+/// device blob) after the call returns, and nothing else orders the payload's release after them: a
+/// HOST batch records no reader event, and a device blob is freed on its own allocation stream.
+/// Every read therefore records an event on its stream, and the destructor waits for the last one
+/// before it lets go of the wrapped source. The cursors of a state hold this source too, so it is
+/// destroyed after them.
+///
+/// A small host or disk payload is read once, whole, into a device buffer (make_resident), and
+/// every read of the state is then served from that copy in place: a window refill of such a
+/// batch costs no transfer and no staging, where the wrapped source would copy (host) or read
+/// from the file and wait (disk) once per leaf buffer of every column. The copy follows the rules
+/// of the cursors: it is allocated on the stream and from the resource they are built with, and
+/// dropped with them when either changes.
+class tagged_payload_source final : public simpatico::payload_source {
+ public:
+  tagged_payload_source(std::shared_ptr<simpatico::payload_source> source,
+                        std::type_index type,
+                        const void* storage)
+    : _source(std::move(source)), _type(type), _storage(storage)
+  {
+  }
+
+  ~tagged_payload_source() override
+  {
+    wait_for_reads();
+    if (_event != nullptr) {
+      device_scope const scope{_device};
+      CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventDestroy(_event));
+    }
+  }
+
+  tagged_payload_source(const tagged_payload_source&)            = delete;
+  tagged_payload_source& operator=(const tagged_payload_source&) = delete;
+
+  void read_to_device(std::uint64_t offset,
+                      std::uint64_t size,
+                      void* dst,
+                      rmm::cuda_stream_view stream) override
+  {
+    current().read_to_device(offset, size, dst, stream);
+  }
+
+  [[nodiscard]] const std::byte* device_base() const noexcept override
+  {
+    return current().device_base();
+  }
+
+  /// Copies the payload of @p representation to the device when it is at most @p max_bytes and
+  /// not there already. Called once the cursors of any other stream or resource are gone and
+  /// before a cursor is built, so no cursor ever sees the source change under it. A copy that
+  /// cannot be allocated is not retried until the cursors are dropped: the reads then stage what
+  /// they need, as they do for a larger payload.
+  void make_resident(const simpatico_compressed_representation& representation,
+                     std::size_t max_bytes,
+                     ::cuda::stream_ref stream,
+                     rmm::device_async_resource_ref mr)
+  {
+    if (_resident != nullptr || _resident_tried) { return; }
+    _resident_tried  = true;
+    auto const bytes = resident_payload_bytes(representation);
+    if (bytes == 0 || bytes > max_bytes || _source->device_base() != nullptr) { return; }
+    try {
+      _resident = load_resident_payload(representation, stream, mr);
+    } catch (const std::bad_alloc& e) {
+      SIRIUS_LOG_DEBUG(
+        "[compressed_row_range_readers] no device memory for a {} byte payload copy ({}); "
+        "reading it by ranges",
+        bytes,
+        e.what());
+      return;
+    }
+    spill::io_stats::get().record_payload_load(representation.get_current_tier(), bytes);
+  }
+
+  /// Frees the device copy of the payload. Only after wait_for_reads() and with no cursor left.
+  void drop_resident() noexcept
+  {
+    _resident.reset();
+    _resident_tried = false;
+  }
+
+  [[nodiscard]] bool reads(std::type_index type, const void* storage) const noexcept
+  {
+    return _type == type && _storage == storage;
+  }
+
+  /// Whether the state's cursors may hold device memory of another stream than @p stream or of
+  /// another memory resource than @p mr: an earlier read ran on such a stream or allocated from
+  /// such a resource. The cursors must then be dropped before this read builds or uses one.
+  [[nodiscard]] bool cursors_built_otherwise(cudaStream_t stream,
+                                             rmm::device_async_resource_ref mr) const noexcept
+  {
+    return (_event != nullptr && _stream != stream) || (_resource.has_value() && *_resource != mr);
+  }
+
+  /// Names the memory resource the cursors built from now on allocate from. Called once the
+  /// cursors of any other resource are gone, before a cursor is built.
+  void set_cursor_resource(rmm::device_async_resource_ref mr) noexcept { _resource = mr; }
+
+  /// Marks the end of the work a read enqueued on @p stream.
+  void record_read(cudaStream_t stream) noexcept
+  {
+    if (_event == nullptr) {
+      CUCASCADE_ASSERT_CUDA_SUCCESS(cudaGetDevice(&_device));
+      if (cudaEventCreateWithFlags(&_event, cudaEventDisableTiming) != cudaSuccess) {
+        // No event to wait on later: finish the work now. The failure is handled here, so it
+        // must not stay behind as the thread's last error for an unrelated check.
+        static_cast<void>(cudaGetLastError());
+        _event = nullptr;
+        CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(stream));
+        return;
+      }
+    }
+    _stream = stream;
+    if (cudaEventRecord(_event, stream) != cudaSuccess) {
+      // The event still marks an earlier read (or nothing), so a later wait on it would return
+      // before this read's work has run: finish the work now.
+      static_cast<void>(cudaGetLastError());
+      CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(stream));
+    }
+  }
+
+  /// Blocks until the device has run everything the reads so far enqueued.
+  void wait_for_reads() const noexcept
+  {
+    if (_event == nullptr) { return; }
+    device_scope const scope{_device};
+    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventSynchronize(_event));
+  }
+
+ private:
+  /// Makes @p device current for the scope: the state may be dropped on a thread bound to
+  /// another GPU than the one the reads ran on.
+  class device_scope {
+   public:
+    explicit device_scope(int device) noexcept
+    {
+      if (cudaGetDevice(&_previous) == cudaSuccess && _previous != device) {
+        _restore = cudaSetDevice(device) == cudaSuccess;
+      }
+    }
+    ~device_scope()
+    {
+      if (_restore) { CUCASCADE_ASSERT_CUDA_SUCCESS(cudaSetDevice(_previous)); }
+    }
+    device_scope(const device_scope&)            = delete;
+    device_scope& operator=(const device_scope&) = delete;
+
+   private:
+    int _previous{0};
+    bool _restore{false};
+  };
+
+  cudaEvent_t _event{nullptr};
+  cudaStream_t _stream{nullptr};
+  int _device{0};
+  [[nodiscard]] simpatico::payload_source& current() const noexcept
+  {
+    return _resident != nullptr ? *_resident : *_source;
+  }
+
+  /// The resource the state's cursors were built with; compared, never allocated from.
+  std::optional<rmm::device_async_resource_ref> _resource;
+  std::shared_ptr<simpatico::payload_source> _source;
+  /// The payload on the device, when it was small enough to copy whole. Declared after _source:
+  /// it is released first.
+  std::shared_ptr<simpatico::payload_source> _resident;
+  bool _resident_tried{false};
+  std::type_index _type;
+  const void* _storage;
+};
+
+/// A projection or a filtered view decodes to other rows and columns than the stored chunk.
+template <typename Representation>
+void require_whole_chunk(const Representation& representation)
+{
+  if (representation.selected_indices().has_value() || representation.pushdown_scan() != nullptr ||
+      representation.visibility_mask().has_mask()) {
+    throw row_range_unsupported_error(
+      "compressed row-range read: the batch is a projection or a filtered view of its chunk");
+  }
+}
+
+const void* backing_store(const compressed_device_representation& representation)
+{
+  require_whole_chunk(representation);
+  if (!representation.has_table()) {
+    throw row_range_unsupported_error(
+      "compressed row-range read: the compressed device batch has no table");
+  }
+  return &representation.table();
+}
+
+const void* backing_store(const compressed_host_representation& representation)
+{
+  require_whole_chunk(representation);
+  return &representation.payload();
+}
+
+const void* backing_store(const compressed_disk_representation& representation)
+{
+  return &representation.path();
+}
+
+/// A device batch is read in place, so the decode kernels on @p stream dereference the batch's
+/// device pointers: without peer access that faults when the stream belongs to another GPU. The
+/// built-in GPU reader refuses such a read the same way (require_same_device in
+/// cucascade/src/cudf/row_range_reader_gpu.cpp), and the caller converts the batch instead.
+void require_same_device(const compressed_device_representation& representation,
+                         ::cuda::stream_ref stream)
+{
+  int stream_device = -1;
+  CUCASCADE_CUDA_TRY(cudaStreamGetDevice(stream.get(), &stream_device));
+  if (stream_device != representation.get_device_id()) {
+    throw row_range_unsupported_error(
+      "compressed row-range read: the compressed device batch lives on CUDA device " +
+      std::to_string(representation.get_device_id()) + " but the stream belongs to device " +
+      std::to_string(stream_device));
+  }
+}
+
+/// Host blocks and files are copied to the stream's device, whichever it is.
+void require_same_device(const compressed_host_representation&, ::cuda::stream_ref) {}
+void require_same_device(const compressed_disk_representation&, ::cuda::stream_ref) {}
+
+/// Records, when a read returns or throws, the end of what it enqueued on its stream.
+class read_recorder {
+ public:
+  read_recorder(tagged_payload_source& source, cudaStream_t stream) noexcept
+    : _source(source), _stream(stream)
+  {
+  }
+  ~read_recorder() { _source.record_read(_stream); }
+  read_recorder(const read_recorder&)            = delete;
+  read_recorder& operator=(const read_recorder&) = delete;
+
+ private:
+  tagged_payload_source& _source;
+  cudaStream_t _stream;
+};
+
+/// The state in @p slot if it reads @p representation, else a new one stored in @p slot. The
+/// state's payload is a tagged_payload_source.
+template <typename Representation>
+compressed_reader_state& state_for(const Representation& representation,
+                                   std::unique_ptr<cucascade::row_range_reader_state>& slot,
+                                   ::cuda::stream_ref stream)
+{
+  auto const type     = std::type_index(typeid(Representation));
+  auto const* storage = backing_store(representation);
+  if (auto* state = dynamic_cast<compressed_reader_state*>(slot.get())) {
+    auto const* tagged = dynamic_cast<const tagged_payload_source*>(state->payload.get());
+    if (tagged != nullptr && tagged->reads(type, storage) && state->description != nullptr) {
+      return *state;
+    }
+  }
+  auto opened        = open_compressed_payload(representation, stream);
+  auto state         = std::make_unique<compressed_reader_state>();
+  state->description = std::move(opened.description);
+  state->payload = std::make_shared<tagged_payload_source>(std::move(opened.source), type, storage);
+  state->cursors.resize(state->description->columns.size());
+  auto& ref = *state;
+  slot      = std::move(state);
+  return ref;
+}
+
+/// Largest row count whose bytes fit @p capacity when @p reserved_rows more rows also need room.
+std::size_t rows_fitting(std::size_t capacity, std::size_t bytes_per_row, std::size_t reserved_rows)
+{
+  auto const rows = capacity / bytes_per_row;
+  return rows > reserved_rows ? rows - reserved_rows : 0;
+}
+
+/// One requested column, validated.
+struct requested_column {
+  const simpatico::hpln_column_description* source{nullptr};
+  simpatico::compressed_column_cursor* cursor{nullptr};
+  simpatico::column_write_target target;
+  bool is_string{false};
+  std::size_t width{0};  ///< bytes per row; 0 for STRING
+};
+
+template <typename Representation>
+cucascade::row_range_result read_rows_compressed(
+  const cucascade::idata_representation& source,
+  const cucascade::row_range_request& request,
+  std::span<cucascade::column_destination> dst,
+  ::cuda::stream_ref stream,
+  cucascade::memory::reservation* scratch,
+  std::unique_ptr<cucascade::row_range_reader_state>* state_slot)
+{
+  auto const* representation = dynamic_cast<const Representation*>(&source);
+  if (representation == nullptr) {
+    throw std::invalid_argument(
+      "compressed row-range read: the source is not the registered representation");
+  }
+  if (dst.size() != request.columns.size()) {
+    throw std::invalid_argument("compressed row-range read: " + std::to_string(dst.size()) +
+                                " destinations for " + std::to_string(request.columns.size()) +
+                                " requested columns");
+  }
+  require_same_device(*representation, stream);
+  auto const num_rows = static_cast<std::size_t>(representation->num_rows());
+  if (request.row_begin > num_rows) {
+    throw std::out_of_range("compressed row-range read: row_begin " +
+                            std::to_string(request.row_begin) + " is past the source's " +
+                            std::to_string(num_rows) + " rows");
+  }
+
+  // A caller that keeps no state gets one for this call only; dropping it at the end of the
+  // call waits for the read (see tagged_payload_source).
+  std::unique_ptr<cucascade::row_range_reader_state> call_state;
+  auto& state =
+    state_for(*representation, state_slot != nullptr ? *state_slot : call_state, stream);
+  auto& tagged = static_cast<tagged_payload_source&>(*state.payload);
+
+  // Where this read's device memory comes from: the caller's scratch resource (for the windowed
+  // merge, the allocator of the task's GPU memory space, which charges the task's stream), as
+  // cucascade::detail::allocate_scratch does for the built-in readers.
+  rmm::cuda_stream_view const stream_view{stream.get()};
+  auto const mr = scratch != nullptr ? scratch->get_memory_resource()
+                                     : rmm::mr::get_current_device_resource_ref();
+
+  // One stream and one memory resource per set of cursors. A cursor's device buffers (decoder
+  // state, scratch, dictionary keys and each call's staged payload) are stream-ordered
+  // allocations, on the stream and from the resource it was built with: they are reused without
+  // a wait by the next read and freed on that stream, through that resource. When the caller
+  // moves to another stream (the merger's next task) or passes another resource, the earlier
+  // reads are waited for and the cursors dropped (which frees their buffers through the earlier
+  // resource: it must still be alive, see compressed_reader_state). No device memory of the
+  // state is then shared between two streams, every buffer is freed on the stream that last
+  // used it, and nothing is ever allocated from the resource of an earlier call.
+  //
+  // A caller that takes a new stream per task (the windowed merger: one pool stream per merge
+  // task) therefore pays the wait and the rebuild of every cursor, prefix loads and dictionary
+  // keys included, on the first read of each task: the cursors are worth keeping only within
+  // one task. Carrying them over would take a cursor that can move its buffers to another
+  // stream, which simpatico::compressed_column_cursor does not offer.
+  if (tagged.cursors_built_otherwise(stream.get(), mr)) {
+    tagged.wait_for_reads();
+    for (auto& cursor : state.cursors) {
+      cursor.reset();
+    }
+    tagged.drop_resident();
+  }
+  tagged.set_cursor_resource(mr);
+  read_recorder const recorder{tagged, stream.get()};
+  tagged.make_resident(
+    *representation, get_spill_compression_settings().read_cache_max_bytes, stream, mr);
+
+  // ---- validate every requested column and bound k by the slot capacities (rule 1) ----
+  constexpr auto max_size = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
+  std::size_t k           = std::min(request.max_rows, num_rows - request.row_begin);
+  std::vector<requested_column> columns(dst.size());
+  for (std::size_t i = 0; i < dst.size(); ++i) {
+    auto const index        = request.columns[i];
+    auto const column_label = "compressed row-range read: requested column " + std::to_string(i);
+    if (index >= state.description->columns.size()) {
+      throw std::out_of_range(column_label + " has index " + std::to_string(index) +
+                              ", the source has " +
+                              std::to_string(state.description->columns.size()) + " columns");
+    }
+    auto const& description = state.description->columns[index];
+    auto const& d           = dst[i];
+    auto const type         = description.dtype;
+    bool const is_string    = type.id() == cudf::type_id::STRING;
+    if (!is_string && !cudf::is_fixed_width(type)) {
+      throw row_range_unsupported_error(column_label + " has an unsupported type (id " +
+                                        std::to_string(static_cast<std::int32_t>(type.id())) + ")");
+    }
+    if (d.type_id != static_cast<std::int32_t>(type.id())) {
+      throw std::invalid_argument(column_label + ": destination type id " +
+                                  std::to_string(d.type_id) + " is not the source's " +
+                                  std::to_string(static_cast<std::int32_t>(type.id())));
+    }
+    if (static_cast<std::size_t>(description.num_rows) != num_rows) {
+      throw row_range_unsupported_error(column_label + " has " +
+                                        std::to_string(description.num_rows) + " rows, the batch " +
+                                        std::to_string(num_rows));
+    }
+    if (d.dst_row_offset > max_size) {
+      throw std::invalid_argument(column_label + ": dst_row_offset " +
+                                  std::to_string(d.dst_row_offset) +
+                                  " exceeds a column's row limit");
+    }
+    k = std::min(k, max_size - d.dst_row_offset);
+
+    auto& out     = columns[i];
+    out.source    = &description;
+    out.is_string = is_string;
+    if (is_string) {
+      if (d.offsets.data == nullptr) {
+        throw std::invalid_argument(column_label + ": STRING destination has no offsets slot");
+      }
+      if (d.offset_width != 4 && d.offset_width != 8) {
+        throw std::invalid_argument(column_label + ": STRING destination offset_width " +
+                                    std::to_string(d.offset_width) + " is not 4 or 8");
+      }
+      // k + 1 offsets are written. The chars budget is applied by the decode itself.
+      k = std::min(k, rows_fitting(d.offsets.capacity_bytes, d.offset_width, d.dst_row_offset + 1));
+      if (d.dst_byte_offset > d.data.capacity_bytes) { k = 0; }
+    } else {
+      if (d.data.data == nullptr) {
+        throw std::invalid_argument(column_label + ": fixed-width destination has no data slot");
+      }
+      out.width = cudf::size_of(type);
+      k         = std::min(k, rows_fitting(d.data.capacity_bytes, out.width, d.dst_row_offset));
+    }
+    if (d.null_mask.data != nullptr) {
+      // Rule 1 for the mask slot: whole 32-bit words only, and a slot of more words than a row
+      // count can address does not bound k. Keep in step with fit_rows
+      // (cucascade/src/cudf/row_range_fit.cpp), which validate_request applies for the built-in
+      // readers: both are private to cuCascade (src/cudf/row_range_detail.hpp), so they cannot
+      // be called from here.
+      auto const mask_words = d.null_mask.capacity_bytes / sizeof(cudf::bitmask_type);
+      auto const mask_rows  = mask_words > std::numeric_limits<std::size_t>::max() / 32
+                                ? std::numeric_limits<std::size_t>::max()
+                                : mask_words * 32;
+      k = std::min(k, mask_rows > d.dst_row_offset ? mask_rows - d.dst_row_offset : 0);
+    } else if (description.null_count > 0) {
+      throw row_range_unsupported_error(column_label +
+                                        " has nulls and the destination no null mask");
+    }
+
+    auto& cursor = state.cursors[index];
+    if (cursor == nullptr) {
+      try {
+        cursor = std::make_unique<simpatico::compressed_column_cursor>(
+          state.description, index, state.payload, stream_view, mr);
+      } catch (const simpatico::unsupported_chunk_decode& e) {
+        throw row_range_unsupported_error(column_label + ": " + e.what());
+      }
+    }
+    if (!cursor->supported()) {
+      throw row_range_unsupported_error(
+        column_label + " is compressed with a plan that cannot be " + "decoded by row range");
+    }
+    out.cursor                 = cursor.get();
+    out.target.data            = d.data.data;
+    out.target.data_capacity   = d.data.capacity_bytes;
+    out.target.null_mask       = static_cast<cudf::bitmask_type*>(d.null_mask.data);
+    out.target.offsets         = d.offsets.data;
+    out.target.offset_width    = d.offset_width;
+    out.target.dst_row_offset  = static_cast<cudf::size_type>(d.dst_row_offset);
+    out.target.dst_byte_offset = d.dst_byte_offset;
+  }
+
+  cucascade::row_range_result result;
+  result.data_bytes_written.assign(dst.size(), 0);
+
+  // ---- decode ----
+  auto const chunk_rows  = static_cast<std::size_t>(simpatico::kChunkRows);
+  auto const chunk_begin = static_cast<cudf::size_type>(request.row_begin / chunk_rows);
+  auto const skip_head   = static_cast<cudf::size_type>(request.row_begin % chunk_rows);
+  auto const decode      = [&](requested_column& column, std::size_t take) {
+    auto const chunk_end =
+      static_cast<cudf::size_type>((request.row_begin + take + chunk_rows - 1) / chunk_rows);
+    try {
+      return static_cast<std::size_t>(
+        simpatico::decompress_column_chunks(*column.cursor,
+                                            chunk_begin,
+                                            chunk_end,
+                                            skip_head,
+                                            static_cast<cudf::size_type>(take),
+                                            column.target,
+                                            stream_view));
+    } catch (const simpatico::unsupported_chunk_decode& e) {
+      throw row_range_unsupported_error(std::string{"compressed row-range read: "} + e.what());
+    }
+  };
+
+  // STRING columns first: only the decode knows how many rows of chars fit. A column that
+  // delivers fewer rows lowers k for every column after it. The STRING columns before it have
+  // then written past the final k, but their first k rows and k + 1 offsets are what a read of
+  // k rows writes, so they are not decoded again (the exception to contract rules 3 and 4 that
+  // register_compressed_row_range_readers documents).
+  for (auto& column : columns) {
+    if (k == 0) { break; }
+    if (column.is_string) { k = std::min(k, decode(column, k)); }
+  }
+  if (k > 0) {
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+      auto& column = columns[i];
+      if (column.is_string) { continue; }
+      if (decode(column, k) != k) {
+        throw std::logic_error("compressed row-range read: a fixed-width column was cut short");
+      }
+      result.data_bytes_written[i] = k * column.width;
+    }
+
+    // The chars a STRING column delivered: its rebased offset at row k, read back from the
+    // destination (one transfer per STRING column, one wait for all of them).
+    std::vector<std::int64_t> end_offsets(columns.size(), 0);
+    std::vector<std::int32_t> end_offsets32(columns.size(), 0);
+    bool any_string = false;
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+      auto const& column = columns[i];
+      if (!column.is_string) { continue; }
+      any_string       = true;
+      auto const width = static_cast<std::size_t>(column.target.offset_width);
+      auto const* from =
+        static_cast<const std::byte*>(column.target.offsets) + (dst[i].dst_row_offset + k) * width;
+      void* const to =
+        width == 4 ? static_cast<void*>(&end_offsets32[i]) : static_cast<void*>(&end_offsets[i]);
+      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(to, from, width, cudaMemcpyDeviceToHost, stream.get()));
+    }
+    if (any_string) {
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+      for (std::size_t i = 0; i < columns.size(); ++i) {
+        auto const& column = columns[i];
+        if (!column.is_string) { continue; }
+        auto const end =
+          column.target.offset_width == 4 ? std::int64_t{end_offsets32[i]} : end_offsets[i];
+        result.data_bytes_written[i] =
+          static_cast<std::size_t>(end) - column.target.dst_byte_offset;
+      }
+    }
+  }
+
+  result.rows_written     = k;
+  result.source_exhausted = request.row_begin + k == num_rows;
+  return result;
+}
+
+template <typename Representation>
+void register_reader(cucascade::row_range_reader_registry& registry)
+{
+  registry.register_reader<Representation>(&read_rows_compressed<Representation>);
+}
+
+}  // namespace
+
+void register_compressed_row_range_readers(cucascade::row_range_reader_registry& registry)
+{
+  register_reader<compressed_device_representation>(registry);
+  register_reader<compressed_host_representation>(registry);
+  register_reader<compressed_disk_representation>(registry);
+}
+
+}  // namespace sirius::compression

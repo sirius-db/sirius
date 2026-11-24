@@ -98,10 +98,10 @@ TEST_CASE("Host initial pools resolve from NUMA RAM unless explicitly configured
       ", block_size: " + std::to_string(block_size) + ", pool_size: " + std::to_string(pool_size);
     expected_error = "pool size in bytes overflows";
   }
-  SECTION("default host budget uses ninety percent of NUMA RAM")
+  SECTION("default host budget is one third of NUMA RAM for one GPU on the node")
   {
     host_settings.clear();
-    expected_capacity = static_cast<std::size_t>(static_cast<double>(64ULL << 30) * 0.9);
+    expected_capacity = static_cast<std::size_t>(static_cast<double>(64ULL << 30) * (1.0 / 3.0));
   }
   SECTION("smaller host budget caps initial allocation")
   {

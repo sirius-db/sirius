@@ -1,1 +1,1 @@
-target_sources(sirius_objects PRIVATE downgrade_executor.cpp)
+target_sources(sirius_objects PRIVATE downgrade_executor.cpp spill_io_stats.cpp)

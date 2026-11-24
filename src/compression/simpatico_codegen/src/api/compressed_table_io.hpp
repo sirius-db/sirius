@@ -10,11 +10,12 @@
 // File layout:
 //   [Binary header]
 //     "HPLN" (4 bytes)
-//     version (uint8)                     [14 for all codecs and nvCOMP builds]
+//     version (uint8)                     [15 for all codecs and nvCOMP builds]
 //     num_cols (uint16 LE)
 //     per column:
 //       name_len (uint16 LE) + name bytes   [0 = no name]
 //       dtype_tag (uint8)                   [decoded column type]
+//       scale (int32 LE)                    [fixed-point scale of the column type; 0 otherwise]
 //       num_rows (int64 LE)
 //       validity_kind (uint8)               [0=all_valid 1=all_null 2=mask]
 //         if kind != all_valid: null_count (int64 LE)
@@ -33,6 +34,7 @@
 //         slot (int32 LE)                   [-1 = node's own rep, else output port]
 //         kind (uint8)                      [OpId]
 //         type_tag (uint8)                  [decoded element type]
+//         num_rows (uint64 LE)              [the node's own output length]
 //         meta_kind (uint8)  0=none 1=alp_rd 2=ans 3=bitcomp 4=cascaded 5=snappy 6=lz4 7=deflate
 //         meta bytes (variable per meta_kind; see push_meta)
 //           ANS and Cascaded end with payload_format (uint8): 5=pre-v6, 6=v6

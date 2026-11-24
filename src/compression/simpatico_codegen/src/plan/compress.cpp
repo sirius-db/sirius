@@ -32,6 +32,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // The C++-native JIT codegen encode entry point (``encode_fused_subtree``) is
@@ -156,6 +157,14 @@ struct CompressWalk {
   rmm::device_async_resource_ref mr;
   std::string* error_out;
   bool failed = false;
+
+  // The plan's first node when begin_compress_column() queued its measure launch, and that
+  // launch's state; consumed by the node's emit.
+  NodeId pending_node           = 0;
+  pending_fused_encode* pending = nullptr;
+  // Leave a fused region's last launch queued when nothing downstream reads its outputs
+  // (see finish_compress_column).
+  bool defer_completion = false;
 
   // Eager-release bookkeeping: which reprs_by_input key owns each live column,
   // and how many of a key's consumed outputs are still referenced in `columns`.
@@ -353,7 +362,15 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
   fused_leaf_builder builder;
   std::string jit_err;
   CodegenHead head;
-  if (!encode_fused_subtree(tree, n, col, stream, mr, builder, &jit_err, &head)) {
+  // An entropy tail or a chained step reads this region's outputs, possibly through a
+  // library that works on streams of its own, so only a region the plan ends in is left
+  // queued; the check after the encode waits for any other.
+  fused_encode_options options;
+  options.defer_completion = defer_completion;
+  if (pending != nullptr && n == pending_node) {
+    options.pending = std::exchange(pending, nullptr);
+  }
+  if (!encode_fused_subtree(tree, n, col, stream, mr, builder, &jit_err, &head, options)) {
     // A codegen-only op (bitpack/delta/rle/...) has no generic compressor, so a
     // real encode failure would otherwise surface as a misleading "unknown
     // compressor" from the generic fallback. Report the actual reason.
@@ -470,6 +487,7 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
       to_recurse.push_back(output_val);
     }
   }
+  if (defer_completion && !to_recurse.empty()) { cudaStreamSynchronize(stream.get()); }
   for (auto const& op : to_recurse) {
     if (failed) return true;
     emit_path(op);
@@ -586,16 +604,31 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
 
 }  // namespace
 
-std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
-                                          std::string_view plan_dsl,
-                                          ::cuda::stream_ref stream,
-                                          rmm::device_async_resource_ref mr,
-                                          std::string* error_out)
+// What begin_compress_column() leaves for finish_compress_column().
+struct column_encode {
+  std::unique_ptr<PlanTree> plan_tree;
+  // The column with its validity detached.
+  cudf::column_view values;
+  ValueConsumeMap consumer_by_input;
+  ::cuda::stream_ref stream;
+  rmm::device_async_resource_ref mr;
+  NodeId pending_node{0};
+  pending_fused_encode_ptr pending{};
+};
+
+void column_encode_deleter::operator()(column_encode* encode) const noexcept { delete encode; }
+
+bool has_queued_launch(column_encode const& encode) { return encode.pending != nullptr; }
+
+column_encode_ptr begin_compress_column(cudf::column_view input,
+                                        std::string_view plan_dsl,
+                                        ::cuda::stream_ref stream,
+                                        rmm::device_async_resource_ref mr,
+                                        std::string* error_out)
 {
-  nvtx_scoped_range nvtx_range{"simpatico::compress_column"};
   // Single-stream per column: all work runs on `stream`. Cross-column
-  // parallelism is the caller's job (one column per worker thread, each on its
-  // own stream). Intermediate device buffers are freed eagerly by the walk.
+  // parallelism is the caller's job (one column per stream). Intermediate
+  // device buffers are freed eagerly by the walk.
 
   auto plan_tree = std::make_unique<PlanTree>();
   {
@@ -624,6 +657,27 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
     }
   }
 
+  column_encode_ptr encode{
+    new column_encode{std::move(plan_tree), values, std::move(consumer_by_input), stream, mr}};
+
+  // The node the walk starts at, when emit_path() would hand it to the fused encode.
+  auto const first = encode->consumer_by_input.find(ValueId{0, 0});
+  if (first != encode->consumer_by_input.end()) {
+    PlanNode const& node = tree.nodes[first->second];
+    if (node.input_sources.size() == 1 && is_codegen_compressor(node.op)) {
+      encode->pending_node = first->second;
+      encode->pending      = begin_fused_encode(tree, first->second, values, stream, mr);
+    }
+  }
+  return encode;
+}
+
+std::unique_ptr<PlanTree> finish_compress_column(column_encode& encode,
+                                                 bool defer_completion,
+                                                 std::string* error_out)
+{
+  PlanTree& tree = *encode.plan_tree;
+
   // Single recursive walk from "input", placing reps as it goes. When the
   // whole plan fuses into one JIT kernel, emit_fused_node (called from
   // emit_path via CompressWalk below) performs that single encode_fused_subtree
@@ -631,13 +685,22 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
   // case (a raw-passthrough or boundary channel with a downstream consumer)
   // uniformly — so there is no separate fast path to maintain here.
   ValueColumnMap columns;
-  columns.emplace(ValueId{0, 0}, values);  // the column input is value (node 0, port 0)
+  columns.emplace(ValueId{0, 0}, encode.values);  // the column input is value (node 0, port 0)
   std::unordered_map<ValueId, std::unique_ptr<compressed_representation>, ValueIdHash>
     reprs_by_input;
   std::vector<bool> visited(tree.nodes.size(), false);
 
-  CompressWalk walk{
-    tree, consumer_by_input, columns, reprs_by_input, visited, stream, mr, error_out};
+  CompressWalk walk{tree,
+                    encode.consumer_by_input,
+                    columns,
+                    reprs_by_input,
+                    visited,
+                    encode.stream,
+                    encode.mr,
+                    error_out};
+  walk.pending_node     = encode.pending_node;
+  walk.pending          = encode.pending.get();
+  walk.defer_completion = defer_completion;
   walk.emit_path(ValueId{0, 0});
   if (walk.failed) return nullptr;
 
@@ -658,7 +721,19 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
   }
 
   if (error_out) error_out->clear();
-  return plan_tree;
+  return std::move(encode.plan_tree);
+}
+
+std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
+                                          std::string_view plan_dsl,
+                                          ::cuda::stream_ref stream,
+                                          rmm::device_async_resource_ref mr,
+                                          std::string* error_out)
+{
+  nvtx_scoped_range nvtx_range{"simpatico::compress_column"};
+  auto encode = begin_compress_column(input, plan_dsl, stream, mr, error_out);
+  if (!encode) return nullptr;
+  return finish_compress_column(*encode, /*defer_completion=*/false, error_out);
 }
 
 namespace {

@@ -17,6 +17,7 @@
 #include "transparent/physical_sirius_execution.hpp"
 
 #include "log/logging.hpp"
+#include "op/discard_copy_function.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
@@ -26,8 +27,11 @@
 
 #include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/execution/executor.hpp>
+#include <duckdb/execution/operator/helper/physical_execute.hpp>
 #include <duckdb/execution/operator/helper/physical_result_collector.hpp>
 #include <duckdb/execution/operator/helper/physical_result_sink.hpp>
+#include <duckdb/execution/operator/persistent/physical_copy_to_file.hpp>
+#include <duckdb/execution/physical_plan_generator.hpp>
 #include <duckdb/main/buffered_data/batched_buffered_data.hpp>
 #include <duckdb/main/buffered_data/simple_buffered_data.hpp>
 #include <duckdb/main/client_config.hpp>
@@ -42,6 +46,22 @@
 #include <thread>
 
 namespace sirius::transparent {
+
+namespace {
+
+/// Whether @p prepared is a `COPY ... (FORMAT sirius_discard)`, which writes no file.
+bool is_discard_copy(duckdb::PreparedStatementData const& prepared)
+{
+  if (!prepared.physical_plan) { return false; }
+  auto const* root = &prepared.physical_plan->Root();
+  while (root->type == duckdb::PhysicalOperatorType::EXECUTE) {
+    root = &root->Cast<duckdb::PhysicalExecute>().plan;
+  }
+  return root->type == duckdb::PhysicalOperatorType::COPY_TO_FILE &&
+         root->Cast<duckdb::PhysicalCopyToFile>().function.name == sirius::op::kDiscardCopyFormat;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Global source state — owns the sirius_interface and the materialized result.
@@ -465,9 +485,11 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       }
 
       // File export is side-effecting. Never replay it after a runtime failure,
-      // even when no rows have yet been returned to the client.
+      // even when no rows have yet been returned to the client. The discard format writes
+      // nothing, so DuckDB's copy function can finish it.
       if (cpu_fallback_prepared_ &&
-          cpu_fallback_prepared_->statement_type == duckdb::StatementType::COPY_STATEMENT) {
+          cpu_fallback_prepared_->statement_type == duckdb::StatementType::COPY_STATEMENT &&
+          !is_discard_copy(*cpu_fallback_prepared_)) {
         throw duckdb::ExecutorException("Sirius Parquet export failed (CPU replay disabled): " +
                                         gpu_msg);
       }

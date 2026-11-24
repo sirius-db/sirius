@@ -66,6 +66,40 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
                                           rmm::device_async_resource_ref mr,
                                           std::string* error_out);
 
+/// A column between begin_compress_column() and finish_compress_column().
+struct column_encode;
+
+struct column_encode_deleter {
+  void operator()(column_encode* encode) const noexcept;
+};
+
+using column_encode_ptr = std::unique_ptr<column_encode, column_encode_deleter>;
+
+/// The first half of compress_column(): parse the plan, detach the column's validity and,
+/// when the plan starts with a fused region that is measured and then packed, queue that
+/// region's measure launch on ``stream`` without waiting for it. A caller with several
+/// columns begins all of them before it finishes the first, so the launches of one column
+/// run while the host waits on another. Returns nullptr and sets ``*error_out`` when the
+/// plan does not parse.
+column_encode_ptr begin_compress_column(cudf::column_view input,
+                                        std::string_view plan_dsl,
+                                        ::cuda::stream_ref stream,
+                                        rmm::device_async_resource_ref mr,
+                                        std::string* error_out);
+
+/// Whether begin_compress_column() queued a launch that finish_compress_column() only has to
+/// collect, so that finishing this column later costs it nothing.
+bool has_queued_launch(column_encode const& encode);
+
+/// The second half of compress_column(): run the rest of the plan and return the tree, or
+/// nullptr with ``*error_out`` set. With ``defer_completion`` a plan that is one fused region
+/// returns with its last launch still queued on the column's stream, and the caller waits for
+/// that stream before anything reads the encoded buffers on another stream or from the host;
+/// without it the column's work is complete at return, as with compress_column().
+std::unique_ptr<PlanTree> finish_compress_column(column_encode& encode,
+                                                 bool defer_completion,
+                                                 std::string* error_out);
+
 /// Compress a single column with ONE operator and return the resulting
 /// ``compressed_representation``.  A thin wrapper for the BFS explorer:
 ///

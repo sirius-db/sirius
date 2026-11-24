@@ -27,6 +27,7 @@
 #include "output/parquet_spec.hpp"
 #include "scan_manager/config.hpp"
 
+#include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -35,6 +36,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -86,8 +88,69 @@ constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 /// cross-device overhead; above it, the multi-GPU floor of `num_gpus` partitions kicks in.
 constexpr uint64_t PARTITION_SMALL_TABLE_BYTES_PER_GPU = 16ULL * 1024 * 1024;  // 16 MB
 
-/// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
+/// Fraction of a GPU's memory limit used per sort partition when max_sort_partition_bytes is 0.
+/// (With sort_partition_auto_sizing off: of the GPU memory free when the boundaries are computed.)
 constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
+
+/// Default for sort_partition_auto_sizing: SORT_SAMPLE derives the number of range partitions from
+/// the GPU memory limit, the merge route, the number of GPUs and the cuDF row limit
+/// (op::compute_sort_partition_sizing). Off restores the previous rule: the data size over
+/// max_sort_partition_memory_fraction of the GPU memory free at that moment.
+constexpr bool DEFAULT_SORT_PARTITION_AUTO_SIZING = true;
+
+/// Default for sort_coalesce_memory_fraction: the share of one GPU's memory that the inputs of the
+/// local sorts running at the same time may add up to. One sorted run is at most this fraction
+/// of the GPU's memory divided by sort_coalesce_concurrent_runs.
+///
+/// Why 0.25: a coalesced sort task holds its input batches, their concatenation, the sort's
+/// scratch and the sorted copy, about 3.3 times the run, so the sorts running at once stay near
+/// 80% of the GPU at their peak only while each of them sorts a full run.
+inline constexpr double DEFAULT_SORT_COALESCE_MEMORY_FRACTION = 0.25;
+
+/// Default for sort_coalesce_concurrent_runs: how many full runs one GPU sorts at the same time.
+/// One run is sort_coalesce_memory_fraction of the GPU divided by this, and a GPU starts another
+/// sort only while the inputs of its running sorts stay within the fraction. 0 restores the
+/// previous rule: a run is the fraction divided by the GPU executor thread count and every
+/// thread may sort one.
+///
+/// Why 2: the sort is a small part of the work on the batches it reads, so two at a time keep up
+/// with the scan, and a run of an eighth of the GPU covers several scan batches, which is what
+/// lowers the number of runs per range partition and so the merge passes.
+inline constexpr uint64_t DEFAULT_SORT_COALESCE_CONCURRENT_RUNS = 2;
+
+/// Default for sort_merge_max_fan_in: the most runs one MERGE_SORT task reads. A partition with
+/// more runs is merged in passes.
+///
+/// Why 8: the k-way tile merge's cost per row grows about linearly with the fan-in, while a
+/// higher fan-in only saves a logarithmic number of passes, and a task's window budget is shared
+/// by the runs it reads, so a higher fan-in also means smaller merge rounds. Measured, the extra
+/// passes of a low fan-in (which rewrite a partition's rows and may spill them again) cost less
+/// than merging many runs at once. It is only an upper bound: op::merge::derive_merge_config
+/// lowers the fan-in further when the task budget cannot hold that many windows at the
+/// window-row floor, and clamps it to the kernel's limit (op::merge::kMaxKwayMergeInputs).
+inline constexpr uint64_t DEFAULT_SORT_MERGE_MAX_FAN_IN = 8;
+
+/// Bits of sort_merge_disabled_rules: the sizing and planning rules of the MERGE_SORT merge that
+/// can be switched off one by one (op::merge::merge_rule documents each). A set bit restores the
+/// behaviour from before the rule; the setting exists to measure each rule's effect.
+namespace sort_merge_rule {
+inline constexpr uint64_t HUFFMAN_PLAN           = uint64_t{1} << 0;
+inline constexpr uint64_t BUDGET_FLOOR           = uint64_t{1} << 1;
+inline constexpr uint64_t PARTITION_BUDGET       = uint64_t{1} << 2;
+inline constexpr uint64_t IN_PLACE_RESERVATION   = uint64_t{1} << 3;
+inline constexpr uint64_t ROUND_ROWS             = uint64_t{1} << 4;
+inline constexpr uint64_t ROW_COUNT_GUARD        = uint64_t{1} << 5;
+inline constexpr uint64_t ONE_SHOT_ESTIMATE      = uint64_t{1} << 6;
+inline constexpr uint64_t SINGLE_RUN_PASSTHROUGH = uint64_t{1} << 7;
+inline constexpr uint64_t STRING_SLOT_ESTIMATE   = uint64_t{1} << 8;
+inline constexpr uint64_t ONE_SHOT_FIT           = uint64_t{1} << 9;
+/// Every rule bit.
+inline constexpr uint64_t ALL = (uint64_t{1} << 10) - 1;
+}  // namespace sort_merge_rule
+
+/// Default for sort_merge_disabled_rules: every rule is in force but the one-shot cold-start
+/// estimate, which measured slower (see op::merge::merge_rule::one_shot_estimate).
+inline constexpr uint64_t DEFAULT_SORT_MERGE_DISABLED_RULES = sort_merge_rule::ONE_SHOT_ESTIMATE;
 
 /// Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
 /// left/output side) instead of cudf::filtered_join (build on the right side). mark_join only
@@ -172,6 +235,44 @@ constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
 
 }  // namespace config
 
+/// Merge path for MERGE_SORT: the windowed k-way merge, or one_shot's concat-then-merge.
+enum class sort_merge_mode : uint8_t {
+  automatic,  ///< "auto": windowed under memory pressure or when any input is not on the GPU
+  windowed,   ///< "windowed": always the windowed k-way merge
+  one_shot,   ///< "one_shot": always concat-then-merge
+};
+
+/// Parse a sort_merge_mode setting value: "auto", "windowed" or "one_shot", case-insensitive.
+/// Returns std::nullopt for anything else.
+[[nodiscard]] inline std::optional<sort_merge_mode> parse_sort_merge_mode(
+  std::string_view value) noexcept
+{
+  auto equals_ignore_case = [](std::string_view lhs, std::string_view rhs) noexcept {
+    if (lhs.size() != rhs.size()) { return false; }
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+      const char c     = lhs[i];
+      const char lower = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+      if (lower != rhs[i]) { return false; }
+    }
+    return true;
+  };
+  if (equals_ignore_case(value, "auto")) { return sort_merge_mode::automatic; }
+  if (equals_ignore_case(value, "windowed")) { return sort_merge_mode::windowed; }
+  if (equals_ignore_case(value, "one_shot")) { return sort_merge_mode::one_shot; }
+  return std::nullopt;
+}
+
+/// The setting spelling of a sort_merge_mode: "auto", "windowed" or "one_shot".
+[[nodiscard]] inline std::string_view to_string(sort_merge_mode mode) noexcept
+{
+  switch (mode) {
+    case sort_merge_mode::automatic: return "auto";
+    case sort_merge_mode::windowed: return "windowed";
+    case sort_merge_mode::one_shot: return "one_shot";
+  }
+  return "auto";
+}
+
 /// Parameters controlling operator-level resource sizing.
 /// Fields are YAML-configurable unless documented as engine-owned; runtime test hooks require
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
@@ -209,8 +310,60 @@ struct operator_params {
   /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
 
-  /// Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0.
+  /// Fraction of a GPU's memory limit per sort partition when max_sort_partition_bytes is 0.
   double max_sort_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
+
+  /// Automatic choice of the sort partition count (SET sort_partition_auto_sizing); false = the
+  /// previous rule based on the GPU memory free when the boundaries are computed.
+  bool sort_partition_auto_sizing = config::DEFAULT_SORT_PARTITION_AUTO_SIZING;
+
+  /// Merge path for MERGE_SORT (SET sort_merge_mode): auto, windowed or one_shot.
+  sort_merge_mode sort_merge_mode_setting = sort_merge_mode::automatic;
+
+  /// Maximum rows per input window (n) of the windowed merge (0 = derive per device).
+  uint64_t sort_merge_window_rows = 0;
+
+  /// Output chunk target (bytes) per windowed merge task (0 = derive per device).
+  uint64_t sort_merge_output_bytes = 0;
+
+  /// In auto mode, the windowed path is taken when partition + output exceed this fraction of
+  /// the GPU (0 = derive from the device's GPU memory size).
+  double sort_merge_one_shot_max_fraction = 0;
+
+  /// Most runs one merge task reads; a partition with more runs is merged in passes.
+  uint64_t sort_merge_max_fan_in = config::DEFAULT_SORT_MERGE_MAX_FAN_IN;
+
+  /// Bit set of config::sort_merge_rule values: the merge rules that are switched off (0 = all
+  /// in force; the default switches off the one-shot cold-start estimate only).
+  uint64_t sort_merge_disabled_rules = config::DEFAULT_SORT_MERGE_DISABLED_RULES;
+
+  /// Whether the per-batch sort of ORDER BY orders string keys and multi-column keys by radix
+  /// sorts over an encoding of the keys (SET sort_key_encoding) instead of cuDF's comparison sort.
+  bool sort_key_encoding = true;
+
+  /// Whether ORDER BY sorts groups of input batches as one run each, so a range partition
+  /// receives few large runs instead of one per input batch (SET sort_coalesce_runs).
+  bool sort_coalesce_runs = true;
+
+  /// Share of one GPU's memory for the inputs of concurrently running local sorts; one run is at
+  /// most this fraction of the GPU divided by sort_coalesce_concurrent_runs.
+  double sort_coalesce_memory_fraction = config::DEFAULT_SORT_COALESCE_MEMORY_FRACTION;
+
+  /// Full runs one GPU sorts at the same time (SET sort_coalesce_concurrent_runs). 0: one per GPU
+  /// executor thread, with no bound on how many sorts run at once.
+  uint64_t sort_coalesce_concurrent_runs = config::DEFAULT_SORT_COALESCE_CONCURRENT_RUNS;
+
+  /// Whether the local sort and the range partitioning of ORDER BY are scheduled ahead of the
+  /// tasks that produce their input, and the producer of a coalescing sort is held back while
+  /// twice sort_coalesce_memory_fraction of every GPU is waiting unsorted (SET
+  /// sort_input_backpressure). Off: plan order, and the producer is never held back.
+  bool sort_input_backpressure = true;
+
+  /// Whether runs are also coalesced when a sort key is a string. It applies only while
+  /// sort_key_encoding is on: the encoded sort costs the same per row at any run size, while
+  /// cuDF's comparison sort of string keys gets slower per row as a run grows, by more than the
+  /// saved merge passes give back for keys with many distinct values.
+  bool sort_coalesce_string_keys = true;
 
   /// Target size (bytes) per hash partition for joins and group-bys.
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
@@ -409,6 +562,37 @@ struct telemetry_config {
   std::string nvtx_injection_lib{};
 };
 
+/// Which cuCascade io stack reads and writes the spill files of a DISK memory space.
+enum class disk_io_backend : uint8_t {
+  AUTOMATIC,  ///< cuCascade's choice: cuFile when GPUDirect Storage works, else io_uring
+  URING,      ///< io_uring reactors
+  CUFILE,     ///< cuFile reactors; POSIX I/O where GPUDirect Storage is off or unavailable
+};
+
+[[nodiscard]] std::optional<disk_io_backend> parse_disk_io_backend(std::string_view name) noexcept;
+[[nodiscard]] std::string_view to_string(disk_io_backend backend) noexcept;
+
+/// Spill-file I/O of one DISK memory space (`sirius.memory.disk.io`, `sirius.space.disk[].io`).
+struct disk_io_config {
+  /// Unset selects the default: the cuFile reactors when this build has them, else AUTOMATIC.
+  std::optional<disk_io_backend> backend;
+  /// false: buffered I/O through the page cache. true: O_DIRECT, and GPUDirect Storage with the
+  /// cuFile reactors.
+  bool direct_io{false};
+  /// Reactor threads serving the space's transfers; 0 keeps cuCascade's own count (4 io_uring
+  /// reactors, a pinned group of cuFile reactors per GPU).
+  std::size_t reactors{8};
+
+  [[nodiscard]] bool operator==(const disk_io_config&) const = default;
+};
+
+/// The backend @p config resolves to in this build (see disk_io_config::backend).
+[[nodiscard]] disk_io_backend effective_disk_io_backend(const disk_io_config& config) noexcept;
+
+/// The cuCascade options that build the io context described by @p config.
+[[nodiscard]] cucascade::disk_io_context_options to_disk_io_context_options(
+  const disk_io_config& config);
+
 /// Parameters controlling Simpatico compression. The unprefixed fields apply to
 /// pin_table(tier=>'host' or 'gpu'); the spill_ fields apply to batches the downgrade
 /// executor spills to the host or disk tier.
@@ -465,6 +649,28 @@ struct compression_config {
   /// its GPU memory space (the encoder's headroom); otherwise it spills uncompressed.
   /// In [0, 1]; 0 skips the check.
   double spill_encode_reserve_fraction{0.5};
+
+  /// A row-range reader (the windowed merge) copies the compressed payload of a spilled host
+  /// or disk batch to the device once, whole, when it is at most this many bytes, and decodes
+  /// every row range from that copy. A larger payload is read range by range. 0 disables the
+  /// copy.
+  std::size_t spill_read_cache_max_bytes{64ULL * 1024 * 1024};  // 64 MiB
+
+  /// The windowed merge decodes a spilled compressed batch whole, instead of window by window,
+  /// when it has at most two merge windows of rows and decodes to at most this many bytes. The
+  /// run is then windowed by slices of the decoded batch. 0 always reads by row range.
+  std::size_t spill_whole_decode_max_bytes{256ULL * 1024 * 1024};  // 256 MiB
+
+  /// When the encoder's headroom is not grantable while other spill encodes run on the same
+  /// GPU, wait up to this many milliseconds for one of them to end and try again, instead of
+  /// spilling the batch uncompressed at once. 0 never waits.
+  std::uint64_t spill_encode_wait_ms{1000};
+
+  /// Spilled batches of the same column types that one set of sampled per-column plans
+  /// encodes before the columns are sampled again. Plans are dropped early when a batch
+  /// compresses clearly worse with them than the batch they were sampled on. 1 samples every
+  /// batch. At least 1.
+  std::uint64_t spill_plan_reuse_batches{8};
 };
 
 class configuration_input_error : public std::runtime_error {
@@ -553,6 +759,10 @@ struct sirius_config {
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
   get_memory_space_configs() const noexcept;
 
+  /// Spill-file I/O settings of the DISK memory space @p disk_id; the defaults when the space
+  /// has no `io` block.
+  [[nodiscard]] disk_io_config get_disk_io_config(int disk_id) const;
+
   [[nodiscard]] const creator::task_creator_config& get_task_creator_config() const noexcept;
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
@@ -598,6 +808,13 @@ struct sirius_config {
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
 
+  /// How GPU pipeline executors wait for a reservation that is not granted at once
+  /// (`sirius.executor.pipeline.wait_for_memory_on_worker`, `fail_fast_on_full_gpu_oom`).
+  [[nodiscard]] const exec::reservation_wait_policy& get_reservation_wait_policy() const noexcept
+  {
+    return _reservation_wait_policy;
+  }
+
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
     return _operator_params;
@@ -634,17 +851,11 @@ struct sirius_config {
   friend class parsed_sirius_config;
 
   /// Apply the knobs derived from the rest of the configuration: the readahead
-  /// scan budgets, the @c pipeline_width stamp, the multi-GPU backend
-  /// override and the uring prefetch reactors, in that order. Called by
+  /// scan budgets, the @c pipeline_width stamp and the uring prefetch
+  /// reactors, in that order. Called by
   /// parsed_sirius_config::resolve after memory capacities and operator
   /// defaults are resolved.
   void finalize_derived_config();
-
-  /// When @c _memory_space_configs contains more than one GPU memory space,
-  /// force @c _scan_manager_config.backend to @c io_backend::native (the
-  /// native backend is required for multi-GPU IO routing). Emits a WARNING when
-  /// the override takes effect. Called from @ref finalize_derived_config.
-  void enforce_native_backend_for_multi_gpu();
 
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
   /// multiple of the configured pipeline pool size. Object-store reads are
@@ -669,6 +880,8 @@ struct sirius_config {
   cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
+  /// `io` blocks of the DISK memory spaces, by disk id.
+  std::map<int, disk_io_config> _disk_io_configs;
   creator::task_creator_config _task_creator_config;
   /// Query admission limit (`sirius.max_concurrent_queries`).
   int _max_concurrent_queries{1};
@@ -676,6 +889,7 @@ struct sirius_config {
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
+  exec::reservation_wait_policy _reservation_wait_policy;
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;
@@ -683,6 +897,11 @@ struct sirius_config {
   std::vector<int> _rest_reactor_cpus;
   output::parquet_compression _parquet_output_compression{output::parquet_compression::snappy};
 };
+
+/// Checks that @p directory can take spill files: it is a directory (created if it is missing)
+/// and a file can be created in it. Throws std::runtime_error naming the directory and the
+/// reason otherwise. An empty path is not checked (no disk tier is built from it).
+void validate_spill_directory(const std::string& directory);
 
 /// Validated configuration intent. Construction and parsing never discover hardware.
 /// Resolution produces a separate value and leaves the specification unchanged.

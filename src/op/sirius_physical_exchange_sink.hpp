@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace sirius::exchange {
@@ -65,6 +66,11 @@ struct exchange_spec {
   std::vector<cudf::null_order> null_precedence;
   /// gather: the receiving rank.
   exchange::rank_t target = 0;
+  /// gather: the target's EXCHANGE_SOURCE is ordered, so this rank's batches must reach it in
+  /// their order. A task's output that carries a position (MERGE_SORT's partition and chunk) is
+  /// sent under that position, since tasks finish, and so send, in any order; output without one
+  /// is sent in send order. A sink sees positions on all of its input or on none of it.
+  bool ordered = false;
 };
 
 /**
@@ -108,7 +114,7 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
-  /// Sends each slice to its rank.
+  /// Sends each slice to its rank; an ordered gather's batch under its position, when it has one.
   void sink(const operator_data& input_data, ::cuda::stream_ref stream) override;
 
   /// An empty table shaped like the batches this sink's input produced, or null before the first
@@ -141,6 +147,9 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
   std::unique_ptr<cudf::table> _input_schema;
   /// null_keys_to_every_rank: a row of this rank's input has gone to every rank.
   std::atomic<bool> _every_rank_has_a_row{false};
+  std::mutex _positioned_mutex;
+  /// ordered: whether the batches sent so far carried a position; none before the first.
+  std::optional<bool> _positioned;
 };
 
 }  // namespace sirius::op

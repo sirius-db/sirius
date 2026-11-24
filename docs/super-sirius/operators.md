@@ -467,10 +467,93 @@ DISTINCT lowering's grouped aggregate over the union itself, keyed on every colu
 ### `sirius_physical_order` — `ORDER_BY`
 **File:** `src/op/sirius_physical_order.hpp`
 
-Local sort of each data batch.
+Local sort: turns its input into sorted runs for SORT_SAMPLE, SORT_PARTITION and MERGE_SORT.
 
-- **GPU execution:** `gpu_order_impl::local_order_by()` using `cudf::order_by()`
+- **GPU execution:** `gpu_order_impl::local_order_by()` per sort unit: a row order, then one
+  `cudf::gather()`.
+- **Row order:** `cudf::sorted_order()` for a single fixed-width key (cuDF radix-sorts it). String
+  keys and multi-column keys use `order::encoded_sorted_order()`
+  (`src/op/order/encoded_sort_order.hpp`) when `sort_key_encoding` is true (the default):
+  - Each key column becomes bit fields whose unsigned order is the column's order: a null flag,
+    the value minus the column minimum (or the maximum minus the value for DESC), and for a
+    string its 8-byte big-endian chunks followed by its length. The fields are packed, as one
+    bit string, into 64-bit words.
+  - The words are applied most-significant first. Each step radix-sorts only the rows still tied
+    on the earlier words, by (tie group, word), over only the bits that differ inside a group. A
+    word that is constant inside every group (a shared string prefix) costs one pass and no sort.
+  - The result is the order of `cudf::stable_sorted_order()`: the same row comparator as the
+    merge (`kway_comparator.cuh`), equal keys in input order.
+  - It falls back to `cudf::sorted_order()` for batches under 4,096 rows, key types other than
+    fixed-width and STRING, strings longer than 256 bytes, and inputs whose encoded sort would
+    need more than a quarter of the GPU memory space.
+  - Memory: the result and all temporaries come from the task's memory space, at most 32 bytes
+    per row at a time (`order::encoded_sort_working_bytes()`; cuDF's comparison sort needs
+    about 8, its single-key radix sort about 24), and the temporaries are freed before the
+    gather. An allocation failure is not caught: the executor records the peak and retries the
+    task with a larger reservation.
 - **Key members:** `orders` (sort keys with ASC/DESC and null ordering), `projections` (output columns), `is_index_sort`
+
+It has two modes, chosen by the planner (`order_by_run_limits()` in `wrap_order_by()`):
+
+| Mode | Plan | Sort unit |
+|------|------|-----------|
+| per batch (`sort_coalesce_runs = false`, a string sort key with `sort_coalesce_string_keys = false` or `sort_key_encoding = false`, a nested column, or an operator built outside the planner) | `… → SORT_SAMPLE → ORDER_BY → input`; ORDER_BY is the sink of its input's pipeline | Each input batch of a task |
+| coalescing (default) | `… → SORT_SAMPLE → ORDER_BY → PASSTHROUGH_SINK → input`; ORDER_BY starts its own pipeline and reads the input's batches from a port (PARTIAL barrier) | A group of parked batches of up to `sort_coalesce_memory_fraction × GPU limit / sort_coalesce_concurrent_runs` bytes, concatenated |
+
+Why coalesce: SORT_PARTITION cuts every sorted run by range, so each partition holds one run per
+sort unit, however small the partition. MERGE_SORT reads at most `sort_merge_max_fan_in` runs per
+task and rewrites a partition once for every extra factor of the fan-in in its run count, while
+the sort itself costs the same per row at any run size for fixed-width keys. Coalescing changes
+which rows share a run; it changes neither the rows nor how a unit is sorted.
+
+Coalescing mode:
+
+- **Group planning** (`plan_next_run()`, used by both `get_next_task_hint()` and
+  `get_next_task_input_data()` under the operator mutex). Parked batches are grouped per GPU
+  device, so a run is built from batches already on the GPU that will sort it; batches that are
+  not on a GPU (spilled, or being moved) form one more group. A group is complete when the next
+  batch of its device would take it past the byte limit or 2^31 - 1 rows, or when it reaches the
+  byte limit; a batch larger than the limit is a group of one. With a string column in the
+  schema a group also stays below 2^31 string bytes, counting for each batch what it holds
+  beyond its fixed-width values and string offsets (its decoded bytes when its row count is
+  unknown), which bounds every string column. Until a group is complete the hint is WAITING on
+  the producer. When the producer has finished, the remainder is packed in repository order
+  regardless of device.
+- **Concurrent runs** (`sort_coalesce_concurrent_runs`, `make_sort_run_limits()`). The inputs of
+  the runs one GPU sorts at the same time stay within `sort_coalesce_memory_fraction` of its
+  limit: a complete group is claimed only if it fits beside the groups already claimed for its
+  GPU and not yet sorted, or if nothing is being sorted there. A group that does not fit stays
+  parked; the sort task that finishes schedules the operator again. This is what lets a run
+  cover several input batches without every executor thread holding one. With the setting at 0
+  a run is the fraction divided by the executor thread count and any number are sorted at once.
+- **Input backpressure** (`sort_input_backpressure`). Without it a scan runs ahead of the sort:
+  its tasks are created as fast as its batches are prepared and are scheduled first, so the
+  unsorted batches fill the GPU and are spilled and read back whole. With it,
+  - ORDER_BY reports `input_backlogged()` while the parked batches plus the producer's
+    unfinished tasks (at the average batch size) reach twice the fraction of every GPU, and the
+    task creator creates no further task for the producing pipeline until a sort task finishes;
+  - SORT_SAMPLE does the same for the sorted runs waiting to be partitioned, once the
+    boundaries exist (not with cross-rank boundaries);
+  - the pipelines of ORDER_BY and SORT_SAMPLE are scheduled ahead of their producers
+    (`runs_ahead_of_producer()`, see [Task Creator](task-creator.md#producer-backpressure));
+  - the unsorted input is spilled after the query's other batches (downgrade priority -50).
+- **Task.** The input is a plain `pipelineable_operator_data`: the task creator places it by data
+  locality and `prepare_for_processing()` brings spilled batches back to the GPU. `execute()`
+  splits the task's batches into sort units again from the real tables (row count, bytes of each
+  string column, same memory space, same cuDF column types), so the cuDF limits hold whatever
+  the batch metadata said. A unit of one batch is sorted directly; a larger unit is concatenated
+  (`gpu_merge_impl::concat()`), sorted, and the concatenation is freed.
+- **Memory.** A coalesced task holds its input batches, their concatenation, the sort's scratch
+  and the sorted copy. The first task of the pipeline reserves three times its input
+  (`no_history_peak_memory_estimate()`); later tasks use the pipeline's memory history. An
+  out-of-memory error is retried by the executor like any other task's.
+- **Counters and log.** `counters()` / `process_counters()` (`order_by_counters`) count tasks,
+  input batches, runs and concatenated bytes. When its pipeline finishes the operator logs one
+  line at INFO:
+
+```
+[order_by][stats] op=<id> coalesce=<0|1> max_run_bytes=… max_concurrent_bytes=… max_backlog_bytes=… tasks=… batches_in=… runs_out=… concat_bytes=…
+```
 
 ### `sirius_physical_top_n` — `TOP_N`
 **File:** `src/op/sirius_physical_top_n.hpp`
@@ -628,21 +711,303 @@ Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE �
 - `execute()` merges the pre-sorted sample batches, computes the boundaries, and moves to `DONE`. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
 - Once `DONE`, the operator falls back to default scheduling and passes through remaining batches unchanged.
 
+**Publishing the boundaries.** `DONE` makes SORT_PARTITION tasks start on every executor thread of every GPU, so the boundaries must be complete and readable everywhere at that point. `execute()` takes the boundary rows as a device table, from its own sample (`local_boundaries()`) or, in a distributed plan, from the cross-rank hook (`cross_rank_sort_boundaries::make()`, see [distributed-sirius.md](distributed-sirius.md)); `store_boundaries()` copies them to host memory (`cudf::pack` layout) and synchronises the stream before `DONE` is stored. `get_partition_boundaries(space, stream)` then gives each GPU its own device copy, uploaded on first use under a mutex and synchronised before it is returned; `clear_partition_boundaries()` frees each copy with its GPU current. A task never reads a table that lives on another GPU or that another stream may still be writing.
+
+**Partition count.** `compute_sort_partition_sizing()` (same header) decides it from the estimated input size:
+- `max_sort_partition_bytes` set: `ceil(data / value)`, nothing else applies.
+- `sort_partition_auto_sizing = true` (default), the largest of:
+  - memory: `ceil(data / (max_sort_partition_memory_fraction x GPU memory limit))` while the data and its sorted copy fit the GPUs (`2 x data <= limit x GPUs`); beyond that `ceil(data / (0.10 x limit))`, because runs are then spilled before the merge starts and smaller partitions keep more of each merge on the GPU;
+  - where partitions take the one-shot merge (`sort_merge_mode = 'one_shot'`, or `auto` with partitions under its one-shot threshold), `ceil(rows / (0.75 x 2^31))`, so that the partition stays a valid cuDF table;
+  - with `sort_merge_mode = 'windowed'` on more than one GPU, one partition per executor thread of a GPU (at most 4), as long as partitions stay at or above 2 GiB and the pieces of an input batch at or above 4 MiB;
+  - with `sort_merge_mode = 'one_shot'`, `ceil(data / (limit / ((3 + 8 / row width) x 2)))`, because a one-shot merge needs 3 x partition bytes + 8 bytes per row on the GPU.
+
+  In `auto` mode the count is then lowered, if needed, to the largest one whose partitions are at least 1.2 times the one-shot threshold of `merge::choose_route`, unless the one-shot merges of the smaller partitions (one per executor thread) fit the GPU limit together. Several partitions just under the threshold would otherwise each be merged whole at the same time and run out of GPU memory.
+- `sort_partition_auto_sizing = false`: the previous rule, `ceil(data / (fraction x GPU memory free at that moment))`.
+
+The decision is logged at INFO as `[sort_sample][sizing] partitions=... rule=...`.
+
 ### `sirius_physical_sort_partition` — `SORT_PARTITION`
 **File:** `src/op/sirius_physical_sort_partition.hpp`
 
-Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to the sample operator via `_sample_op`.
+Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to the sample operator via `_sample_op` and asks it for the boundaries on the GPU of each batch (`get_partition_boundaries(space, stream)`).
 
 Each range slice is published to its original repository partition, retaining indices even when
 intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.
 
+In one process SORT_SAMPLE runs in the same pipeline, so the boundaries exist before any batch
+arrives. After a distributed plan's range exchange it does not, and the exchange's source holds
+its batches until the boundaries are stored (see [distributed-sirius.md](distributed-sirius.md));
+a batch that arrives before them is an error, not a pass-through to partition 0.
+
 ### `sirius_physical_merge_sort` — `MERGE_SORT`
-**File:** `src/op/sirius_physical_merge_sort.hpp`
+**Files:** `src/op/sirius_physical_merge_sort.hpp`, `src/op/sirius_physical_merge_sort.cpp`, `src/op/merge/` (`merge_config`, `windowed_merge_input`, `windowed_merge`, `bounded_kway_merge`, `merge_chunk_position`, `detail/`)
 
-Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way merge via cuDF).
+Merges the sorted runs of each range partition into the query's output order. Every batch that
+SORT_PARTITION publishes to a partition is one sorted run. The operator starts after the
+SORT_PARTITION producer finishes (FULL barrier) and skips empty partitions.
 
-- Custom `get_next_task_input_data()`: drains all batches from the next nonempty range partition per call after the SORT_PARTITION producer finishes. Empty ranges are skipped.
-- Tracks `_current_partition_index` under a mutex and uses the range index as the merged output batch position.
+#### Routes
+
+A partition takes one of two routes, chosen when its first task is created (`arm_partition()`):
+
+| Route | Task input | Behaviour |
+|-------|------------|-----------|
+| one-shot | `pipelineable_operator_data` holding every batch of the partition | One task pops the whole partition, uploads it to the GPU and merges it with `gpu_merge_impl::merge_order_by()` (cuDF multi-way merge). Peak memory is the partition plus its merged output. |
+| windowed | `merge::windowed_merge_input` holding cursors, not batches | A chain of tasks, one at a time per partition, reads the runs in bounded windows. The runs stay in the input repository on whatever tier they are in. Peak memory is a few windows per run. |
+
+The `sort_merge_mode` setting selects the route (see
+[Sort Merge](configuration.md#sort-merge)):
+
+| `sort_merge_mode` | Route |
+|-------------------|-------|
+| `one_shot` | Always one-shot. Output position is the partition index. |
+| `windowed` | Windowed, unless the partition is one of the exceptions below. |
+| `auto` (default) | Windowed when any batch of the partition is not on the GPU tier, when the partition's bytes plus its output (the same bytes again) exceed `sort_merge_one_shot_max_fraction` of the device's total GPU memory, or when the one-shot merges of the sort do not fit the device together (below). Otherwise one-shot. |
+
+A partition under the threshold is not merged alone: merge tasks of several partitions run at the
+same time, next to the runs of the partitions that wait. `merge::one_shot_peak_bytes()` adds up
+what the device then holds: its share of the runs of the whole sort (the bytes of every partition,
+divided by the number of GPUs) plus, for the largest partitions under the threshold, one per
+merge task the device runs at once, twice the partition's bytes and 8 bytes per row for the merge
+temporaries and the output. When that exceeds the device's total GPU memory, the partitions under
+the threshold are windowed too. So every partition of a sort larger than the device is windowed,
+whether or not its own runs are on the GPU when it is armed, and the route of a partition does
+not depend on which runs a downgrade happened to move. `sort_merge_disabled_rules` bit 512
+switches this off.
+
+In `auto` and `windowed` mode these partitions take the one-shot route:
+
+- a fetched column (a sort key or an output column) is nested (LIST or STRUCT), or any column is
+  nested and the partition has more runs than the fan-in cap, because an intermediate pass rewrites
+  every column;
+- late materialization is installed on the operator (`has_late_materialization()`);
+- no batch exposes its column types (for a compressed batch, its header cannot be parsed), a batch
+  has no row count, the partition has zero rows, or a sort key is not a plain column reference.
+
+A one-shot partition in these modes sets `set_materialize_on_gpu(true)` on its input, which
+overrides the port's residency policy for that task (see
+[Input Residency and Downgrade Priority](memory-management.md#input-residency-and-downgrade-priority)).
+An operator that never receives settings through `set_merge_settings()` behaves as `one_shot`;
+the plan generator installs the query's settings.
+
+The sizes of a windowed partition (`merge::derived_merge_config`: window rows, output target,
+fan-in, one-shot fraction) are derived once at arming from the settings, the device's GPU memory and
+the partition's run count and row width. `set_device_budget_provider()` supplies the GPU memory and
+task concurrency. The plan generator installs `make_device_budget_provider()`, which reports the
+GPU memory space holding most of the partition's bytes (the smallest GPU space when no run is on a
+GPU) and the configured GPU executor thread count. The GPU memory it reports is the space's free
+bytes plus the bytes reserved by tasks in flight (`get_available_memory() +
+get_total_reserved_memory()`): the derivation already divides it among the concurrent tasks, so
+partitions of a device get the same sizes whichever task is running when each is armed. Bytes
+allocated outside a reservation (resident batches, kept window buffers) stay subtracted. A directly
+constructed operator has no
+provider: it uses the majority space (or the last one it saw, or 8 GiB with a warning when it has
+seen none) and the default GPU executor width.
+
+Two rules apply to that budget at arming:
+
+- **Floor.** The derivation uses at least a quarter of the device's GPU memory
+  (`merge::kBudgetFloorFraction`). The runs are spilled first, so on a full device the free bytes
+  at arming are whatever a downgrade had freed at that instant; without the floor the same query
+  ran with windows several times smaller or larger from one execution to the next.
+- **Divisor.** The budget is divided by the partitions that can be open, not by the executor
+  width: `clamp(partitions that hold batches or are armed, 1, executor threads)`. The same number
+  is the open-partition cap (below), so two partitions under sixteen threads are sized, and
+  opened, as two.
+
+#### Continuation tasks
+
+`_partitions` maps each partition to a `partition_merge_state`, guarded by `_drain_mutex`. It holds
+one `run_state` per run, the next output chunk index and an `in_flight` flag.
+
+- **Cursors.** A run is a list of batch ids in key order (`merge::merge_run`): one batch, or the
+  batches of an intermediate run. A `merge::merge_input_cursor` is the run plus the next unread
+  `(batch, row)`. Cursors hold no device state.
+- **Peek without pop.** Arming reads batch ids, row counts, sizes, tiers and column types through
+  `get_batch_ids()` and `get_data_batch_by_id()`. The batches are not popped and the task does not
+  subscribe them, so they stay spillable while tasks are queued and running. Zero-row batches are
+  popped at arming.
+- **Arming never waits for a batch lock under `_drain_mutex`.** `on_input_batch_pushed()` records
+  each run's rows and bytes when it arrives, and arming uses `try_to_read_only()`. A run that is
+  locked by a tier move counts as off the GPU. When such a run was never sized, or no readable
+  batch exposes the schema, the partition stays unarmed (`arm_deferred`): a committing task makes
+  it armable again, and when no task is in flight the task-creation thread waits for that batch
+  outside the mutex and arms again.
+- **One task per partition at a time.** Each task starts from the cursors the previous one
+  committed. Different partitions run in parallel. `get_next_task_hint()` returns READY only when
+  some partition has runs and no task in flight, and no hint otherwise.
+- **One positioned chunk per task.** A task runs one `merge::windowed_merger::run()`, which
+  returns one table of about `output_target_bytes`. A final-pass task fetches the output columns
+  plus the keys they lack, drops the key-only columns and publishes one batch.
+- **One merger per task chain.** The `windowed_merger` is kept in the partition's state between
+  tasks (`partition_merger`: the merger, its cursors and the run ids they belong to), so rows a
+  task read into a window buffer but did not emit are not read again by the next task. A task
+  moves it out under `_drain_mutex`, runs it without the mutex, and puts it back at commit. A new
+  merger is built when the task's GPU memory space or window sizes differ (an OOM shrink), when the
+  run set changes (an intermediate pass starts or ends), and after any failed task. A run that
+  ends before the others does not force a rebuild. Between tasks the merger holds references to
+  the unread batches and its window buffers stay allocated on the GPU
+  (see [Windowed Merge Memory](memory-management.md#windowed-merge-memory)).
+- **Open partition cap.** A windowed partition is *open* while it has a task in flight or keeps
+  its merger. A kept merger's window buffers are in no repository, so they cannot be spilled, and
+  the window budget (`derive_merge_config()`) assumes one merger per concurrent task of a device.
+  `get_next_task_input_data()` therefore plans a task for a partition that holds no merger (its
+  first task, or the first task of a new pass) only while fewer partitions are open than the
+  `device_budget::concurrent_tasks` the partition was sized with (`at_open_partition_cap()`);
+  otherwise it skips the partition, and `get_next_task_hint()` does not report it. Open partitions
+  are always served, so they finish, and the commit that closes one schedules the operator again,
+  which opens the next waiting partition. The count is per device, like the budget: an open
+  partition counts on the device of its merger or running task, and one whose first task has not
+  started counts on every device, because it may land on any. Arming is not delayed (it allocates
+  nothing on the GPU), and one-shot partitions are neither counted nor held back: they keep no
+  merger and their inputs are covered by their task's reservation.
+- **Positions.** The output position is `(partition << 32) | chunk`
+  (`merge::make_merge_chunk_position()`), which orders chunks by partition, then by chunk. It
+  throws when either part reaches 2^32. In `auto` and `windowed` mode one-shot partitions use the
+  same encoding with chunk 0. In `one_shot` mode the position is the partition index. In a
+  distributed plan the position travels with the batch through the gather to rank 0
+  (see "Order through the final gather" in [distributed-sirius.md](distributed-sirius.md)).
+- **Commit → pop → `schedule(this)`.** After the merge returns, the task calls
+  `windowed_merger::rebase_consumed()`, which drops the merger's references to the batches read to
+  the end and rebases its cursors to the remaining ones. It then commits under `_drain_mutex`: it
+  pops those batches (which frees them), copies the cursors to the partition's runs by run id,
+  advances the chunk index, returns the merger to the partition and clears `in_flight`. It
+  then calls `task_creator::schedule(this)` when some partition can produce a task, because nothing
+  else asks an operator for its next task when one of its own tasks finishes (see
+  [Self-Rescheduling Operators](task-creator.md#self-rescheduling-operators)).
+- **Retry.** The partition's cursors change only at commit. A task that fails (for example on OOM)
+  leaves them and `in_flight` unchanged and destroys the merger it held, which frees its window
+  buffers. The rescheduled task builds a new merger and replays from the same cursors,
+  possibly with smaller windows (see [Shrink Before Retry](memory-management.md#shrink-before-retry)).
+  The operator does not check for progress itself: `windowed_merger::run` returns no rows only
+  when every cursor is exhausted and throws `internal_exception` on a round that makes no progress.
+- **Counters.** `merge_sort_counters` counts the partitions armed on each route, the windowed and
+  intermediate tasks, the mergers built and the summed `merge::merge_round_stats`. `counters()`
+  reads one operator's; `process_counters()` / `reset_process_counters()` are process-wide, for
+  tests and diagnostics (they are not per query).
+
+#### Bounded k-way merge round
+
+`windowed_merger::run()` repeats rounds until the accumulated output reaches
+`output_target_bytes` (counted with `cudf::table::alloc_size()`, on the host) or every cursor is
+exhausted, then concatenates the rounds into one table.
+With `n` = `window_rows`, each round does the following:
+
+1. **Windows.** Every run that is not exhausted gets a window of at most `n` rows of its current
+   batch, starting at the cursor. A window never spans two batches of a run.
+   - A `gpu_table_representation` batch in the task's memory space is windowed as offset column
+     views over a read-locked table. Nothing is copied. The lock is held until the batch is
+     finished or `run()` returns.
+   - Any other batch is read into a `detail::window_buffer`: two preallocated slots per run, of
+     `min(n, largest remaining batch of the run)` rows, with each STRING column's chars sized from
+     that column's own bytes per row in the batch metadata. Consuming rows only moves a start
+     offset. When fewer rows are left than half of what the last refill held, `consume()` copies
+     the unread tail to the front of the other slot and `refill()` appends rows after it with
+     `cucascade::read_rows_into`, under a read lock held only for that refill (see
+     [Row-Range Readers](memory-management.md#row-range-readers)). A row is copied at most once.
+     A row that does not fit a STRING slot grows the slots (`window_row_too_large_error` is
+     handled by the merger). The buffer is freed when the run ends or its batch is found on the
+     GPU.
+   - A window's `null_count()` is an upper bound (exact only when 0): the kernel reads the masks.
+2. **Safe bound.** A window is *truncated* when its run has unread rows beyond it. The round emits
+   `target = min(n, r_safe, Σ window rows)` rows, where `r_safe` is the smallest, over the
+   truncated windows, of the rank of the window's last row in the combined order, plus one
+   (`detail::safe_target()`). Every emitted row therefore orders at or before every unread row, so
+   the emitted prefix is final.
+3. **Co-rank.** `detail::corank_split()` finds, for an output rank `r`, how many rows of each
+   window are among the first `r` rows of the merged order. It is evaluated at every tile boundary
+   (`detail::bounded_merge_tile_rows()`: 2048 output rows, or 4096 with the dense launch shape
+   below) and at `target`. With a specialised comparator and a fan-in of at most 32 one warp per
+   rank keeps a lane per input and its bounds in registers; otherwise the general kernel runs.
+4. **Tile merge.** `detail::tile_merge()` merges each tile independently and writes an
+   `(input, row)` gather map of `target` entries. A tile is split into sub-tiles, one thread
+   each with a tournament tree in shared memory; the split is chosen from the tile count, the
+   device's SM count and the shared memory the fan-in needs: a block uses at most 40 KiB, and at
+   most 32 KiB when there are more blocks than SMs, because above that fewer blocks fit an SM
+   (`detail::tile_merge_launch_shape()`). The thread density is a policy
+   (`detail::tile_merge_policy_for()`): 256 merge threads per SM in blocks of at most 64 threads
+   by default, and 384 per SM in blocks of up to 128 with 4096-row tiles where that was measured
+   to be faster (a specialised first key, a fan-in of at most 32, compute capability 10.x). It
+   accepts at most `kMaxKwayMergeInputs` (4096) windows; the configured fan-in is clamped to that.
+5. **Gather.** `detail::gather_kway()` copies the selected rows of all fetched columns, with null
+   masks and STRING data, into the round's output table. The null counts, the STRING sizes and
+   the consumed counts come back to the host in one read. A STRING column of short strings is
+   copied one thread per string; a long string among them sends the column to cuDF's batched
+   copy (one more wait).
+6. **Advance.** The co-ranks at `target` are the rows consumed from each window. Cursors advance by
+   them and the window buffers drop the consumed rows.
+
+`bounded_kway_merge()` never materializes the `k × n` window rows, and it breaks ties by window
+index and then row, so the result matches a stable merge. Nested key types are not supported.
+The key comparator copies the column views of all windows to the device in one asynchronous
+copy, so a call waits on the stream twice (the target, then the gather's read-back), three times
+with a STRING column, whatever the fan-in.
+
+When the key is a single fixed-width column (integers, BOOL8, floating point, timestamps,
+durations, decimals), the three kernels compare it through `kway_fixed_key_device_view<T>`: one small entry
+per window (data pointer, null mask, bit offset), a load of the storage type and one unsigned
+compare of the normalised value, instead of the column views and the type dispatch. The order is
+the generic comparator's, tie order included (nulls by the null order, NaN equal to NaN and after
+every value, -0.0 equal to 0.0). Every other key (STRING, several key columns) uses the generic
+comparator; `specialized_keys=2` also specialises a fixed-width first column of a multi-column
+key, with a tie on it continuing in the generic comparison from the second column on (measured
+on INTEGER + BIGINT + VARCHAR keys: 2 to 7% faster at fan-in 4, 8 and 64, 2% slower at 16, so it
+is off by default).
+`detail::kway_tuning` (environment `SIRIUS_KWAY_TUNING`, for example
+`specialized_keys=0;warp_corank=0;baseline_shape=1`) switches the specialised view, the one-warp
+co-rank and the launch-shape rule off for A/B measurements; no switch changes a result.
+
+#### Fan-in cap and intermediate runs
+
+One task reads at most `fan_in` runs: the largest count whose windows fit the task budget with `n`
+at its 65,536-row floor, capped by `sort_merge_max_fan_in` and never below 2.
+
+- With more runs than the cap, `merge::plan_pass()` selects the smallest runs by bytes for an
+  **intermediate pass**: `fan_in` of them, except that with `R` runs and `(R - 1) mod (fan_in - 1)
+  != 0` the first merge takes `((R - 2) mod (fan_in - 1)) + 2`. After that one short merge every
+  later merge and the final pass read exactly `fan_in` runs (the k-ary Huffman plan, which
+  writes the fewest rows; without it the shortfall lands in the final pass, behind a merge that
+  rewrote nearly every row). Its tasks fetch every column, add their output batches to the same
+  partition of the input repository, and publish nothing downstream.
+- The selected runs stay in the pass until they are exhausted. The batches the pass wrote then
+  join the partition as one run, and the next pass is planned.
+- With at most `fan_in` runs left, tasks are **final-pass** tasks and publish positioned chunks.
+- Intermediate runs are ordinary repository batches: they can be spilled like the original runs.
+
+#### Convert-once fallback
+
+A batch whose representation has no row-range reader, or whose read throws
+`row_range_unsupported_error`, is converted once to the GPU tier in the task's memory space
+(`detail::convert_run_batch_to_gpu()`), under the batch's exclusive lock. It stays in the
+repository and is then windowed as a GPU batch. A Simpatico-compressed batch takes this path only
+when its reader refuses it (a projection, a filtered view, or a plan that cannot be decoded by
+chunk). The task input adds the largest batch without a reader to its memory estimate; a batch
+whose reader refuses it only at read time is not in the estimate (see
+[Window reservations](memory-management.md#window-reservations)). If a downgrade moves the batch
+again before the merger re-locks it, the merger retries, three attempts in all, then throws.
+
+#### Statistics line
+
+Each MERGE_SORT logs one line per query at INFO, built by `merge::format_merge_sort_stats`
+(`src/op/merge/merge_sort_stats_log.hpp`):
+
+```text
+[merge_sort][stats] op=<id> windowed_partitions=… one_shot_partitions=… windowed_tasks=… intermediate_tasks=… mergers_built=… rounds=… rows_out=… round_rows_min=… round_rows_max=… refill_rows=… refill_bytes=… refill_bytes_host=… refill_bytes_disk=… refill_bytes_compressed=… runs_read_compressed=… window_growths=… compacted_rows=… fallback_conversions=… shrinks=…
+```
+
+- It is logged at the commit of the operator's last task. An operator that never gets there (no
+  input, or a pipeline that finished early under a LIMIT) logs it from `on_finalize_operator()`
+  with the counters so far. A flag under `_drain_mutex` keeps it to one line.
+- `refill_bytes_host`, `_disk` and `_compressed` split `refill_bytes` by where a refill read
+  from. A GPU-tier batch read through a reader counts in `refill_bytes` only.
+- `runs_read_compressed` counts (run, windowed task) pairs, not distinct runs.
+- `fallback_conversions` counts batches converted whole to the GPU tier: those no row-range
+  reader can serve, and the compressed batches of at most two windows that the merge decodes
+  whole (`compression.spill_whole_decode_max_bytes`). The rows of the latter are sliced in
+  place, so they are in none of the `refill_*` counters and not in `runs_read_compressed`.
+- `shrinks` counts windowed inputs that shrank their window for an OOM retry.
+- The keys and their order are the contract with `test/sort_performance/bench_metrics.py`
+  (`test_bench_metrics_source_formats.py` fails when they drift): append new keys at the end.
 
 ### `sirius_physical_grouped_aggregate_merge` — `MERGE_GROUP_BY`
 **File:** `src/op/sirius_physical_grouped_aggregate_merge.hpp`
@@ -703,6 +1068,39 @@ Final sink that materializes query results into a `ColumnDataCollection`. The GP
 The materialized collector builds local collections in parallel. For positioned input, it combines
 them by ascending position in `get_result()`, independently of task completion order.
 
+### `sirius_physical_discard_sink` — `DISCARD_SINK`
+**Files:** `src/op/sirius_physical_discard_sink.hpp`, `src/op/discard_copy_function.hpp`
+
+Runs a query without returning or keeping its rows. It exists for benchmarks and validation
+(`test/sort_performance/`), and is reached only through the `sirius_discard` COPY format:
+
+```sql
+COPY (SELECT ... ORDER BY k) TO '/dev/null' (FORMAT sirius_discard);
+COPY (SELECT ... ORDER BY k) TO 'ignored' (FORMAT sirius_discard, check_order true);
+```
+
+The path is never opened. The result is COPY's: one BIGINT row, the row count. Every other COPY
+format stays on DuckDB, and with `gpu_execution = false` (or after a runtime fallback) DuckDB's
+copy function for the format counts and drops the rows on the CPU.
+
+- **Plan.** `query → DISCARD_SINK → UNGROUPED_AGGREGATE(SUM) → MERGE_AGGREGATE → PROJECTION`. The
+  sink emits one row per task (the task's row count, at the input's position), so its declared
+  output type is one BIGINT, not the schema it drops (`input_types()`).
+- **Streaming input.** `input_barrier_for` returns `PIPELINE` for any producer, so each batch is
+  dropped as it arrives and the sort's output never accumulates.
+- **Counts batches where they are.** `input_residency_policy` returns
+  `{.materialize_inputs_on_gpu = false, .downgrade_priority = -100}`: a batch that spilled while
+  it waited is counted from its metadata, not read back, and the sink's repository is the last
+  one of the query the downgrade sweep visits. The count row is allocated in the task's GPU
+  memory space, which the sink's task input records at `prepare_for_processing`.
+- **`check_order`** is a validation mode. It is on only when the query's root is an ORDER BY
+  whose keys are all plain output columns; otherwise the planner logs the reason at DEBUG and
+  leaves it off. With it the input is materialized on the GPU: each batch is checked with
+  `cudf::is_sorted`, and the first and last key rows of each task are copied to the host. When
+  the pipeline finishes (`on_finalize_operator` → `finish()`), the tasks are walked in position
+  order and every seam is compared with a host comparator that follows cudf's row order.
+- `finish()` logs `[discard_sink] rows=… bytes=… order_violations=…` at INFO, once.
+
 ### `sirius_physical_empty_result` — `EMPTY_RESULT`
 **File:** `src/op/sirius_physical_empty_result.hpp`
 
@@ -727,7 +1125,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | TOP_N | Sort | Order + limit |
 | SORT_SAMPLE | Sort | Sample + boundary computation |
 | SORT_PARTITION | Sort | Range partition by boundaries |
-| MERGE_SORT | Sort | `gpu_merge_impl::merge_order_by()` |
+| MERGE_SORT | Sort | `gpu_merge_impl::merge_order_by()` (one-shot), `merge::windowed_merger` (windowed) |
 | UNGROUPED_AGGREGATE | Agg | `gpu_aggregate_impl::local_ungrouped_aggregate()` |
 | HASH_GROUP_BY | Agg | `gpu_aggregate_impl::local_grouped_aggregate()` |
 | MERGE_AGGREGATE | Agg | Merge ungrouped partitions |
@@ -747,3 +1145,4 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | RESULT_COLLECTOR | Result | Final result materialization |
 | EMPTY_RESULT | Result | Empty result set |
 | STREAMING_SINK | Result | Terminal operator of a streaming fragment |
+| DISCARD_SINK | Result | Counts and drops each batch (`FORMAT sirius_discard`); optional `cudf::is_sorted` order check |

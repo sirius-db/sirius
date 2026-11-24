@@ -22,7 +22,6 @@
 
 #include <catch.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 
@@ -43,38 +42,12 @@ class producer_pipeline : public sirius::pipeline::sirius_pipeline {
   bool finished = false;
 };
 
-// Metadata-only scheduler tests must not initialize the default backend's CUDA pinned pool.
-class no_io_backend : public cucascade::idisk_io_backend {
- public:
-  void write(std::filesystem::path const&,
-             void const*,
-             std::size_t,
-             std::size_t,
-             ::cuda::stream_ref) override
-  {
-    throw std::logic_error("Unexpected GPU write");
-  }
-  void read(
-    std::filesystem::path const&, void*, std::size_t, std::size_t, ::cuda::stream_ref) override
-  {
-    throw std::logic_error("Unexpected GPU read");
-  }
-  void write(std::filesystem::path const&, void const*, std::size_t, std::size_t) override
-  {
-    throw std::logic_error("Unexpected host write");
-  }
-  void read(std::filesystem::path const&, void*, std::size_t, std::size_t) override
-  {
-    throw std::logic_error("Unexpected host read");
-  }
-};
-
 struct fixture {
   // Metadata-only disk batches exercise scheduling and slicing without CUDA or actual disk I/O.
-  cucascade::memory::memory_space space{
-    cucascade::memory::disk_memory_space_config{
-      .disk_id = 0, .memory_capacity = 1024 * 1024, .mount_paths = "/tmp"},
-    std::make_shared<no_io_backend>()};
+  // The space has no io context, so any disk I/O would first have to install one (see
+  // memory_space::get_or_init_io_context).
+  cucascade::memory::memory_space space{cucascade::memory::disk_memory_space_config{
+    .disk_id = 0, .memory_capacity = 1024 * 1024, .mount_paths = "/tmp"}};
   duckdb::LogicalComparisonJoin logical;
   std::unique_ptr<sirius_physical_nested_loop_join> join;
   std::array<std::shared_ptr<producer_pipeline>, 2> producers;

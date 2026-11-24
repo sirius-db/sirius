@@ -17,11 +17,13 @@
 #include "compression_converters.hpp"
 
 #include "compressed_disk_representation.hpp"
+#include "compressed_payload_sources.hpp"
 #include "compressed_representation.hpp"
 #include "compressed_scan.hpp"
 #include "cuda/device_health.hpp"
 #include "device_compressed_blob.hpp"
 #include "spill_compression.hpp"
+#include "spill_io.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
@@ -38,7 +40,6 @@
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -52,6 +53,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <new>
 #include <numeric>
 #include <optional>
@@ -146,7 +148,7 @@ std::unique_ptr<cucascade::idata_representation> to_gpu_representation(
 // the byte transport (how `fetch` pulls the payload) differs between them.
 std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_gpu(
   std::span<const std::uint8_t> header,
-  simpatico::payload_fetch_fn const& fetch,
+  simpatico::payload_fetch_fn fetch,
   const std::optional<std::vector<std::size_t>>& selected_indices,
   decompression_pushdown_scan const* scan,
   decode_visibility_mask const& keep_mask,
@@ -173,6 +175,9 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   if (!read_error.empty()) {
     throw std::runtime_error("[compression_converters] reconstruct failed: " + read_error);
   }
+  // The leaves are filled: whatever the fetch holds to serve them (a device copy of the
+  // payload, for a disk batch) is not needed by the decode.
+  fetch = nullptr;
 
   auto* const gpu_mr = space.get_memory_resource_of<cucascade::memory::Tier::GPU>();
   if (!gpu_mr) {
@@ -385,18 +390,59 @@ std::unique_ptr<cucascade::idata_representation> decompress_disk_to_gpu(
   nvtx_scoped_range nvtx_range{"sirius::compression::disk_to_gpu"};
   auto const& rep   = source.cast<compressed_disk_representation>();
   auto const& space = gpu_decode_space(target_memory_space, "disk-to-GPU decompression", stream);
-  auto& backend     = rep.get_memory_space().get_io_backend();
-
+  rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{space.get_device_id()}};
+  auto ctx = compression::detail::spill_context(rep.get_memory_space());
+  if (!ctx->supports_device_read()) {
+    throw std::logic_error("compressed spill: DISK context cannot read device memory");
+  }
+  auto object = ctx->open_io_object(rep.path());
   std::vector<std::uint8_t> header(rep.header_bytes());
-  backend.read(rep.path(), header.data(), header.size(), 0);
-  // Read each compressed leaf buffer from the file straight into device memory.
+  // Cache-unaware primitives: spill files must not populate or be served by a scan cache.
+  compression::detail::check_spill_bytes(
+    ctx->host_read_io(*object, 0, header.size(), header.data()), header.size());
+
+  // The payload is read once, whole, with one vectored request that spreads over the I/O reactors,
+  // and the leaf buffers are then filled from that copy device to device. Reading each buffer on
+  // its own costs a request and a wait per buffer, one after the other, at unaligned offsets.
+  // The copy is freed before the decode, so the conversion's peak is unchanged: two compressed
+  // sizes while the leaves are filled stay below the compressed plus the decoded size that
+  // follows. Without the memory for it the buffers are read one by one, as before.
+  std::shared_ptr<simpatico::payload_source> resident;
+  try {
+    resident = compression::load_resident_payload(
+      rep, *ctx, *object, stream, rmm::mr::get_current_device_resource_ref());
+  } catch (std::bad_alloc const& e) {
+    static_cast<void>(cudaGetLastError());
+    SIRIUS_LOG_DEBUG(
+      "[compression_converters] no device memory for a {} byte payload copy ({}); reading its "
+      "buffers one by one",
+      rep.get_size_in_bytes(),
+      e.what());
+  }
+
+  // Every fetch drains before reconstruction can release its destination buffer, including
+  // failures. Retain the context and the one opened object throughout all decode callbacks.
   simpatico::payload_fetch_fn fetch =
-    [&backend, &rep](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
-      backend.read(rep.path(), dst, sz, rep.header_bytes() + off, s);
-    };
+    resident != nullptr
+      ? simpatico::payload_fetch_fn{[resident](std::uint64_t off,
+                                               std::size_t sz,
+                                               void* dst,
+                                               ::cuda::stream_ref s) {
+          resident->read_to_device(off, sz, dst, rmm::cuda_stream_view{s.get()});
+        }}
+      : simpatico::payload_fetch_fn{
+          [ctx, object, header_bytes = rep.header_bytes()](
+            std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
+            compression::detail::spill_request request{ctx->device_read_async_io(
+              *object, header_bytes + off, sz, static_cast<std::uint8_t*>(dst), s)};
+            compression::detail::check_spill_bytes(request.get(), sz);
+          }};
+  // The fetch owns the copy from here on, so it is freed with the fetch (stream-ordered, behind
+  // the copies out of it) once the leaves are filled.
+  resident.reset();
 
   return reconstruct_and_decompress_to_gpu(
-    header, fetch, std::nullopt, nullptr, decode_visibility_mask{}, space, stream);
+    header, std::move(fetch), std::nullopt, nullptr, decode_visibility_mask{}, space, stream);
 }
 
 // Whether a decode failure is the device running out of memory or streams, which

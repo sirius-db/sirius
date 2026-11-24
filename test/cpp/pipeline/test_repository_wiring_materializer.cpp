@@ -28,10 +28,12 @@
 #include <pipeline/repository_wiring.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 
+#include <string>
 #include <string_view>
 #include <vector>
 
 using sirius::op::MemoryBarrierType;
+using sirius::op::port_residency_policy;
 using sirius::op::sirius_physical_operator;
 using sirius::op::sirius_physical_partition;
 using sirius::op::sirius_physical_right_delim_join;
@@ -81,6 +83,24 @@ std::shared_ptr<sirius_pipeline> build_pipeline(
   pipeline->set_pipeline_id(pipeline_id);
   return pipeline;
 }
+
+// Opts its "build" port into on-demand residency and downgrade-first; every other port keeps
+// the default policy. Records each port id it is asked about.
+class residency_test_operator : public sirius::op::test_physical_operator {
+ public:
+  using sirius::op::test_physical_operator::test_physical_operator;
+
+  static constexpr port_residency_policy build_policy{.materialize_inputs_on_gpu = false,
+                                                      .downgrade_priority        = 100};
+
+  port_residency_policy input_residency_policy(std::string_view port_id) const override
+  {
+    queried_port_ids.emplace_back(port_id);
+    return port_id == "build" ? build_policy : port_residency_policy{};
+  }
+
+  mutable std::vector<std::string> queried_port_ids;
+};
 
 }  // namespace
 
@@ -197,7 +217,7 @@ TEST_CASE("materialize: explicit source op (5-arg-style) records fanout on the s
 }
 
 TEST_CASE("materialize: multiple wirings to the same destination attach distinct ports",
-          "[repository_wiring][materializer]")
+          "[repository_wiring][materializer][residency_policy]")
 {
   wiring_test_env env;
   cucascade::shared_data_repository_manager mgr;
@@ -239,6 +259,90 @@ TEST_CASE("materialize: multiple wirings to the same destination attach distinct
   CHECK(default_port->src_pipeline == probe_pipeline);
   CHECK(build_port->src_pipeline == build_pipeline_handle);
   CHECK(default_port->repo != build_port->repo);  // Each port has its own repo.
+
+  // An operator that does not override input_residency_policy wires with the default policy.
+  for (auto* port : {default_port, build_port}) {
+    CHECK(port->residency == port_residency_policy{});
+    CHECK(port->repo->get_downgrade_priority() == 0);
+  }
+}
+
+TEST_CASE("materialize: opted-in port gets the operator's residency policy and repo priority",
+          "[repository_wiring][materializer][residency_policy]")
+{
+  wiring_test_env env;
+  cucascade::shared_data_repository_manager mgr;
+
+  sirius::op::test_physical_operator probe_sink;
+  auto probe_pipeline = build_pipeline(env, &probe_sink, {}, /*pipeline_id=*/0);
+
+  sirius::op::test_physical_operator build_sink;
+  auto build_pipeline_handle = build_pipeline(env, &build_sink, {}, /*pipeline_id=*/1);
+
+  residency_test_operator join_op;
+  sirius::op::test_physical_operator dest_sink;
+  auto dest_pipeline = build_pipeline(env, &dest_sink, {&join_op}, /*pipeline_id=*/2);
+
+  std::vector<repository_wiring> wirings = {
+    {std::string_view{"default"},
+     MemoryBarrierType::PARTIAL,
+     &probe_sink,
+     probe_pipeline,
+     dest_pipeline},
+    {std::string_view{"build"},
+     MemoryBarrierType::FULL,
+     &build_sink,
+     build_pipeline_handle,
+     dest_pipeline},
+  };
+
+  env.assign_ids();
+
+  materialize_repository_wiring(wirings, mgr);
+
+  auto* default_port = join_op.get_port("default");
+  auto* build_port   = join_op.get_port("build");
+  REQUIRE(default_port != nullptr);
+  REQUIRE(build_port != nullptr);
+
+  CHECK(build_port->residency == residency_test_operator::build_policy);
+  CHECK(build_port->repo->get_downgrade_priority() == 100);
+
+  CHECK(default_port->residency == port_residency_policy{});
+  CHECK(default_port->repo->get_downgrade_priority() == 0);
+
+  // The policy is read once per port, with the wiring's exact port id.
+  CHECK(join_op.queried_port_ids == std::vector<std::string>{"default", "build"});
+}
+
+TEST_CASE("materialize: empty operators applies the destination sink's residency policy",
+          "[repository_wiring][materializer][residency_policy]")
+{
+  wiring_test_env env;
+  cucascade::shared_data_repository_manager mgr;
+
+  sirius::op::test_physical_operator source_sink;
+  auto src_pipeline = build_pipeline(env, &source_sink, {}, /*pipeline_id=*/0);
+
+  // No intermediate operators: the sink is the destination, so its policy applies.
+  residency_test_operator dest_sink;
+  auto dest_pipeline = build_pipeline(env, &dest_sink, /*operators=*/{}, /*pipeline_id=*/1);
+
+  std::vector<repository_wiring> wirings = {{std::string_view{"build"},
+                                             MemoryBarrierType::FULL,
+                                             &source_sink,
+                                             src_pipeline,
+                                             dest_pipeline}};
+
+  env.assign_ids();
+
+  materialize_repository_wiring(wirings, mgr);
+
+  auto* port = dest_sink.get_port("build");
+  REQUIRE(port != nullptr);
+  CHECK(port->residency == residency_test_operator::build_policy);
+  CHECK(port->repo->get_downgrade_priority() == 100);
+  CHECK(dest_sink.queried_port_ids == std::vector<std::string>{"build"});
 }
 
 TEST_CASE("materialize: delim join destinations use the generic path with no sibling side effects",

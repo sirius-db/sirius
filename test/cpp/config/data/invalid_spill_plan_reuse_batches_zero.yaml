@@ -1,0 +1,3 @@
+sirius:
+  compression:
+    spill_plan_reuse_batches: 0

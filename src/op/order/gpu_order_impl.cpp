@@ -17,10 +17,18 @@
 #include "op/order/gpu_order_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "op/order/encoded_sort_order.hpp"
 
 #include <cudf/sorting.hpp>
+
+#include <cstddef>
 namespace sirius {
 namespace op {
+
+namespace {
+/// The encoded sort is used while its working memory is at most 1/N of the memory space.
+constexpr std::size_t kEncodedSortMaxSpaceFraction = 4;
+}  // namespace
 
 std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
   const cucascade::read_only_data_batch& input,
@@ -30,7 +38,8 @@ std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
   const std::vector<int>& projections,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  bool sort_key_encoding)
 {
   if (order_key_idx.size() != column_order.size() ||
       order_key_idx.size() != null_precedence.size()) {
@@ -45,11 +54,31 @@ std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
   for (int idx : order_key_idx) {
     sort_cols.push_back(input_table.column(idx));
   }
-  auto sorted_order = cudf::sorted_order(cudf::table_view(sort_cols),
-                                         column_order,
-                                         null_precedence,
-                                         stream,
-                                         memory_space.get_default_allocator());
+  const cudf::table_view sort_keys(sort_cols);
+  std::unique_ptr<cudf::column> sorted_order;
+  if (sort_key_encoding) {
+    // String keys and multi-column keys: radix sorts over an encoding of the keys. Returns
+    // nullptr for the key shapes it leaves to cuDF.
+    //
+    // Memory: it allocates only from the memory space's allocator, at most
+    // order::encoded_sort_working_bytes(rows) at a time (32 bytes per row, against about 8 for
+    // cuDF's comparison sort), and frees its temporaries before returning. An input whose sort
+    // would need more than a quarter of the memory space is left to cuDF. An allocation failure
+    // is not caught here: like any operator's, it reaches the executor, which records the peak
+    // and retries the task with a larger reservation.
+    order::encoded_sort_options options;
+    options.max_working_bytes = memory_space.get_max_memory() / kEncodedSortMaxSpaceFraction;
+    sorted_order              = order::encoded_sorted_order(sort_keys,
+                                               column_order,
+                                               null_precedence,
+                                               stream,
+                                               memory_space.get_default_allocator(),
+                                               options);
+  }
+  if (!sorted_order) {
+    sorted_order = cudf::sorted_order(
+      sort_keys, column_order, null_precedence, stream, memory_space.get_default_allocator());
+  }
 
   // Do projection
   std::vector<cudf::column_view> project_input_cols;

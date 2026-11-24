@@ -121,6 +121,9 @@ sirius_physical_exchange_sink::sirius_physical_exchange_sink(
     throw sirius::invalid_input_exception(
       "exchange sink: gather to rank {} of {}", _spec.target, _service->world_size());
   }
+  if (_spec.ordered && _spec.routing != mode::gather) {
+    throw sirius::invalid_input_exception("exchange sink: only a gather is ordered");
+  }
 }
 
 void sirius_physical_exchange_sink::set_range_boundaries(
@@ -197,7 +200,14 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
   // Only now: a task rescheduled after an OOM above must send its row again. Two tasks racing
   // may both send one, which is harmless.
   if (row_to_every_rank) { _every_rank_has_a_row.store(true, std::memory_order_release); }
-  return std::make_unique<routed_operator_data>(std::move(slices), std::move(ranks));
+  // An ordered gather sends a batch under its position, which names one batch: MERGE_SORT emits
+  // one per position, and what follows it in the pipeline keeps that.
+  auto const position = _spec.ordered ? input.get_position() : std::nullopt;
+  if (position && slices.size() > 1) {
+    throw sirius::internal_exception(
+      "exchange sink: {} batches at position {} of an ordered gather", slices.size(), *position);
+  }
+  return std::make_unique<routed_operator_data>(std::move(slices), std::move(ranks), position);
 }
 
 std::unique_ptr<cudf::table> sirius_physical_exchange_sink::empty_like_input() const
@@ -298,16 +308,28 @@ void sirius_physical_exchange_sink::sink(const operator_data& input_data,
   auto const& routed  = dynamic_cast<const routed_operator_data&>(input_data);
   auto const& batches = routed.get_data_batches();
   auto const self     = _service->rank();
+  // Set by execute() for an ordered gather only. The source releases this rank's batches by
+  // number, so numbers from positions and numbers from send order cannot share a stream.
+  std::optional<std::uint64_t> number;
+  if (auto const position = routed.get_position()) { number = *position; }
+  if (_spec.ordered && !batches.empty()) {
+    std::lock_guard lock{_positioned_mutex};
+    if (_positioned.value_or(number.has_value()) != number.has_value()) {
+      throw sirius::internal_exception(
+        "exchange sink: an ordered gather of batches with and without a position");
+    }
+    _positioned = number.has_value();
+  }
   // A broadcast or NULL-key batch is one data_batch for every rank. This rank's copy lands in a
   // spillable repository, and a spilled batch can no longer be sent, so the peers go first: each
   // peer's send holds a read lock until its frames are staged. Order per destination is kept.
   for (std::size_t i = 0; i < batches.size(); ++i) {
     auto const to = static_cast<exchange::rank_t>(routed.destinations()[i]);
-    if (to != self) { _service->send(_stream, to, batches[i]); }
+    if (to != self) { _service->send(_stream, to, batches[i], number); }
   }
   for (std::size_t i = 0; i < batches.size(); ++i) {
     auto const to = static_cast<exchange::rank_t>(routed.destinations()[i]);
-    if (to == self) { _service->send(_stream, to, batches[i]); }
+    if (to == self) { _service->send(_stream, to, batches[i], number); }
   }
 }
 

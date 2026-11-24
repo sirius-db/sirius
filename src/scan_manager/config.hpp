@@ -23,12 +23,14 @@
 #include "scan_manager/preparation_options.hpp"
 
 #include <cucascade/io/config.hpp>
+#include <cucascade/io/cufile/config.hpp>
 
 #include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -121,6 +123,8 @@ inline bool enum_to_string(prefetch_strategy s, std::string& out)
 enum class io_backend {
   /// cuCascade's native IO stack: uring for local paths, REST for @c s3:// URLs.
   native,
+  /// cuFile for local files (with POSIX fallback), REST for @c s3:// URLs.
+  cufile,
 };
 
 /// Parse a @ref io_backend from its lowercase YAML spelling.  @c "sirius" is the
@@ -128,7 +132,9 @@ enum class io_backend {
 inline bool string_to_enum(std::string_view sv, io_backend& out)
 {
   static const std::unordered_map<std::string_view, io_backend> map = {
-    {"native", io_backend::native}, {"sirius", io_backend::native},  // deprecated alias
+    {"native", io_backend::native},
+    {"sirius", io_backend::native},  // deprecated alias
+    {"cufile", io_backend::cufile},
   };
   auto it = map.find(sv);
   if (it != map.end()) {
@@ -143,6 +149,7 @@ inline bool enum_to_string(io_backend b, std::string& s)
 {
   switch (b) {
     case io_backend::native: s = "native"; return true;
+    case io_backend::cufile: s = "cufile"; return true;
   }
   return false;
 }
@@ -212,10 +219,12 @@ struct memory_prefetcher_config {
  *
  * @c backend selects the IO stack: @ref io_backend::native routes local paths
  * to @c uring_ioctx and @c s3:// URLs to the REST backend (cuCascade's native
- * io_uring HTTP/1.1 transport with kTLS or user-space TLS). Object-store LIST
- * and glob use the same REST backend. Reads go through
+ * io_uring HTTP/1.1 transport with kTLS or user-space TLS); @ref io_backend::cufile
+ * uses cuFile for local files and the same REST backend for @c s3://. Object-store
+ * LIST and glob use the REST backend either way. Reads go through
  * @c cucascade::io::datasource. Raw HTTP(S) URLs are unsupported; use @c s3://
- * paths with an object-store endpoint instead.
+ * paths with an object-store endpoint instead. Both backends serve every
+ * configured GPU.
  *
  * The backend sub-configs are cuCascade's own structs; @ref to_io_config hands
  * them to the @c cucascade::io::io_context_registry.
@@ -227,6 +236,7 @@ struct memory_prefetcher_config {
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
+ *  - @c cufile  — local cuFile read tunables (no fs_cache or cache-driven readahead).
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -269,6 +279,12 @@ struct scan_manager_config {
   /// Independent of the metadata pool's explicit cpu_affinity override.
   std::vector<int> worker_startup_cpus;
 
+  /// Local cuFile reactors.  0 (the default) plans a pinned
+  /// group of @c cufile.reactors_per_device reactors for each GPU in
+  /// @c cufile.devices (see @ref resolved_cufile); a positive count runs one
+  /// flat, unpinned pool of that many reactors instead.
+  std::size_t cufile_n_reactors{0};
+
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:
   /// with a cache on, the budget is the backend reactor's own
@@ -303,6 +319,10 @@ struct scan_manager_config {
   /// @c min_segment_bytes / @c max_segment_bytes.
   cucascade::io::rest::config rest{};
 
+  /// Local cuFile read tunables. cuFile cannot use fs_cache, so cache-driven
+  /// readahead is disabled independently of cache.mode for these reads.
+  cucascade::io::cufile::config cufile{};
+
   /// The read path's caching configuration: mode, eviction policy and the
   /// prefetching cache's tunables.  One block, rather than a mode here and the
   /// tunables in a sibling one.
@@ -331,14 +351,42 @@ struct scan_manager_config {
     cucascade::io::io_config out{};
     switch (backend) {
       case io_backend::native: out.backend = cucascade::io::io_backend::native; break;
+      case io_backend::cufile: out.backend = cucascade::io::io_backend::cufile; break;
     }
     out.uring_n_reactors = uring_n_reactors;
     out.rest_n_reactors  = rest_n_reactors;
-    out.uring            = uring;
-    out.rest             = rest;
-    out.cache            = cache;
-    out.object_store     = object_store;
+#ifdef CUCASCADE_HAS_CUFILE
+    out.cufile_n_reactors = cufile_n_reactors;
+    out.cufile            = cufile;
+#endif
+    out.uring        = uring;
+    out.rest         = rest;
+    out.cache        = cache;
+    out.object_store = object_store;
     out.apply_cache_mode();
+    return out;
+  }
+
+  /// The cuFile configuration the default cufile pool is built with: @ref cufile,
+  /// with an empty @c devices list narrowed to @p gpu_ids (the GPUs Sirius reads
+  /// into), so the plan spawns reactors and reserves staging only on those.
+  ///
+  /// @throws std::invalid_argument when @c cufile.devices names a GPU outside
+  ///         @p gpu_ids: its reactors and staging would serve no read, while reads
+  ///         into Sirius's GPU would have none.
+  [[nodiscard]] cucascade::io::cufile::config resolved_cufile(std::span<int const> gpu_ids) const
+  {
+    auto out = cufile;
+    if (out.devices.empty()) {
+      out.devices.assign(gpu_ids.begin(), gpu_ids.end());
+      return out;
+    }
+    for (int const device : out.devices) {
+      if (std::ranges::find(gpu_ids, device) == gpu_ids.end()) {
+        throw std::invalid_argument("'cufile.devices': GPU " + std::to_string(device) +
+                                    " is not one Sirius reads into");
+      }
+    }
     return out;
   }
 
@@ -396,6 +444,25 @@ inline int resolve_scan_manager_num_threads(scan_manager_config const& config, s
 inline scan_manager_config validate_scan_manager_config(scan_manager_config config)
 {
   (void)config.preparation.resolve(config.thread_pool.num_threads);
+  if (config.cufile.max_inflight == 0) {
+    throw std::invalid_argument("'cufile.max_inflight': must be positive");
+  }
+  if (config.cufile.max_op_bytes < cucascade::io::IO_BLOCK_SIZE) {
+    throw std::invalid_argument("'cufile.max_op_bytes': must be at least 4 KiB");
+  }
+  if (config.cufile.staging_piece_bytes == 0 ||
+      config.cufile.staging_piece_bytes % cucascade::io::IO_BLOCK_SIZE != 0) {
+    throw std::invalid_argument(
+      "'cufile.staging_piece_bytes': must be a positive multiple of 4 KiB");
+  }
+  if (config.cufile.staging_slots_per_reactor == 0) {
+    throw std::invalid_argument("'cufile.staging_slots_per_reactor': must be positive");
+  }
+  if (!config.cufile.use_odirect &&
+      config.cufile.compat_mode == cucascade::io::cufile::compat::off) {
+    throw std::invalid_argument(
+      "'cufile.use_odirect': false conflicts with cufile.compat_mode=off");
+  }
   return config;
 }
 }  // namespace sirius::scan_manager

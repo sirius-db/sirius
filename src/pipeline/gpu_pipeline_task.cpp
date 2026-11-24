@@ -79,7 +79,12 @@ void validate_operator_output_types(const op::operator_data* data,
   for (size_t batch_index = 0; batch_index < batches.size(); batch_index++) {
     const auto& batch = batches[batch_index];
     if (!batch) { continue; }
-    cudf::table_view tbl = get_cudf_table_view(*batch);
+    // Only a GPU table has a schema to compare; an operator may forward a batch it left in
+    // another tier.
+    auto const ro         = batch->to_read_only();
+    auto const* gpu_table = dynamic_cast<const cucascade::gpu_table_representation*>(ro.get_data());
+    if (gpu_table == nullptr) { continue; }
+    cudf::table_view tbl = gpu_table->get_table_view();
     if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
       SIRIUS_LOG_WARN(
         "gpu_pipeline_task: operator '{}' (id={}) output batch {} column count mismatch: got "
@@ -141,8 +146,9 @@ void log_operator_data(const op::sirius_physical_operator& op,
     num_batches         = batches.size();
     for (auto const& batch : batches) {
       if (batch.get_data()) {
-        auto view = get_cudf_table_view(batch);
-        batch_rows += std::to_string(view.num_rows()) + "  ";
+        // A port that opts out of GPU materialization hands its operator batches in any tier.
+        auto const rows = representation_num_rows(batch.get_data());
+        batch_rows += (rows ? std::to_string(*rows) : std::string("?")) + "  ";
         total_bytes = memory::saturating_add(total_bytes, batch.get_data()->get_size_in_bytes());
       }
     }
@@ -387,6 +393,8 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
 
   std::size_t input_size   = 0;
   auto* pipelineable_input = dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
+  // Inputs left in place by the operator's port_residency_policy are never converted or cloned.
+  if (pipelineable_input && !pipelineable_input->materializes_on_gpu()) { return 0; }
   if (pipelineable_input) {
     for (const auto& ro : pipelineable_input->get_read_only_batches()) {
       if (!ro.get_data()) { continue; }
@@ -983,6 +991,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
       scan_input && target_space
         ? scan_input->get_estimated_working_set_size_in_bytes(target_space->get_device_id())
         : ls._input_data->get_estimated_working_set_size_in_bytes();
+  } else if (input_type == op::operator_data_type::WINDOWED_MERGE && ls._input_data) {
+    // A windowed merge input sizes the window buffers, merge scratch and output its task
+    // allocates.
+    working_set_bytes = ls._input_data->get_estimated_working_set_size_in_bytes();
   }
 
   std::size_t num_batches = 0;
@@ -1009,6 +1021,12 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     // pipeline_memory_history may estimate below the current fresh batch's known decode working
     // set.
     if (input_type == op::operator_data_type::GPU_SCAN && !input_resident) {
+      info.peak_memory_estimate = std::max(info.peak_memory_estimate, working_set_bytes);
+    }
+    // The history of a merge pipeline mixes tasks that reuse the windows of a kept merger (a low
+    // peak) with tasks that allocate them and with one-shot partitions, so its estimate may be
+    // below the working set this task's input knows it allocates.
+    if (input_type == op::operator_data_type::WINDOWED_MERGE) {
       info.peak_memory_estimate = std::max(info.peak_memory_estimate, working_set_bytes);
     }
     // pipeline_memory_history keys estimates by input bytes, not carrier layout, so batches with

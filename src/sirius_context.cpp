@@ -20,6 +20,8 @@
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "data/sirius_row_range_reader_registry.hpp"
+#include "downgrade/spill_io_stats.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -41,6 +43,8 @@
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
+#include "op/discard_copy_function.hpp"
+#include "pipeline/gpu_pipeline_executor.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_sql_rewrite.hpp"
@@ -58,6 +62,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -80,16 +85,20 @@
 #include <cctype>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>   // for fprintf/fileno (fallback banner)
 #include <cstdlib>  // for std::getenv
 #include <exception>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace duckdb {
 
@@ -605,6 +614,10 @@ std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
   auto const keys_released = release_query_state(query_id, inject_failure);
   try {
     log_pool_stats(end_tag);
+    // What the query's spills stored and read back, in stored bytes (see spill::io_stats).
+    SIRIUS_LOG_INFO("[spill_io] {} {}",
+                    end_tag,
+                    sirius::spill::format_io_totals(sirius::spill::io_stats::get().take()));
   } catch (...) {
   }
   return keys_released;
@@ -938,12 +951,14 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   struct initialization_guard {
     SiriusContext* self;
     bool owns_converter_registry = false;
+    bool owns_row_range_registry = false;
     bool committed               = false;
     ~initialization_guard()
     {
       if (committed) { return; }
       self->release_resources();
       if (owns_converter_registry) { sirius::converter_registry::shutdown(); }
+      if (owns_row_range_registry) { sirius::row_range_reader_registry::shutdown(); }
     }
   } rollback{this};
 
@@ -975,6 +990,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 
   rollback.owns_converter_registry = sirius::converter_registry::initialize(
     config_.get_downgrade_executor_config().copy_chunk_bytes);
+  rollback.owns_row_range_registry = sirius::row_range_reader_registry::initialize();
 
   // Discovery is shared by all subsystems; execution GPU ids come from the
   // configured memory manager built below.
@@ -988,8 +1004,87 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
       "  GPU {}: {} (numa={}, pci={})", gpu.id, gpu.name, gpu.numa_node, gpu.pci_bus_id);
   }
 
-  memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-    config_.get_memory_space_configs());
+  // A spill directory that is missing or not writable fails every write to the disk tier
+  // while the run goes on without one; refuse to start instead. Each disk space gets the io
+  // context its `io` settings describe; spaces with equal settings share one context (one set
+  // of reactors).
+  auto memory_space_configs = config_.get_memory_space_configs();
+  std::vector<std::pair<sirius::disk_io_config, std::shared_ptr<cucascade::io::ioctx>>>
+    disk_io_contexts;
+  for (auto& space : memory_space_configs) {
+    auto* disk = std::get_if<cucascade::memory::disk_memory_space_config>(&space);
+    if (disk == nullptr) { continue; }
+    sirius::validate_spill_directory(disk->mount_paths);
+    if (disk->io_context != nullptr) { continue; }
+    auto const io = config_.get_disk_io_config(disk->disk_id);
+    auto shared   = std::ranges::find(disk_io_contexts, io, [](auto const& e) { return e.first; });
+    if (shared == disk_io_contexts.end()) {
+      auto context = cucascade::make_disk_io_context(sirius::to_disk_io_context_options(io));
+      shared       = disk_io_contexts.emplace(disk_io_contexts.end(), io, std::move(context));
+    }
+    disk->io_context = shared->second;
+    SIRIUS_LOG_INFO(
+      "SiriusContext: disk space {} ('{}') spills through the {} reactors (backend setting {}, "
+      "direct_io {}, {} reactors)",
+      disk->disk_id,
+      disk->mount_paths,
+      shared->second->type() == cucascade::io::io_context_type::cufile ? "cuFile" : "io_uring",
+      sirius::to_string(sirius::effective_disk_io_backend(io)),
+      io.direct_io,
+      io.reactors);
+  }
+  sirius::pipeline::gpu_pipeline_executor::set_reservation_policy(
+    config_.get_reservation_wait_policy());
+
+  // cuFile's registered staging lives outside RMM for the life of the process. Take it
+  // before the GPU pools claim the devices, rather than from what the pools leave free.
+  {
+    std::vector<int> gpu_ids;
+    for (auto const& space : config_.get_memory_space_configs()) {
+      if (auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
+        gpu_ids.push_back(gpu->device_id);
+      }
+    }
+    sirius::scan_manager::reserve_cufile_staging(
+      config_.get_scan_manager_config(), gpu_ids, config_.get_hw_topology());
+  }
+
+  memory_manager_ =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(memory_space_configs);
+
+  // The usage limit bounds what Sirius allocates, not what the device's memory pool reserves:
+  // under spilling the pool can hold up to 1.4 times the limit and not give it back, and
+  // allocations then fail below the limit
+  // (OOM retry storms). Say so at startup when the device cannot supply that much.
+  for (auto const* gpu_space :
+       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    auto const* adaptor = gpu_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+    if (adaptor == nullptr) { continue; }
+    rmm::cuda_set_device_raii const device{rmm::cuda_device_id{gpu_space->get_device_id()}};
+    std::size_t device_free  = 0;
+    std::size_t device_total = 0;
+    if (cudaMemGetInfo(&device_free, &device_total) != cudaSuccess) { continue; }
+    std::uint64_t pool_reserved = 0;
+    if (auto pool = adaptor->pool_handle(); pool != nullptr) {
+      cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &pool_reserved);
+    }
+    auto const limit       = gpu_space->get_max_memory();
+    auto const available   = device_free + pool_reserved;  // what the pool has or can still get
+    auto const recommended = static_cast<std::size_t>(static_cast<double>(available) / 1.4);
+    if (limit > recommended) {
+      SIRIUS_LOG_WARN(
+        "SiriusContext: GPU {} memory limit of {} bytes is close to what the device can supply "
+        "({} of {} bytes available). The device memory pool can hold up to 1.4 times the limit "
+        "when data is spilled, so allocations may fail below the limit and tasks retry (slow, "
+        "not wrong). A limit of at most {} bytes (sirius.memory.gpu.usage_limit_bytes, or "
+        "usage_limit_fraction 0.7) avoids it.",
+        gpu_space->get_device_id(),
+        limit,
+        available,
+        device_total,
+        recommended);
+    }
+  }
 
   // Session cache for pinned GPU-resident cuVS ANN indexes. Takes the memory
   // manager so an index build can reserve its GPU footprint through Sirius.
@@ -1010,23 +1105,36 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     }
   }
 
-  // Verify cucascade built one host memory space per NUMA node. Warn rather
-  // than throw — non-NUMA CI hosts legitimately report num_numa_nodes == 0.
+  // One host memory space is expected per NUMA node that carries a configured GPU. The
+  // machine's NUMA node count is not the yardstick: it includes CPU-less nodes (GPU memory
+  // exposed as NUMA nodes) and empty ones, none of which backs a host space.
   {
-    auto const mgpu05_host_spaces =
+    auto const host_spaces =
       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    SIRIUS_LOG_INFO("SiriusContext: {} host memory space(s) created for {} NUMA node(s)",
-                    mgpu05_host_spaces.size(),
-                    topo.num_numa_nodes);
-    if (topo.num_numa_nodes > 0 &&
-        mgpu05_host_spaces.size() != static_cast<size_t>(topo.num_numa_nodes)) {
-      SIRIUS_LOG_WARN(
-        "SiriusContext: host space count ({}) != NUMA node count ({}) — "
-        "expected one host space per NUMA domain. Check "
-        "sirius_config apply_defaults (.use_numa_id_as_host_id()) or YAML host "
-        "configuration.",
-        mgpu05_host_spaces.size(),
-        topo.num_numa_nodes);
+    std::set<int> gpu_numa_nodes;
+    for (auto const* gpu_space :
+         memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      auto const it = std::ranges::find_if(topo.gpus, [&](auto const& gpu) {
+        return static_cast<int>(gpu.id) == gpu_space->get_device_id();
+      });
+      gpu_numa_nodes.insert(it != topo.gpus.end() ? it->numa_node : -1);
+    }
+    SIRIUS_LOG_INFO(
+      "SiriusContext: {} host memory space(s) created for {} NUMA node(s) carrying a "
+      "configured GPU ({} NUMA node(s) reported by the machine)",
+      host_spaces.size(),
+      gpu_numa_nodes.size(),
+      topo.num_numa_nodes);
+    for (auto const* host_space : host_spaces) {
+      auto const* node = topo.find_numa_node(host_space->get_device_id());
+      if (node != nullptr && node->is_device_memory) {
+        SIRIUS_LOG_WARN(
+          "SiriusContext: host memory space {} is on NUMA node {}, which has memory but no "
+          "CPUs (device memory); host data must not be placed there. Check the host space "
+          "configuration.",
+          host_space->get_device_id(),
+          node->id);
+      }
     }
   }
 
@@ -2017,16 +2125,27 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 
   // In v2, SQL and C++ prepared executions both have an EXECUTE wrapper.
   auto statement_type = prepared.statement_type;
-  if (statement_type == StatementType::EXECUTE_STATEMENT && prepared.physical_plan &&
-      prepared.physical_plan->Root().type == PhysicalOperatorType::EXECUTE) {
-    statement_type =
-      prepared.physical_plan->Root().Cast<PhysicalExecute>().prepared->statement_type;
+  // The root of the statement's own plan, under the EXECUTE wrapper when there is one.
+  const PhysicalOperator* statement_root =
+    prepared.physical_plan ? &prepared.physical_plan->Root() : nullptr;
+  if (statement_type == StatementType::EXECUTE_STATEMENT && statement_root != nullptr &&
+      statement_root->type == PhysicalOperatorType::EXECUTE) {
+    auto const& execute = statement_root->Cast<PhysicalExecute>();
+    statement_type      = execute.prepared->statement_type;
+    statement_root      = &execute.plan;
   }
+  // Two COPY statements run on the GPU: the discard format, which writes nothing (the planner
+  // ends its query in a discard sink), and the Parquet export. Every other COPY stays on DuckDB.
+  auto const is_discard_copy =
+    statement_type == StatementType::COPY_STATEMENT && statement_root != nullptr &&
+    statement_root->type == PhysicalOperatorType::COPY_TO_FILE &&
+    statement_root->Cast<PhysicalCopyToFile>().function.name == sirius::op::kDiscardCopyFormat;
   if (statement_type != StatementType::SELECT_STATEMENT &&
       statement_type != StatementType::COPY_STATEMENT) {
     return RebindQueryInfo::DO_NOT_REBIND;
   }
-  if (statement_type == StatementType::COPY_STATEMENT && !is_gpu_copy_candidate(prepared)) {
+  if (statement_type == StatementType::COPY_STATEMENT && !is_discard_copy &&
+      !is_gpu_copy_candidate(prepared)) {
     return RebindQueryInfo::DO_NOT_REBIND;
   }
   // Try to capture the SQL string while the active query context is alive —

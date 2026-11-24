@@ -1,0 +1,7 @@
+[2026-11-12 10:17:00.100] [warning] [140400] GPU Pipeline Executor: reschedule (retry 1/8) for task 42 (original task 42), resuming from operator index 2: OOM at operator MERGE_SORT (index 2)
+[2026-11-12 10:17:00.200] [warning] [140401] GPU Pipeline Executor: reschedule (retry 2/8) for task 57 (original task 42), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: CUDA error at: rmm/mr/device/cuda_memory_resource.hpp
+[2026-11-12 10:17:00.300] [warning] [140402] GPU Pipeline Executor: reschedule (retry 1/8) for task 60 (original task 60), resuming from operator index 3: OOM restoring a deferral at the sink
+[2026-11-12 10:17:00.400] [warning] [140403] GPU Pipeline Executor: reschedule (retry 1/8) for task 61 (original task 61), resuming from operator index 1: transient CUDA kernel launch failure at operator ORDER_BY (index 1)
+[2026-11-12 10:17:00.500] [warning] [140403] GPU Pipeline Executor: input of task 57 (original task 42) shrank for retry 2; keeping the reservation floor from before this OOM
+[2026-11-12 10:17:00.600] [error] [140404] Pipeline 3: OOM preparing batches for processing
+[2026-11-12 10:17:00.700] [warning] [140405] GPU Pipeline Executor: reschedule (retry garbled

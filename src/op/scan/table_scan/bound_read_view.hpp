@@ -44,7 +44,13 @@ class sirius_physical_table_scan;
 }
 namespace sirius::op::scan {
 /// Storage or streaming source category used by scan admission.
-enum class source_kind : uint8_t { duckdb_native, parquet_local, parquet_s3, stream_source };
+enum class source_kind : uint8_t {
+  duckdb_native,
+  parquet_local,
+  parquet_s3,
+  stream_source,
+  generator
+};
 /// Detail available in captured file observations, not a snapshot guarantee.
 enum class evidence_depth : uint8_t { path, path_and_size, path_size_and_tag };
 
@@ -84,6 +90,14 @@ struct native_table_identity {
 struct stream_identity {
   uint64_t stream_id = 0;
 };
+/// Identity of a `sirius_generate` read: the data is a pure function of the bound spec.
+struct generator_identity {
+  /// Deterministic hash of the whole spec (columns, parameters, batch shape and seed).
+  uint64_t spec_hash      = 0;
+  uint64_t num_batches    = 0;
+  uint64_t rows_per_batch = 0;
+  uint64_t seed           = 0;
+};
 /// Non-owning, statement-bounded pointers for the existing provider execution lanes.
 struct provider_borrow {
   /// Active DuckDB query ID at capture time; does not extend provider lifetime.
@@ -121,7 +135,11 @@ struct provider_read_identity {
 /// Stable read identity shared after an equal comparison; evidence remains capture-specific.
 struct bound_read_identity {
   verified_source_identity source;
-  std::variant<native_table_identity, file_inventory, stream_identity, provider_read_identity>
+  std::variant<native_table_identity,
+               file_inventory,
+               stream_identity,
+               provider_read_identity,
+               generator_identity>
     data_view;
   duckdb::vector<duckdb::LogicalType> bound_types;
   duckdb::vector<std::string> bound_names;

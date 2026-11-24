@@ -48,8 +48,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
+#include <stop_token>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace sirius::parallel;
@@ -821,6 +824,217 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
   // Should get only the one batch's worth
   REQUIRE(freed == batch_size);
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+
+  executor.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Downgrade priority: order of the tier-1 repository sweep
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A repository holding two equal-size GPU batches, plus the handles the tests assert on.
+struct priority_test_repo {
+  std::unique_ptr<cucascade::shared_data_repository> repo;
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+
+  explicit priority_test_repo(cucascade::memory::memory_space& gpu_space, int32_t priority = 0)
+    : repo(std::make_unique<cucascade::shared_data_repository>())
+  {
+    for (int i = 0; i < 2; ++i) {
+      batches.push_back(make_gpu_batch(gpu_space));
+      repo->add_data_batch(batches.back());
+    }
+    repo->set_downgrade_priority(priority);
+  }
+
+  [[nodiscard]] size_t bytes() const
+  {
+    size_t total = 0;
+    for (auto const& b : batches) {
+      total += get_batch_size(*b);
+    }
+    return total;
+  }
+
+  [[nodiscard]] bool all_on(cucascade::memory::Tier tier) const
+  {
+    return std::ranges::all_of(batches,
+                               [tier](auto const& b) { return get_batch_tier(*b) == tier; });
+  }
+};
+
+/// Registers one two-batch repository per {operator id, downgrade priority} of @p repos, in that
+/// order, then asks the executor for one repository's bytes at a time and requires that the
+/// repositories are spilled in @p expected_order (indices into @p repos) while every other one
+/// stays on the GPU.
+void require_sweep_order(const std::vector<std::pair<size_t, int32_t>>& repos,
+                         const std::vector<size_t>& expected_order)
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+
+  std::vector<priority_test_repo> handles;
+  handles.reserve(repos.size());
+  for (auto const& entry : repos) {
+    handles.emplace_back(*gpu_space, entry.second);
+    REQUIRE(handles.back().repo->get_downgrade_priority() == entry.second);
+  }
+  const size_t one_repo_bytes = handles.front().bytes();
+  for (size_t i = 0; i < repos.size(); ++i) {
+    repo_mgr.add_new_repository(repos[i].first, "out", std::move(handles[i].repo));
+  }
+
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  std::vector<bool> spilled(handles.size(), false);
+  for (auto const next : expected_order) {
+    REQUIRE(executor.request_free_memory_and_wait(one_repo_bytes) == one_repo_bytes);
+    spilled[next] = true;
+    for (size_t i = 0; i < handles.size(); ++i) {
+      CAPTURE(next, i);
+      REQUIRE(handles[i].all_on(spilled[i] ? cucascade::memory::Tier::HOST
+                                           : cucascade::memory::Tier::GPU));
+    }
+  }
+
+  executor.stop();
+}
+
+}  // namespace
+
+TEST_CASE("tier-1 sweep orders repositories by downgrade priority, then by get_repositories()",
+          "[downgrade_executor][downgrade_priority]")
+{
+  SECTION("equal priorities: get_repositories() order")
+  {
+    // Registered out of order: get_repositories() is ascending {operator_id, port_id}, so with
+    // every priority at the default the lowest operator id is spilled first.
+    require_sweep_order({{3, 0}, {1, 0}, {2, 0}}, {1, 2});
+  }
+  SECTION("a higher-priority repository is spilled first")
+  {
+    require_sweep_order({{1, 0}, {2, 0}, {3, 100}}, {2});
+  }
+  SECTION("repositories with equal priority keep their relative order")
+  {
+    require_sweep_order({{1, 0}, {2, 100}, {3, 100}}, {1, 2});
+  }
+  SECTION("a negative-priority repository is visited after the default ones")
+  {
+    require_sweep_order({{1, -5}, {2, 0}, {3, 0}}, {1, 2});
+  }
+}
+
+TEST_CASE("downgrade priority does not reorder repositories across queries",
+          "[downgrade_executor][downgrade_priority]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  const auto older_query = sirius::make_query_id(1);
+  const auto newer_query = sirius::make_query_id(2);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(older_query);
+  lifecycle.open_query(newer_query);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& older_mgr = *repo_registry.create_for_query(older_query);
+  auto& newer_mgr = *repo_registry.create_for_query(newer_query);
+
+  priority_test_repo older_high(*gpu_space, /*priority=*/100);
+  priority_test_repo newer_low(*gpu_space, /*priority=*/-5);
+  size_t one_repo_bytes = older_high.bytes();
+  older_mgr.add_new_repository(1, "out", std::move(older_high.repo));
+  newer_mgr.add_new_repository(1, "out", std::move(newer_low.repo));
+
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  // Newest query first, whatever the priorities say.
+  REQUIRE(executor.request_free_memory_and_wait(one_repo_bytes) == one_repo_bytes);
+  REQUIRE(newer_low.all_on(cucascade::memory::Tier::HOST));
+  REQUIRE(older_high.all_on(cucascade::memory::Tier::GPU));
+
+  executor.stop();
+}
+
+TEST_CASE("tier-1 sweep tolerates downgrade priorities changing concurrently",
+          "[downgrade_executor][downgrade_priority]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+
+  constexpr size_t num_repos = 8;
+  std::vector<priority_test_repo> repos;
+  std::vector<cucascade::shared_data_repository*> repo_ptrs;
+  repos.reserve(num_repos);
+  for (size_t i = 0; i < num_repos; ++i) {
+    repos.emplace_back(*gpu_space);
+    repo_ptrs.push_back(repos.back().repo.get());
+  }
+  size_t one_batch_bytes = get_batch_size(*repos.front().batches.front());
+  for (size_t i = 0; i < num_repos; ++i) {
+    repo_mgr.add_new_repository(i + 1, "out", std::move(repos[i].repo));
+  }
+
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  // Declared after the repositories' owner and the executor so it is stopped and joined first on
+  // every exit path. No Catch2 assertions in here: they are not thread-safe.
+  std::atomic<uint64_t> writes{0};
+  std::jthread writer([&repo_ptrs, &writes](std::stop_token stop) {
+    int32_t value = 100;
+    while (!stop.stop_requested()) {
+      for (size_t i = 0; i < repo_ptrs.size(); ++i) {
+        repo_ptrs[i]->set_downgrade_priority(i % 2 == 0 ? value : -value);
+      }
+      value = -value;
+      writes.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+
+  auto all_on_host = [&repos] {
+    return std::ranges::all_of(
+      repos, [](auto const& r) { return r.all_on(cucascade::memory::Tier::HOST); });
+  };
+
+  const auto deadline = std::chrono::steady_clock::now() + 30s;
+  while (writes.load(std::memory_order_relaxed) == 0) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::yield();
+  }
+
+  // One batch per sweep, so the priorities are re-read and re-sorted many times while they flip.
+  // Whatever order a sweep settles on, each one must still spill a batch.
+  size_t sweeps = 0;
+  while (!all_on_host()) {
+    REQUIRE(sweeps++ < 4 * num_repos);
+    auto future = executor.request_free_memory(one_batch_bytes);
+    REQUIRE(future.wait_until(deadline) == std::future_status::ready);
+    size_t freed = 0;
+    REQUIRE_NOTHROW(freed = future.get());
+    REQUIRE(freed >= one_batch_bytes);
+  }
+
+  writer.request_stop();
+  writer.join();
+  REQUIRE(all_on_host());
 
   executor.stop();
 }
