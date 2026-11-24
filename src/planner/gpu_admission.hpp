@@ -37,8 +37,8 @@ namespace sirius::planner {
  * @brief Visit every GPU_SCAN operator reachable from @p node.
  *
  * Mirrors sirius_physical_plan_generator::set_parent_ops, the canonical full-tree descent.
- * RESULT_COLLECTOR holds its child in `plan` and DELIM JOIN holds `join`/`distinct_root`,
- * both outside `children[]`; missing either under-counts scans and admits too few GPUs.
+ * RESULT_COLLECTOR holds its child in `plan`, outside `children[]`; missing it under-counts
+ * scans and admits too few GPUs.
  * Allocates nothing, so cleanup paths that must not fail can use it.
  */
 void for_each_gpu_scan(const op::sirius_physical_operator& node,

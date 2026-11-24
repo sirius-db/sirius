@@ -66,32 +66,34 @@ std::shared_ptr<cucascade::data_batch> ship(std::shared_ptr<cucascade::data_batc
 {
   rmm::cuda_stream send_stream;
   rmm::cuda_stream recv_stream;
-  auto out = outgoing_batch::make(std::move(batch), send_stream.view());
+  auto out = outgoing_batch::make(std::move(batch), ::cuda::stream_ref{send_stream.value()});
   REQUIRE(out.has_value());
-  auto landing = incoming_batch::land(
-    decode_header(encode_header(out->header())), *env().gpu, env().host, recv_stream.view());
+  auto landing = incoming_batch::land(decode_header(encode_header(out->header())),
+                                      *env().gpu,
+                                      env().host,
+                                      ::cuda::stream_ref{recv_stream.value()});
   REQUIRE(landing != nullptr);
   CHECK(landing->tier() == expect_tier);
 
-  rmm::device_buffer send_frame(frame_bytes, send_stream.view());
-  rmm::device_buffer recv_frame(frame_bytes, recv_stream.view());
+  rmm::device_buffer send_frame(frame_bytes, ::cuda::stream_ref{send_stream.value()});
+  rmm::device_buffer recv_frame(frame_bytes, ::cuda::stream_ref{recv_stream.value()});
   auto const total = out->stream_bytes();
   for (std::size_t at = 0; at < total; at += frame_bytes) {
     auto const len = std::min(frame_bytes, total - at);
-    out->copy_range(at, at + len, send_frame.data(), send_stream.view());
+    out->copy_range(at, at + len, send_frame.data(), ::cuda::stream_ref{send_stream.value()});
     send_stream.synchronize();
     // The peer's WRITE.
     REQUIRE(cudaMemcpy(recv_frame.data(), send_frame.data(), len, cudaMemcpyDeviceToDevice) ==
             cudaSuccess);
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
-    landing->copy_in(at, recv_frame.data(), len, recv_stream.view());
+    landing->copy_in(at, recv_frame.data(), len, ::cuda::stream_ref{recv_stream.value()});
     recv_stream.synchronize();
     // Once copied in, the frame goes back to its sender: a later WRITE must not change the batch.
     REQUIRE(cudaMemset(recv_frame.data(), 0xab, frame_bytes) == cudaSuccess);
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
   }
   out.reset();
-  return landing->seal(recv_stream.view());
+  return landing->seal(::cuda::stream_ref{recv_stream.value()});
 }
 
 std::vector<std::uint8_t> fixed_width_bytes(cudf::column_view const& column)
@@ -229,7 +231,7 @@ TEST_CASE("a host landing spread over several host blocks keeps every value and 
   auto batch = gpu_batch(sample_table(80'000));
   {
     rmm::cuda_stream stream;
-    auto out = outgoing_batch::make(batch, stream.view());
+    auto out = outgoing_batch::make(batch, ::cuda::stream_ref{stream.value()});
     REQUIRE(out.has_value());
     REQUIRE(out->stream_bytes() > 2 * block);
   }
@@ -273,7 +275,8 @@ TEST_CASE("a send waits for the batch's pending writer, known or not", "[exchang
   rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
   rmm::cuda_stream send_stream{rmm::cuda_stream::flags::non_blocking};
   rmm::cuda_stream recv_stream;
-  rmm::device_buffer send_frame(rows * sizeof(std::int32_t), send_stream.view());
+  rmm::device_buffer send_frame(rows * sizeof(std::int32_t),
+                                ::cuda::stream_ref{send_stream.value()});
   send_stream.synchronize();
   std::shared_ptr<cucascade::data_batch> batch;
   std::optional<outgoing_batch> out;
@@ -292,8 +295,10 @@ TEST_CASE("a send waits for the batch's pending writer, known or not", "[exchang
                           cudaMemcpyDeviceToDevice,
                           producer.value()) == cudaSuccess);
   if (known_writer) {
-    batch = sirius::make_data_batch(
-      std::move(table), *env().gpu, producer.view(), sirius::telemetry::batch_telemetry_info{});
+    batch = sirius::make_data_batch(std::move(table),
+                                    *env().gpu,
+                                    ::cuda::stream_ref{producer.value()},
+                                    sirius::telemetry::batch_telemetry_info{});
   } else {
     batch = cucascade::data_batch::make(
       sirius::get_next_batch_id(),
@@ -304,7 +309,7 @@ TEST_CASE("a send waits for the batch's pending writer, known or not", "[exchang
 
   // The send takes the caller's owner: nothing else keeps the batch alive while it is sent.
   auto planning = std::async(std::launch::async, [&, sent = std::move(batch)]() mutable {
-    return outgoing_batch::make(std::move(sent), send_stream.view());
+    return outgoing_batch::make(std::move(sent), ::cuda::stream_ref{send_stream.value()});
   });
   if (known_writer) {
     // The send stream waits for the writer's event; the caller does not.
@@ -319,14 +324,16 @@ TEST_CASE("a send waits for the batch's pending writer, known or not", "[exchang
   REQUIRE(out.has_value());
   auto const bytes = out->stream_bytes();
   REQUIRE(bytes <= send_frame.size());
-  landing = incoming_batch::land(
-    decode_header(encode_header(out->header())), *env().gpu, env().host, recv_stream.view());
+  landing = incoming_batch::land(decode_header(encode_header(out->header())),
+                                 *env().gpu,
+                                 env().host,
+                                 ::cuda::stream_ref{recv_stream.value()});
   REQUIRE(landing != nullptr);
   CHECK(landing->tier() == Tier::GPU);
   recv_stream.synchronize();
   // The copy out of the batch and its delivery, both on the send stream.
-  out->copy_range(0, bytes, send_frame.data(), send_stream.view());
-  landing->copy_in(0, send_frame.data(), bytes, send_stream.view());
+  out->copy_range(0, bytes, send_frame.data(), ::cuda::stream_ref{send_stream.value()});
+  landing->copy_in(0, send_frame.data(), bytes, ::cuda::stream_ref{send_stream.value()});
   if (known_writer) {
     std::this_thread::sleep_for(std::chrono::milliseconds{200});
     CHECK(cudaStreamQuery(send_stream.value()) == cudaErrorNotReady);
@@ -336,7 +343,7 @@ TEST_CASE("a send waits for the batch's pending writer, known or not", "[exchang
   send_stream.synchronize();
   REQUIRE_FALSE(gate.timed_out.load());
   out.reset();
-  auto const received = landing->seal(recv_stream.view());
+  auto const received = landing->seal(::cuda::stream_ref{recv_stream.value()});
   auto const ro       = received->to_read_only();
   if (cudaEvent_t writer = ro.get_writer_event()) {
     REQUIRE(cudaEventSynchronize(writer) == cudaSuccess);
@@ -351,16 +358,18 @@ TEST_CASE("a landing with no room anywhere is refused, not waited for", "[exchan
 {
   rmm::cuda_stream stream;
   auto batch = gpu_batch(sample_table(1000));
-  auto out   = outgoing_batch::make(batch, stream.view());
+  auto out   = outgoing_batch::make(batch, ::cuda::stream_ref{stream.value()});
   REQUIRE(out.has_value());
   auto const hold = hold_gpu();
-  CHECK(incoming_batch::land(out->header(), *env().gpu, nullptr, stream.view()) == nullptr);
+  CHECK(incoming_batch::land(
+          out->header(), *env().gpu, nullptr, ::cuda::stream_ref{stream.value()}) == nullptr);
 }
 
 TEST_CASE("a batch no tier could ever hold fails at once, naming its size", "[exchange][batch_io]")
 {
   rmm::cuda_stream stream;
-  auto out = outgoing_batch::make(gpu_batch(sample_table(1000)), stream.view());
+  auto out =
+    outgoing_batch::make(gpu_batch(sample_table(1000)), ::cuda::stream_ref{stream.value()});
   REQUIRE(out.has_value());
   auto header = out->header();
   auto column = std::find_if(
@@ -369,8 +378,9 @@ TEST_CASE("a batch no tier could ever hold fails at once, naming its size", "[ex
   auto const too_big  = env().gpu->get_max_memory() + 1;
   column->data_size   = too_big;
   header.stream_bytes = too_big;
-  CHECK_THROWS_WITH(incoming_batch::land(header, *env().gpu, nullptr, stream.view()),
-                    Catch::Matchers::ContainsSubstring("can land neither"));
+  CHECK_THROWS_WITH(
+    incoming_batch::land(header, *env().gpu, nullptr, ::cuda::stream_ref{stream.value()}),
+    Catch::Matchers::ContainsSubstring("can land neither"));
 }
 
 TEST_CASE("a sliced batch is sent as its rows only", "[exchange][batch_io]")
@@ -393,16 +403,20 @@ TEST_CASE("an empty batch is not sent; a range outside the stream is refused",
           "[exchange][batch_io]")
 {
   rmm::cuda_stream stream;
-  CHECK_FALSE(outgoing_batch::make(gpu_batch(sample_table(0)), stream.view()).has_value());
+  CHECK_FALSE(outgoing_batch::make(gpu_batch(sample_table(0)), ::cuda::stream_ref{stream.value()})
+                .has_value());
 
-  auto out = outgoing_batch::make(gpu_batch(sample_table(100)), stream.view());
+  auto out = outgoing_batch::make(gpu_batch(sample_table(100)), ::cuda::stream_ref{stream.value()});
   REQUIRE(out.has_value());
-  rmm::device_buffer frame(out->stream_bytes() + 1, stream.view());
-  CHECK_THROWS_AS(out->copy_range(0, out->stream_bytes() + 1, frame.data(), stream.view()),
-                  sirius::invalid_input_exception);
-  auto landing = incoming_batch::land(out->header(), *env().gpu, env().host, stream.view());
+  rmm::device_buffer frame(out->stream_bytes() + 1, ::cuda::stream_ref{stream.value()});
+  CHECK_THROWS_AS(
+    out->copy_range(0, out->stream_bytes() + 1, frame.data(), ::cuda::stream_ref{stream.value()}),
+    sirius::invalid_input_exception);
+  auto landing =
+    incoming_batch::land(out->header(), *env().gpu, env().host, ::cuda::stream_ref{stream.value()});
   REQUIRE(landing != nullptr);
-  CHECK_THROWS_AS(landing->copy_in(out->stream_bytes(), frame.data(), 1, stream.view()),
-                  sirius::invalid_input_exception);
+  CHECK_THROWS_AS(
+    landing->copy_in(out->stream_bytes(), frame.data(), 1, ::cuda::stream_ref{stream.value()}),
+    sirius::invalid_input_exception);
   stream.synchronize();
 }

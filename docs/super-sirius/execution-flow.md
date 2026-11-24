@@ -99,7 +99,6 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 - **UNGROUPED_AGGREGATE** → inserts `PARTITION + MERGE_AGGREGATE`
 - **ORDER_BY** → creates 4-phase sort: `ORDER → SORT_SAMPLE → SORT_PARTITION → MERGE_SORT`
 - **TOP_N** → adds `MERGE_TOP_N`
-- **DELIM_JOIN** → complex splitting with partition_join and distinct branches
 
 ### 4c. Data Repository Wiring
 

@@ -25,7 +25,7 @@
 
 namespace {
 
-// Correlated MIN/MAX/AVG subqueries that Sirius computes from the delim join's outer rows. Parts 5
+// Correlated MIN/MAX/AVG subqueries that Sirius computes from the delim CTE's outer rows. Parts 5
 // and 7 appear twice, so the outer rows repeat their lineitems; some lineitems have a NULL part,
 // and some parts have no lineitems.
 class DelimAggregateReuseFixture : public sirius::test::GpuExecutionFixture {
@@ -66,23 +66,18 @@ class DelimAggregateReuseFixture : public sirius::test::GpuExecutionFixture {
     run_ok("CHECKPOINT;");
   }
 
-  /// Rewritten and unrewritten GPU plans against the CPU, under both of DuckDB's
-  /// representations of the delim join. @p approx_column, when set, is a DOUBLE compared with a
-  /// tolerance.
+  /// Rewritten and unrewritten GPU plans against the CPU. @p approx_column, when set, is a DOUBLE
+  /// compared with a tolerance.
   void compare_rewritten_and_not(std::string const& query,
                                  std::optional<std::size_t> approx_column = std::nullopt)
   {
-    for (bool const as_cte : {false, true}) {
-      CAPTURE(as_cte);
-      sirius::test::scoped_sirius_setting representation{*con, "delim_join_as_cte", as_cte};
-      for (bool const reuse : {true, false}) {
-        CAPTURE(reuse);
-        sirius::test::scoped_sirius_setting setting{*con, "enable_delim_aggregate_reuse", reuse};
-        if (approx_column) {
-          compare_gpu_vs_cpu_approx(query, {*approx_column});
-        } else {
-          compare_gpu_vs_cpu(query);
-        }
+    for (bool const reuse : {true, false}) {
+      CAPTURE(reuse);
+      sirius::test::scoped_sirius_setting setting{*con, "enable_delim_aggregate_reuse", reuse};
+      if (approx_column) {
+        compare_gpu_vs_cpu_approx(query, {*approx_column});
+      } else {
+        compare_gpu_vs_cpu(query);
       }
     }
   }

@@ -42,16 +42,19 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <format>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -64,6 +67,7 @@
 // already compile fine without them.
 #include "api/compressed_table_io.hpp"
 #include "codegen/bridge/fused_tree_build.hpp"
+#include "codegen/bridge/meld_backend.hpp"
 #include "codegen/codegen_bridge.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/plan_tree.hpp"
@@ -111,6 +115,12 @@ int simpatico_compact_raw_values(const void* d_padded_v,
                                  std::int32_t chunk_size,
                                  std::int32_t elem_size,
                                  void* stream_v);
+int simpatico_first_mismatch(void const* a,
+                             void const* b,
+                             std::size_t rows,
+                             std::size_t row_bytes,
+                             void* first,
+                             void* stream_v);
 }
 
 #define SIMPATICO_CUDA_CHECK(call, ret, ...)                     \
@@ -696,19 +706,6 @@ struct TrailingArgStorage {
 
 // The tree's shape: op kinds and child port names, which (with the dtypes and decode shape) are
 // everything the decode renderer reads.
-void append_tree_shape(std::string& key, jit::FusedTree const& node)
-{
-  key += std::to_string(static_cast<int>(node.op));
-  key += '(';
-  for (auto const& [port, child] : node.children) {
-    key += port;
-    key += '=';
-    append_tree_shape(key, *child);
-    key += ';';
-  }
-  key += ')';
-}
-
 // The rendered decode kernel for a tree shape, rendered once per process. The source is invariant
 // in the row count (chunk_id comes from blockIdx.x), so it is rendered for one chunk.
 std::shared_ptr<cdj::DecodeKernelSpec const> rendered_decode_spec(
@@ -719,7 +716,7 @@ std::shared_ptr<cdj::DecodeKernelSpec const> rendered_decode_spec(
   std::vector<std::int32_t> const& undivided)
 {
   std::string key;
-  append_tree_shape(key, tree);
+  jit::append_tree_shape(key, tree);
   key += '|';
   key += cxx_dtype;
   key += '|';
@@ -746,11 +743,164 @@ std::shared_ptr<cdj::DecodeKernelSpec const> rendered_decode_spec(
   return specs.emplace(std::move(key), std::move(spec)).first->second;
 }
 
+// `transients` before `persisted`; per-chunk metadata must cover the grid.
+jit::LabeledBuffer const& bound_buffer(std::int32_t node_id,
+                                       std::string const& field,
+                                       jit::LabeledBuffers const& persisted,
+                                       jit::LabeledBuffers const& transients,
+                                       std::int32_t num_chunks)
+{
+  auto const key = jit::buffer_key(node_id, field);
+  auto found     = transients.find(key);
+  if (found == transients.end()) {
+    found = persisted.find(key);
+    if (found == persisted.end()) {
+      throw std::invalid_argument("simpatico decode: missing labeled buffer '" + key + "'");
+    }
+  }
+  bool const is_offset    = field == "rle_runs_offsets" || field == "bp_offsets";
+  bool const is_per_chunk = field == "chunk_min" || field == "chunk_divisors" ||
+                            field == "chunk_bits" || field == "chunk_count" ||
+                            field == "references" || field == "offsets" || is_offset;
+  auto const required = static_cast<std::size_t>(num_chunks) + (is_offset ? 1u : 0u);
+  if (is_per_chunk && found->second.length < required) {
+    throw std::invalid_argument("simpatico decode: metadata buffer '" + key + "' has " +
+                                std::to_string(found->second.length) + " entries; grid requires " +
+                                std::to_string(required));
+  }
+  return found->second;
+}
+
+void launch_meld_decode(simpatico::meld::DecodeKernel const& decoder,
+                        jit::LabeledBuffers const& persisted,
+                        jit::LabeledBuffers const& transients,
+                        std::int32_t num_chunks,
+                        std::int64_t num_rows,
+                        void* out,
+                        simpatico::decode_frame& frame)
+{
+  using Kind  = simpatico::meld::Parameter::Kind;
+  auto output = reinterpret_cast<CUdeviceptr>(out);
+  std::vector<CUdeviceptr> pointers;
+  pointers.reserve(decoder.parameters.size());
+  std::vector<void*> args;
+  args.reserve(decoder.parameters.size());
+  for (auto const& parameter : decoder.parameters) {
+    switch (parameter.kind) {
+      case Kind::channel:
+        pointers.push_back(reinterpret_cast<CUdeviceptr>(
+          bound_buffer(parameter.node, parameter.field, persisted, transients, num_chunks).ptr));
+        args.push_back(&pointers.back());
+        break;
+      case Kind::output: args.push_back(&output); break;
+      case Kind::row_count: args.push_back(&num_rows); break;
+    }
+  }
+
+  frame.keep_kernel(decoder.kernel);
+  auto function = decoder.kernel->func_for_current_device();
+  raise_shared_memory_limit(function, decoder.shared_bytes);
+  auto const grid = cuda::ceil_div(num_chunks, decoder.chunks_per_block);
+  simpatico::throw_if_cu_error(cuLaunchKernel(function,
+                                              static_cast<unsigned>(grid),
+                                              1,
+                                              1,
+                                              static_cast<unsigned>(decoder.block_threads),
+                                              1,
+                                              1,
+                                              static_cast<unsigned>(decoder.shared_bytes),
+                                              reinterpret_cast<CUstream>(frame.stream().get()),
+                                              args.data(),
+                                              nullptr),
+                               "simpatico decode: cuLaunchKernel (meld)");
+}
+
+// The record simpatico_first_mismatch writes.
+struct mismatch_record {
+  std::uint64_t first;
+  std::array<std::uint64_t, 2> nvrtc;
+  std::array<std::uint64_t, 2> meld;
+};
+static_assert(sizeof(mismatch_record) == 5 * sizeof(std::uint64_t));
+
+// Pinned, so the copy into a record stays asynchronous. Never released, since releasing pinned
+// memory waits for the device; a record returns to the pool once its frame no longer holds it.
+std::shared_ptr<mismatch_record> pinned_mismatch_record()
+{
+  struct pool {
+    std::mutex mu;
+    std::vector<mismatch_record*> free;
+  };
+  static auto* const records = new pool;
+  std::lock_guard lock(records->mu);
+  if (records->free.empty()) {
+    constexpr std::size_t kSlabRecords = 256;
+    void* slab                         = nullptr;
+    simpatico::throw_if_cuda_error(
+      cudaHostAlloc(&slab, kSlabRecords * sizeof(mismatch_record), cudaHostAllocPortable),
+      "simpatico decode: shadow record allocation");
+    for (std::size_t i = 0; i < kSlabRecords; ++i)
+      records->free.push_back(static_cast<mismatch_record*>(slab) + i);
+  }
+  auto* const record = records->free.back();
+  records->free.pop_back();
+  return {record, [](mismatch_record* released) {
+            std::lock_guard lock(records->mu);
+            records->free.push_back(released);
+          }};
+}
+
+// Queues Meld's decode beside `out` and their comparison without waiting; the session's finish()
+// throws at the first row that differs.
+void shadow_meld_decode(simpatico::meld::DecodeKernel const& decoder,
+                        std::size_t element_size,
+                        jit::LabeledBuffers const& persisted,
+                        jit::LabeledBuffers const& transients,
+                        std::int32_t num_chunks,
+                        std::int64_t num_rows,
+                        void const* out,
+                        simpatico::decode_frame& frame)
+{
+  if (num_rows == 0) return;
+  auto const bytes = static_cast<std::size_t>(num_rows) * element_size;
+  rmm::device_buffer shadow(bytes, frame.stream(), frame.mr());
+  launch_meld_decode(decoder, persisted, transients, num_chunks, num_rows, shadow.data(), frame);
+
+  auto const stream = frame.stream().get();
+  rmm::device_buffer device_record(sizeof(mismatch_record), frame.stream(), frame.mr());
+  simpatico::throw_if_cuda_error(
+    static_cast<cudaError_t>(simpatico_first_mismatch(out,
+                                                      shadow.data(),
+                                                      static_cast<std::size_t>(num_rows),
+                                                      element_size,
+                                                      device_record.data(),
+                                                      stream)),
+    "simpatico decode: shadow compare");
+  // The frame holds the record before the copy into it is queued, until the stream has drained.
+  auto record = pinned_mismatch_record();
+  frame.check_on_completion([record, element_size, num_rows, kernel = decoder.kernel] {
+    if (record->first == static_cast<std::uint64_t>(num_rows)) return;
+    auto const hex = [&](std::array<std::uint64_t, 2> const& words) {
+      return element_size == 16 ? std::format("{:#018x}{:016x}", words[1], words[0])
+                                : std::format("{:#0{}x}", words[0], 2 + 2 * element_size);
+    };
+    throw std::runtime_error("simpatico decode: shadow mismatch at row " +
+                             std::to_string(record->first) + " of " + std::to_string(num_rows) +
+                             ": nvrtc " + hex(record->nvrtc) + ", meld " + hex(record->meld) +
+                             "; scheme:\n" + kernel->rendered_source);
+  });
+  simpatico::throw_if_cuda_error(
+    cudaMemcpyAsync(
+      record.get(), device_record.data(), sizeof(mismatch_record), cudaMemcpyDeviceToHost, stream),
+    "simpatico decode: shadow compare copy");
+}
+
 // Bind the renderer's ordered buffers and trailing arguments, looking up decode-only `transients`
 // before the persisted buffers. The caller owns every synthesized buffer until this launch has been
 // queued.
 void launch_rendered_decode(jit::FusedTree const& tree,
                             char const* cxx_dtype,
+                            std::size_t element_size,
                             jit::LabeledBuffers const& persisted,
                             jit::LabeledBuffers const& transients,
                             std::int64_t num_rows,
@@ -762,38 +912,38 @@ void launch_rendered_decode(jit::FusedTree const& tree,
     static_cast<std::int32_t>(std::max<std::int64_t>(1, (num_rows + kChunkSize - 1) / kChunkSize));
   // Bitpack nodes whose chunk_divisors channel is empty render the plain affine reader.
   std::vector<std::int32_t> undivided;
+  bool divided = false;
   for (auto const& [key, buffer] : persisted) {
     constexpr std::string_view kDivisors = ".chunk_divisors";
-    if (buffer.length == 0 && key.size() > kDivisors.size() && key.ends_with(kDivisors)) {
-      undivided.push_back(std::stoi(key.substr(0, key.size() - kDivisors.size())));
+    if (key.size() > kDivisors.size() && key.ends_with(kDivisors)) {
+      if (buffer.length == 0) {
+        undivided.push_back(std::stoi(key.substr(0, key.size() - kDivisors.size())));
+      } else {
+        divided = true;
+      }
     }
   }
   std::sort(undivided.begin(), undivided.end());
+
+  std::optional<simpatico::meld::DecodeKernel> meld_decoder;
+  auto const backend = simpatico::meld::decode_backend();
+  // Meld's decoder writes the column's own type, never a wider one, and does not divide.
+  if (backend != simpatico::meld::Backend::nvrtc && !divided && va.shape == cdj::kShapePlain &&
+      va.grid_blocks == 0 && va.out_dtype == nullptr) {
+    meld_decoder = simpatico::meld::plain_decode_kernel(tree, cxx_dtype);
+  }
+  if (meld_decoder && backend == simpatico::meld::Backend::meld) {
+    launch_meld_decode(*meld_decoder, persisted, transients, num_chunks, num_rows, out, frame);
+    return;
+  }
+
   auto const spec_ptr = rendered_decode_spec(tree, cxx_dtype, va.shape, va.out_dtype, undivided);
   auto const& spec    = *spec_ptr;
   std::vector<CUdeviceptr> pointers;
   pointers.reserve(spec.buffers.size());
   for (auto const& buffer : spec.buffers) {
-    auto const key = jit::buffer_key(buffer.node_id, buffer.field);
-    auto found     = transients.find(key);
-    if (found == transients.end()) {
-      found = persisted.find(key);
-      if (found == persisted.end()) {
-        throw std::invalid_argument("simpatico decode: missing labeled buffer '" + key + "'");
-      }
-    }
-    auto const& field       = buffer.field;
-    bool const is_offset    = field == "rle_runs_offsets" || field == "bp_offsets";
-    bool const is_per_chunk = field == "chunk_min" || field == "chunk_divisors" ||
-                              field == "chunk_bits" || field == "chunk_count" ||
-                              field == "references" || field == "offsets" || is_offset;
-    auto const required = static_cast<std::size_t>(num_chunks) + (is_offset ? 1u : 0u);
-    if (is_per_chunk && found->second.length < required) {
-      throw std::invalid_argument("simpatico decode: metadata buffer '" + key + "' has " +
-                                  std::to_string(found->second.length) +
-                                  " entries; grid requires " + std::to_string(required));
-    }
-    pointers.push_back(reinterpret_cast<CUdeviceptr>(found->second.ptr));
+    pointers.push_back(reinterpret_cast<CUdeviceptr>(
+      bound_buffer(buffer.node_id, buffer.field, persisted, transients, num_chunks).ptr));
   }
 
   auto output = reinterpret_cast<CUdeviceptr>(out);
@@ -812,6 +962,10 @@ void launch_rendered_decode(jit::FusedTree const& tree,
                        args.data(),
                        static_cast<unsigned>(va.grid_blocks > 0 ? va.grid_blocks : dense_grid),
                        frame);
+  if (meld_decoder) {
+    shadow_meld_decode(
+      *meld_decoder, element_size, persisted, transients, num_chunks, num_rows, out, frame);
+  }
 }
 }  // namespace
 
@@ -842,7 +996,8 @@ void launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
   check_variant_contract(variant, mask, num_rows, out, dtype, "fused kernel");
   auto const kernel_rows =
     num_rows + (variant.shape.consumer == cdj::Consumer::offsets_meta ? 1 : 0);
-  std::size_t const element_size = std::strcmp(cxx_dtype, "int64_t") == 0   ? 8u
+  std::size_t const element_size = std::strcmp(cxx_dtype, "__int128") == 0  ? 16u
+                                   : std::strcmp(cxx_dtype, "int64_t") == 0 ? 8u
                                    : std::strcmp(cxx_dtype, "int16_t") == 0 ? 2u
                                    : std::strcmp(cxx_dtype, "int8_t") == 0  ? 1u
                                                                             : 4u;
@@ -856,7 +1011,8 @@ void launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
   codegen::jit::LabeledBuffers transients;
   synthesize_decode_transients(
     tree, element_size, allocate, frame.stream().get(), persisted, transients);
-  launch_rendered_decode(tree, cxx_dtype, persisted, transients, kernel_rows, out, variant, frame);
+  launch_rendered_decode(
+    tree, cxx_dtype, element_size, persisted, transients, kernel_rows, out, variant, frame);
 }
 
 }  // namespace

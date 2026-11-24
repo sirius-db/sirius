@@ -26,7 +26,6 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::DUMMY_SCAN: return "DUMMY_SCAN";
     case SiriusPhysicalOperatorType::CHUNK_SCAN: return "CHUNK_SCAN";
     case SiriusPhysicalOperatorType::COLUMN_DATA_SCAN: return "COLUMN_DATA_SCAN";
-    case SiriusPhysicalOperatorType::DELIM_SCAN: return "DELIM_SCAN";
     case SiriusPhysicalOperatorType::ORDER_BY: return "ORDER_BY";
     case SiriusPhysicalOperatorType::LIMIT: return "LIMIT";
     case SiriusPhysicalOperatorType::LIMIT_PERCENT: return "LIMIT_PERCENT";
@@ -46,8 +45,6 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::PROJECTION: return "PROJECTION";
     case SiriusPhysicalOperatorType::COPY_TO_FILE: return "COPY_TO_FILE";
     case SiriusPhysicalOperatorType::BATCH_COPY_TO_FILE: return "BATCH_COPY_TO_FILE";
-    case SiriusPhysicalOperatorType::LEFT_DELIM_JOIN: return "LEFT_DELIM_JOIN";
-    case SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN: return "RIGHT_DELIM_JOIN";
     case SiriusPhysicalOperatorType::BLOCKWISE_NL_JOIN: return "BLOCKWISE_NL_JOIN";
     case SiriusPhysicalOperatorType::NESTED_LOOP_JOIN: return "NESTED_LOOP_JOIN";
     case SiriusPhysicalOperatorType::HASH_JOIN: return "HASH_JOIN";

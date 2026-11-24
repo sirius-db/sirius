@@ -51,7 +51,11 @@ namespace sirius::op::scan {
 
 /// Materialized data roles and ordered output slots, resolved when the scan plan is built.
 struct scan_column_layout {
-  enum class data_role : std::uint8_t { OUTPUT, FILTER_ONLY, ROW_COUNT_CARRIER };
+  /// DELETE_KEY: read only so a delete keyed on VALUES (an Iceberg equality delete) can match
+  /// rows; dropped with the other non-output columns. Kept apart from FILTER_ONLY because a
+  /// filter-only column may be replaced by a predicate's BOOL8 answer, and a key must keep its
+  /// values. A key that is also filtered on is DELETE_KEY; one that is also output is OUTPUT.
+  enum class data_role : std::uint8_t { OUTPUT, FILTER_ONLY, ROW_COUNT_CARRIER, DELETE_KEY };
   std::vector<data_role> data_roles;               ///< One role per reader data column, in D order.
   std::vector<std::size_t> output_data_positions;  ///< M slots, in output order.
   std::vector<std::size_t> materialized_primary_indices;  ///< M order, including virtuals.
@@ -169,6 +173,8 @@ struct scan_plan {
 
   /// D positions read only for pushed-down table filters.
   [[nodiscard]] std::unordered_set<std::size_t> filter_only_batch_positions() const;
+  /// D positions read only as value-delete keys.
+  [[nodiscard]] std::unordered_set<std::size_t> delete_key_batch_positions() const;
   /// D positions absent from the output, including a row-count carrier.
   [[nodiscard]] std::unordered_set<std::size_t> non_output_batch_positions() const;
 };
@@ -270,6 +276,9 @@ struct bound_virtual_column {
 /// @param returned_types      DuckDB schema column types.
 /// @param projected_output_count   The scan operator's types.size() — used to split
 ///                            projection_ids into output vs pure-filter.
+/// @param delete_key_primary_indices  Schema indices of value-delete keys. A non-output data
+///                            column among them takes the DELETE_KEY role instead of FILTER_ONLY.
+///                            They must already be reachable through @p projection_ids.
 /// @param partition_indices   Hive partition indices advertised by the bind data.
 ///                            TODO: other partition indices may need to be supported for other
 ///                            formats.
@@ -280,7 +289,8 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           std::size_t projected_output_count,
                           duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
                           std::vector<bound_virtual_column> const& virtual_columns = {},
-                          bool allow_metadata_only                                 = false);
+                          bool allow_metadata_only                                 = false,
+                          std::span<std::size_t const> delete_key_primary_indices  = {});
 
 /// True when @p column_ids is a pruned or reordered subset of the full schema (of
 /// size @p full_schema_size) — a non-identity projection the cuDF reader must

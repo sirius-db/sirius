@@ -16,12 +16,9 @@
 
 #include "expression/ast/case_expr.hpp"
 #include "expression/ast/node.hpp"
-#include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "utils/parquet_fixture_utils.hpp"
-#include "utils/scoped_sirius_setting.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
@@ -105,12 +102,6 @@ std::vector<sirius::op::sirius_physical_operator*> collect(
     auto sub = collect(child.get(), type);
     out.insert(out.end(), sub.begin(), sub.end());
   }
-  // A delim join keeps its inner join outside `children`.
-  if (root->type == T::LEFT_DELIM_JOIN || root->type == T::RIGHT_DELIM_JOIN) {
-    auto const& delim = root->Cast<sirius::op::sirius_physical_delim_join>();
-    auto sub          = collect(delim.join.get(), type);
-    out.insert(out.end(), sub.begin(), sub.end());
-  }
   return out;
 }
 
@@ -123,9 +114,6 @@ struct exists_rewrite_fixture {
     db  = sirius::test::open_sirius_db(db_dir.file("exists_rewrite.db").c_str(), cfg);
     con = std::make_unique<Connection>(*db);
     set_flag(true);
-    // The delim-join shapes are the baseline here; the tests of the plain-join shapes turn
-    // `delim_join_as_cte` on themselves.
-    REQUIRE_FALSE(con->Query("SET delim_join_as_cte = false")->HasError());
 
     con->Query("CREATE TABLE dim (id BIGINT, tag INTEGER)");
     con->Query("INSERT INTO dim SELECT range, range % 5 FROM range(1, 30)");
@@ -170,19 +158,6 @@ struct exists_rewrite_fixture {
   std::unique_ptr<Connection> con;
 };
 
-/// Join type of every delim join's inner join in @p plan, of either orientation.
-std::vector<duckdb::JoinType> delim_join_types(sirius::op::sirius_physical_operator* plan)
-{
-  std::vector<duckdb::JoinType> types;
-  for (auto const type : {T::LEFT_DELIM_JOIN, T::RIGHT_DELIM_JOIN}) {
-    for (auto* delim : collect(plan, type)) {
-      auto const& join = delim->Cast<sirius::op::sirius_physical_delim_join>().join;
-      types.push_back(join->Cast<sirius::op::sirius_physical_hash_join>().join_type);
-    }
-  }
-  return types;
-}
-
 constexpr char const* q21_shape_query =
   "SELECT f.k, count(*) FROM fact f WHERE f.late "
   "AND EXISTS (SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v) "
@@ -202,17 +177,18 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
                  "exists rewrite merges sibling subqueries over the same table into one scan",
                  "[exists_rewrite][plan]")
 {
+  // DuckDB leaves q21's subqueries as a SEMI and an ANTI join, comparing keys with `=` in one and
+  // IS NOT DISTINCT FROM in the other; the two still share one scan.
   CHECK(rewrites(q21_shape_query) == 2);
 
   auto merged = physical_plan(q21_shape_query);
   // One aggregate answers both subqueries, joined to the outer rows read twice from one CTE.
-  CHECK(delim_join_types(merged.get()).empty());
   CHECK(collect(merged.get(), T::CTE).size() == 1);
   CHECK(collect(merged.get(), T::CTE_SCAN).size() == 2);
 
   set_flag(false);
   auto unrewritten = physical_plan(q21_shape_query);
-  CHECK(delim_join_types(unrewritten.get()).size() == 2);
+  CHECK(collect(unrewritten.get(), T::CTE).empty());
   // The outer rows and one shared subquery scan, against one scan per subquery.
   CHECK(collect(merged.get(), T::GPU_SCAN).size() == 2);
   CHECK(collect(unrewritten.get(), T::GPU_SCAN).size() == 3);
@@ -225,7 +201,10 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
   auto const query = siblings("g.k = f.k AND g.v <> f.v", "g.k = f.k AND g.v <> f.v AND g.late");
   REQUIRE(rewrites(query) == 2);
   auto plan = physical_plan(query);
-  // Only the NOT EXISTS has a filter of its own: one masked `v` feeds both its MIN and MAX.
+  // DuckDB compares both subqueries' values with IS DISTINCT FROM, and only the NOT EXISTS's keys
+  // null-safely. So each subquery has a filter (the EXISTS skips the NULL-key group, the NOT EXISTS
+  // keeps `late` rows) and a "NULL value seen" flag. Per subquery that is one CASE for the flag and
+  // one masked `v`, which feeds both its MIN and its MAX.
   std::size_t masked = 0;
   for (auto* projection : collect(plan.get(), T::PROJECTION)) {
     for (auto const& entry :
@@ -233,7 +212,7 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
       if (entry && entry->holds<sirius::ast::case_expr>()) { ++masked; }
     }
   }
-  CHECK(masked == 1);
+  CHECK(masked == 4);
 }
 
 TEST_CASE_METHOD(exists_rewrite_fixture,
@@ -250,7 +229,7 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
                  "exists rewrite leaves lone and unsupported subqueries alone",
                  "[exists_rewrite][plan]")
 {
-  // A lone subquery, as a delim join or as the plain SEMI join DuckDB leaves for simple shapes.
+  // A lone subquery, written as EXISTS or as the SEMI join DuckDB makes of it.
   CHECK(rewrites("SELECT f.k FROM fact f WHERE f.w > f.v AND EXISTS "
                  "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v)") == 0);
   CHECK(rewrites("SELECT f.k FROM fact f SEMI JOIN fact g ON g.k = f.k AND g.v <> f.v") == 0);
@@ -273,46 +252,25 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
 }
 
 TEST_CASE_METHOD(exists_rewrite_fixture,
-                 "exists rewrite merges the plain joins left under delim_join_as_cte",
-                 "[exists_rewrite][plan]")
-{
-  // DuckDB removes q21's delim joins, comparing keys with `=` in one subquery and
-  // IS NOT DISTINCT FROM in the other; the two still share one scan.
-  sirius::test::scoped_sirius_setting as_cte{*con, "delim_join_as_cte", true};
-  CHECK(rewrites(q21_shape_query) == 2);
-  auto merged = physical_plan(q21_shape_query);
-  CHECK(delim_join_types(merged.get()).empty());
-  CHECK(collect(merged.get(), T::CTE).size() == 1);
-  CHECK(collect(merged.get(), T::CTE_SCAN).size() == 2);
-  CHECK(collect(merged.get(), T::GPU_SCAN).size() == 2);
-}
-
-TEST_CASE_METHOD(exists_rewrite_fixture,
-                 "exists rewrite leaves plain joins over a GPU pin that fits unmerged",
+                 "exists rewrite leaves joins over a GPU pin that fits unmerged",
                  "[exists_rewrite][plan]")
 {
   // 5000 rows of a BIGINT key and an INTEGER value: 60,000 bytes per join.
   std::uint64_t const fits = 1 << 20, spills = 1 << 10;
-  {
-    sirius::test::scoped_sirius_setting as_cte{*con, "delim_join_as_cte", true};
-    CHECK(rewrites(q21_shape_query, fits) == 2);
-    REQUIRE_FALSE(con->Query("CHECKPOINT")->HasError());
-    auto const pin = con->Query("CALL pin_table(format='duckdb', name='fact', tier='gpu')");
-    INFO(pin->GetError());
-    REQUIRE_FALSE(pin->HasError());
-    CHECK(rewrites(q21_shape_query, fits) == 0);
-    CHECK(rewrites(q21_shape_query, spills) == 2);
-  }
-  // Delim joins are merged regardless.
   CHECK(rewrites(q21_shape_query, fits) == 2);
+  REQUIRE_FALSE(con->Query("CHECKPOINT")->HasError());
+  auto const pin = con->Query("CALL pin_table(format='duckdb', name='fact', tier='gpu')");
+  INFO(pin->GetError());
+  REQUIRE_FALSE(pin->HasError());
+  CHECK(rewrites(q21_shape_query, fits) == 0);
+  CHECK(rewrites(q21_shape_query, spills) == 2);
   REQUIRE_FALSE(con->Query("CALL unpin_table('fact')")->HasError());
 }
 
 TEST_CASE_METHOD(exists_rewrite_fixture,
-                 "exists rewrite merges plain joins over a GPU pin missing a column they read",
+                 "exists rewrite merges joins over a GPU pin missing a column they read",
                  "[exists_rewrite][plan]")
 {
-  sirius::test::scoped_sirius_setting as_cte{*con, "delim_join_as_cte", true};
   REQUIRE_FALSE(con->Query("CHECKPOINT")->HasError());
   // Both subqueries also compare `v`, which the pin lacks, so their scans read storage.
   auto const pin =

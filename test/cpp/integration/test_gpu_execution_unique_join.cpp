@@ -15,7 +15,7 @@
  */
 
 // GPU-vs-CPU correctness for the unique-build-key (distinct_hash_join) fast path,
-// including the DELIM_GET structural uniqueness proof (the TPC-H q2/q22 shape).
+// including correlated NOT EXISTS (the TPC-H q22 shape).
 // A wrong uniqueness proof drops matches, so the GPU result diverges from CPU.
 
 #include <catch.hpp>
@@ -31,10 +31,9 @@ class UniqueJoinFixture : public sirius::test::GpuExecutionFixture {
  public:
   UniqueJoinFixture()
   {
-    // On toy tables the deliminator rewrites the delim join away, and
     // compressed_materialization wraps GROUP BY keys in __internal_compress_integral_*
-    // calls the GPU translator rejects. Disabling both preserves the plan shape under
-    // test; it applies to the GPU and CPU passes alike, so comparisons stay fair.
+    // calls the GPU translator rejects. It is disabled together with the deliminator; that
+    // applies to the GPU and CPU passes alike, so comparisons stay fair.
     optimizer_guard = std::make_unique<sirius::test::disabled_optimizers_guard>(
       *con, "deliminator,compressed_materialization");
 
@@ -49,8 +48,7 @@ class UniqueJoinFixture : public sirius::test::GpuExecutionFixture {
       " (5, 3, 100), (1, 3, 1), (2, 3, 2), (3, 3, 3), (NULL, 3, 4), (4, 1, 8),"
       " (4, 2, 9), (1, 2, 11), (2, 1, 12), (3, 1, 13), (5, NULL, 60), (NULL, NULL, 70);");
 
-    // Much larger than fact's deduplicated key set, so the DELIM_GET stays the build
-    // side of the NOT EXISTS re-join.
+    // Much larger than fact; the subquery table of the correlated NOT EXISTS tests.
     run_ok("CREATE TABLE big (okey INTEGER, k INTEGER);");
     run_ok("INSERT INTO big SELECT i, i % 4 FROM range(3000) t(i);");
 
@@ -94,18 +92,17 @@ TEST_CASE_METHOD(UniqueJoinFixture,
 }
 
 TEST_CASE_METHOD(UniqueJoinFixture,
-                 "gpu_execution delim-shaped NOT EXISTS (q22 DELIM_GET build)",
+                 "gpu_execution correlated NOT EXISTS (q22 shape)",
                  "[integration][gpu_execution][join][unique_build_keys]")
 {
-  // Decorrelates into a DELIM_JOIN whose inner re-join probes big against a DELIM_GET
-  // of dedup'd fact.k keys (one of them NULL) — the proof this change adds.
+  // Correlated on fact.k, whose values repeat and include NULL.
   compare_gpu_vs_cpu(
     "SELECT f.k, f.grp, f.v FROM fact f "
     "WHERE f.v > 3 AND NOT EXISTS (SELECT 1 FROM big o WHERE o.k = f.k)");
 }
 
 TEST_CASE_METHOD(UniqueJoinFixture,
-                 "gpu_execution delim-shaped NOT EXISTS over an empty table",
+                 "gpu_execution correlated NOT EXISTS over an empty table",
                  "[integration][gpu_execution][join][unique_build_keys]")
 {
   compare_gpu_vs_cpu(

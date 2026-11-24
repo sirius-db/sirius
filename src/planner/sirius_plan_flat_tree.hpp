@@ -55,16 +55,14 @@ struct flat_tree {
   std::vector<duckdb::unique_ptr<duckdb::Expression>> predicates;
 };
 
-/// Where a subquery gets the outer rows' distinct keys from. Set exactly one of the three kinds;
+/// Where a subquery gets the outer rows' distinct keys from. Set exactly one of the two kinds;
 /// `flatten` then records the key relation it finds as a `keys` leaf.
-///  - `delim_get`: a one-column DELIM_GET.
 ///  - `cte`: a SEMI join against the distinct values of one column of a CTE, the form an inlined
 ///    dedup CTE takes in an optimized plan.
 ///  - `dedup_ref`: a SEMI join against a scan of the CTE `cte_index`, the form DuckDB's
 ///    delim-to-CTE rewrite produces before the optimizer runs. The keys leaf has that CTE's
 ///    columns.
 struct key_source {
-  bool delim_get = false;
   bool cte       = false;
   bool dedup_ref = false;
   std::optional<std::size_t> leaf;

@@ -29,11 +29,10 @@ class LogicalOperator;
 namespace sirius::planner {
 
 /// Compute each decorrelated subquery aggregate (`MIN`, `MAX` or `AVG` per correlation key) from
-/// the outer rows its delim join already materializes, instead of from a second scan of the
+/// the outer rows its delim CTE already materializes, instead of from a second scan of the
 /// subquery's tables, when the subquery's rows are provably the outer rows of each key. Works on
-/// the optimized, unresolved plan in either of DuckDB's delim-join representations: a
-/// `DELIM_JOIN` becomes a materialized CTE of its outer rows read twice, and an aggregate under an
-/// existing delim CTE reads that CTE. Returns the number of aggregates rewritten.
+/// the optimized, unresolved plan: an aggregate restricted to the distinct keys of a delim CTE
+/// reads that CTE. Returns the number of aggregates rewritten.
 std::size_t reuse_delim_rows_for_subquery_aggregates(
   duckdb::ClientContext& context,
   duckdb::Binder& binder,

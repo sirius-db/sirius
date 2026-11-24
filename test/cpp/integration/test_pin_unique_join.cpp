@@ -381,6 +381,23 @@ TEST_CASE("a pinned distinct parquet column proves a join's build keys unique",
     set_option(con, "RESET pin_table_prove_unique_keys;");
   }
 
+  SECTION("column aliases do not move a proof to another column")
+  {
+    // dup_dim holds a repeated `k` and a distinct `payload`; the aliases trade their names. A
+    // proof looked up by alias would call the repeated column distinct and drop its matches.
+    auto const aliased = [&](std::string const& key, std::string const& value) {
+      return "SELECT count(*), sum(f.v + d." + value + ") FROM read_parquet(" +
+             sirius::test::sql_literal(fact.string()) + ") f JOIN read_parquet(" +
+             sirius::test::sql_literal(dup_dim.string()) + ") AS d(payload, k) ON f.f_k = d." + key;
+    };
+    auto const repeated = aliased("payload", "k");
+    CHECK_FALSE(join_proven_unique(con, repeated));
+    CHECK(gpu_answer(con, repeated) == cpu_answer(repeated));
+    auto const distinct = aliased("k", "payload");
+    CHECK(join_proven_unique(con, distinct));
+    CHECK(gpu_answer(con, distinct) == cpu_answer(distinct));
+  }
+
   for (auto const* name : {"pin_unique_join_unique_dim", "pin_unique_join_dup_dim"}) {
     con.Query("CALL unpin_table('" + std::string{name} + "');");
   }
