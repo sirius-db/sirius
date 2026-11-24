@@ -477,6 +477,22 @@ TEST_CASE_METHOD(ParquetCountCarrierFixture,
 }
 
 TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet columns keep their values under column aliases",
+                 "[integration][scan][parquet][gpu]")
+{
+  // The aliases trade the names of two same-typed columns. A scan that reads its columns by the
+  // aliased names returns each one's values under the other's name.
+  compare_gpu_vs_cpu("SELECT * FROM " + scan("strings.parquet") + " AS t(b, a)");
+  // A filter on a column the query does not return is resolved by name as well; by the aliased
+  // names it would test the other column's values and keep no row.
+  auto const filtered = "SELECT a FROM " + scan("strings.parquet") + " AS t(b, a) WHERE b = 'a-0'";
+  compare_gpu_vs_cpu(filtered);
+  auto const rows = con->Query(filtered);
+  REQUIRE(rows->RowCount() == 1);
+  CHECK(rows->Collection().GetValue(0, 0).ToString() == "b-0");
+}
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
                  "parquet empty-file count star matches the CPU oracle",
                  "[integration][scan][parquet][gpu][carrier]")
 {
@@ -1239,6 +1255,19 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     "SELECT id, x, y FROM iceberg_scan('" + conf_drop_readd_path + "') ORDER BY id;",
     gpu_route::gpu,
     {{"1", "10", "NULL"}, {"2", "20", "NULL"}});
+}
+
+// The aliases trade the names of `id` and `x`, both INTEGER. The scan finds each column's field
+// ID by its bound name; by alias it would find the other column's and return 10 and 20.
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - columns keep their values under column aliases",
+                 "[integration][gpu_execution][iceberg]")
+{
+  require_session_can_read(conf_drop_readd_path);
+  expect_iceberg_rows(
+    "SELECT x FROM iceberg_scan('" + conf_drop_readd_path + "') AS t(x, id, y) ORDER BY x;",
+    gpu_route::gpu,
+    {{"1"}, {"2"}});
 }
 
 // Pinned, unlike the case above: these schema changes arrived WITH new snapshots, so both forms
