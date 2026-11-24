@@ -3,20 +3,34 @@ name = "sirius-telemetry-analyzer"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["filesystem"]
+# Native-only `quent-open` viewer that reads collector output from disk. Disable for
+# `wasm32-unknown-unknown`, where events arrive through a browser bundle instead.
+filesystem = [
+    "dep:quent-io",
+    "dep:quent-store",
+    "sirius-telemetry-store/filesystem",
+]
+
 [dependencies]
-sirius-telemetry-store = { path = "../store" }
+sirius-telemetry-store = { path = "../store", default-features = false }
 quent-analyzer = { workspace = true }
 quent-dynamic-attributes = { workspace = true }
 quent-events = { workspace = true }
-quent-io = { workspace = true, features = ["ndjson"] }
+quent-io = { workspace = true, features = ["ndjson"], optional = true }
 quent-query-engine-analyzer = { workspace = true }
 quent-query-engine-ui = { workspace = true }
-quent-store = { workspace = true, features = ["io-ndjson"] }
+quent-store = { workspace = true, features = ["io-ndjson"], optional = true }
 quent-time = { workspace = true }
 quent-ui = { workspace = true }
 rustc-hash = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde"] }
+
+[[example]]
+name = "print_resource_tree"
+required-features = ["filesystem"]
 
 [dev-dependencies]
 sirius-telemetry-instrumentation = { package = "instrumentation-model", path = "../model" }

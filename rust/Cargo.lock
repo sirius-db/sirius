@@ -2052,6 +2052,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "quent-browser-bundle"
+version = "0.2.0"
+source = "git+https://github.com/rapidsai/quent.git?rev=3829e73e413b0dbf42d0a0c034b7a4bcae88f099#3829e73e413b0dbf42d0a0c034b7a4bcae88f099"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "quent-browser-bundle-build"
+version = "0.2.0"
+source = "git+https://github.com/rapidsai/quent.git?rev=3829e73e413b0dbf42d0a0c034b7a4bcae88f099#3829e73e413b0dbf42d0a0c034b7a4bcae88f099"
+dependencies = [
+ "postcard",
+ "quent-browser-bundle",
+ "quent-events",
+ "quent-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "uuid",
+ "zip",
+]
+
+[[package]]
 name = "quent-build-info"
 version = "0.2.0"
 source = "git+https://github.com/rapidsai/quent.git?rev=3829e73e413b0dbf42d0a0c034b7a4bcae88f099#3829e73e413b0dbf42d0a0c034b7a4bcae88f099"
@@ -2392,6 +2420,24 @@ dependencies = [
  "quent-ui",
  "rustc-hash",
  "uuid",
+]
+
+[[package]]
+name = "quent-query-engine-browser"
+version = "0.2.0"
+source = "git+https://github.com/rapidsai/quent.git?rev=3829e73e413b0dbf42d0a0c034b7a4bcae88f099#3829e73e413b0dbf42d0a0c034b7a4bcae88f099"
+dependencies = [
+ "async-trait",
+ "js-sys",
+ "quent-analyzer",
+ "quent-query-engine-analyzer",
+ "quent-query-engine-ui",
+ "quent-ui",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3044,6 +3090,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "sirius-telemetry-browser"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "instrumentation-model",
+ "postcard",
+ "quent-browser-bundle",
+ "quent-browser-bundle-build",
+ "quent-build-info",
+ "quent-events",
+ "quent-io",
+ "quent-query-engine-analyzer",
+ "quent-query-engine-browser",
+ "sirius-telemetry-analyzer",
+ "sirius-telemetry-store",
+ "tempfile",
+ "uuid",
+ "wasm-bindgen-futures",
+ "zip",
+]
+
+[[package]]
 name = "sirius-telemetry-server"
 version = "0.1.0"
 dependencies = [
@@ -3076,6 +3144,7 @@ dependencies = [
  "quent-store-build",
  "quent-yaml",
  "serde",
+ "sha2",
  "smallvec",
 ]
 
@@ -3843,6 +3912,17 @@ dependencies = [
  "rustversion",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
+]
+
+[[package]]
+name = "wasm-bindgen-futures"
+version = "0.4.80"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e14e0327cb5368ad60ccb22d04a9827a693c95a926d8d125e9fa39e0baec501"
+dependencies = [
+ "js-sys",
+ "tokio",
+ "wasm-bindgen",
 ]
 
 [[package]]

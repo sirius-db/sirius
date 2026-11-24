@@ -110,6 +110,23 @@ pixi run quent /path/to/telemetry_data  # if you used a different output_directo
 Then open Quent UI at `http://localhost:8080` and select the captured Sirius engine/query to explore its
 timeline.
 
+## 5. Share as a browser bundle (optional)
+
+A hosted Quent viewer can open a trace without a server by loading a `.quent-browser` file. Convert
+a completed telemetry directory (or a Quent ZIP) with:
+
+```bash
+pixi run -e browser quent-browser-bundle                                  # telemetry_data -> trace.quent-browser
+pixi run -e browser quent-browser-bundle /path/to/telemetry_data out.quent-browser
+```
+
+The `browser` environment contains only a Rust toolchain, so it avoids installing the CUDA
+dependencies of the default environment. The input must contain exactly one Sirius engine. The command prints the bundle's `model_name`
+(`sirius`), `schema_digest`, and `format_version`. A host selects the browser analyzer from that
+triple, so upload the file with a `quent-browser` role and keep the archival Quent ZIP as a separate
+asset. See the [browser crate README](../../rust/crates/telemetry/browser/README.md) for the analyzer
+build and hosting contract.
+
 ## Example Screenshots
 
 **Default view** — the query plan on the left and the per-resource execution timeline

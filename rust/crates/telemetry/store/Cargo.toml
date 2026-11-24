@@ -3,10 +3,15 @@ name = "sirius-telemetry-store"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["filesystem"]
+# Native-only loading of collector output; disable for `wasm32-unknown-unknown`.
+filesystem = ["quent-store/io-ndjson"]
+
 [dependencies]
 quent-analyzer = { workspace = true }
 quent-events = { workspace = true, features = ["serde"] }
-quent-store = { workspace = true, features = ["io-ndjson"] }
+quent-store = { workspace = true, features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 smallvec = "1"
 
@@ -14,3 +19,4 @@ smallvec = "1"
 quent-build-info = { workspace = true }
 quent-store-build = { workspace = true }
 quent-yaml = { workspace = true }
+sha2 = "0.11"
