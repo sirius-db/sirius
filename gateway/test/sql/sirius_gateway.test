@@ -155,9 +155,22 @@ set on every rank by the gateway
 
 # A client's transaction stays in its own gateway session; the shared rank sessions never see it.
 query I
-SELECT sirius_gateway_route('', 'BEGIN TRANSACTION; SELECT 1; COMMIT') = 'BEGIN TRANSACTION;' || chr(10) || 'FROM sirius_gateway_run(''SELECT 1'');' || chr(10) || 'COMMIT;' || chr(10);
+SELECT sirius_gateway_route('', 'BEGIN TRANSACTION; SELECT 1; COMMIT') = 'BEGIN TRANSACTION' || chr(10) || ';' || chr(10) || 'FROM sirius_gateway_run(''SELECT 1'');' || chr(10) || 'COMMIT' || chr(10) || ';' || chr(10);
 ----
 true
+
+# A line comment at the end of a statement that stays on the gateway does not take its terminator.
+query I
+SELECT sirius_gateway_route('', 'BEGIN -- note') = 'BEGIN -- note' || chr(10) || ';' || chr(10);
+----
+true
+
+# Text that does not parse is refused whole: run as written, the client's gateway session would
+# execute the statements before the bad one, unrouted.
+statement error
+SELECT sirius_gateway_route('', 'SET GLOBAL sirius_gateway_min_ranks = 7; THIS IS NOT SQL');
+----
+syntax error
 
 statement ok con2
 BEGIN TRANSACTION;
@@ -262,6 +275,27 @@ statement error con2
 SELECT * FROM sirius_gateway_status(), read_text('/etc/hostname');
 ----
 cannot read tables, files or other table functions
+
+# One of the statement's own CTEs is not a table.
+query I con2
+WITH s AS (FROM sirius_gateway_status()) SELECT count(*) FROM s WHERE state = 'up';
+----
+2
+
+# A CTE that writes would do so on the gateway host.
+statement error con2
+WITH c AS (COPY (SELECT 1) TO '{TEST_DIR}/sirius_gateway_cte.csv') SELECT count(*) FROM sirius_gateway_status();
+----
+cannot write tables or files
+
+# On the ranks, a SELECT with a CTE that writes changes state like any DML: it is logged for replay.
+statement ok con2
+WITH x AS (INSERT INTO t VALUES (-1) RETURNING k) SELECT * FROM x;
+
+query I con2
+SELECT count(*) FROM sirius_gateway_log() WHERE sql LIKE 'WITH x AS (INSERT%';
+----
+1
 
 query I con2
 SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up';

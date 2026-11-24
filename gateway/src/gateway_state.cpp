@@ -1,18 +1,15 @@
 #include "gateway_state.hpp"
 
+#include "statement_facts.hpp"
+
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/parser/expression/function_expression.hpp"
-#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
-#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/attach_statement.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
-#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/set_statement.hpp"
-#include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -69,7 +66,28 @@ std::string setting(ClientContext& context, char const* name, std::string fallba
 constexpr std::array<char const*, 7> credential_words{
   "secret", "token", "password", "key_id", "access_key", "connection_string", "credential"};
 
-/// Statements whose effect a fresh rank must see again: everything but reads.
+/// Whether a fresh rank must see the effect of @p stmt again: everything but a read. A SELECT
+/// is no read when one of its CTEs is DML or a COPY, and neither is an EXPLAIN ANALYZE of a
+/// statement that changes state, which runs it.
+bool changes_state(duckdb::SQLStatement& stmt)
+{
+  switch (stmt.type) {
+    case duckdb::StatementType::SELECT_STATEMENT:
+      try {
+        return facts_of(stmt).writes;
+      } catch (duckdb::NotImplementedException&) {
+        return true;  // a tree that cannot be walked may hold a write
+      }
+    case duckdb::StatementType::EXPLAIN_STATEMENT: {
+      auto& explain = stmt.Cast<duckdb::ExplainStatement>();
+      return explain.explain_type == duckdb::ExplainType::EXPLAIN_ANALYZE &&
+             changes_state(*explain.stmt);
+    }
+    case duckdb::StatementType::TRANSACTION_STATEMENT: return false;
+    default: return true;
+  }
+}
+
 bool changes_state(std::string const& sql)
 {
   duckdb::Parser parser{duckdb::ParserOptions::Builtin()};
@@ -79,12 +97,7 @@ bool changes_state(std::string const& sql)
     return false;
   }
   return std::any_of(parser.statements.begin(), parser.statements.end(), [](auto const& stmt) {
-    switch (stmt->type) {
-      case duckdb::StatementType::SELECT_STATEMENT:
-      case duckdb::StatementType::EXPLAIN_STATEMENT:
-      case duckdb::StatementType::TRANSACTION_STATEMENT: return false;
-      default: return true;
-    }
+    return changes_state(*stmt);
   });
 }
 
@@ -205,14 +218,13 @@ std::string try_save_ddl_log(std::filesystem::path const& file, std::vector<std:
   }
 }
 
-/// Whether @p sql only reads the catalog: SELECTs whose every table, at any depth, is a
-/// `duckdb_*()`, `pragma_*()` or `sirius_rank_info()` table function or one of the statement's
-/// top-level CTEs. Quack sends such reads on every client's ATTACH. @p touches is set when one of
-/// those functions is read, which `SELECT 1` does not.
+/// Whether @p sql only reads the catalog: SELECTs that write nothing and whose every source, at
+/// any depth, is a `duckdb_*()`, `pragma_*()` or `sirius_rank_info()` table function or one of
+/// the statement's CTEs. Quack sends such reads on every client's ATTACH. @p touches is set when
+/// one of those functions is read, which `SELECT 1` does not.
 bool reads_only_catalog(std::string const& sql, bool* touches = nullptr)
 {
-  using namespace duckdb;
-  Parser parser{ParserOptions::Builtin()};
+  duckdb::Parser parser{duckdb::ParserOptions::Builtin()};
   try {
     parser.ParseQuery(sql);
   } catch (std::exception&) {
@@ -220,54 +232,21 @@ bool reads_only_catalog(std::string const& sql, bool* touches = nullptr)
   }
   if (parser.statements.empty()) { return false; }
   for (auto& stmt : parser.statements) {
-    if (stmt->type != StatementType::SELECT_STATEMENT) { return false; }
-    auto& node = *stmt->Cast<SelectStatement>().node;
-    std::set<std::string> ctes;
-    for (auto const& kv : node.cte_map.map) {
-      ctes.insert(StringUtil::Lower(kv.first.GetIdentifierName()));
-    }
-    bool only                             = true;
-    std::function<void(TableRef&)> on_ref = [&](TableRef& ref) {
-      switch (ref.type) {
-        case TableReferenceType::BASE_TABLE:
-          only =
-            only &&
-            ctes.count(StringUtil::Lower(ref.Cast<BaseTableRef>().Table().GetIdentifierName())) > 0;
-          break;
-        case TableReferenceType::TABLE_FUNCTION: {
-          auto& f = *ref.Cast<TableFunctionRef>().function;
-          auto const name =
-            f.GetExpressionClass() == ExpressionClass::FUNCTION
-              ? StringUtil::Lower(f.Cast<FunctionExpression>().FunctionName().GetIdentifierName())
-              : std::string{};
-          bool const catalog = StringUtil::StartsWith(name, "duckdb_") ||
-                               StringUtil::StartsWith(name, "pragma_") ||
-                               name == "sirius_rank_info";
-          only = only && catalog;
-          if (catalog && touches) { *touches = true; }
-          break;
-        }
-        case TableReferenceType::JOIN:
-        case TableReferenceType::SUBQUERY:
-        case TableReferenceType::EMPTY_FROM:
-        case TableReferenceType::EXPRESSION_LIST: break;
-        default: only = false;
-      }
-    };
-    std::function<void(unique_ptr<ParsedExpression>&)> on_expr =
-      [&](unique_ptr<ParsedExpression>& e) {
-        if (e->GetExpressionClass() == ExpressionClass::SUBQUERY) {
-          ParsedExpressionIterator::EnumerateQueryNodeChildren(
-            *e->Cast<SubqueryExpression>().SubqueryMutable()->node, on_expr, on_ref);
-        }
-        ParsedExpressionIterator::EnumerateChildren(*e, on_expr);
-      };
+    if (stmt->type != duckdb::StatementType::SELECT_STATEMENT) { return false; }
+    statement_facts facts;
     try {
-      ParsedExpressionIterator::EnumerateQueryNodeChildren(node, on_expr, on_ref);
+      facts = facts_of(*stmt);
     } catch (std::exception&) {
       return false;
     }
-    if (!only) { return false; }
+    if (facts.reads_table || facts.writes) { return false; }
+    for (auto const& name : facts.table_functions) {
+      if (!duckdb::StringUtil::StartsWith(name, "duckdb_") &&
+          !duckdb::StringUtil::StartsWith(name, "pragma_") && name != "sirius_rank_info") {
+        return false;
+      }
+      if (touches) { *touches = true; }
+    }
   }
   return true;
 }
