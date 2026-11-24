@@ -17,6 +17,9 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
+
+#include <string>
 
 namespace {
 
@@ -94,4 +97,41 @@ TEST_CASE_METHOD(CteFixture,
   REQUIRE(rows[0].size() == 2);
   REQUIRE(rows[0][0] == "1");
   REQUIRE(rows[0][1] == "42");
+}
+
+// With `delim_join_as_cte` off (deprecated in DuckDB), a correlated subquery DuckDB cannot flatten
+// stays a delim join, which Sirius has no operators for. Only a plan that has one is left to
+// DuckDB; the setting does not matter to any other plan.
+TEST_CASE_METHOD(CteFixture,
+                 "gpu_execution leaves a plan with a delim join to DuckDB",
+                 "[integration][gpu_execution][cte]")
+{
+  std::string const plain = "SELECT count(*) FROM ct WHERE k > 10";
+  // Correlated on an inequality, which keeps the delim join through DuckDB's optimizer.
+  std::string const correlated =
+    "SELECT count(*) FROM ct o WHERE k > (SELECT avg(k) FROM ct i WHERE i.g < o.g)";
+  auto const stats = [&] { return sirius::test::get_transparent_execution_stats(*con); };
+
+  run_ok("PREPARE under_default AS " + correlated + ";");
+  run_ok("EXECUTE under_default;");
+  {
+    sirius::test::scoped_sirius_setting off{*con, "delim_join_as_cte", false};
+    compare_gpu_vs_cpu(plain);
+    // A correlated subquery DuckDB flattens into an ordinary join has no delim join either.
+    compare_gpu_vs_cpu(
+      "SELECT count(*) FROM ct o WHERE EXISTS (SELECT 1 FROM ct i WHERE i.g = o.g AND i.k <> o.k)");
+    expect_plan_fallback_matches_cpu(correlated);
+    // A statement prepared under the default is planned again when it runs.
+    auto const before = stats();
+    run_ok("EXECUTE under_default;");
+    CHECK(stats().fallbacks == before.fallbacks + 1);
+    CHECK(stats().executions == before.executions);
+
+    // Without a CPU fallback, the error names the setting.
+    sirius::test::scoped_sirius_setting no_fallback{*con, "enable_duckdb_fallback", false};
+    CHECK(query_error(correlated).find("delim_join_as_cte = true") != std::string::npos);
+    compare_gpu_vs_cpu(plain);
+  }
+  // Under the default the subquery is a CTE, and the query runs on the GPU.
+  compare_gpu_vs_cpu(correlated);
 }

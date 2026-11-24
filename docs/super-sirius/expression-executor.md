@@ -122,7 +122,7 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 | `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, `concat`, etc.) and arithmetic (`a + b`, `-x`) — `sirius::function_id` enum |
 | `aggregate` | `sirius::ast::aggregate` | Aggregate function (`SUM`, `COUNT`, etc.) — `sirius::aggregate_id` enum |
 
-**Translation boundary:** `sirius::ast::from_duckdb(expr)` produces a `sirius::ast::node` from a `duckdb::Expression`. This happens once at plan time in the plan builders (and at the scan boundary for pushdown filters); the resulting node is owned by the operator and never re-translated.
+**Translation boundary:** `sirius::ast::from_duckdb(expr)` produces a `sirius::ast::node` from a `duckdb::Expression`. This happens once at plan time in the plan builders (and at the scan boundary for pushdown filters); the resulting node is owned by the operator and never re-translated. A cast between equal DuckDB types that DuckDB bound to a no-op, and that no other rule declines, translates to its child: DuckDB can wrap a literal argument in one (for example a `LIKE` pattern), which the evaluator must still see as a constant.
 
 **Key files:**
 
@@ -329,17 +329,22 @@ The current contract matches DuckDB: signed epoch ticks reserve exactly `+MAX` a
 normalize their temporal values to this representation before using these helpers;
 the helpers do not depend on DuckDB types or a frontend identity.
 
-`cast_to_microseconds_checked()` converts second, millisecond, and nanosecond
-columns to microseconds. It checks finite values before multiplying, preserves
-infinity, and truncates nanoseconds toward zero. Overflow raises
-`sirius::invalid_input_exception`; reading the overflow result synchronizes the
-supplied stream. The cast evaluator dispatches to this helper for semantic casts.
+`cast_timestamp_checked()` converts a timestamp column to every finer precision
+(seconds to milliseconds, microseconds, or nanoseconds; milliseconds to
+microseconds or nanoseconds; microseconds to nanoseconds) and nanoseconds to
+microseconds. It checks finite values before multiplying, preserves infinity, and
+rounds nanoseconds to the nearest microsecond with ties away from the epoch.
+Overflow raises `sirius::invalid_input_exception`; reading the overflow result
+synchronizes the supplied stream. `has_checked_timestamp_cast()` names the casts it
+implements, and the cast evaluator dispatches to this helper for semantic casts
+among them. The other casts to a coarser precision use `cudf::cast`, which
+neither applies DuckDB's rounding nor preserves infinity.
 
 `finite_mask()` returns a nullable boolean column for DATE or any timestamp
 precision. Both checked conversion and millisecond/microsecond extraction use it,
 so sentinel handling has one implementation. The evaluator boundary regressions
-are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
-tagged `[timestamp_extraction]`.
+are tagged `[timestamp_bounds]`; SQL comparisons against DuckDB are tagged
+`[timestamp_extraction]` for extraction and `[timestamp_cast]` for precision casts.
 
 ### HUGEINT
 

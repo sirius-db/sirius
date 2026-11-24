@@ -171,6 +171,14 @@ class decode_frame final {
    */
   void keep_kernel(std::shared_ptr<codegen::jit::CompiledKernel const> kernel);
 
+  /**
+   * @brief Run @p check once finish() has drained the session's streams, before it returns.
+   *
+   * A check observes host state that queued work wrote, so registering one never waits. A check
+   * that throws fails finish(); a session destroyed without finish() runs none.
+   */
+  void check_on_completion(std::function<void()> check);
+
  private:
   friend class decode_session;
   decode_frame(::cuda::stream_ref stream, rmm::device_async_resource_ref mr) noexcept;
@@ -180,6 +188,7 @@ class decode_frame final {
   std::vector<std::unique_ptr<std::byte[]>> uploads_;
   // Dropping the final module handle can synchronize the CUDA context.
   std::vector<std::shared_ptr<codegen::jit::CompiledKernel const>> kernels_;
+  std::vector<std::function<void()>> checks_;
 };
 
 /**
@@ -246,7 +255,8 @@ class decode_session final {
    * Waits once for each distinct stream that received a request, which also covers other work
    * queued there; a supplied stream that received no request is not waited for. An empty session
    * performs no CUDA work. Success or failure closes the session: neither append() nor finish() may
-   * be called again. A failed call returns no partial results.
+   * be called again. A failed call returns no partial results. Checks registered with
+   * decode_frame::check_on_completion() run after the waits, and the first to throw fails the call.
    *
    * @return Completed columns, excluding mask-only requests
    */

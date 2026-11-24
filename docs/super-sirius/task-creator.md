@@ -137,10 +137,9 @@ for task creation; hints do not select a consumer algorithm. Consumer-specific b
 routing modes, placement, and any concat-all requirement. The decision is serialized once for all
 bound inputs; the routers do not acquire each other's operator locks.
 
-Hash-join bindings normally size from build; right-family joins size from probe except inside a
-right-delim join. Dense-count bindings wait for both producers before measuring the combined
-input. Grouped-merge bindings may use a projected size. A completed empty sizing input preserves
-the one-partition fallback. After resolution, normal port barriers determine readiness.
+Hash-join bindings normally size from build; right-family joins size from probe. Dense-count
+bindings wait for both producers before measuring the combined input. Grouped-merge bindings may
+use a projected size. A completed empty sizing input preserves the one-partition fallback. After resolution, normal port barriers determine readiness.
 
 The build-input observer certifies dynamic-filter inventory before the first claim, contributes
 before scatter, and publishes after successful scatter. That lifecycle belongs to the hash-join
@@ -205,13 +204,6 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call, adva
 
 Same pattern as MERGE_SORT: drains all batches from one partition per call.
 
-### DELIM_JOIN
-
-| Method | Behavior |
-|--------|----------|
-| `get_next_task_input_data()` | Delegates to internal `partition_join` operator |
-| Why custom | Wrapper pattern — the actual task creation is handled by the embedded join |
-
 ## Override Summary Table
 
 | Operator | `get_next_task_hint()` | `get_next_task_input_data()` | Why Custom |
@@ -226,7 +218,6 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 | GROUPED_AGGREGATE_MERGE | Base class | Drain all from one partition | Per-partition merge |
 | MERGE_AGGREGATE | Claim one task after upstream completion | Drain all partials or create input-free descriptor | Final SQL row even with zero input batches |
 | TOP_N_MERGE | Base class | Drain all from one partition | Per-partition merge |
-| DELIM_JOIN | N/A | Delegates to partition_join | Wrapper pattern |
 
 ## Task Creator Manager Loop
 

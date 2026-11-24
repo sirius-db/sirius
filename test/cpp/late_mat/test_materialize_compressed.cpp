@@ -41,10 +41,10 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/bit.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream_ref>
 #include <cuda_runtime.h>
 
 #include <api/simpatico_codegen.hpp>
@@ -86,7 +86,7 @@ bool row_is_null(std::int64_t global_id) { return global_id % 7 == 3 || global_i
 std::unique_ptr<cudf::column> make_batch(std::int64_t first_row,
                                          std::int64_t rows,
                                          bool nullable,
-                                         rmm::cuda_stream_view stream)
+                                         ::cuda::stream_ref stream)
 {
   std::vector<std::int32_t> values(static_cast<std::size_t>(rows));
   std::iota(values.begin(), values.end(), static_cast<std::int32_t>(first_row));
@@ -100,7 +100,7 @@ std::unique_ptr<cudf::column> make_batch(std::int64_t first_row,
                   values.data(),
                   values.size() * sizeof(std::int32_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
+                  stream.get());
 
   if (nullable) {
     auto const words = static_cast<std::size_t>(
@@ -119,11 +119,11 @@ std::unique_ptr<cudf::column> make_batch(std::int64_t first_row,
                     host_mask.data(),
                     host_mask.size() * sizeof(cudf::bitmask_type),
                     cudaMemcpyHostToDevice,
-                    stream.value());
-    cudaStreamSynchronize(stream.value());
+                    stream.get());
+    cudaStreamSynchronize(stream.get());
     col->set_null_count(nulls);
   }
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   return col;
 }
 
@@ -140,7 +140,7 @@ struct fake_compressed_pin {
   fake_compressed_pin(std::vector<std::int64_t> const& batch_rows,
                       std::string const& dsl,
                       bool nullable,
-                      rmm::cuda_stream_view stream)
+                      ::cuda::stream_ref stream)
   {
     auto const mr   = rmm::mr::get_current_device_resource_ref();
     manager         = sirius::test::operator_utils::initialize_memory_manager();
@@ -154,7 +154,7 @@ struct fake_compressed_pin {
       auto blob = std::make_shared<sirius::compressed_device_blob>();
       blob->table =
         simpatico::compress_with_plan(cudf::table_view{{source->view()}}, dsl, stream, mr);
-      cudaStreamSynchronize(stream.value());
+      cudaStreamSynchronize(stream.get());
 
       auto rep = std::make_shared<sirius::compressed_device_representation>(
         *gpu_space,
@@ -209,7 +209,7 @@ std::vector<bool> read_validity(cudf::column_view const& col)
   return valid;
 }
 
-rmm::device_buffer upload_ids(std::vector<std::uint64_t> const& host, rmm::cuda_stream_view stream)
+rmm::device_buffer upload_ids(std::vector<std::uint64_t> const& host, ::cuda::stream_ref stream)
 {
   rmm::device_buffer buf(
     host.size() * sizeof(std::uint64_t), stream, rmm::mr::get_current_device_resource_ref());
@@ -218,8 +218,8 @@ rmm::device_buffer upload_ids(std::vector<std::uint64_t> const& host, rmm::cuda_
                     host.data(),
                     host.size() * sizeof(std::uint64_t),
                     cudaMemcpyHostToDevice,
-                    stream.value());
-    cudaStreamSynchronize(stream.value());
+                    stream.get());
+    cudaStreamSynchronize(stream.get());
   }
   return buf;
 }
@@ -231,7 +231,7 @@ void check_against_ids(pinned_column_view const& view,
                        std::vector<std::uint64_t> const& ids,
                        bool nullable,
                        bool sorted_unique,
-                       rmm::cuda_stream_view stream)
+                       ::cuda::stream_ref stream)
 {
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   auto const layout = pinned_table_layout::from_batch_rows(batch_rows);
@@ -242,7 +242,7 @@ void check_against_ids(pinned_column_view const& view,
                                                 static_cast<std::int64_t>(ids.size()),
                                                 sorted_unique});
   auto const column = materialize(view, prepared, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   REQUIRE(column->size() == static_cast<cudf::size_type>(ids.size()));
 
@@ -264,7 +264,7 @@ struct device_row_set {
 
   device_row_set(std::vector<std::int64_t> const& rows,
                  std::int64_t num_rows,
-                 rmm::cuda_stream_view stream)
+                 ::cuda::stream_ref stream)
   {
     std::vector<std::uint32_t> chunks, offsets{0};
     std::vector<std::uint16_t> positions;
@@ -282,14 +282,14 @@ struct device_row_set {
     auto upload   = [&](void const* src, std::size_t bytes) {
       rmm::device_buffer buf(bytes, stream, mr);
       if (bytes != 0) {
-        cudaMemcpyAsync(buf.data(), src, bytes, cudaMemcpyHostToDevice, stream.value());
+        cudaMemcpyAsync(buf.data(), src, bytes, cudaMemcpyHostToDevice, stream.get());
       }
       return buf;
     };
     chunk_ids     = upload(chunks.data(), chunks.size() * sizeof(std::uint32_t));
     block_offsets = upload(offsets.data(), offsets.size() * sizeof(std::uint32_t));
     in_chunk_rows = upload(positions.data(), positions.size() * sizeof(std::uint16_t));
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
 
     view.chunk_ids     = static_cast<std::uint32_t const*>(chunk_ids.data());
     view.block_offsets = static_cast<std::uint32_t const*>(block_offsets.data());
@@ -309,7 +309,7 @@ struct device_mask {
 
 device_mask mask_over(device_row_set const& set,
                       std::int64_t num_rows,
-                      rmm::cuda_stream_view stream,
+                      ::cuda::stream_ref stream,
                       rmm::device_async_resource_ref mr)
 {
   device_mask out;
@@ -347,7 +347,7 @@ constexpr char const* kFullPlan = "input -> ans\n";
 TEST_CASE("a compressed chunk reports its null count without decoding",
           "[late_mat][materialize_compressed]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
 
   fake_compressed_pin nullable({4 * kChunk}, kBitpackPlan, /*nullable=*/true, stream);
   fake_compressed_pin plain({4 * kChunk}, kBitpackPlan, /*nullable=*/false, stream);
@@ -375,7 +375,7 @@ TEST_CASE("a compressed chunk reports its null count without decoding",
 TEST_CASE("deferral admission takes a nullable compressed column and refuses a chunk with no blob",
           "[late_mat][materialize_compressed][admission]")
 {
-  auto const stream        = rmm::cuda_stream_view{};
+  auto const stream        = ::cuda::stream_ref{cudaStream_t{}};
   auto const nullable_rows = GENERATE(false, true);
   CAPTURE(nullable_rows);
   fake_compressed_pin pin({kChunk, kChunk}, kBitpackPlan, nullable_rows, stream);
@@ -412,7 +412,7 @@ TEST_CASE("deferral admission takes a nullable compressed column and refuses a c
 
 TEST_CASE("the dense route decodes a whole nullable batch", "[late_mat][materialize_compressed]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   std::vector<std::int64_t> const batch_rows{2 * kChunk};
   fake_compressed_pin pin(batch_rows, kBitpackPlan, /*nullable=*/true, stream);
 
@@ -426,7 +426,7 @@ TEST_CASE("the dense route decodes a whole nullable batch", "[late_mat][material
 TEST_CASE("a nullable bitpack column takes the full decode and keeps the selected rows' validity",
           "[late_mat][materialize_compressed]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   std::vector<std::int64_t> const batch_rows{4 * kChunk};
   fake_compressed_pin pin(batch_rows, kBitpackPlan, /*nullable=*/true, stream);
@@ -458,7 +458,7 @@ TEST_CASE("a nullable bitpack column takes the full decode and keeps the selecte
 TEST_CASE("a nullable delta column is offered no compacted route and keeps its validity",
           "[late_mat][materialize_compressed]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   std::vector<std::int64_t> const batch_rows{4 * kChunk};
   fake_compressed_pin pin(batch_rows, kDeltaPlan, /*nullable=*/true, stream);
@@ -494,7 +494,7 @@ TEST_CASE("a nullable delta column is offered no compacted route and keeps its v
 TEST_CASE("the full-decode fallback carries validity through its gather",
           "[late_mat][materialize_compressed]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   std::vector<std::int64_t> const batch_rows{2 * kChunk};
   fake_compressed_pin pin(batch_rows, kFullPlan, /*nullable=*/true, stream);
@@ -528,7 +528,7 @@ TEST_CASE("the full-decode fallback carries validity through its gather",
 TEST_CASE("validity stays with its value under a repeated, unsorted selection",
           "[late_mat][materialize_compressed]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   std::vector<std::int64_t> const batch_rows{3 * kChunk, 2 * kChunk};
   fake_compressed_pin pin(batch_rows, kBitpackPlan, /*nullable=*/true, stream);
 
@@ -544,7 +544,7 @@ TEST_CASE("validity stays with its value under a repeated, unsorted selection",
 TEST_CASE("a compressed origin with no nulls materializes unchanged",
           "[late_mat][materialize_compressed]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   std::vector<std::int64_t> const batch_rows{3 * kChunk, 2 * kChunk};
   fake_compressed_pin pin(batch_rows, kBitpackPlan, /*nullable=*/false, stream);
 
@@ -555,7 +555,7 @@ TEST_CASE("a compressed origin with no nulls materializes unchanged",
 TEST_CASE("an all-null compressed column materializes as all null",
           "[late_mat][materialize_compressed]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   auto manager      = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space   = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
@@ -567,12 +567,12 @@ TEST_CASE("an all-null compressed column materializes as all null",
                                           static_cast<cudf::size_type>(kRows),
                                           cudf::mask_state::ALL_NULL,
                                           stream);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   auto blob = std::make_shared<sirius::compressed_device_blob>();
   blob->table =
     simpatico::compress_with_plan(cudf::table_view{{source->view()}}, kBitpackPlan, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   auto const counted = simpatico::column_null_count(blob->table, 0);
   REQUIRE(counted.has_value());
@@ -602,7 +602,7 @@ TEST_CASE("an all-null compressed column materializes as all null",
                                                 static_cast<std::int64_t>(ids.size()),
                                                 false});
   auto const column = materialize(view, prepared, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   REQUIRE(column->size() == static_cast<cudf::size_type>(ids.size()));
   REQUIRE(column->null_count() == static_cast<cudf::size_type>(ids.size()));

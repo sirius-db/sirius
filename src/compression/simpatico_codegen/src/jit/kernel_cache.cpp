@@ -79,7 +79,21 @@ std::shared_ptr<const CompiledKernel> KernelCache::get_or_compile_plain(
   const std::string& source, const std::string& entry_symbol, const CompileOptions& opts)
 {
   const detail::CompilationRequest request(source, entry_symbol, opts);
-  const auto key = detail::request_identity(request.identity_view());
+  return get_or_build(
+    detail::request_identity(request.identity_view()),
+    [] { return detail::cache_environment(); },
+    entry_symbol,
+    source,
+    [&] { return detail::compile_request(request); });
+}
+
+std::shared_ptr<const CompiledKernel> KernelCache::get_or_build(
+  const detail::Digest& key,
+  const std::function<detail::Digest()>& environment,
+  const std::string& entry_symbol,
+  const std::string& source,
+  const std::function<CompiledKernel()>& build)
+{
   {
     std::lock_guard<std::mutex> lock(mu_);
     if (auto it = table_.find(key); it != table_.end()) {
@@ -100,7 +114,7 @@ std::shared_ptr<const CompiledKernel> KernelCache::get_or_compile_plain(
   std::string path;
   if (cdir && !cdir->empty()) {
     // Do not swallow an NVRTC version error in the storage-miss fallback.
-    const detail::CompilationIdentity identity{detail::cache_environment(), key};
+    const detail::CompilationIdentity identity{environment(), key};
     try {
       // One best-effort maintenance pass per process, including first-use disk
       // hits. The static initializer serializes concurrent cold callers.
@@ -117,7 +131,7 @@ std::shared_ptr<const CompiledKernel> KernelCache::get_or_compile_plain(
             load_kernel_from_cubin(std::move(bytes), entry_symbol, source));
           ++g_jit_disk_hits;
           std::lock_guard<std::mutex> lock(mu_);
-          auto [it, inserted] = table_.emplace(std::move(key), std::move(loaded));
+          auto [it, inserted] = table_.emplace(key, std::move(loaded));
           (void)inserted;
           return it->second;
         } catch (...) {
@@ -130,7 +144,7 @@ std::shared_ptr<const CompiledKernel> KernelCache::get_or_compile_plain(
   }
 
   auto _t0             = std::chrono::steady_clock::now();
-  CompiledKernel fresh = detail::compile_request(request);
+  CompiledKernel fresh = build();
   auto _us =
     std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0)
       .count();
@@ -141,7 +155,7 @@ std::shared_ptr<const CompiledKernel> KernelCache::get_or_compile_plain(
 
   auto kernel = std::make_shared<const CompiledKernel>(std::move(fresh));
   std::lock_guard<std::mutex> lock(mu_);
-  auto [it, inserted] = table_.emplace(std::move(key), std::move(kernel));
+  auto [it, inserted] = table_.emplace(key, std::move(kernel));
   (void)inserted;
   return it->second;
 }

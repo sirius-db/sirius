@@ -356,7 +356,7 @@ TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results"
     REQUIRE(deltas.on.producers_enabled == deltas.off.producers_enabled);
   }
 
-  SECTION("TPC-H q17: a delim-scan build wires only through opaque-build evidence")
+  SECTION("TPC-H q17: a build on the delim CTE's keys wires through opaque-build evidence")
   {
     auto const deltas =
       require_switch_result_equivalence(con,
@@ -390,7 +390,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("INSERT INTO items VALUES (3000, NULL, 1), (3001, 1, NULL);");
   run_ok("CHECKPOINT;");
 
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   sirius::test::coverage_gate_disable_guard gate_off(*con);
   std::string query;
 
@@ -471,7 +470,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("INSERT INTO items VALUES (3000, NULL, 1), (3001, 1, NULL), (3002, NULL, NULL);");
   run_ok("CHECKPOINT;");
 
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   // Each outer query filters its rows so that DuckDB keeps the delim CTE.
   std::string query;
 
@@ -538,7 +536,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("INSERT INTO items VALUES (30000, NULL, 1), (30001, 1, NULL), (30002, NULL, NULL);");
   run_ok("CHECKPOINT;");
 
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   sirius::test::scoped_sirius_setting accumulation(
     *con, "enable_dynamic_filter_multi_partition", true);
   // TPC-Havoc Q05_V01 shape: the correlated scalar subquery makes a delim CTE of the outer rows,
@@ -576,7 +573,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("INSERT INTO person VALUES (NULL, '1', true, 3), (17, NULL, true, NULL);");
   run_ok("CHECKPOINT;");
 
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   compare_gpu_vs_cpu(
     "WITH o AS MATERIALIZED (SELECT * FROM person WHERE selected) "
     "SELECT count(*), sum(q.m) FROM o JOIN (SELECT p.id, p.tag, "
@@ -596,7 +592,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("CREATE TABLE t3 AS SELECT i::INTEGER AS b, (i % 4)::INTEGER AS g FROM range(10) t(i);");
   run_ok("CHECKPOINT;");
 
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   compare_gpu_vs_cpu(
     "SELECT count(*), sum(s.n), min(s.n), max(s.n) FROM ("
     "WITH __duckdb_delim_9 AS MATERIALIZED (SELECT b, x FROM t1) "
@@ -644,7 +639,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     "SELECT depth + 1 FROM walk WHERE depth < 7) SELECT depth FROM walk) expanded "
     "JOIN vertices target ON target.id = expanded.depth + 1;");
 
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   std::string const walk = "SELECT count(*) FROM joined_walk WHERE id = 3";
   std::string const selected =
     "WITH o AS MATERIALIZED (SELECT * FROM person WHERE selected) "
