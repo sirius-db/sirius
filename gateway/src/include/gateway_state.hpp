@@ -161,6 +161,8 @@ class gateway_state {
   struct outcome {
     std::unique_ptr<duckdb::QueryResult> result;
     std::optional<duckdb::ErrorData> error;
+    /// The gateway gave up on the call, so the rank is lost.
+    bool abandoned = false;
   };
   /// When a fan-out cancels its calls: the client interrupting, and the statement timeout.
   struct fan_out_policy {
