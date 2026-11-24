@@ -24,9 +24,8 @@ inline const operator_params& operator_defaults()
 
 }  // namespace detail
 
-/// `sirius.operator_params`: operator sizing and planning policy. Options a DuckDB SET overrides
-/// per connection are scope query; the file value is where a connection starts. Every batch size
-/// resolution derives is a production setting: an effective configuration without one would
+/// `sirius.operator_params`: operator sizing and planning policy. Every batch size resolution
+/// derives is a production setting: an effective configuration without one would
 /// derive it again from the GPU usage limit the file names, smaller than the first time.
 struct operator_options : block_base<operator_options> {
   static const operator_params& defaults() { return detail::operator_defaults(); }
@@ -35,198 +34,230 @@ struct operator_options : block_base<operator_options> {
   config_option<bool> enable_late_materialization =
     option<bool>("enable_late_materialization")
       .fallback(defaults().enable_late_materialization)
-      .scope(option_scope::query)
+      .describe("carry rowids instead of values for pinned-table scans")
       .build();
-  config_option<bool> enable_fused_scan_filter = option<bool>("enable_fused_scan_filter")
-                                                   .fallback(defaults().enable_fused_scan_filter)
-                                                   .scope(option_scope::query)
-                                                   .build();
+  config_option<bool> enable_fused_scan_filter =
+    option<bool>("enable_fused_scan_filter")
+      .fallback(defaults().enable_fused_scan_filter)
+      .describe("fuse row filters into compressed scan decoding")
+      .build();
   config_option<bool> enable_low_cardinality_groupby =
     option<bool>("enable_low_cardinality_groupby")
       .fallback(defaults().enable_low_cardinality_groupby)
-      .scope(option_scope::query)
+      .describe("dedicated kernel for small string-key group-bys")
       .build();
   config_option<int> late_materialization_min_boundaries =
     option<int>("late_materialization_min_boundaries")
       .validate(non_negative<int>{})
       .fallback(defaults().late_materialization_min_boundaries)
-      .scope(option_scope::query)
+      .describe("minimum port crossings late materialization must save")
       .build();
   config_option<std::int64_t> late_materialization_min_value_x_boundaries =
     option<std::int64_t>("late_materialization_min_value_x_boundaries")
       .validate(non_negative<std::int64_t>{})
       .fallback(defaults().late_materialization_min_value_x_boundaries)
-      .scope(option_scope::query)
+      .describe("minimum bytes per row times crossings a deferral must save")
       .build();
   config_option<bool> late_materialization_count_defer =
     option<bool>("late_materialization_count_defer")
       .fallback(defaults().late_materialization_count_defer)
-      .scope(option_scope::query)
+      .describe("let columns read only by COUNT stay deferred")
       .build();
   config_option<std::int64_t> late_materialization_min_value_compressed =
     option<std::int64_t>("late_materialization_min_value_compressed")
       .validate(non_negative<std::int64_t>{})
       .fallback(defaults().late_materialization_min_value_compressed)
-      .scope(option_scope::query)
+      .describe("minimum deferred bytes per row for compressed origins")
       .build();
-  config_option<bool> fused_scan_diagnostics = option<bool>("fused_scan_diagnostics")
-                                                 .fallback(defaults().fused_scan.diagnostics)
-                                                 .scope(option_scope::query)
-                                                 .build();
+  config_option<bool> fused_scan_diagnostics =
+    option<bool>("fused_scan_diagnostics")
+      .fallback(defaults().fused_scan.diagnostics)
+      .describe("verbose fused-scan decision traces and decoder diagnostics")
+      .build();
   config_option<double> fused_scan_max_selectivity =
     option<double>("fused_scan_max_selectivity")
       .validate(positive_finite{})
       .fallback(defaults().fused_scan.max_selectivity)
-      .scope(option_scope::query)
+      .describe("surviving-row share limit for fused-scan compaction")
       .build();
   config_option<double> fused_scan_full_route_max_selectivity =
     option<double>("fused_scan_full_route_max_selectivity")
       .validate(positive_finite{})
       .fallback(defaults().fused_scan.full_route_max_selectivity)
-      .scope(option_scope::query)
+      .describe("surviving-row share limit for full-width fused decoding")
       .build();
   config_option<double> fused_scan_index_walk_max_selectivity =
     option<double>("fused_scan_index_walk_max_selectivity")
       .validate(positive_finite{})
       .fallback(defaults().fused_scan.index_walk_max_selectivity)
-      .scope(option_scope::query)
+      .describe("surviving-row share limit for the survivor-index walk")
       .build();
   config_option<std::size_t> fused_scan_max_membership_sources =
     option<std::size_t>("fused_scan_max_membership_sources")
       .validate(
         at_most<std::size_t>{static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())})
       .fallback(defaults().fused_scan.max_membership_sources)
-      .scope(option_scope::query)
+      .describe("join-filter probes carried by one fused decode")
       .build();
 
   // -- batch and partition sizes. Unset sizes derive from the GPU memory when the configuration
   // is resolved (max_build_hash_table_bytes from hash_partition_bytes).
   config_option<ubytes> scan_task_batch_size =
-    option<ubytes>("scan_task_batch_size").validate(positive<ubytes>{}).mark_production().build();
+    option<ubytes>("scan_task_batch_size")
+      .validate(positive<ubytes>{})
+      .mark_production()
+      .describe("target batch size for DuckDB scan tasks")
+      .build();
   /// 0 = max_sort_partition_memory_fraction of the GPU memory.
   config_option<ubytes> max_sort_partition_bytes =
     option<ubytes>("max_sort_partition_bytes")
       .fallback(ubytes(defaults().max_sort_partition_bytes))
-      .scope(option_scope::query)
       .mark_production()
+      .describe("maximum bytes per sort partition")
       .build();
   config_option<double> max_sort_partition_memory_fraction =
     option<double>("max_sort_partition_memory_fraction")
       .validate(fraction{})
       .fallback(defaults().max_sort_partition_memory_fraction)
-      .scope(option_scope::query)
+      .describe("share of GPU memory per sort partition when auto-sized")
       .build();
-  config_option<ubytes> hash_partition_bytes = option<ubytes>("hash_partition_bytes")
-                                                 .validate(positive<ubytes>{})
-                                                 .scope(option_scope::query)
-                                                 .mark_production()
-                                                 .build();
+  config_option<ubytes> hash_partition_bytes =
+    option<ubytes>("hash_partition_bytes")
+      .validate(positive<ubytes>{})
+      .mark_production()
+      .describe("target partition size for hash joins and group-bys")
+      .build();
   config_option<ubytes> concat_batch_bytes =
-    option<ubytes>("concat_batch_bytes").mark_production().build();
+    option<ubytes>("concat_batch_bytes")
+      .mark_production()
+      .describe("target output batch size for CONCAT and REPLICATE")
+      .build();
   config_option<ubytes> cross_join_task_bytes =
-    option<ubytes>("cross_join_task_bytes").mark_production().build();
+    option<ubytes>("cross_join_task_bytes")
+      .mark_production()
+      .describe("target output size of each cross product task")
+      .build();
   config_option<ubytes> sort_sample_bytes =
-    option<ubytes>("sort_sample_bytes").scope(option_scope::query).mark_production().build();
+    option<ubytes>("sort_sample_bytes")
+      .mark_production()
+      .describe("bytes sampled to compute sort partition boundaries")
+      .build();
   /// 0 turns BUILD_PROBE off, MARK joins included.
-  config_option<ubytes> max_build_hash_table_bytes = option<ubytes>("max_build_hash_table_bytes")
-                                                       .scope(option_scope::query)
-                                                       .mark_production()
-                                                       .build();
+  config_option<ubytes> max_build_hash_table_bytes =
+    option<ubytes>("max_build_hash_table_bytes")
+      .mark_production()
+      .describe("per-GPU hash-table size limit for BUILD_PROBE joins")
+      .build();
   /// 0 turns BUILD_PROBE off, MARK joins included.
   config_option<ubytes> max_build_probe_resident_bytes =
     option<ubytes>("max_build_probe_resident_bytes")
-      .scope(option_scope::query)
       .mark_production()
+      .describe("per-GPU GPU-resident build payload limit for BUILD_PROBE joins")
       .build();
   config_option<ubytes> max_broadcast_join_size =
     option<ubytes>("max_broadcast_join_size")
       .fallback(ubytes(defaults().max_broadcast_join_size))
-      .scope(option_scope::query)
       .mark_production()
+      .describe("largest build side eligible for a broadcast join")
       .build();
   /// 0 always uses filtered_join.
   config_option<double> mark_join_build_switch_ratio =
     option<double>("mark_join_build_switch_ratio")
       .validate(non_negative<double>{})
       .fallback(defaults().mark_join_build_switch_ratio)
-      .scope(option_scope::query)
+      .describe("row ratio at which MARK joins build on the left side")
       .build();
 
   // -- dynamic filters
-  config_option<bool> enable_dynamic_filter =
-    option<bool>("enable_dynamic_filter").fallback(defaults().enable_dynamic_filter).build();
+  config_option<bool> enable_dynamic_filter = option<bool>("enable_dynamic_filter")
+                                                .fallback(defaults().enable_dynamic_filter)
+                                                .describe("runtime filters for eligible hash joins")
+                                                .build();
   config_option<bool> enable_dynamic_filter_multi_partition =
     option<bool>("enable_dynamic_filter_multi_partition")
       .fallback(defaults().enable_dynamic_filter_multi_partition)
+      .describe("Bloom filters for multi-partition hash join builds")
       .build();
   config_option<bool> enable_dynamic_zone_map_filter =
     option<bool>("enable_dynamic_zone_map_filter")
       .fallback(defaults().enable_dynamic_zone_map_filter)
+      .describe("build-key min/max runtime filters")
       .build();
   /// Above 1 turns the coverage gate off.
   config_option<double> dynamic_filter_domain_coverage_threshold =
     option<double>("dynamic_filter_domain_coverage_threshold")
       .validate(valid_domain_coverage_threshold{})
       .fallback(defaults().dynamic_filter_domain_coverage_threshold)
-      .scope(option_scope::query)
+      .describe("build key-domain coverage above which a key is not filtered")
       .build();
   config_option<double> dynamic_filter_inlist_max_l2_fraction =
     option<double>("dynamic_filter_inlist_max_l2_fraction")
       .validate(fraction{})
       .fallback(defaults().dynamic_filter_inlist_max_l2_fraction)
-      .scope(option_scope::query)
+      .describe("largest exact IN-list runtime filter, as a share of GPU L2")
       .build();
   config_option<double> dynamic_filter_keep_threshold =
     option<double>("dynamic_filter_keep_threshold")
       .validate(fraction{})
       .fallback(defaults().dynamic_filter_keep_threshold)
-      .scope(option_scope::query)
+      .describe("kept-row share above which post-decode filtering stops")
       .build();
 
   // -- pinning, compression and planning rewrites
   config_option<bool> enable_pinned_zone_map_pruning =
     option<bool>("enable_pinned_zone_map_pruning")
       .fallback(defaults().enable_pinned_zone_map_pruning)
+      .describe("prune pinned chunks with per-chunk min/max statistics")
       .build();
   config_option<bool> enable_decimal_sum_stats_bound =
     option<bool>("enable_decimal_sum_stats_bound")
       .fallback(defaults().enable_decimal_sum_stats_bound)
+      .describe("plan-time SUM/AVG widening decisions from table statistics")
       .build();
   config_option<bool> enable_compressed_materialization =
     option<bool>("enable_compressed_materialization")
       .fallback(defaults().enable_compressed_materialization)
-      .scope(option_scope::query)
+      .describe("narrower carriers for eligible integer and DECIMAL values")
       .build();
-  config_option<bool> enable_dense_count_join =
-    option<bool>("enable_dense_count_join").fallback(defaults().enable_dense_count_join).build();
+  config_option<bool> enable_dense_count_join = option<bool>("enable_dense_count_join")
+                                                  .fallback(defaults().enable_dense_count_join)
+                                                  .describe("fused count-over-outer-join operator")
+                                                  .build();
   config_option<bool> enable_delim_aggregate_reuse =
     option<bool>("enable_delim_aggregate_reuse")
       .fallback(defaults().enable_delim_aggregate_reuse)
+      .describe("compute decorrelated subquery aggregates from delim CTE rows")
       .build();
-  config_option<bool> pin_table_prove_unique_keys = option<bool>("pin_table_prove_unique_keys")
-                                                      .fallback(defaults().prove_unique_keys)
-                                                      .scope(option_scope::query)
-                                                      .build();
+  config_option<bool> pin_table_prove_unique_keys =
+    option<bool>("pin_table_prove_unique_keys")
+      .fallback(defaults().prove_unique_keys)
+      .describe("prove pinned columns distinct for join planning")
+      .build();
   /// 0 = a share of the pinning GPU memory space's capacity.
   config_option<ubytes> pin_table_unique_exact_max_bytes =
     option<ubytes>("pin_table_unique_exact_max_bytes")
       .fallback(ubytes(defaults().unique_exact_max_bytes))
-      .scope(option_scope::query)
+      .describe("value cap for the pin-time exact uniqueness check")
       .build();
   config_option<bool> enable_exists_minmax_rewrite =
     option<bool>("enable_exists_minmax_rewrite")
       .fallback(defaults().enable_exists_minmax_rewrite)
+      .describe("rewrite sibling correlated EXISTS into a MIN/MAX aggregate")
       .build();
   config_option<bool> enable_partial_aggregate_below_join =
     option<bool>("enable_partial_aggregate_below_join")
       .fallback(defaults().enable_partial_aggregate_below_join)
+      .describe("aggregate below an inner join that only adds payload")
       .build();
-  config_option<bool> enable_subquery_key_carry = option<bool>("enable_subquery_key_carry")
-                                                    .fallback(defaults().enable_subquery_key_carry)
-                                                    .build();
+  config_option<bool> enable_subquery_key_carry =
+    option<bool>("enable_subquery_key_carry")
+      .fallback(defaults().enable_subquery_key_carry)
+      .describe("restrict correlated subquery tables to the outer rows' keys")
+      .build();
   config_option<bool> enable_exists_from_aggregate =
     option<bool>("enable_exists_from_aggregate")
       .fallback(defaults().enable_exists_from_aggregate)
+      .describe("drop a correlated EXISTS covered by an aggregate subquery")
       .build();
 
   // -- admission
@@ -234,22 +265,25 @@ struct operator_options : block_base<operator_options> {
   config_option<ubytes> admission_bytes_per_gpu =
     option<ubytes>("admission_bytes_per_gpu")
       .fallback(ubytes(defaults().admission_bytes_per_gpu))
-      .scope(option_scope::query)
+      .describe("target projected scan-output bytes per GPU at admission")
       .build();
   config_option<ubytes> avg_variable_column_bytes =
     option<ubytes>("avg_variable_column_bytes")
       .validate(positive<ubytes>{})
       .fallback(ubytes(defaults().avg_variable_column_bytes))
-      .scope(option_scope::query)
+      .describe("assumed per-row width of variable-width columns")
       .build();
   config_option<bool> enable_runtime_size_estimation =
     option<bool>("enable_runtime_size_estimation")
       .fallback(defaults().enable_runtime_size_estimation)
-      .scope(option_scope::query)
+      .describe("size group-by partitions from projected input")
       .build();
   /// Read once at startup.
   config_option<bool> use_hw_decompression =
-    option<bool>("use_hw_decompression").fallback(defaults().use_hw_decompression).build();
+    option<bool>("use_hw_decompression")
+      .fallback(defaults().use_hw_decompression)
+      .describe("hardware decompression for compressed Parquet scans")
+      .build();
 
   auto fields()
   {

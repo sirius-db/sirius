@@ -454,7 +454,7 @@ try {
   // Read back what the user defined: fallbacks fill in the rest and every block checks its rules,
   // for a configuration built in code (or never read) as much as for one read from a file.
   config::user_config user;
-  user.read(input.write(false), config::user_config_root, config::environment::prod);
+  user.read(input.write(false), config::user_config_root);
 
   auto impl         = std::make_shared<Impl>();
   impl->source_path = source_path;
@@ -532,9 +532,10 @@ try {
   if (auto const* strategy = sm.readahead_strategy.get_if()) {
     sm_cfg.readahead_strategy = *strategy;
   }
-  named.scan_manager = sm.num_threads.user_defined();
-  named.uring        = sm.uring_n_reactors.user_defined();
-  named.rest         = sm.rest_n_reactors.user_defined();
+  named.scan_manager          = sm.num_threads.user_defined();
+  sm_cfg.num_threads_explicit = named.scan_manager;
+  named.uring                 = sm.uring_n_reactors.user_defined();
+  named.rest                  = sm.rest_n_reactors.user_defined();
 
   auto& uring = sm_cfg.uring;
   if (auto const* scans = sm.uring.n_max_concurrent_scans.get_if()) {
@@ -707,10 +708,13 @@ try {
   compression.min_batch_size_bytes          = c.min_batch_size_bytes.get().count();
   compression.max_compressed_fraction       = c.max_compressed_fraction.get();
   compression.input_plan_dir                = c.input_plan_dir.get();
+  compression.min_table_device_fraction     = c.min_table_device_fraction.get();
   compression.enable_spill_compression      = c.enable_spill_compression.get();
   compression.spill_min_batch_bytes         = c.spill_min_batch_bytes.get().count();
   compression.spill_max_compressed_fraction = c.spill_max_compressed_fraction.get();
   compression.spill_encode_reserve_fraction = c.spill_encode_reserve_fraction.get();
+
+  settings._parquet_output_compression = user.output.parquet.compression.get();
 
   // -- memory spaces listed one by one: all GPU, then host, then disk spaces
   for (auto const& space : user.space.gpu) {
@@ -761,7 +765,7 @@ config::user_config effective_user_config(const config::user_config& user,
                                           const sirius_config& resolved)
 {
   config::user_config out;
-  out.read(user.write(false), config::user_config_root, config::environment::prod);
+  out.read(user.write(false), config::user_config_root);
   // What resolution derived for an option the user left to it, as the user would have written it.
   auto const derived = [](auto& option, auto value) {
     if (!option.user_defined()) { option.assign(std::move(value)); }

@@ -35,7 +35,7 @@ struct memory_root : block_base<memory_root> {
 memory_root read(std::string_view text)
 {
   memory_root root;
-  read_yaml(root, text, "sirius", environment::prod);
+  read_yaml(root, text, "sirius");
   return root;
 }
 
@@ -43,7 +43,7 @@ std::string read_error(std::string_view text)
 {
   memory_root root;
   try {
-    read_yaml(root, text, "sirius", environment::prod);
+    read_yaml(root, text, "sirius");
   } catch (const config_error& e) {
     return e.what();
   }
@@ -95,17 +95,23 @@ TEST_CASE("topology selects GPUs by count or by id", "[config][config_memory]")
     read("sirius:\n  topology:\n    gpu_ids: [1, 0]\n").topology.gpus.get<std::vector<int>>() ==
     std::vector<int>{1, 0});
   REQUIRE(read_error("sirius:\n  topology:\n    num_gpus: 1\n    gpu_ids: [0]\n") ==
-          "'sirius.topology': 'num_gpus' and 'gpu_ids' are mutually exclusive");
+          "'sirius.topology': 'num_gpus' and 'gpu_ids' are mutually exclusive; GPUs Sirius "
+          "uses, by count or by device id");
   REQUIRE(read_error("sirius:\n  topology:\n    gpu_ids: []\n") ==
-          "'sirius.topology.gpu_ids': must contain at least one device id");
+          "'sirius.topology.gpu_ids': must contain at least one device id"
+          "; GPUs Sirius uses, by count or by device id");
   REQUIRE(read_error("sirius:\n  topology:\n    gpu_ids: [0, -1]\n") ==
-          "'sirius.topology.gpu_ids': must contain only non-negative device ids");
+          "'sirius.topology.gpu_ids': must contain only non-negative device ids"
+          "; GPUs Sirius uses, by count or by device id");
   REQUIRE(read_error("sirius:\n  topology:\n    gpu_ids: [2, 0, 2]\n") ==
-          "'sirius.topology.gpu_ids': must not contain duplicate device ids");
+          "'sirius.topology.gpu_ids': must not contain duplicate device ids"
+          "; GPUs Sirius uses, by count or by device id");
   REQUIRE(read_error("sirius:\n  topology:\n    num_gpus: -1\n") ==
-          "'sirius.topology.num_gpus': must be a nonnegative integer, got '-1'");
+          "'sirius.topology.num_gpus': must be a nonnegative integer, got '-1'"
+          "; GPUs Sirius uses, by count or by device id");
   REQUIRE(read_error("sirius:\n  topology:\n    gpus_per_query: -1\n") ==
-          "'sirius.topology.gpus_per_query': value out of range: '-1' (must not be negative)");
+          "'sirius.topology.gpus_per_query': value out of range: '-1' (must not be negative)"
+          "; GPUs allocated to each query at admission");
 }
 
 TEST_CASE("GPU memory takes bytes or a fraction", "[config][config_memory]")
@@ -121,16 +127,18 @@ TEST_CASE("GPU memory takes bytes or a fraction", "[config][config_memory]")
   REQUIRE(read_error("sirius:\n  memory:\n    gpu:\n      usage_limit_bytes: 1 GiB\n"
                      "      usage_limit_fraction: 0.5\n") ==
           "'sirius.memory.gpu': 'usage_limit_bytes' and 'usage_limit_fraction' are mutually "
-          "exclusive");
+          "exclusive; GPU memory capacity Sirius may use on each GPU");
   REQUIRE(read_error("sirius:\n  memory:\n    gpu:\n      usage_limit_fraction: 1.5\n") ==
           "'sirius.memory.gpu.usage_limit_fraction': value out of range: '1.5' (must be between "
-          "0.0 and 1.0)");
+          "0.0 and 1.0)"
+          "; GPU memory capacity Sirius may use on each GPU");
   // Zero usage is allowed (it is special-cased); a zero reservation share is not.
   REQUIRE(read("sirius:\n  memory:\n    gpu:\n      usage_limit_fraction: 0\n")
             .memory.gpu.usage_limit.get<double>() == 0.0);
   REQUIRE(read_error("sirius:\n  memory:\n    gpu:\n      reservation_limit_fraction: 0\n") ==
           "'sirius.memory.gpu.reservation_limit_fraction': value out of range: '0.0' (must be "
-          "greater than 0.0 and at most 1.0)");
+          "greater than 0.0 and at most 1.0)"
+          "; part of the GPU capacity that reservations may take");
 }
 
 TEST_CASE("downgrade fractions keep 0 < stop < trigger", "[config][config_memory]")
@@ -157,7 +165,8 @@ TEST_CASE("host memory rejects values cuCascade cannot use", "[config][config_me
                  Catch::Matchers::ContainsSubstring("value out of range"));
   }
   REQUIRE(read_error("sirius:\n  memory:\n    host:\n      pool_size: -1\n") ==
-          "'sirius.memory.host.pool_size': must be a nonnegative integer, got '-1'");
+          "'sirius.memory.host.pool_size': must be a nonnegative integer, got '-1'; allocation "
+          "blocks per pinned host pool");
 
   auto const root = read(
     "sirius:\n  memory:\n    host:\n      capacity_bytes: 16 GiB\n"
@@ -244,7 +253,7 @@ TEST_CASE("memory blocks keep upstream's unknown keys and pairs", "[config][conf
                            "host:\n      capacity_bytes: 1 GiB\n      capacity_fraction: 0.5"}) {
     INFO(pair);
     REQUIRE_THAT(read_error(std::string("sirius:\n  memory:\n    ") + pair + "\n"),
-                 Catch::Matchers::EndsWith("are mutually exclusive"));
+                 Catch::Matchers::ContainsSubstring("are mutually exclusive"));
   }
   // A null alternative is absent.
   auto const root = read(
@@ -318,7 +327,7 @@ TEST_CASE("fraction boundaries", "[config][config_memory]")
   }
   REQUIRE(read_error("sirius:\n  memory:\n    host:\n      capacity_fraction: 1.5\n") ==
           "'sirius.memory.host.capacity_fraction': value out of range: '1.5' (must be greater than "
-          "0.0 and at most 1.0)");
+          "0.0 and at most 1.0); pinned host memory capacity per NUMA node");
   REQUIRE(read_error("sirius:\n  memory:\n    gpu:\n      downgrade_trigger_fraction: 0.6\n") ==
           "'sirius.memory.gpu.downgrade_stop_fraction': must be less than "
           "downgrade_trigger_fraction");  // stop == trigger
@@ -331,9 +340,11 @@ TEST_CASE("fraction boundaries", "[config][config_memory]")
 TEST_CASE("topology shapes", "[config][config_memory]")
 {
   REQUIRE(read_error("sirius:\n  topology:\n    gpu_ids: 0\n") ==
-          "'sirius.topology.gpu_ids': expected a sequence, got a scalar");
+          "'sirius.topology.gpu_ids': expected a sequence, got a scalar; GPUs Sirius uses, by "
+          "count or by device id");
   REQUIRE(read_error("sirius:\n  topology:\n    gpu_ids: [~]\n") ==
-          "'sirius.topology.gpu_ids': element 0: expected a scalar, got null");
+          "'sirius.topology.gpu_ids': element 0: expected a scalar, got null"
+          "; GPUs Sirius uses, by count or by device id");
   auto const root = read("sirius:\n  topology:\n    num_gpus: 0\n    gpu_ids: ~\n");
   REQUIRE(root.topology.gpus.user_defined());
   REQUIRE(root.topology.gpus.get<std::size_t>() == 0);

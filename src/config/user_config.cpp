@@ -30,24 +30,24 @@ node user_config::write(const write_options& options) const
   return out;
 }
 
-user_config read_user_config(std::string_view yaml, environment env)
+user_config read_user_config(std::string_view yaml)
 {
   user_config config;
-  read_yaml(config, yaml, user_config_root, env);
+  read_yaml(config, yaml, user_config_root);
   return config;
 }
 
-user_config read_user_config(const node& document, environment env)
+user_config read_user_config(const node& document)
 {
   user_config config;
-  read_yaml(config, document, user_config_root, env);
+  read_yaml(config, document, user_config_root);
   return config;
 }
 
-user_config default_user_config(environment env)
+user_config default_user_config()
 {
   user_config config;
-  config.read(node{}, user_config_root, env);
+  config.read(node{}, user_config_root);
   return config;
 }
 

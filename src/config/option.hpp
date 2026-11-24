@@ -24,17 +24,10 @@ namespace sirius::config {
 
 /// Where an option's current value came from.
 enum class value_source {
-  unset,     ///< not loaded, absent without a fallback, or skipped (for_prod outside prod)
+  unset,     ///< not loaded, or absent without a fallback
   user,      ///< defined by the user: read from the configuration, or assigned
   fallback,  ///< absent, so the declared fallback applies
 };
-
-/// The environment a configuration is loaded for; for_prod() options are skipped outside prod.
-enum class environment { dev, prod };
-
-/// When a setting may change: once per session (the engine reads it at startup), or per query
-/// (a DuckDB SET can override it for a connection; the file value is the starting point).
-enum class option_scope { session, query };
 
 [[nodiscard]] constexpr std::string_view to_string(value_source source) noexcept
 {
@@ -46,17 +39,8 @@ enum class option_scope { session, query };
   return "unknown";
 }
 
-[[nodiscard]] constexpr std::string_view to_string(option_scope scope) noexcept
-{
-  switch (scope) {
-    case option_scope::session: return "session";
-    case option_scope::query: return "query";
-  }
-  return "unknown";
-}
-
-/// A configuration the user supplied cannot be used. The message names the dotted key:
-/// `'<dotted.path>': <reason>`.
+/// A configuration the user supplied cannot be used. The message names the dotted key and, when
+/// the option has a description, what it is for: `'<dotted.path>': <reason>[; <description>]`.
 class config_error : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
@@ -306,8 +290,6 @@ struct option_alternative {
  * - a required option must be present when its block is (a null block is an absent one, and
  *   then nothing is required); a fallback does not satisfy it;
  * - absent and optional: the fallback (value_source::fallback) or nothing (value_source::unset);
- * - for_prod() options are left unset outside environment::prod, without looking at the file:
- *   a value there is neither checked nor kept, so writing the configuration back drops it;
  * - a failed load leaves the option unset.
  *
  * Declare options with option<T>(key)...build(). Not synchronized: load, assign and reset must
@@ -332,11 +314,9 @@ class config_option {
   /// The declared fallback, if any.
   [[nodiscard]] const std::optional<value_type>& fallback() const noexcept { return _fallback; }
   [[nodiscard]] bool is_required() const noexcept { return _required; }
-  [[nodiscard]] bool is_prod_only() const noexcept { return _prod_only; }
   /// A developer-only option, as every option not marked production is: a configuration dump
   /// outside developer mode leaves it out.
   [[nodiscard]] bool is_developer() const noexcept { return _developer; }
-  [[nodiscard]] option_scope scope() const noexcept { return _scope; }
   [[nodiscard]] const std::string& description() const noexcept { return _description; }
 
   /// The first alternative's key, which names the option.
@@ -381,7 +361,7 @@ class config_option {
     auto const& alt = std::get<option_alternative<A>>(_alternatives);
     if (alt.validator) {
       if (auto status = alt.validator(candidate); !status) {
-        throw config_error("'" + alt.key + "': " + status.error());
+        fail("'" + alt.key + "': " + status.error());
       }
     }
     reset();  // a throwing emplace then leaves the option unset, not half-assigned
@@ -402,10 +382,9 @@ class config_option {
    * @throws config_error naming the offending key; an exception from a custom parser or
    * validator is reported the same way. std::bad_alloc passes through.
    */
-  void load(const node& block, std::string_view path, environment env)
+  void load(const node& block, std::string_view path)
   {
     reset();
-    if (_prod_only && env != environment::prod) { return; }
 
     std::vector<std::string_view> present;
     std::apply(
@@ -414,15 +393,13 @@ class config_option {
       },
       _alternatives);
     if (present.size() > 1) {
-      throw config_error(
-        detail::framed(path, quote_list(present, " and ") + " are mutually exclusive"));
+      fail(detail::framed(path, quote_list(present, " and ") + " are mutually exclusive"));
     }
     if (present.empty() && _required && !block.is_null()) {
       if constexpr (sizeof...(Ts) == 1) {
-        throw config_error("'" + join_path(path, key()) + "': required but missing");
+        fail("'" + join_path(path, key()) + "': required but missing");
       } else {
-        throw config_error(
-          detail::framed(path, "one of " + quote_list(keys(), " or ") + " is required"));
+        fail(detail::framed(path, "one of " + quote_list(keys(), " or ") + " is required"));
       }
     }
 
@@ -470,11 +447,17 @@ class config_option {
     return text;
   }
 
+  [[noreturn]] void fail(std::string message) const
+  {
+    if (!_description.empty()) { message += "; " + _description; }
+    throw config_error(message);
+  }
+
   template <class T>
-  static void read(const option_alternative<T>& alt,
-                   const node& block,
-                   std::string_view path,
-                   std::optional<value_type>& candidate)
+  void read(const option_alternative<T>& alt,
+            const node& block,
+            std::string_view path,
+            std::optional<value_type>& candidate) const
   {
     auto const* n = block.find(alt.key);
     if (n == nullptr || n->is_null()) { return; }
@@ -488,17 +471,15 @@ class config_option {
     } catch (const std::exception& e) {
       status = parse_status::failure(e.what());
     }
-    if (!status) { throw config_error("'" + join_path(path, alt.key) + "': " + status.error()); }
+    if (!status) { fail("'" + join_path(path, alt.key) + "': " + status.error()); }
     candidate.emplace(std::in_place_type<T>, std::move(parsed));
   }
 
   std::tuple<option_alternative<Ts>...> _alternatives;
   std::optional<value_type> _fallback;
   std::optional<value_type> _value;
-  bool _required      = false;
-  bool _prod_only     = false;
-  bool _developer     = true;
-  option_scope _scope = option_scope::session;
+  bool _required  = false;
+  bool _developer = true;
   std::string _description;
   value_source _source = value_source::unset;
 };
@@ -659,9 +640,7 @@ class option_builder {
         std::move(*_spec._fallback));
     }
     next._required    = _spec._required;
-    next._prod_only   = _spec._prod_only;
     next._developer   = _spec._developer;
-    next._scope       = _spec._scope;
     next._description = std::move(_spec._description);
     return option_builder<Ts..., U>(std::move(next));
   }
@@ -694,16 +673,7 @@ class option_builder {
     _spec._developer = false;
     return *this;
   }
-  option_builder& for_prod()
-  {
-    _spec._prod_only = true;
-    return *this;
-  }
-  option_builder& scope(option_scope s)
-  {
-    _spec._scope = s;
-    return *this;
-  }
+  /// What the option is for, in a few words; every error about the option ends with it.
   option_builder& describe(std::string text)
   {
     _spec._description = std::move(text);

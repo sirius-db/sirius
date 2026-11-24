@@ -8,6 +8,7 @@
 #include "config/options/executor.hpp"
 #include "config/options/memory.hpp"
 #include "config/options/operator.hpp"
+#include "config/options/output.hpp"
 #include "config/options/space.hpp"
 #include "config/options/telemetry.hpp"
 #include "config/options/topology.hpp"
@@ -31,13 +32,17 @@ inline constexpr std::string_view user_config_root = "sirius";
 struct user_config : block_base<user_config> {
   topology_options topology;
   memory_options memory;
-  config_option<int> max_concurrent_queries =
-    option<int>("max_concurrent_queries").validate(positive<int>{}).fallback(1).build();
+  config_option<int> max_concurrent_queries = option<int>("max_concurrent_queries")
+                                                .validate(positive<int>{})
+                                                .fallback(1)
+                                                .describe("queries that may execute at once")
+                                                .build();
   executor_options executor;
   telemetry_options telemetry;
   compression_options compression;
   space_options space;
   operator_options operator_params;
+  output_options output;
 
   auto fields()
   {
@@ -48,7 +53,8 @@ struct user_config : block_base<user_config> {
                       sub("telemetry", telemetry),
                       sub("compression", compression),
                       sub("space", space),
-                      sub("operator_params", operator_params));
+                      sub("operator_params", operator_params),
+                      sub("output", output));
   }
 
   /// sirius.memory and non-empty sirius.space lists are two ways to describe the same spaces.
@@ -60,15 +66,13 @@ struct user_config : block_base<user_config> {
 };
 
 /// Read the YAML text of a configuration file. @throws yaml_syntax_error / config_error.
-[[nodiscard]] user_config read_user_config(std::string_view yaml,
-                                           environment env = environment::prod);
+[[nodiscard]] user_config read_user_config(std::string_view yaml);
 
 /// Read a configuration document already parsed into a node tree.
-[[nodiscard]] user_config read_user_config(const node& document,
-                                           environment env = environment::prod);
+[[nodiscard]] user_config read_user_config(const node& document);
 
 /// The configuration of an empty file: every option at its fallback.
-[[nodiscard]] user_config default_user_config(environment env = environment::prod);
+[[nodiscard]] user_config default_user_config();
 
 /// The YAML text read_user_config reads back to @p config: the user's values, plus what @p options
 /// adds (every fallback, developer-only settings).

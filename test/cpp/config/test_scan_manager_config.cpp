@@ -127,7 +127,8 @@ void require_load_error(std::string const& name,
 {
   scoped_yaml yaml(name, text);
   sirius::sirius_config cfg;
-  REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path()), Catch::Matchers::EndsWith(": " + message));
+  REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path()),
+                      Catch::Matchers::ContainsSubstring(": " + message));
 }
 
 /// The hardware defaults a config loaded from a file resolves to on this machine: the unnamed

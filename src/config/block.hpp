@@ -59,7 +59,7 @@ class config_block {
    * removed or unknown key, or a failed cross-field rule.
    * @throws std::logic_error for a declaration bug (an empty or repeated key).
    */
-  virtual void read(const node& n, std::string_view path, environment env) = 0;
+  virtual void read(const node& n, std::string_view path) = 0;
 
   /// The mapping read() reads back to the same values: user-defined values only, plus fallbacks
   /// when options.include_fallbacks, without developer-only options unless
@@ -140,11 +140,11 @@ struct is_config_option<config_option<Ts...>> : std::true_type {};
 template <class Derived>
 class block_base : public config_block {
  public:
-  void read(const node& n, std::string_view path, environment env) override
+  void read(const node& n, std::string_view path) override
   {
     // Read into a copy and swap it in, so a failure leaves this block as it was.
     Derived next(self());
-    next.read_in_place(n, path, env);
+    next.read_in_place(n, path);
     self() = std::move(next);
   }
 
@@ -260,7 +260,7 @@ class block_base : public config_block {
     }
   }
 
-  void read_in_place(const node& n, std::string_view path, environment env)
+  void read_in_place(const node& n, std::string_view path)
   {
     if (!n.is_null() && !n.is_mapping()) {
       throw config_error(
@@ -271,7 +271,7 @@ class block_base : public config_block {
 
     // Removed keys first: they explain themselves better than whatever else is wrong.
     std::apply([&](auto&... field) { (check_removed(field, n, path), ...); }, fields);
-    std::apply([&](auto&... field) { (read_field(field, n, path, env), ...); }, fields);
+    std::apply([&](auto&... field) { (read_field(field, n, path), ...); }, fields);
     if (n.is_mapping()) {
       for (auto const& entry : n.entries()) {
         if (!contains(claims, entry.first)) {
@@ -325,12 +325,9 @@ class block_base : public config_block {
   {
   }
   template <class... Ts>
-  static void read_field(config_option<Ts...>& option,
-                         const node& n,
-                         std::string_view path,
-                         environment env)
+  static void read_field(config_option<Ts...>& option, const node& n, std::string_view path)
   {
-    option.load(n, path, env);
+    option.load(n, path);
   }
   template <class... Ts>
   static void write_field(const config_option<Ts...>& option,
@@ -362,14 +359,11 @@ class block_base : public config_block {
   {
   }
   template <class B>
-  static void read_field(const nested_block<B>& field,
-                         const node& n,
-                         std::string_view path,
-                         environment env)
+  static void read_field(const nested_block<B>& field, const node& n, std::string_view path)
   {
     static const node absent;
     auto const* child = n.find(field.key);
-    field.block->read(child != nullptr ? *child : absent, join_path(path, field.key), env);
+    field.block->read(child != nullptr ? *child : absent, join_path(path, field.key));
   }
   template <class B>
   static void write_field(const nested_block<B>& field, node& out, const write_options& options)
@@ -402,10 +396,7 @@ class block_base : public config_block {
   {
   }
   template <class B>
-  static void read_field(const block_list<B>& field,
-                         const node& n,
-                         std::string_view path,
-                         environment env)
+  static void read_field(const block_list<B>& field, const node& n, std::string_view path)
   {
     auto const list_path = join_path(path, field.key);
     std::vector<B> blocks;
@@ -417,8 +408,7 @@ class block_base : public config_block {
       }
       blocks.reserve(child->elements().size());
       for (std::size_t i = 0; i < child->elements().size(); ++i) {
-        blocks.emplace_back().read(
-          child->elements()[i], list_path + "[" + std::to_string(i) + "]", env);
+        blocks.emplace_back().read(child->elements()[i], list_path + "[" + std::to_string(i) + "]");
       }
     }
     *field.blocks = std::move(blocks);
@@ -459,7 +449,7 @@ class block_base : public config_block {
       throw config_error("'" + join_path(path, field.key) + "': " + field.reason);
     }
   }
-  static void read_field(const removed_key&, const node&, std::string_view, environment) {}
+  static void read_field(const removed_key&, const node&, std::string_view) {}
   static void write_field(const removed_key&, node&, const write_options&) {}
   static void check_nested(const removed_key&) {}
   static bool holds_user_values(const removed_key&) { return false; }

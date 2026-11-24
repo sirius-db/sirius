@@ -168,18 +168,12 @@ std::string emit_yaml(const node& n)
   return std::string(out.c_str(), out.size()) + "\n";
 }
 
-void read_yaml(config_block& block,
-               std::string_view text,
-               std::string_view root_key,
-               environment env)
+void read_yaml(config_block& block, std::string_view text, std::string_view root_key)
 {
-  read_yaml(block, parse_yaml(text), root_key, env);
+  read_yaml(block, parse_yaml(text), root_key);
 }
 
-void read_yaml(config_block& block,
-               const node& document,
-               std::string_view root_key,
-               environment env)
+void read_yaml(config_block& block, const node& document, std::string_view root_key)
 {
   auto const missing = "missing top-level '" + std::string(root_key) + "' key";
   if (document.is_null()) { throw config_error(missing); }
@@ -193,7 +187,7 @@ void read_yaml(config_block& block,
   // A root key without a value is missing, as before: `sirius: {}` is the empty configuration.
   auto const* root = document.find(root_key);
   if (root == nullptr || root->is_null()) { throw config_error(missing); }
-  block.read(*root, root_key, env);
+  block.read(*root, root_key);
 }
 
 std::string write_yaml(const config_block& block,

@@ -22,9 +22,9 @@ Configuration passes through two representations:
 1. **`sirius::config::user_config`** (`src/config/user_config.hpp`) — what the user writes: the
    `sirius:` document as one typed block per YAML block (`src/config/options/`). Each option is
    declared once, with its key, type, fallback, validator, mutually exclusive alternatives
-   (`capacity_bytes` | `capacity_fraction`), whether it is required when its block is present,
-   its scope (`session`: read at startup; `query`: a DuckDB `SET` can override it per
-   connection), and whether it is a production setting (any other is developer-only).
+   (`capacity_bytes` | `capacity_fraction`), whether it is required when its block is present, a
+   short description that ends every error about it, and whether it is a production setting (any
+   other is developer-only).
    `user_defined()` tells a value the user wrote from a fallback. `read_user_config()` reads YAML
    text; `write_user_config()` writes the user's values back (optionally with every fallback too,
    or only the production settings).

@@ -152,8 +152,9 @@ std::string describe(const sirius::sirius_config& c, bool in_effect = false)
   describe_pool(d, "scan_manager", sm.thread_pool);
   d("sm.backend", sm.backend)("sm.uring_reactors", sm.uring_n_reactors)(
     "sm.rest_reactors", sm.rest_n_reactors)("sm.reserve", sm.reserve_rest_reactor_cpus)(
-    "sm.placement", sm.rest_placement_cpus)("sm.readahead", sm.max_readahead_scans)(
-    "sm.strategy", sm.readahead_strategy)("sm.width", sm.pipeline_width);
+    "sm.startup", sm.startup_cpus)("sm.worker_startup", sm.worker_startup_cpus)(
+    "sm.readahead", sm.max_readahead_scans)("sm.strategy", sm.readahead_strategy)(
+    "sm.width", sm.pipeline_width);
   auto const& u = sm.uring;
   d("uring.scans", u.n_max_concurrent_scans);
   if (!in_effect) { d("uring.explicit", u.n_max_concurrent_scans_explicit); }

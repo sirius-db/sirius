@@ -24,10 +24,16 @@ inline const exec::downgrade_executor_config& downgrade_defaults()
 /// `sirius.executor.task_creator`: the threads that turn ready inputs into GPU tasks.
 struct task_creator_options : block_base<task_creator_options> {
   /// Unset: the resolver's fixed default.
-  config_option<int> num_threads =
-    option<int>("num_threads").validate(positive<int>{}).mark_production().build();
+  config_option<int> num_threads = option<int>("num_threads")
+                                     .validate(positive<int>{})
+                                     .mark_production()
+                                     .describe("task creator worker threads")
+                                     .build();
   config_option<std::vector<int>> cpu_affinity =
-    option<std::vector<int>>("cpu_affinity").fallback(std::vector<int>{}).build();
+    option<std::vector<int>>("cpu_affinity")
+      .fallback(std::vector<int>{})
+      .describe("CPU cores task creator threads are pinned to")
+      .build();
 
   auto fields()
   {
@@ -46,8 +52,11 @@ struct task_creator_options : block_base<task_creator_options> {
 /// `sirius.executor.pipeline`: the GPU pipeline threads.
 struct pipeline_options : block_base<pipeline_options> {
   /// Unset: derived from the machine and the GPU count when the configuration is resolved.
-  config_option<int> num_threads =
-    option<int>("num_threads").validate(positive<int>{}).mark_production().build();
+  config_option<int> num_threads = option<int>("num_threads")
+                                     .validate(positive<int>{})
+                                     .mark_production()
+                                     .describe("GPU pipeline worker threads")
+                                     .build();
 
   auto fields() { return field_list(num_threads); }
 };
@@ -55,20 +64,28 @@ struct pipeline_options : block_base<pipeline_options> {
 /// `sirius.executor.downgrade`: the threads that spill batches to lower memory tiers.
 struct downgrade_options : block_base<downgrade_options> {
   /// Unset: derived from the machine and the GPU count when the configuration is resolved.
-  config_option<int> num_threads =
-    option<int>("num_threads").validate(positive<int>{}).mark_production().build();
+  config_option<int> num_threads = option<int>("num_threads")
+                                     .validate(positive<int>{})
+                                     .mark_production()
+                                     .describe("downgrade (spill) executor worker threads")
+                                     .build();
   config_option<std::vector<int>> cpu_affinity =
-    option<std::vector<int>>("cpu_affinity").fallback(std::vector<int>{}).build();
+    option<std::vector<int>>("cpu_affinity")
+      .fallback(std::vector<int>{})
+      .describe("CPU cores downgrade executor threads are pinned to")
+      .build();
   /// Period of the memory pressure monitor; 0 turns the monitor off.
   config_option<std::chrono::milliseconds> monitor_period =
     option<std::chrono::milliseconds>("monitor_period")
       .validate(non_negative<std::chrono::milliseconds>{})
       .fallback(detail::downgrade_defaults().monitor_period)
+      .describe("period of the memory pressure monitor")
       .build();
   /// Copy granularity of GPU-to-host spills; 0 submits a batch's copies at once.
   config_option<ubytes> copy_chunk_bytes =
     option<ubytes>("copy_chunk_bytes")
       .fallback(ubytes(detail::downgrade_defaults().copy_chunk_bytes))
+      .describe("copy granularity of GPU-to-host spills")
       .build();
 
   auto fields() { return field_list(num_threads, cpu_affinity, monitor_period, copy_chunk_bytes); }

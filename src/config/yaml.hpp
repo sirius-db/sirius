@@ -44,16 +44,10 @@ class yaml_syntax_error : public config_error {
  * @throws yaml_syntax_error / config_error as parse_yaml and config_block::read; @p block is
  * unchanged on failure.
  */
-void read_yaml(config_block& block,
-               std::string_view text,
-               std::string_view root_key,
-               environment env);
+void read_yaml(config_block& block, std::string_view text, std::string_view root_key);
 
 /// read_yaml for a document already parsed into a node tree.
-void read_yaml(config_block& block,
-               const node& document,
-               std::string_view root_key,
-               environment env);
+void read_yaml(config_block& block, const node& document, std::string_view root_key);
 
 /// The YAML document read_yaml reads back to @p block's values: `<root_key>:` holding the block's
 /// user-defined values, plus what @p options adds.

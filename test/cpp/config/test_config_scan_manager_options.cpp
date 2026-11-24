@@ -34,7 +34,7 @@ constexpr std::string_view prefix = "sirius:\n  executor:\n    scan_manager:\n";
 scan_root read(std::string_view body)
 {
   scan_root root;
-  read_yaml(root, std::string(prefix) + std::string(body), "sirius", environment::prod);
+  read_yaml(root, std::string(prefix) + std::string(body), "sirius");
   return root;
 }
 
@@ -42,7 +42,7 @@ std::string read_error(std::string_view body)
 {
   scan_root root;
   try {
-    read_yaml(root, std::string(prefix) + std::string(body), "sirius", environment::prod);
+    read_yaml(root, std::string(prefix) + std::string(body), "sirius");
   } catch (const config_error& e) {
     return e.what();
   }
@@ -60,7 +60,7 @@ TEST_CASE("scan manager blocks declare their keys once", "[config][config_scan_m
 TEST_CASE("absent scan manager blocks take today's defaults", "[config][config_scan_manager]")
 {
   scan_root root;
-  read_yaml(root, "sirius: {}\n", "sirius", environment::prod);
+  read_yaml(root, "sirius: {}\n", "sirius");
   auto const& sm = root.executor.scan_manager;
   // Derived when the configuration is resolved.
   REQUIRE(sm.num_threads.is_unset());
@@ -163,36 +163,46 @@ TEST_CASE("scan manager values are checked", "[config][config_scan_manager]")
 {
   REQUIRE(read_error("      backend: kvikio\n") ==
           "'sirius.executor.scan_manager.backend': backend: kvikio has been removed; use "
-          "backend: native instead");
+          "backend: native instead; IO backend for scan reads");
   REQUIRE(read_error("      backend: s3\n") ==
-          "'sirius.executor.scan_manager.backend': invalid enum value 's3'");
+          "'sirius.executor.scan_manager.backend': invalid enum value 's3'"
+          "; IO backend for scan reads");
   REQUIRE(read_error("      uring_n_reactors: -1\n") ==
           "'sirius.executor.scan_manager.uring_n_reactors': must be a nonnegative integer, got "
-          "'-1'");
+          "'-1'"
+          "; io_uring reactors for local-disk reads");
   REQUIRE(read_error("      uring:\n        slices_per_pass: 65\n") ==
           "'sirius.executor.scan_manager.uring.slices_per_pass': must be between 0 and 64 (0 = no "
-          "cap: fill every free staging slot), got 65");
+          "cap: fill every free staging slot), got 65"
+          "; slices a uring reactor reads per loop pass");
   REQUIRE(read_error("      rest:\n        wait_mode: poll\n") ==
           "'sirius.executor.scan_manager.rest.wait_mode': invalid enum value 'poll' (expected "
-          "epoll, uring)");
+          "epoll, uring)"
+          "; how an idle REST reactor blocks");
   REQUIRE(read_error("      rest:\n        max_retry_attempts: 4294967296\n") ==
           "'sirius.executor.scan_manager.rest.max_retry_attempts': value out of range: "
-          "'4294967296' (must be between 1 and 4294967295)");
+          "'4294967296' (must be between 1 and 4294967295)"
+          "; attempt budget for transient request failures");
   REQUIRE(read_error("      rest:\n        tls:\n          max_version: tls1.1\n") ==
           "'sirius.executor.scan_manager.rest.tls.max_version': invalid enum value 'tls1.1' "
-          "(expected auto, tls1.2, tls1.3)");
+          "(expected auto, tls1.2, tls1.3)"
+          "; maximum TLS version");
   REQUIRE(read_error("      cache:\n        mode: memory\n") ==
-          "'sirius.executor.scan_manager.cache.mode': invalid enum value 'memory'");
+          "'sirius.executor.scan_manager.cache.mode': invalid enum value 'memory'"
+          "; which cache the read path goes through");
   REQUIRE(read_error("      memory_prefetcher:\n        poll_interval_ms: 0\n") ==
           "'sirius.executor.scan_manager.memory_prefetcher.poll_interval_ms': value out of range: "
-          "'0 ms' (must be greater than zero)");
+          "'0 ms' (must be greater than zero)"
+          "; memory prefetcher sweep interval");
   REQUIRE(read_error("      preparation:\n        lookahead_batches: 0\n") ==
           "'sirius.executor.scan_manager.preparation.lookahead_batches': value out of range: '0' "
-          "(must be greater than zero)");
+          "(must be greater than zero)"
+          "; per-scan preparation target in scan batches");
   REQUIRE(
     read_error("      preparation:\n        partial_batch:\n          min_fill_percent: 0\n") ==
     "'sirius.executor.scan_manager.preparation.partial_batch.min_fill_percent': value out of "
-    "range: '0' (must be between 1 and 100)");
+    "range: '0' (must be between 1 and 100)"
+    "; minimum batch fill for early publication");
 }
 
 TEST_CASE("scan manager cross-field rules", "[config][config_scan_manager]")
@@ -251,7 +261,7 @@ TEST_CASE("scan manager blocks write what they read", "[config][config_scan_mana
   REQUIRE(parse_yaml(write_yaml(root, "sirius")) == parse_yaml(std::string(prefix) + body));
 
   scan_root all;
-  read_yaml(all, write_yaml(root, "sirius", true), "sirius", environment::prod);
+  read_yaml(all, write_yaml(root, "sirius", true), "sirius");
   REQUIRE(all.executor.scan_manager.rest.tls.cipher_list.user_defined());
   REQUIRE(all.executor.scan_manager.rest.max_connections.is_unset());  // derived, never written
   REQUIRE(all.executor.scan_manager.memory_prefetcher.drain_quiet.get() == 1000ms);
@@ -364,9 +374,9 @@ TEST_CASE("more scan manager rows", "[config][config_scan_manager]")
                  Catch::Matchers::ContainsSubstring("value out of range"));
   }
   REQUIRE_THAT(read_error("      cache:\n        eviction: x\n"),
-               Catch::Matchers::EndsWith("invalid enum value 'x'"));
+               Catch::Matchers::ContainsSubstring("invalid enum value 'x'"));
   REQUIRE_THAT(read_error("      readahead_strategy: lazy\n"),
-               Catch::Matchers::EndsWith("invalid enum value 'lazy'"));
+               Catch::Matchers::ContainsSubstring("invalid enum value 'lazy'"));
   REQUIRE_THAT(read_error("      max_readahead_scans: -1\n"),
                Catch::Matchers::ContainsSubstring("must be a nonnegative integer"));
   // Counts cuCascade keeps in an unsigned int.
@@ -406,7 +416,7 @@ TEST_CASE("deprecated spellings are written canonically", "[config][config_scan_
 TEST_CASE("scan manager fallbacks equal the runtime defaults", "[config][config_scan_manager]")
 {
   scan_root root;
-  read_yaml(root, "sirius: {}\n", "sirius", environment::prod);
+  read_yaml(root, "sirius: {}\n", "sirius");
   auto const& sm = root.executor.scan_manager;
   sirius::scan_manager::scan_manager_config const runtime{};
   auto const& r = runtime.rest;

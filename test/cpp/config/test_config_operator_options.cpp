@@ -35,7 +35,7 @@ struct operator_root : block_base<operator_root> {
 operator_root read(std::string_view text)
 {
   operator_root root;
-  read_yaml(root, text, "sirius", environment::prod);
+  read_yaml(root, text, "sirius");
   return root;
 }
 
@@ -43,7 +43,7 @@ std::string read_error(std::string_view text)
 {
   operator_root root;
   try {
-    read_yaml(root, text, "sirius", environment::prod);
+    read_yaml(root, text, "sirius");
   } catch (const config_error& e) {
     return e.what();
   }
@@ -106,18 +106,6 @@ TEST_CASE("explicit batch sizes are user-defined", "[config][config_operator]")
   REQUIRE(root.operator_params.hash_partition_bytes.is_unset());
 }
 
-TEST_CASE("operator scopes follow the DuckDB settings", "[config][config_operator]")
-{
-  operator_options op;
-  REQUIRE(op.hash_partition_bytes.scope() == option_scope::query);
-  REQUIRE(op.enable_compressed_materialization.scope() == option_scope::query);
-  REQUIRE(op.pin_table_prove_unique_keys.scope() == option_scope::query);
-  // Overridable only under SIRIUS_ENABLE_TEST_OPTIONS: session for users.
-  REQUIRE(op.scan_task_batch_size.scope() == option_scope::session);
-  REQUIRE(op.enable_dynamic_filter.scope() == option_scope::session);
-  REQUIRE(op.use_hw_decompression.scope() == option_scope::session);
-}
-
 TEST_CASE("operator fixtures read through the new block", "[config][config_operator]")
 {
   struct expectation {
@@ -162,19 +150,22 @@ TEST_CASE("operator option messages", "[config][config_operator]")
   REQUIRE(
     read_error("sirius:\n  operator_params:\n    hash_partition_bytes: 0\n") ==
     "'sirius.operator_params.hash_partition_bytes': value out of range: '0 B' (must be greater "
-    "than zero)");
+    "than zero); target partition size for hash joins and group-bys");
   REQUIRE(
     read_error("sirius:\n  operator_params:\n    fused_scan_max_selectivity: .inf\n") ==
     "'sirius.operator_params.fused_scan_max_selectivity': value out of range: '.inf' (must be "
-    "finite and greater than 0)");
+    "finite and greater than 0)"
+    "; surviving-row share limit for fused-scan compaction");
   REQUIRE(
     read_error("sirius:\n  operator_params:\n    late_materialization_min_boundaries: -1\n") ==
     "'sirius.operator_params.late_materialization_min_boundaries': value out of range: '-1' "
-    "(must not be negative)");
+    "(must not be negative)"
+    "; minimum port crossings late materialization must save");
   REQUIRE(read_error("sirius:\n  operator_params:\n    fused_scan_max_membership_sources: "
                      "9223372036854775808\n") ==
           "'sirius.operator_params.fused_scan_max_membership_sources': value out of range: "
-          "'9223372036854775808' (must be at most 9223372036854775807)");
+          "'9223372036854775808' (must be at most 9223372036854775807)"
+          "; join-filter probes carried by one fused decode");
   REQUIRE(
     read_error("sirius:\n  operator_params:\n    max_dynamic_filter_bloom_bytes_per_gpu: ~\n") ==
     "'sirius.operator_params.max_dynamic_filter_bloom_bytes_per_gpu': removed; the Bloom budget "
@@ -204,11 +195,9 @@ TEST_CASE("operator options write what they read", "[config][config_operator]")
   REQUIRE(all.operator_params.scan_task_batch_size.is_unset());  // derived, never written
 }
 
-TEST_CASE("every operator option's scope, fallback and audience", "[config][config_operator]")
+TEST_CASE("every operator option's fallback and audience", "[config][config_operator]")
 {
   operator_options const op;
-  auto const query      = option_scope::query;
-  auto const session    = option_scope::session;
   auto const production = std::vector<std::string>{"max_broadcast_join_size",
                                                    "max_sort_partition_bytes",
                                                    "hash_partition_bytes",
@@ -218,57 +207,56 @@ TEST_CASE("every operator option's scope, fallback and audience", "[config][conf
                                                    "max_build_hash_table_bytes",
                                                    "scan_task_batch_size",
                                                    "max_build_probe_resident_bytes"};
-  auto check            = [&](const auto& option, option_scope scope, bool has_fallback) {
+  auto check            = [&](const auto& option, bool has_fallback) {
     INFO(option.key());
-    REQUIRE(option.scope() == scope);
     REQUIRE(option.fallback().has_value() == has_fallback);
     REQUIRE(option.is_developer() ==
             (std::find(production.begin(), production.end(), option.key()) == production.end()));
   };
-  check(op.enable_late_materialization, query, true);
-  check(op.enable_fused_scan_filter, query, true);
-  check(op.enable_low_cardinality_groupby, query, true);
-  check(op.late_materialization_min_boundaries, query, true);
-  check(op.late_materialization_min_value_x_boundaries, query, true);
-  check(op.late_materialization_count_defer, query, true);
-  check(op.late_materialization_min_value_compressed, query, true);
-  check(op.fused_scan_diagnostics, query, true);
-  check(op.fused_scan_max_selectivity, query, true);
-  check(op.fused_scan_full_route_max_selectivity, query, true);
-  check(op.fused_scan_index_walk_max_selectivity, query, true);
-  check(op.fused_scan_max_membership_sources, query, true);
-  check(op.scan_task_batch_size, session, false);
-  check(op.max_sort_partition_bytes, query, true);
-  check(op.max_sort_partition_memory_fraction, query, true);
-  check(op.hash_partition_bytes, query, false);
-  check(op.concat_batch_bytes, session, false);
-  check(op.cross_join_task_bytes, session, false);
-  check(op.sort_sample_bytes, query, false);
-  check(op.max_build_hash_table_bytes, query, false);
-  check(op.max_build_probe_resident_bytes, query, false);
-  check(op.max_broadcast_join_size, query, true);
-  check(op.mark_join_build_switch_ratio, query, true);
-  check(op.enable_dynamic_filter, session, true);
-  check(op.enable_dynamic_filter_multi_partition, session, true);
-  check(op.enable_dynamic_zone_map_filter, session, true);
-  check(op.dynamic_filter_domain_coverage_threshold, query, true);
-  check(op.dynamic_filter_inlist_max_l2_fraction, query, true);
-  check(op.dynamic_filter_keep_threshold, query, true);
-  check(op.enable_pinned_zone_map_pruning, session, true);
-  check(op.enable_decimal_sum_stats_bound, session, true);
-  check(op.enable_compressed_materialization, query, true);
-  check(op.enable_dense_count_join, session, true);
-  check(op.enable_delim_aggregate_reuse, session, true);
-  check(op.pin_table_prove_unique_keys, query, true);
-  check(op.pin_table_unique_exact_max_bytes, query, true);
-  check(op.enable_exists_minmax_rewrite, session, true);
-  check(op.enable_partial_aggregate_below_join, session, true);
-  check(op.enable_subquery_key_carry, session, true);
-  check(op.enable_exists_from_aggregate, session, true);
-  check(op.admission_bytes_per_gpu, query, true);
-  check(op.avg_variable_column_bytes, query, true);
-  check(op.enable_runtime_size_estimation, query, true);
-  check(op.use_hw_decompression, session, true);
+  check(op.enable_late_materialization, true);
+  check(op.enable_fused_scan_filter, true);
+  check(op.enable_low_cardinality_groupby, true);
+  check(op.late_materialization_min_boundaries, true);
+  check(op.late_materialization_min_value_x_boundaries, true);
+  check(op.late_materialization_count_defer, true);
+  check(op.late_materialization_min_value_compressed, true);
+  check(op.fused_scan_diagnostics, true);
+  check(op.fused_scan_max_selectivity, true);
+  check(op.fused_scan_full_route_max_selectivity, true);
+  check(op.fused_scan_index_walk_max_selectivity, true);
+  check(op.fused_scan_max_membership_sources, true);
+  check(op.scan_task_batch_size, false);
+  check(op.max_sort_partition_bytes, true);
+  check(op.max_sort_partition_memory_fraction, true);
+  check(op.hash_partition_bytes, false);
+  check(op.concat_batch_bytes, false);
+  check(op.cross_join_task_bytes, false);
+  check(op.sort_sample_bytes, false);
+  check(op.max_build_hash_table_bytes, false);
+  check(op.max_build_probe_resident_bytes, false);
+  check(op.max_broadcast_join_size, true);
+  check(op.mark_join_build_switch_ratio, true);
+  check(op.enable_dynamic_filter, true);
+  check(op.enable_dynamic_filter_multi_partition, true);
+  check(op.enable_dynamic_zone_map_filter, true);
+  check(op.dynamic_filter_domain_coverage_threshold, true);
+  check(op.dynamic_filter_inlist_max_l2_fraction, true);
+  check(op.dynamic_filter_keep_threshold, true);
+  check(op.enable_pinned_zone_map_pruning, true);
+  check(op.enable_decimal_sum_stats_bound, true);
+  check(op.enable_compressed_materialization, true);
+  check(op.enable_dense_count_join, true);
+  check(op.enable_delim_aggregate_reuse, true);
+  check(op.pin_table_prove_unique_keys, true);
+  check(op.pin_table_unique_exact_max_bytes, true);
+  check(op.enable_exists_minmax_rewrite, true);
+  check(op.enable_partial_aggregate_below_join, true);
+  check(op.enable_subquery_key_carry, true);
+  check(op.enable_exists_from_aggregate, true);
+  check(op.admission_bytes_per_gpu, true);
+  check(op.avg_variable_column_bytes, true);
+  check(op.enable_runtime_size_estimation, true);
+  check(op.use_hw_decompression, true);
 }
 
 TEST_CASE("operator validator boundaries", "[config][config_operator]")

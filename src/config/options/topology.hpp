@@ -31,11 +31,15 @@ struct topology_options : block_base<topology_options> {
         return {};
       })
       .fallback(std::size_t{0})
+      .describe("GPUs Sirius uses, by count or by device id")
       .build();
 
   /// GPUs admitted per query at first; 0 = every active GPU.
-  config_option<int> gpus_per_query =
-    option<int>("gpus_per_query").validate(non_negative<int>{}).fallback(0).build();
+  config_option<int> gpus_per_query = option<int>("gpus_per_query")
+                                        .validate(non_negative<int>{})
+                                        .fallback(0)
+                                        .describe("GPUs allocated to each query at admission")
+                                        .build();
 
   auto fields() { return field_list(gpus, gpus_per_query); }
 };

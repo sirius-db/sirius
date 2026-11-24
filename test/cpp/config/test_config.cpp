@@ -19,6 +19,8 @@
 #include "sirius_config.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 
+#include <yaml-cpp/yaml.h>  // IWYU pragma: keep
+
 #include <filesystem>
 #include <fstream>
 #include <limits>

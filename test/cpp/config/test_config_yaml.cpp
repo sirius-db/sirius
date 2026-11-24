@@ -48,7 +48,7 @@ std::string read_error(std::string_view text)
 {
   sample_root root;
   try {
-    read_yaml(root, text, "sirius", environment::prod);
+    read_yaml(root, text, "sirius");
   } catch (const config_error& e) {
     return e.what();
   }
@@ -121,8 +121,7 @@ sirius:
     - capacity_bytes: 4 GiB
     - monitor_period: 1s
 )",
-            "sirius",
-            environment::prod);
+            "sirius");
   REQUIRE(root.max_concurrent_queries.get() == 2);
   REQUIRE(root.pipeline.cpu_affinity.get() == std::vector<int>{0, 2});
   REQUIRE(root.pipeline.name.is_unset());
@@ -150,7 +149,7 @@ TEST_CASE("read_yaml checks the document shape", "[config][config_yaml]")
 
   // An empty root mapping is valid: every option takes its fallback.
   sample_root root;
-  read_yaml(root, "sirius: {}\n", "sirius", environment::prod);
+  read_yaml(root, "sirius: {}\n", "sirius");
   REQUIRE(root.max_concurrent_queries.is_fallback());
 }
 
@@ -169,7 +168,7 @@ TEST_CASE("write_yaml round-trips file values and optionally fallbacks", "[confi
     - monitor_period: 2 min
 )";
   sample_root root;
-  read_yaml(root, text, "sirius", environment::prod);
+  read_yaml(root, text, "sirius");
   REQUIRE(root.pipeline.name.get() == "~");
 
   auto const written = write_yaml(root, "sirius");
@@ -177,7 +176,7 @@ TEST_CASE("write_yaml round-trips file values and optionally fallbacks", "[confi
   REQUIRE(parse_yaml(written) == parse_yaml(text));
 
   sample_root all;
-  read_yaml(all, write_yaml(root, "sirius", true), "sirius", environment::prod);
+  read_yaml(all, write_yaml(root, "sirius", true), "sirius");
   REQUIRE(all.max_concurrent_queries.user_defined());
   REQUIRE(all.disk.period.get() == 100ms);
   REQUIRE(all.spaces.at(0).capacity.get<bytes>() == 1_TiB);
@@ -284,26 +283,12 @@ TEST_CASE("emit_yaml round-trips keys and nested shapes", "[config][config_yaml]
 TEST_CASE("read_yaml leaves the block as it was on failure", "[config][config_yaml]")
 {
   sample_root root;
-  read_yaml(root, "sirius:\n  max_concurrent_queries: 3\n", "sirius", environment::prod);
-  REQUIRE_THROWS_AS(read_yaml(root, "sirius: [oops", "sirius", environment::prod), config_error);
-  REQUIRE_THROWS_AS(read_yaml(root, "other: 1\n", "sirius", environment::prod), config_error);
-  REQUIRE_THROWS_AS(
-    read_yaml(root, "sirius:\n  max_concurrent_queries: x\n", "sirius", environment::prod),
-    config_error);
+  read_yaml(root, "sirius:\n  max_concurrent_queries: 3\n", "sirius");
+  REQUIRE_THROWS_AS(read_yaml(root, "sirius: [oops", "sirius"), config_error);
+  REQUIRE_THROWS_AS(read_yaml(root, "other: 1\n", "sirius"), config_error);
+  REQUIRE_THROWS_AS(read_yaml(root, "sirius:\n  max_concurrent_queries: x\n", "sirius"),
+                    config_error);
   REQUIRE(root.max_concurrent_queries.get() == 3);
-}
-
-TEST_CASE("read_yaml forwards the environment", "[config][config_yaml]")
-{
-  struct sample_prod : block_base<sample_prod> {
-    config_option<int> level = option<int>("level").fallback(1).for_prod().build();
-    auto fields() { return field_list(level); }
-  };
-  sample_prod block;
-  read_yaml(block, "sirius:\n  level: 5\n", "sirius", environment::dev);
-  REQUIRE(block.level.is_unset());
-  read_yaml(block, "sirius:\n  level: 5\n", "sirius", environment::prod);
-  REQUIRE(block.level.get() == 5);
 }
 
 TEST_CASE("write_yaml of a block nobody read", "[config][config_yaml]")
@@ -311,6 +296,6 @@ TEST_CASE("write_yaml of a block nobody read", "[config][config_yaml]")
   sample_root root;
   REQUIRE(parse_yaml(write_yaml(root, "sirius")) == node::mapping({{"sirius", node::mapping()}}));
   sample_root reread;
-  read_yaml(reread, write_yaml(root, "sirius"), "sirius", environment::prod);
+  read_yaml(reread, write_yaml(root, "sirius"), "sirius");
   REQUIRE(reread.max_concurrent_queries.is_fallback());
 }

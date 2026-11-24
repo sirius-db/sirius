@@ -29,7 +29,7 @@ struct executor_root : block_base<executor_root> {
 executor_root read(std::string_view text)
 {
   executor_root root;
-  read_yaml(root, text, "sirius", environment::prod);
+  read_yaml(root, text, "sirius");
   return root;
 }
 
@@ -37,7 +37,7 @@ std::string read_error(std::string_view text)
 {
   executor_root root;
   try {
-    read_yaml(root, text, "sirius", environment::prod);
+    read_yaml(root, text, "sirius");
   } catch (const config_error& e) {
     return e.what();
   }
@@ -99,10 +99,11 @@ TEST_CASE("executor blocks reject bad values and retired keys", "[config][config
 {
   for (auto const* block : {"task_creator", "pipeline", "downgrade"}) {
     INFO(block);
-    REQUIRE(
-      read_error(std::string("sirius:\n  executor:\n    ") + block + ":\n      num_threads: 0\n") ==
-      std::string("'sirius.executor.") + block +
-        ".num_threads': value out of range: '0' (must be greater than zero)");
+    REQUIRE_THAT(
+      read_error(std::string("sirius:\n  executor:\n    ") + block + ":\n      num_threads: 0\n"),
+      Catch::Matchers::StartsWith(std::string("'sirius.executor.") + block +
+                                  ".num_threads': value out of range: '0' (must be greater than "
+                                  "zero); "));
     REQUIRE(read_error(std::string("sirius:\n  executor:\n    ") + block +
                        ":\n      thread_name_prefix: x\n") ==
             std::string("unknown config key: 'thread_name_prefix' in sirius.executor.") + block);
@@ -111,7 +112,8 @@ TEST_CASE("executor blocks reject bad values and retired keys", "[config][config
           "unknown config key: 'cpu_affinity' in sirius.executor.pipeline");
   REQUIRE(read_error("sirius:\n  executor:\n    downgrade:\n      monitor_period: -1ms\n") ==
           "'sirius.executor.downgrade.monitor_period': value out of range: '-1 ms' (must not be "
-          "negative)");
+          "negative)"
+          "; period of the memory pressure monitor");
   REQUIRE(read_error("sirius:\n  executor:\n    task_creator:\n      strategy: ~\n") ==
           "'sirius.executor.task_creator.strategy': removed; task creation policy is internal and "
           "currently demand-driven; remove this key");
@@ -157,23 +159,30 @@ TEST_CASE("thread counts and affinities are checked", "[config][config_executor]
   };
   REQUIRE(error("num_threads: -1") ==
           "'sirius.executor.downgrade.num_threads': value out of range: '-1' (must be greater than "
-          "zero)");
+          "zero); downgrade (spill) executor worker threads");
   REQUIRE(error("num_threads: abc") ==
-          "'sirius.executor.downgrade.num_threads': invalid integer value: 'abc'");
+          "'sirius.executor.downgrade.num_threads': invalid integer value: 'abc'"
+          "; downgrade (spill) executor worker threads");
   REQUIRE(error("num_threads: 1.5") ==
-          "'sirius.executor.downgrade.num_threads': invalid integer value: '1.5'");
+          "'sirius.executor.downgrade.num_threads': invalid integer value: '1.5'"
+          "; downgrade (spill) executor worker threads");
   REQUIRE(error("num_threads: 2147483648") ==
-          "'sirius.executor.downgrade.num_threads': integer out of range: '2147483648'");
+          "'sirius.executor.downgrade.num_threads': integer out of range: '2147483648'"
+          "; downgrade (spill) executor worker threads");
   REQUIRE(
     error("num_threads: 010") ==
     "'sirius.executor.downgrade.num_threads': invalid integer value: '010' (leading zeros are "
-    "not allowed)");
+    "not allowed)"
+    "; downgrade (spill) executor worker threads");
   REQUIRE(error("cpu_affinity: 3") ==
-          "'sirius.executor.downgrade.cpu_affinity': expected a sequence, got a scalar");
+          "'sirius.executor.downgrade.cpu_affinity': expected a sequence, got a scalar"
+          "; CPU cores downgrade executor threads are pinned to");
   REQUIRE(error("cpu_affinity: [a]") ==
-          "'sirius.executor.downgrade.cpu_affinity': element 0: invalid integer value: 'a'");
+          "'sirius.executor.downgrade.cpu_affinity': element 0: invalid integer value: 'a'"
+          "; CPU cores downgrade executor threads are pinned to");
   REQUIRE(error("cpu_affinity: [~]") ==
-          "'sirius.executor.downgrade.cpu_affinity': element 0: expected a scalar, got null");
+          "'sirius.executor.downgrade.cpu_affinity': element 0: expected a scalar, got null"
+          "; CPU cores downgrade executor threads are pinned to");
 
   // Ids are not checked, as today.
   auto const root = read(
@@ -203,14 +212,17 @@ TEST_CASE("monitor_period and copy_chunk_bytes forms", "[config][config_executor
   REQUIRE_THAT(error("monitor_period: -1"),
                Catch::Matchers::ContainsSubstring("must not be negative"));
   REQUIRE(error("monitor_period: abc") ==
-          "'sirius.executor.downgrade.monitor_period': invalid time value: 'abc'");
+          "'sirius.executor.downgrade.monitor_period': invalid time value: 'abc'; period of the "
+          "memory pressure monitor");
 
   REQUIRE(value("copy_chunk_bytes: 0").copy_chunk_bytes.get() == 0_B);  // the builtin converter
   REQUIRE(value("copy_chunk_bytes: 4194304").copy_chunk_bytes.get() == 4_MiB);
   REQUIRE(error("copy_chunk_bytes: -1") ==
-          "'sirius.executor.downgrade.copy_chunk_bytes': byte value must be non-negative");
+          "'sirius.executor.downgrade.copy_chunk_bytes': byte value must be non-negative"
+          "; copy granularity of GPU-to-host spills");
   REQUIRE(error("copy_chunk_bytes: 1 XB") ==
-          "'sirius.executor.downgrade.copy_chunk_bytes': unknown byte suffix: 'XB'");
+          "'sirius.executor.downgrade.copy_chunk_bytes': unknown byte suffix: 'XB'"
+          "; copy granularity of GPU-to-host spills");
   REQUIRE_THAT(error("copy_chunk_bytes: 1.5"),
                Catch::Matchers::ContainsSubstring("would need rounding"));
 }
