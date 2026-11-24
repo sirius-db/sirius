@@ -178,6 +178,9 @@ std::unique_ptr<cudf::column> cast_through_rep(cudf::column_view const& column,
   // representation-backed DATE and the other is a strict narrow carrier. Every other pair,
   // including DATE<->TIMESTAMP, follows cuDF's conversion rules.
   auto const source = column.type();
+  // A dictionary carrier may already arrive in its STRING form, and cuDF casts only fixed-width
+  // targets.
+  if (source == target) { return std::make_unique<cudf::column>(column, stream, mr); }
   if (is_dictionary_carrier_of(source, target)) {
     return decode_dictionary_carrier(column, stream, mr);
   }
