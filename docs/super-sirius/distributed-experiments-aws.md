@@ -180,7 +180,6 @@ sirius:
     pipeline: { num_threads: $(( ranks <= 2 ? 16 : 4 )) }
     scan_manager: { num_threads: 32, uring_n_reactors: 4, cache: { mode: none } }
   operator_params:
-    max_dynamic_filter_bloom_bytes_per_gpu: 2Gi
     max_build_probe_resident_bytes: 32Gi
     max_build_hash_table_bytes: 32Gi
 EOF
@@ -192,11 +191,10 @@ EOF
 | `pipeline.num_threads` | A rank runs this many scan tasks at once. With 1 or 2 ranks, 4 threads per rank cannot keep the disks busy: use 16. With 4 ranks, 4 already saturate the disks | 4, 8, 16 |
 | `scan_manager.num_threads` | 32 per rank, as on NVL nodes. That is 128 threads for 4 ranks on 96 vCPUs; it worked, and fewer was not tested | 32 |
 | `scan_manager.cache.mode` | `none` reads with `O_DIRECT` and is bound by the disks. `os` uses the page cache: much faster once the columns are cached, and it scales with ranks. See [What we learned](#what-we-learned) | `none`, `os` |
-| Bloom, build/probe, hash table | 2Gi and 32Gi: half the values used on NVL nodes, for 96 GB GPUs | all 22 queries at SF3000 |
+| Build/probe, hash table | 32Gi: half the values used on NVL nodes, for 96 GB GPUs | all 22 queries at SF3000 |
 
-Change the config only if a run fails, one change at a time, and record each change and why. The
-Bloom cap is set in the file only; a `SET` fails. Keep the `exchange` and `ucx` settings at
-their defaults.
+Change the config only if a run fails, one change at a time, and record each change and why.
+Keep the `exchange` and `ucx` settings at their defaults.
 
 Write `$OUT/run.sql` with the snippet of
 [step 4](distributed-experiments-no-slurm.md#4-config-and-queries) of the other document. Set

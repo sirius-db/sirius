@@ -76,7 +76,6 @@ sirius:
     mark_join_build_switch_ratio: 10.1054
     dynamic_filter_domain_coverage_threshold: 0.6257
     dynamic_filter_keep_threshold: 0.8144
-    max_dynamic_filter_bloom_bytes_per_gpu: 2577Mi
 EOF
 ```
 
