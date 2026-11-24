@@ -188,15 +188,17 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 Simpatico compression is enabled by default when `pin_table` caches input tables on
 the host or GPU. Use `CALL pin_table(..., compression => false)` to opt out for a specific
 pin, or `SET pin_table_compression = false` for the session default. Matching table plans
-in `input_plan_dir` override automatic selection; without one, each chunk uses the same
-type/sample-based plan selection as spill compression, after carrier narrowing. The
-size and actual compressed-footprint gates below still apply.
+in `input_plan_dir` override automatic selection; without one, a large enough table has each
+chunk's plans chosen from type and sample after carrier narrowing, favoring plans a filtered
+scan can decode in place (see [Compressed Pinning](compressed-pinning.md)). The size and actual
+compressed-footprint gates below still apply.
 
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
 | `enable_pin_table_compression` | `pin_table_compression` | bool | true | Default for `pin_table` calls that omit the `compression` argument. |
 | `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
 | `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
+| `min_table_device_fraction` | `pin_table_compression_min_table_device_fraction` | finite double >= 0 | 0.05 | Select plans automatically for a GPU-tier pin only when its uncompressed size (first chunk's bytes per row times the table's rows) is at least this fraction of the memory of the GPUs it pins to; store a smaller one uncompressed. Host pins and explicit table plans are not gated. `0` disables the gate. |
 | `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Optional directory of per-table Simpatico plan overrides. An empty path or no readable, nonempty matching file selects plans automatically. A selected plan that does not cover the pinned columns leaves the pin raw. |
 
 The YAML loader and DuckDB `SET` surface reject negative, NaN, and infinite
@@ -370,12 +372,12 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 0**) | 18 | Metadata-producer worker threads; fixed default. |
+| `num_threads` | int (**> 0**) | max(18, eligible NUMA domains) | Shared metadata and Parquet-coalescing worker count. Explicit values must cover all eligible domains. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`, including S3 listing and globs. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 2 if T < 32, otherwise 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
 | `rest_n_reactors` | int (**>= 0**) | kTLS loaded: one per steered NIC IRQ CPU when there are fewer than 16, else clamp(floor(T/6), 4, 16); no kTLS: clamp(floor(T/6), 8, 16) | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. Unnamed, the count depends on whether cuCascade's topology reports kernel TLS loaded (`system_topology_info::kernel_tls.loaded`: the kernel `tls` module loaded or built in). With kTLS, when the egress NIC's queue IRQs are also steered to a strict subset of its NUMA node's cores on fewer than 16 CPUs, the count is the number of IRQ CPUs, at least 4 (the reactors are pinned round-robin onto those CPUs); otherwise it is clamp(floor(T/6), 4, 16). Without kTLS it is clamp(floor(T/6), 8, 16): user-space TLS costs the reactor threads CPU per byte. A named count, `0` included, is used as written. |
-| `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built from the startup mask the CPUs were planned from, so it pins the same way. |
+| `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built under the saved rank startup mask, so it pins the same way while preserving the caller's CUDA and thread-local context. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
@@ -685,7 +687,7 @@ These settings are loaded at initialization. Metadata jobs default to a limit of
 | `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
 | `native_reader_workers` | 2 | Native-reader worker threads per scan manager, started lazily at the first native reservation. Positive and independent of metadata workers and GPU count. |
 | `max_native_readers` | 64 | Reader slots shared by all attempts within that manager. Must be at least `native_reader_workers`; an attempt reserves its full group before any reader starts. |
-| `coordinator_workers` | 1 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per reader attempt. Metadata-only attempts still run coordination on the query owner. |
+| `coordinator_workers` | 1 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per asynchronous-coalescing or reader attempt. Parquet/Iceberg attempts also use independent coordination; synchronous-only metadata attempts retain query-owner coordination. |
 | `max_control_work` | N | Maximum coordinator actions per iteration. |
 | `drain_quantum` | N | Maximum coalescing work per result advancement. |
 | `partial_batch` | enabled | Partial-publication policy. An omitted or empty block uses the defaults below. |
@@ -1181,6 +1183,7 @@ retention gates.
 | `pin_table_input_compression_plan_dir` | (empty) | Optional directory of per-table Simpatico plan overrides (`<table_name>.<ext>`, multi-column plan DSL). If no readable, nonempty matching file is found, plans are selected automatically; a selected plan that does not cover the pinned columns leaves the pin raw. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
 | `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). Spill compression uses `spill_max_compressed_fraction` instead. |
+| `pin_table_compression_min_table_device_fraction` | 0.05 | Select plans automatically for a GPU-tier pin only when its uncompressed size is at least this fraction of its GPUs' memory; store a smaller one uncompressed; host pins are not gated; `0` disables. |
 | `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time and use those facts as join-key proofs (single-pass distinct hash join) and as late materialization's proof for a group-by-rowid ride. Affects pins and plans made after it is set. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values retained across all columns for the pin-time exact uniqueness check; `0` uses 10% of the GPU memory space capacity. |
 
@@ -1277,7 +1280,7 @@ SET enable_runtime_size_estimation = true;   -- off by default
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus explicit `CALL gpu_execution(...)`. Set to `false` to surface Sirius errors instead of falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates plan-time fallback (unsupported operator/type) and runtime fallback for transparent SELECT, plus explicit `CALL gpu_execution(...)`. Unsupported COPY options can fall back during planning; transparent [Parquet COPY](parquet-output.md#failure-and-cleanup) never replays runtime failures because files may already be visible. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
@@ -1336,3 +1339,76 @@ prefetcher `min_free_fraction` below 0.4, prefetcher threads above 3,
 pipeline threads above 8. The H2D interconnect sustains ~350-380 GB/s
 regardless of stream count; past these settings the link, not scheduling,
 is the bound.
+
+### Metadata worker NUMA placement and asynchronous Parquet preparation
+
+The existing `scan_manager.num_threads` budget is divided across eligible NUMA domains
+associated with configured GPUs. When `num_threads` is omitted or null, its initial default
+is 18; after discovering eligible domains, initialization
+raises that default if necessary to provide at least one worker per domain. An explicitly
+supplied value is never raised: initialization rejects it when it cannot cover all eligible
+domains. Each worker binds once, before accepting work; there is no per-operation affinity
+guard or extra coalescing pool. cuCascade discovers the rank's main-thread CPU affinity
+and its effective cgroup v2 CPU allowance. Configuration resolution saves their intersection
+as the startup CPU boundary shared by metadata placement, worker startup and lazy REST and
+exchange construction. GPU-local CPU sets and explicit pool affinity may narrow this boundary;
+they cannot expand it. Reserved REST-reactor CPUs remain excluded from worker pools, subject
+to the documented explicit-affinity fallback.
+
+A `taskset` or `numactl --cpunodebind` launch is honored through the main thread's mask, even
+when several ranks share a broader cgroup. A later single-CPU DuckDB worker mask does not
+replace that boundary. Capture occurs at engine configuration resolution: the embedder must
+preserve the launch mask on the main thread until then. Changing the main thread's affinity
+before capture changes the boundary; this mechanism cannot reconstruct historical launch
+settings. Native/coordinator workers start lazily from the saved mask, and each startup scope
+restores its caller's previous affinity on success and failure without changing CUDA/TLS state.
+If the deployment cpuset shrinks before lazy startup, coordinator/native workers, the
+dedicated coordinator runner, and lazy REST/exchange construction use the nonempty subset
+the kernel grants from the saved boundary and log the narrowed mask. They never substitute
+the creating thread's narrower mask or expand beyond the saved boundary. An empty subset
+still rejects startup; dormant worker pools may retry after the allowance is restored.
+
+cuCascade resolves cgroup2 mount roots and inherited effective cpusets. If cgroup discovery is
+unavailable, it retains the main-thread affinity with a diagnostic. If the main thread's mask
+cannot be read, it falls back to caller affinity with a diagnostic. A known empty intersection
+fails initialization; no broader mask is substituted. Missing GPU-local topology uses the
+permitted CPU boundary and reports the locality fallback. CPU restrictions do not select GPUs
+or change memory-binding policy, and ranks sharing a socket are not automatically assigned
+exclusive CPU or memory shares.
+
+Each preparation source selects a stable coalescing domain from the query's eligible GPU
+domains. A manager-wide cursor rotates the starting domain across queries, including
+independent single-source scans; each query rotates within its own eligible GPU-domain set.
+If CPU restrictions leave none of the query's GPU-local domains available, the query uses
+the first permitted manager domain instead. That domain may be remote from all of the
+query's GPUs; CPU restrictions still apply. This exception also applies when a per-query
+GPU limit selects only GPUs whose local domains were excluded.
+Independent metadata jobs rotate across the query's eligible domains, so a single source
+can use metadata workers in multiple domains. Each whole job executes in its assigned domain;
+plain Parquet creates one metadata job per file. There is no persistent file-to-domain mapping,
+so separate jobs referencing the same file may use different domains. A source's Parquet
+coalescer operations retain their stable domain. Workers do not steal domain-routed jobs from
+other domains. Metadata may therefore be produced in a different domain from its coalescer.
+This routing does not select I/O reactor or driver queues. Final GPU batch placement is unchanged;
+CPU placement does not imply page migration or pin all batches to one GPU.
+
+The query dispatcher alternates pending metadata and coalescing work when both are ready.
+Running metadata I/O is not preempted: a domain whose workers are all blocked on reads can
+still delay coalescing. No worker waits for another job in the pool. Trace logs report
+coalescing queue and execution duration; storage/concurrency qualification must check both.
+
+Thread counts are separate budgets. `scan_manager.num_threads` counts only the shared
+metadata/coalescing workers. Asynchronous Parquet/Iceberg attempts additionally use the
+manager's `preparation.coordinator_workers` control pool (one worker by default, started
+lazily). Setting that value to zero instead starts one coordinator thread per asynchronous
+or reader attempt. Native reads use their own `preparation.native_reader_workers` pool
+(two workers by default, started lazily). Each uring or REST reactor is another worker;
+reactor counts are per IO context. These workers are additional to pipeline, task-creator
+and downgrade threads. Pool defaults are independently sized and capped; the scan-manager
+default of 18 is not a total process thread cap and does not subtract coordinator, native-reader
+or additional IO-context workers.
+
+Completed coalescing operations are consumed in rotating source order, with at most one
+completion per control turn. This prevents a repeatedly ready first source from bypassing
+later ready sources. Shared admission can still delay work before an idle domain worker
+receives it; class alternation and rotating consumption provide no wall-clock latency bound.

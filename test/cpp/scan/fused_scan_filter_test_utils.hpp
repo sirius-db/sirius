@@ -281,7 +281,11 @@ inline std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_key_set(
                           cudaMemcpyHostToDevice,
                           stream.get()) == cudaSuccess);
   stream.sync();
-  return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col->view(), stream, mr);
+  auto filter =
+    std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col->view(), stream, mr);
+  // The set builds asynchronously on `stream`; decodes probe it from non-blocking pool streams.
+  stream.sync();
+  return filter;
 }
 
 /// Whether @p value is in the set `make_key_set` builds with @p step: the multiples of @p step in

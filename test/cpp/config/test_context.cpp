@@ -1021,6 +1021,21 @@ TEST_CASE("Sirius configuration accepts intentional compression retention fracti
   require_fraction("valid_compression_fraction_above_one.yaml", 1.5);
 }
 
+TEST_CASE("Sirius configuration loads the pin compression table size gate", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config config;
+  REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_pin_min_table_device_fraction.yaml"));
+  REQUIRE(config.get_compression_config().min_table_device_fraction == Approx(0.05));
+
+  sirius::sirius_config negative;
+  REQUIRE_THROWS_WITH(
+    negative.load_from_file(data_dir / "invalid_pin_min_table_device_fraction.yaml"),
+    Catch::Matchers::ContainsSubstring("min_table_device_fraction"));
+}
+
 TEST_CASE("Sirius configuration loads spill compression settings", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();

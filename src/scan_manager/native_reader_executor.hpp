@@ -60,7 +60,7 @@ class native_reader_executor {
   };
 
   // No worker threads are started until the first nonempty reservation succeeds.
-  native_reader_executor(size_t workers, size_t max_readers);
+  native_reader_executor(size_t workers, size_t max_readers, std::vector<int> cpu_affinity = {});
   // All attempts must retire and return their leases before the runtime destroys the executor.
   ~native_reader_executor();
   native_reader_executor(native_reader_executor const&)            = delete;
@@ -79,6 +79,7 @@ class native_reader_executor {
   std::shared_ptr<preparation_wakeup> observe(preparation_wakeup);
 
  private:
+  std::vector<int> cpu_affinity_;
   // Serializes startup/admission/shutdown. Workers and lease release never acquire it.
   std::mutex lifecycle_mutex_;
   std::unique_ptr<state> state_;

@@ -48,6 +48,7 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/scan_returned_types.hpp"
+#include "planner/scan_source_names.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -157,8 +158,8 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
   std::optional<int64_t> snapshot_id;
   auto const sid_it          = op.named_parameters.find("snapshot_from_id");
   bool const has_explicit_id = sid_it != op.named_parameters.end() && !sid_it->second.IsNull();
+  auto const bound = op::scan::capture_iceberg_snapshot(op.function, op.bind_data.get(), context);
   if (!has_explicit_id) {
-    auto const bound = op::scan::capture_iceberg_snapshot(op.function, op.bind_data.get(), context);
     if (!bound) {
       return iceberg_decline(
         scan_reason::iceberg_no_snapshot_id,
@@ -219,7 +220,12 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
       }
       ~probe_timer() { stop(); }
     } timer{delete_time_us};
-    auto result = op::scan::read_delete_inventory(context, table_path, snapshot_id, injection);
+    auto result = op::scan::read_delete_inventory(
+      context,
+      table_path,
+      snapshot_id,
+      injection,
+      bound ? std::string_view(bound->table_uuid) : std::string_view{});
     auto const n_delete_files = result.equality_count;
     timer.stop();
     if (n_delete_files > 0) {
@@ -929,6 +935,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     }
   }
   op.ResolveOperatorTypes();
+  auto source_names = scan_source_names(op);
   // create the table scan node
   if (!op.function.projection_pushdown) {
     // function does not support projection pushdown
@@ -939,7 +946,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       sirius::from_duckdb_vec(op.returned_types),
       column_ids,
       duckdb::vector<duckdb::column_t>(),
-      duckdb::IdentifiersToStrings(op.names),
+      std::move(source_names),
       std::move(table_filters),
       op.estimated_cardinality,
       std::move(op.extra_info),
@@ -1015,7 +1022,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     scan_returned_types(op.returned_types, column_ids),
     column_ids,
     duckdb::vector<std::size_t>(op.projection_ids.begin(), op.projection_ids.end()),
-    duckdb::IdentifiersToStrings(op.names),
+    std::move(source_names),
     std::move(table_filters),
     op.estimated_cardinality,
     std::move(op.extra_info),

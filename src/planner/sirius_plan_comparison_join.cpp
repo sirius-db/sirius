@@ -49,8 +49,10 @@
 #include "planner/dynamic_filter/build_key_domain.hpp"
 #include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
+#include "planner/gpu_admission.hpp"
 #include "planner/join_implied_filters.hpp"
 #include "planner/join_key_nullability.hpp"
+#include "planner/scan_source_names.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_join_utils.hpp"
 #include "sirius_context.hpp"
@@ -196,6 +198,7 @@ static unique_keys prove_unique_from_pin(duckdb::SiriusContext* sirius_context,
   auto const& column_ids  = get.GetColumnIds();
   auto const& proj_ids    = get.projection_ids;
   auto const output_count = proj_ids.empty() ? column_ids.size() : proj_ids.size();
+  auto const source_names = scan_source_names(get);
   unique_keys keys;
   for (duckdb::idx_t output_idx = 0; output_idx < output_count; ++output_idx) {
     auto const column_idx           = proj_ids.empty() ? output_idx : proj_ids[output_idx];
@@ -203,7 +206,7 @@ static unique_keys prove_unique_from_pin(duckdb::SiriusContext* sirius_context,
     // Virtual columns (row ids and the like) have no pinned counterpart.
     if (primary_column_index >= get.names.size()) { continue; }
     if (hive_partition_columns.contains(primary_column_index)) { continue; }
-    auto const& column_name = get.names[primary_column_index].GetIdentifierName();
+    auto const& column_name = source_names[primary_column_index];
     if (proven_unique(column_name)) {
       SIRIUS_LOG_DEBUG("[join] column '{}' proven distinct by the pinned table", column_name);
       keys.push_back({output_idx});
@@ -862,6 +865,37 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                 .dynamic_filter_plan       = std::move(filter_plan),
                                 .dynamic_filter_stats_sink = stats});
     auto& hj  = *join;
+    if (op.join_type == duckdb::JoinType::RIGHT_SEMI ||
+        op.join_type == duckdb::JoinType::RIGHT_ANTI) {
+      // Every partition keeps its build rows resident until the whole probe is read, and that
+      // state cannot be spilled, so partitioning does not bound it. Build on the kept side only
+      // when all of it fits the per-GPU BUILD_PROBE residency budget across the GPUs.
+      auto const num_gpus   = std::max<std::size_t>(1, gpu_spaces.size());
+      auto const kept_bytes = sirius::memory::saturating_mul(
+        rhs_cardinality,
+        sirius::planner::estimate_bytes_per_row(hj.children[1]->types,
+                                                op_params.avg_variable_column_bytes));
+      auto const budget =
+        sirius::memory::saturating_mul(num_gpus, op_params.max_build_probe_resident_bytes);
+      if (kept_bytes < budget) {
+        hj.set_kept_build_streaming(true);
+        SIRIUS_LOG_DEBUG(
+          "[sirius_plan_comparison_join] {} builds on its kept side and streams the probe (probe "
+          "est {} rows, build est {} rows, {} bytes).",
+          duckdb::JoinTypeToString(op.join_type),
+          lhs_cardinality,
+          rhs_cardinality,
+          kept_bytes);
+      } else {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_plan_comparison_join] {} keeps the STANDARD build: its kept side, est {} "
+          "bytes, exceeds the {} GPU(s)' residency budget of {} bytes.",
+          duckdb::JoinTypeToString(op.join_type),
+          kept_bytes,
+          num_gpus,
+          budget);
+      }
+    }
     hj.set_single_join_error_on_multiple_rows(
       duckdb::Settings::Get<duckdb::ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 

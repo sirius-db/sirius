@@ -24,6 +24,7 @@
 #include "expression_evaluator/query_policy.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/config.hpp"
+#include "output/parquet_spec.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -430,6 +431,14 @@ struct compression_config {
   //  Default 0.75 (that coincides with a 1.33x compression ratio).
   double max_compressed_fraction{0.75};
 
+  /// Select plans automatically for a GPU-tier pin only when its uncompressed size (the first
+  /// chunk's bytes per row times the table's rows) is at least this fraction of the memory of
+  /// the GPUs it pins to. A smaller pin is stored uncompressed: it frees little GPU memory and
+  /// its scans still pay for decoding. Host pins are not gated, as fewer bytes always shorten
+  /// their host-to-device copies. Explicit table plans are not gated either. Finite and
+  /// non-negative; 0 disables the gate.
+  double min_table_device_fraction{0.05};
+
   /// Directory containing per-table Simpatico plan files for input-table
   /// compression.  Each file is named "<table_name>.<ext>" (any extension);
   /// its contents are the multi-column plan DSL (columns separated by "---"
@@ -568,6 +577,17 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
+  /// Rank CPU boundary shared by pool startup, metadata placement and lazy I/O/exchange.
+  [[nodiscard]] const std::vector<int>& get_startup_cpus() const noexcept
+  {
+    return _scan_manager_config.startup_cpus;
+  }
+
+  /// Startup CPUs for unconfigured worker/management and exchange threads, excluding
+  /// reserved reactor CPUs when any were reserved. Explicit pool masks remain authoritative
+  /// within the rank boundary.
+  [[nodiscard]] std::vector<int> get_worker_startup_cpus() const;
+
   /// CPUs reserved for the pinned REST reactors and kept out of every Sirius
   /// thread pool's affinity; empty when nothing is reserved.
   [[nodiscard]] const std::vector<int>& get_rest_reactor_cpus() const noexcept
@@ -598,6 +618,11 @@ struct sirius_config {
   [[nodiscard]] compression_config& get_compression_config() noexcept
   {
     return _compression_config;
+  }
+
+  output::parquet_compression parquet_output_compression() const noexcept
+  {
+    return _parquet_output_compression;
   }
 
   /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
@@ -656,6 +681,7 @@ struct sirius_config {
   compression_config _compression_config;
   /// CPUs the REST reactors will pin to, reserved from the thread pools (empty: none).
   std::vector<int> _rest_reactor_cpus;
+  output::parquet_compression _parquet_output_compression{output::parquet_compression::snappy};
 };
 
 /// Validated configuration intent. Construction and parsing never discover hardware.
@@ -669,6 +695,7 @@ class parsed_sirius_config {
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
+  [[nodiscard]] output::parquet_compression parquet_output_compression() const noexcept;
   /// The scan-manager settings as parsed (backend selection, REST tuning, cache). Lets an
   /// embedder check backend-dependent options before the engine is brought up.
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;

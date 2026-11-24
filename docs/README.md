@@ -121,8 +121,10 @@ keep it alive before creating another instance. See the [Context API documentati
 for process-wide configuration and lifetime restrictions.
 
 The v2 extension requires the exact DuckDB revision pinned in this repository.
-Use the built CLI above. The default environment's DuckDB 1.5 Python package cannot
-load this extension; Python use requires a package built from the matching revision.
+Python use requires a package built from that matching revision. The DuckDB Python
+package in [`pixi.toml`](../pixi.toml) is intended for fixtures and data generation;
+its version number alone does not establish extension compatibility. Use the built
+CLI above if a matching Python client is unavailable.
 
 Save this example as `example.py` in the repository root and replace `/path/to/lineitem.parquet`
 with your TPC-H Parquet file. `allow_unsigned_extensions` allows loading the locally built
@@ -149,7 +151,8 @@ print(rows)
 con.close()
 ```
 
-Run it from the repository root:
+Run it from the repository root with a Python client built from the matching DuckDB
+revision. If that client is installed in your Pixi environment, use:
 
 ```bash
 pixi run python example.py
@@ -159,8 +162,8 @@ For an example using TPC-H data from Parquet files or a DuckDB database, see the
 [Python benchmark script](../test/tpch_performance/performance_test.py).
 
 The Python benchmark and power/throughput runners require a Python DuckDB client
-built from the pinned v2 revision; the default environment's 1.5 client cannot
-load this extension. The CLI-based scripts use the built v2 host.
+built from the pinned v2 revision, as described above. The CLI-based scripts use
+the built v2 host.
 
 ## Pinning Tables for Hot Runs
 

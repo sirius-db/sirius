@@ -117,11 +117,19 @@ enum class operator_data_type : uint8_t {
   INPUT_FREE,
 };
 
+// Describes the task delivering this input, independently of physical batch IDs.
+// The executor stamps the actual input before each execute() call. A writer's
+// accounting is query-local, so the original task ID needs no query ID here.
+struct delivery_metadata {
+  std::uint64_t original_task_id = 0;
+  std::uint32_t retry_count      = 0;
+};
+
 /**
  * @brief Generic base class for operator input/output data.
  *
- * This is an intentionally minimal base class with no opinion on what the
- * data should be. Derived classes define the concrete data representation.
+ * Derived classes define the concrete data representation. Optional delivery
+ * metadata describes the task invocation independently of that representation.
  */
 class operator_data {
  public:
@@ -132,6 +140,12 @@ class operator_data {
   operator_data& operator=(const operator_data&) = default;
   operator_data(operator_data&&)                 = default;
   operator_data& operator=(operator_data&&)      = default;
+
+  [[nodiscard]] delivery_metadata const* delivery() const noexcept
+  {
+    return _delivery ? &*_delivery : nullptr;
+  }
+  void set_delivery(delivery_metadata metadata) noexcept { _delivery = metadata; }
 
   /**
    * @brief Identify the concrete subclass at runtime.
@@ -235,6 +249,9 @@ class operator_data {
   [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
 
  private:
+  // Optional while constructing an input; overwritten for each task invocation,
+  // including after row-preserving materialization or a downstream task boundary.
+  std::optional<delivery_metadata> _delivery;
   /// Producer-assigned device preference; nullopt until set_preferred_device_id.
   std::optional<int> _preferred_device_id;
 };

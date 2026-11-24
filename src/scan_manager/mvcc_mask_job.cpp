@@ -88,6 +88,10 @@ void fan_out_and_join(exec::scoped_dispatcher& dispatcher,
   }
   controller.close();
   done_future.wait();
+  // Completion slots retire inside callback destruction, before the enclosing
+  // dispatcher reservation. Join that reservation too before the prepare owner
+  // reuses this dispatcher and binds coordinator callbacks.
+  dispatcher.wait_for_all();
 
   if (submission_error) { std::rethrow_exception(submission_error); }
   if (state->first_error) { std::rethrow_exception(state->first_error); }

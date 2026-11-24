@@ -246,7 +246,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
 
       // Build a minimal PreparedStatementData with the output schema.
       auto prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
-        duckdb::StatementType::SELECT_STATEMENT);
+        cpu_fallback_prepared_ ? cpu_fallback_prepared_->statement_type
+                               : duckdb::StatementType::SELECT_STATEMENT);
+      if (cpu_fallback_prepared_) prepared->properties = cpu_fallback_prepared_->properties;
       prepared->types = types;
       prepared->names = result_names_;
 
@@ -345,7 +347,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           context.client, {{sirius::value_of(window->query_id())}, 0});
         // A copy of the hook-captured plan keeps its CTE_REF indexes, so its proofs still hold.
         if (copied_from_hook) { planner.cte_reader_proofs = cte_reader_proofs_; }
-        sirius_plan = planner.create_plan(std::move(fresh_plan));
+        planner.copy_statement_sql = query_sql_;
+        sirius_plan                = planner.create_plan(std::move(fresh_plan));
         if (read_view_injection_stage == "execute") {
           planner.read_views->inject_mismatch_for_testing(false);
         }
@@ -447,9 +450,10 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           state.sirius_context)
         state.sirius_context->record_late_failure(failure.cause);
       const std::string gpu_msg = gpu_error.RawMessage();
-      SIRIUS_LOG_ERROR("Transparent GPU execution error: {}", gpu_msg);
+      sirius::log::log_noexcept(
+        [&] { SIRIUS_LOG_ERROR("Transparent GPU execution error: {}", gpu_msg); });
 
-      // A user interrupt is never a fallback candidate — propagate it as-is.
+      // Preserve cancellation classification before the side-effecting COPY guard.
       if (gpu_error.Type() == duckdb::ExceptionType::INTERRUPT) { gpu_error.Throw(); }
 
       // A pre-existing-unavailable error on an S3 query keeps its stable typed
@@ -458,6 +462,14 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       if (runtime_unavailable_error && (source_policy_.reads_sirius_owned_s3() ||
                                         sirius::references_sirius_owned_s3_parquet(query_sql_))) {
         gpu_error.Throw();
+      }
+
+      // File export is side-effecting. Never replay it after a runtime failure,
+      // even when no rows have yet been returned to the client.
+      if (cpu_fallback_prepared_ &&
+          cpu_fallback_prepared_->statement_type == duckdb::StatementType::COPY_STATEMENT) {
+        throw duckdb::ExecutorException("Sirius Parquet export failed (CPU replay disabled): " +
+                                        gpu_msg);
       }
 
       try {
