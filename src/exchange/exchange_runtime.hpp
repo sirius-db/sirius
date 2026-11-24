@@ -43,16 +43,18 @@ constexpr std::uint32_t max_tcp_lanes = 64;
 
 /// Ring sizing: @p send_frames staging frames shared by all peers, and @p recv_frames_per_peer
 /// frames (credits) for each peer, each @p frame_bytes, a positive multiple of 256. A write covers
-/// up to half a peer's credits of consecutive frames: NVLink between nodes needs writes of 16 MiB
-/// or more (about 450 GB/s at 16 MiB, 700 at 128 MiB, 770 at 1 GiB), and 16 credits of 16 MiB
-/// keep two 128 MiB writes to a peer in flight. The sizing is fixed until credits are granted on
-/// demand (#2371).
+/// consecutive frames, up to half of the smaller of a peer's credits and the send frames. The
+/// defaults keep the rings, which are outside the GPU memory budget, at 576 MiB for 8 ranks.
+/// NVLink between nodes needs larger writes (about 450 GB/s at 16 MiB, 700 at 128 MiB, 770 at
+/// 1 GiB): 16 MiB frames, 32 send frames and 16 credits keep two 128 MiB writes to a peer in
+/// flight, for 2.25 GiB at 8 ranks. The sizing is fixed until credits are granted on demand
+/// (#2371).
 struct nixl_exchange_options {
-  std::size_t frame_bytes   = std::size_t{16} * 1024 * 1024;  // 16 MiB
-  std::uint32_t send_frames = 32;
+  std::size_t frame_bytes   = std::size_t{8} * 1024 * 1024;  // 8 MiB
+  std::uint32_t send_frames = 16;
   /// The frames a peer may have in flight to this rank. Over TCP lanes a write is one frame and a
   /// peer keeps one frame per lane in flight, so fewer frames than lanes leave lanes idle.
-  std::uint32_t recv_frames_per_peer = 16;
+  std::uint32_t recv_frames_per_peer = 8;
   host_staging staging               = host_staging::automatic;
   mnnvl_mode mnnvl                   = mnnvl_mode::automatic;
   /// TCP lanes per rank (at most max_tcp_lanes); 0 shares 16 among the ranks on this host.

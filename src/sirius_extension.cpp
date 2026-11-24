@@ -3961,14 +3961,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "peer's receive frames (one frame over TCP lanes). Same on every rank; set before "
     "sirius_exchange_rank",
     LogicalType::UBIGINT,
-    Value::UBIGINT(16ull << 20),
+    Value::UBIGINT(8ull << 20),
     SetExchangeFrameBytes);
   config.AddExtensionOption(
     "sirius_exchange_send_frames",
     "Distributed execution: send frames, shared by all peers; they bound the bytes in flight. "
     "Same on every rank; set before sirius_exchange_rank",
     LogicalType::UBIGINT,
-    Value::UBIGINT(32),
+    Value::UBIGINT(16),
     SetExchangeSendFrames);
   config.AddExtensionOption(
     "sirius_exchange_tcp_lanes",
@@ -3983,7 +3983,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "it times the peers, and a TCP lane carries one. Same on every rank; set before "
     "sirius_exchange_rank",
     LogicalType::UBIGINT,
-    Value::UBIGINT(16),
+    Value::UBIGINT(8),
     SetExchangeRecvFramesPerPeer);
   config.AddExtensionOption("sirius_distributed_query_id",
                             "Distributed execution: number of the next distributed query, set by "

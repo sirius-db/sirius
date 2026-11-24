@@ -182,12 +182,14 @@ the fabric path, into its own credit frames there, and logs the rate. Below 150 
 (`require`: fails) that UCX did not take `cuda_ipc`. `UCX_PROTO_INFO=y` prints the transport of
 each UCX protocol, for example `cuda_ipc/cuda` for a put from `cuda/GPU0` to `cuda/dev[0]`.
 
-The ring sizes are settings, the same on every rank: `sirius_exchange_frame_bytes` (16 MiB),
-`sirius_exchange_send_frames` (32, shared by the peers) and `sirius_exchange_recv_frames_per_peer`
-(16: two 128 MiB writes to a peer in flight). A rank's ring memory is
-`frame × (send frames + receive frames × peers)`: 2.25 GiB with 8 ranks, 18.3 GiB with 72
-(credits on demand, #2371, would bound it). With 8 receive frames per peer, one GPU pair moved
-626 GB/s instead of 706.
+The ring sizes are settings, the same on every rank: `sirius_exchange_frame_bytes` (8 MiB),
+`sirius_exchange_send_frames` (16, shared by the peers) and `sirius_exchange_recv_frames_per_peer`
+(8). A rank's ring memory is `frame × (send frames + receive frames × peers)`, outside the GPU
+memory budget: 576 MiB with 8 ranks by default. For NVLink between nodes, set 16 MiB frames, 32
+send frames and 16 receive frames per peer, which keep two 128 MiB writes to a peer in flight,
+and `UCX_NET_DEVICES=rails`: 2.25 GiB with 8 ranks, 18.3 GiB with 72 (credits on demand, #2371,
+would bound it). With that sizing one GPU pair moved 694 to 706 GB/s, and 626 with 8 receive
+frames per peer; with `tcp` on bond0 for the notifications, 677 and 579.
 
 `scripts/distributed_test_nixl_pairs.sh <node1>,<node2>` runs the hidden `[nixl_pairs]` test on
 two nodes of a Slurm partition, one rank per GPU paired with the same GPU on the other node: one
@@ -461,11 +463,12 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   Between nodes of one NVLink domain the data goes over the
   [NVLink fabric](#nvlink-between-nodes-mnnvl), which two and four GB200 nodes with 4 GPUs each
   ran for all of TPC-H at SF30000, and between other hosts over TCP lanes (#2372).
-- **Credits:** each peer gets a fixed share of the receive ring (16 frames of 16 MiB by
+- **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by
   default: `sirius_exchange_recv_frames_per_peer`, `sirius_exchange_frame_bytes`).
   Clusters much larger than 8 ranks would need credits granted on demand (#2371).
-- **Ring memory:** by default the rings take (32 + 16 x (ranks - 1)) x 16 MiB per GPU (768 MiB
-  at 2 ranks, 2.25 GiB at 8), allocated outside the GPU memory space's budget, which does not
+- **Ring memory:** by default the rings take (16 + 8 x (ranks - 1)) x 8 MiB per GPU (192 MiB
+  at 2 ranks, 576 MiB at 8; 2.25 GiB at 8 with the sizing for NVLink between nodes), allocated
+  outside the GPU memory space's budget, which does not
   shrink for them. A rank on the TCP lanes path also pins, in host memory, a mirror the size of
   its receive ring and two send slots of one frame per lane. Reserving them from the space instead stalls any task whose request is clamped to the
   space's whole budget, so charging them waits for the budget to shrink with them (#2371).

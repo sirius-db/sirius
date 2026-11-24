@@ -489,18 +489,18 @@ void LoadInternal(ExtensionLoader& loader)
   option("sirius_gateway_exchange_frame_bytes",
          "sirius_exchange_frame_bytes for every rank",
          LogicalType::UBIGINT,
-         Value::UBIGINT(16ull << 20),
+         Value::UBIGINT(8ull << 20),
          check_frame_bytes);
   option("sirius_gateway_exchange_send_frames",
          "sirius_exchange_send_frames for every rank",
          LogicalType::UBIGINT,
-         Value::UBIGINT(32),
+         Value::UBIGINT(16),
          check_frames);
   option("sirius_gateway_exchange_recv_frames_per_peer",
          "sirius_exchange_recv_frames_per_peer for every rank; over TCP lanes, "
          "one frame in flight per lane",
          LogicalType::UBIGINT,
-         Value::UBIGINT(16),
+         Value::UBIGINT(8),
          check_frames);
   option("sirius_gateway_log_dir",
          "Directory for rank init files and logs; empty uses a temporary one",
