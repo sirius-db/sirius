@@ -41,6 +41,7 @@
 #include "helper/type_conversions.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "log/logging.hpp"
+#include "memory/runtime_stream_pool.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "op/partition/consumer_partition_policy.hpp"
@@ -90,16 +91,21 @@
 
 #include <cudf/cudf_utils.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/uri_parser.hpp>
 #include <duckdb/common/serializer/binary_serializer.hpp>
 #include <duckdb/common/serializer/memory_stream.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <thread>
 #include <utility>
@@ -371,6 +377,90 @@ void collect_iceberg_schema(std::vector<duckdb::MultiFileColumnDefinition> const
   }
 }
 
+}  // namespace
+
+//! Make every equality-delete key readable by the scan without changing what it outputs. Keys
+//! the query does not read are appended behind `projected_output_count`, so the plan gives them
+//! the DELETE_KEY role and the output projection drops them. Only `info` changes.
+void widen_scan_for_equality_keys(sirius::op::scan::parquet_ingestible_table_info& info,
+                                  sirius::op::scan::iceberg_equality_plan const& plan)
+{
+  if (plan.files.empty()) return;
+  // An empty projection means "every column_id is read and emitted". Spell that out first, or
+  // an appended key would become an output column.
+  if (info.projection_ids.empty()) {
+    if (info.projected_output_count != info.column_ids.size()) {
+      throw duckdb::NotImplementedException(
+        "iceberg_scan with equality deletes: the scan emits %llu column(s) but binds %llu, so "
+        "its key columns cannot be appended without changing its output",
+        static_cast<unsigned long long>(info.projected_output_count),
+        static_cast<unsigned long long>(info.column_ids.size()));
+    }
+    for (duckdb::idx_t c = 0; c < info.column_ids.size(); ++c)
+      info.projection_ids.push_back(c);
+  }
+  // Ascending field-ID order keeps the widened layout independent of hash-map iteration.
+  std::map<int32_t, std::size_t> keys;
+  for (auto const& [field_id, key] : plan.keys)
+    keys.emplace(field_id, key.primary_index);
+  for (auto const& [field_id, primary] : keys) {
+    if (primary >= info.names.size()) {
+      throw duckdb::InternalException("equality-delete key field id %d is outside the scan schema",
+                                      field_id);
+    }
+    if (std::find(info.delete_key_primary_indices.begin(),
+                  info.delete_key_primary_indices.end(),
+                  primary) == info.delete_key_primary_indices.end())
+      info.delete_key_primary_indices.push_back(primary);
+    std::optional<duckdb::idx_t> position;
+    for (duckdb::idx_t c = 0; c < info.column_ids.size(); ++c) {
+      if (info.column_ids[c].GetPrimaryIndex() == primary) {
+        position = c;
+        break;
+      }
+    }
+    if (!position) {
+      position = info.column_ids.size();
+      info.column_ids.emplace_back(primary);
+    }
+    if (std::find(info.projection_ids.begin(), info.projection_ids.end(), *position) ==
+        info.projection_ids.end())
+      info.projection_ids.push_back(*position);
+  }
+}
+
+namespace {
+
+//! Load a scan's delete payload. Equality-delete tables are built here, at plan time, for the one
+//! GPU the plan gate admitted: on its device, from its memory space, on one of its streams.
+std::shared_ptr<const sirius::op::scan::IcebergDeleteData> load_scan_delete_payload(
+  duckdb::ClientContext& context,
+  duckdb::SiriusContext& sirius_ctx,
+  std::string const& table_path,
+  sirius::op::scan::iceberg_delete_discovery const& discovery)
+{
+  auto const& ioctx = sirius_ctx.get_scan_manager().shared_io_ctx();
+  if (discovery.equality_delete_entries.empty())
+    return sirius::op::scan::load_delete_payload(context, table_path, ioctx, discovery);
+  auto const spaces =
+    sirius_ctx.get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (spaces.size() != 1) {
+    throw duckdb::NotImplementedException(
+      "iceberg_scan with equality deletes builds its delete tables for one GPU, but %llu are "
+      "configured",
+      static_cast<unsigned long long>(spaces.size()));
+  }
+  auto const& space = *spaces.front();
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space.get_device_id()}};
+  auto stream = sirius::memory::runtime_stream_pool::acquire(space);
+  return sirius::op::scan::load_delete_payload(
+    context,
+    table_path,
+    ioctx,
+    discovery,
+    sirius::op::scan::equality_build_resources{stream.get(), space.get_default_allocator()});
+}
+
 //! Build an `iceberg_ingestible_table_info`: the parquet bind data plus the table's delete
 //! data, resolved here at plan time.
 //!
@@ -462,6 +552,7 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   }
   auto inventory = std::move(*scan_op.delete_inventory);
   scan_op.delete_inventory.reset();
+  if (inventory.equality) widen_scan_for_equality_keys(*info, *inventory.equality);
   if (info->field_mapping_requirements)
     info->files_without_partition_values =
       sirius::op::scan::iceberg_files_without_partition_values(context, inventory);
@@ -470,8 +561,7 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   if (supplied_discovery)
     *supplied_discovery = std::move(discovery);
   else
-    info->delete_data = sirius::op::scan::load_delete_payload(
-      context, info->table_path, sirius_ctx->get_scan_manager().shared_io_ctx(), discovery);
+    info->delete_data = load_scan_delete_payload(context, *sirius_ctx, info->table_path, discovery);
   auto const delete_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - delete_started)
                                 .count();
@@ -605,6 +695,31 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
         "' has no planning-capable remote backend",
       {{unsupported->contract, verdict_reason::iceberg_puffin_uri_unsupported}});
   }
+  // Equality deletes are charged per statement, like deletion vectors: each scan passed the
+  // ceilings on its own at the plan gate, but every scan's delete tables are retained together.
+  {
+    auto const counters  = sirius_ctx->physical_counters();
+    auto const row_limit = counters->track_units && counters->statement_equality_limit_for_testing
+                             ? *counters->statement_equality_limit_for_testing
+                             : kMaxEqualityDeleteRowsPerStatement;
+    equality_delete_charge charged;
+    for (auto const& c : scans) {
+      if (!c.discovery->equality_plan ||
+          charge_equality_deletes(*c.discovery->equality_plan, charged, row_limit))
+        continue;
+      sirius_ctx->record_semantic_decline(verdict_reason::iceberg_equality_budget);
+      std::vector<std::pair<scan_contract_id, verdict_reason>> declined;
+      for (auto const& scan : scans)
+        if (scan.discovery->equality_plan)
+          declined.emplace_back(scan.scan->contract_id, verdict_reason::iceberg_equality_budget);
+      throw scan_verdict_declined(
+        "iceberg_scan declines the GPU path: the statement's equality deletes exceed the " +
+          std::to_string(row_limit) + " rows or " +
+          std::to_string(kMaxEqualityDeleteBytesPerStatement) +
+          " bytes one statement loads while planning",
+        std::move(declined));
+    }
+  }
   host_reservation_provider provider(sirius_ctx->get_memory_manager(),
                                      std::make_shared<decltype(sirius_ctx)>(sirius_ctx));
   auto counters  = sirius_ctx->physical_counters();
@@ -717,9 +832,9 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   for (auto& c : scans) {
     if (!c.info->deferred) {
       duckdb::SiriusContext::InternalQueryGuard guard(context);
-      auto started        = std::chrono::steady_clock::now();
-      c.info->delete_data = load_delete_payload(
-        context, c.info->table_path, sirius_ctx->get_scan_manager().shared_io_ctx(), *c.discovery);
+      auto started = std::chrono::steady_clock::now();
+      c.info->delete_data =
+        load_scan_delete_payload(context, *sirius_ctx, c.info->table_path, *c.discovery);
       auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - started)
                   .count();

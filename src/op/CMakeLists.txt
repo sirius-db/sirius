@@ -61,7 +61,6 @@ target_sources(
           scan/puffin_reader.cpp
           scan/positional_delete_filter.cpp
           scan/equality_delete_filter.cpp
-          scan/iceberg_delete_pipeline.cpp
           scan/iceberg_gpu_ingestible.cpp
           scan/iceberg_dv_preparation.cpp
           dynamic_filter/dynamic_filter_key_domain.cpp

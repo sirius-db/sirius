@@ -55,12 +55,15 @@
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
 
+#include <cucascade/io/uri_parser.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -81,14 +84,141 @@ pre_decline iceberg_decline(scan_reason reason,
   return {verdict, reason, "iceberg_scan declines the GPU scan path: " + std::move(text)};
 }
 
+bool names_remote_object(std::string const& path)
+{
+  try {
+    return cucascade::io::parse(path).scheme != "file";
+  } catch (std::invalid_argument const&) {
+    // A bare relative path is not a URI; only an explicit scheme marker makes one remote.
+    return path.find("://") != std::string::npos;
+  }
+}
+
+// Plans the live equality deletes of a snapshot into @p inventory, or says why the GPU path
+// cannot apply them: resolves each key field ID to a bound column and enforces the GPU limits.
+std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
+                                                 duckdb::ClientContext& context,
+                                                 duckdb::SiriusContext& sirius_ctx,
+                                                 op::scan::iceberg_delete_inventory& inventory)
+{
+  // The delete hash tables are built once, on one device. A scan task on another device would
+  // probe memory it cannot address.
+  auto const counters = sirius_ctx.physical_counters();
+  auto const gpus = counters && counters->track_units && counters->equality_gpu_count_for_testing
+                      ? *counters->equality_gpu_count_for_testing
+                      : sirius_ctx.get_memory_manager()
+                          .get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)
+                          .size();
+  if (gpus > 1) {
+    return iceberg_decline(
+      scan_reason::iceberg_equality_multi_gpu,
+      "this iceberg table has equality deletes, which the GPU scan path applies on a single "
+      "GPU only");
+  }
+
+  auto const files_limit =
+    counters && counters->track_units && counters->equality_files_per_data_file_limit_for_testing
+      ? *counters->equality_files_per_data_file_limit_for_testing
+      : op::scan::kMaxEqualityDeleteFilesPerDataFile;
+  op::scan::iceberg_equality_plan plan;
+  try {
+    plan = op::scan::read_equality_plan(context, inventory, files_limit);
+  } catch (op::scan::equality_plan_error const& e) {
+    return iceberg_decline(scan_reason::iceberg_equality_plan_unproven, e.what());
+  }
+  // Delete files are opened on the scan manager's local I/O context.
+  for (auto const& file : plan.files) {
+    if (names_remote_object(file.file_path)) {
+      return iceberg_decline(scan_reason::iceberg_equality_remote,
+                             "equality delete '" + file.file_path +
+                               "' is not a local file; the GPU scan path reads equality "
+                               "deletes from the local file system only");
+    }
+  }
+
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
+  if (bind == nullptr) {
+    return iceberg_decline(scan_reason::iceberg_equality_key_unsupported,
+                           "the binding does not expose the table schema, so equality-delete "
+                           "keys cannot be resolved to columns");
+  }
+  auto const& columns = bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema;
+  auto const names    = scan_source_names(op);
+  for (auto const& file : plan.files) {
+    for (auto const id : file.equality_ids) {
+      if (plan.keys.contains(id)) continue;
+      auto const unsupported = [&](std::string const& why) {
+        return iceberg_decline(scan_reason::iceberg_equality_key_unsupported,
+                               "equality delete '" + file.file_path + "' uses key field id " +
+                                 std::to_string(id) + ", " + why);
+      };
+      // Top level only. A key the table has since dropped is not in the bound schema at all;
+      // the spec still requires it, and this path cannot project it.
+      duckdb::MultiFileColumnDefinition const* found = nullptr;
+      for (auto const& column : columns) {
+        if (column.identifier.IsNull() ||
+            column.identifier.type().id() != duckdb::LogicalTypeId::INTEGER ||
+            column.identifier.GetValue<int32_t>() != id)
+          continue;
+        if (found != nullptr) return unsupported("which the bound schema lists twice");
+        found = &column;
+      }
+      if (found == nullptr)
+        return unsupported(
+          "which is not a top-level column of the bound schema (dropped or "
+          "nested keys are not supported)");
+      if (!found->children.empty()) return unsupported("which is a nested column");
+      if (!op::scan::equality_key_cudf_type(found->type))
+        return unsupported("of type " + found->type.ToString() +
+                           "; keys must be BOOLEAN, INTEGER, BIGINT, DATE, TIMESTAMP, "
+                           "TIMESTAMP_NS or VARCHAR");
+      std::optional<std::size_t> primary;
+      for (std::size_t p = 0; p < names.size() && p < op.returned_types.size(); ++p) {
+        if (names[p] != found->name.GetIdentifierName()) continue;
+        if (primary) return unsupported("whose column name is ambiguous in the scan schema");
+        primary = p;
+      }
+      if (!primary || op.returned_types[*primary] != found->type)
+        return unsupported("which the scan schema does not expose with its bound type");
+      plan.keys.emplace(id, op::scan::iceberg_equality_plan::key{*primary, found->type});
+    }
+  }
+
+  // One scan above a ceiling is refused here, where the refusal is a clean pre-decline. The
+  // statement-wide sum over every scan is charged again at lowering.
+  auto const row_limit =
+    counters && counters->track_units && counters->statement_equality_limit_for_testing
+      ? *counters->statement_equality_limit_for_testing
+      : op::scan::kMaxEqualityDeleteRowsPerStatement;
+  op::scan::equality_delete_charge charged;
+  if (!op::scan::charge_equality_deletes(plan, charged, row_limit)) {
+    return iceberg_decline(scan_reason::iceberg_equality_budget,
+                           "this iceberg table's applicable equality deletes exceed the " +
+                             std::to_string(op::scan::kMaxEqualityDeleteRowsPerFile) +
+                             " rows per delete file, " + std::to_string(row_limit) +
+                             " rows per statement or " +
+                             std::to_string(op::scan::kMaxEqualityDeleteBytesPerStatement) +
+                             " bytes per statement the GPU scan path loads while planning");
+  }
+  for (auto const& [data_file, files] : plan.by_data_file) {
+    if (files.size() > files_limit) {
+      return iceberg_decline(scan_reason::iceberg_equality_budget,
+                             "data file '" + data_file + "' is subject to more than the " +
+                               std::to_string(files_limit) +
+                               " equality-delete files the GPU scan path probes per batch");
+    }
+  }
+  inventory.equality = std::move(plan);
+  return std::nullopt;
+}
+
 // Why an `iceberg_scan` table must decline the GPU path, or nullopt when it may run there.
 //
-// V2 positional deletes and V3 deletion vectors are applied on GPU. Equality deletes are not:
-// they match on key VALUES, so the scan must force-project the key columns even when the query
-// does not select them, which is not wired.
+// V2 positional deletes, V3 deletion vectors and V2 equality deletes are applied on GPU.
+// Equality deletes are admitted only after plan_equality_deletes() has planned them.
 //
-// Conservative by construction: any failure to PROVE the table free of equality deletes declines
-// to CPU. A false positive costs performance; a false negative would drop deletes silently.
+// Conservative by construction: any failure to PROVE what the table's deletes are declines to
+// CPU. A false positive costs performance; a false negative would drop deletes silently.
 //
 // Each decline returns the reason it actually hit — a probe that never managed to look is not
 // the same as a table that really carries equality deletes.
@@ -199,8 +329,8 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
         table_path);
       return iceberg_decline(
         scan_reason::interface_unavailable,
-        "the iceberg delete probe could not acquire the Sirius context, so the table could "
-        "not be proven free of equality-delete files",
+        "the iceberg delete probe could not acquire the Sirius context, so the table's delete "
+        "files could not be inspected",
         scan_verdict::incomplete);
     }
     duckdb::SiriusContext::InternalQueryGuard guard(context);
@@ -227,13 +357,17 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
       injection,
       bound ? std::string_view(bound->table_uuid) : std::string_view{});
     auto const n_delete_files = result.equality_count;
-    timer.stop();
     if (n_delete_files > 0) {
-      return iceberg_decline(
-        scan_reason::iceberg_equality_deletes,
-        "this iceberg table has " + std::to_string(n_delete_files) +
-          " equality-delete file(s), which the GPU scan path does not apply yet");
+      if (!result.inventory) {
+        return iceberg_decline(scan_reason::iceberg_equality_deletes,
+                               "this iceberg table has " + std::to_string(n_delete_files) +
+                                 " equality-delete file(s), but no inventory to plan them against");
+      }
+      if (auto decline = plan_equality_deletes(op, context, *sirius_ctx, *result.inventory)) {
+        return decline;
+      }
     }
+    timer.stop();
 
     inventory = std::move(result.inventory);
 
@@ -242,25 +376,23 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
     if (e.missing_result) {
       return iceberg_decline(
         scan_reason::evidence_missing,
-        "the iceberg delete probe returned no rows, so the table could not be proven free of "
-        "equality-delete files",
+        "the iceberg delete probe returned no rows, so the table's delete files could not be "
+        "inspected",
         scan_verdict::incomplete);
     }
     return iceberg_decline(scan_reason::evidence_missing,
                            "the iceberg delete probe could not read this table's metadata (" +
                              std::string(e.what()) +
-                             "), so it could not be proven free of equality-delete files",
+                             "), so its delete files could not be inspected",
                            scan_verdict::incomplete);
   } catch (std::exception const& e) {
     SIRIUS_LOG_DEBUG("[sirius_plan_get] iceberg plan-time probe threw for '{}': {} — CPU fallback",
                      table_path,
                      e.what());
-    return iceberg_decline(
-      scan_reason::evidence_missing,
-      "an iceberg plan-time probe threw (" + std::string(e.what()) +
-        "), so the table could not be proven free of equality-delete files or of schema "
-        "evolution",
-      scan_verdict::incomplete);
+    return iceberg_decline(scan_reason::evidence_missing,
+                           "an iceberg plan-time probe threw (" + std::string(e.what()) +
+                             "), so the table's delete files and schema could not be inspected",
+                           scan_verdict::incomplete);
   }
 }
 
@@ -515,8 +647,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 
   // An iceberg table's data files are parquet, and `iceberg_scan` binds them into the same
   // MultiFileBindData `read_parquet` uses, so the parquet ingestible reads them as-is; the
-  // iceberg ingestible then applies positional deletes and deletion vectors to each decoded
-  // batch. Equality deletes are not applied yet, and reading a table that has them as plain
+  // iceberg ingestible then applies positional deletes, deletion vectors and planned equality
+  // deletes to each decoded batch. Reading a table whose deletes could not be planned as plain
   // parquet would silently return rows the table logically deleted — so refuse here, where
   // NotImplementedException is the established CPU-fallback signal.
   //
