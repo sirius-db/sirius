@@ -47,6 +47,8 @@ for host in "${hosts[@]}"; do
   for ((i = 0; i < per_node; i++, r++)); do peers+="${peers:+,}$ip:$((27000 + r))"; done
 done
 mkdir -p "$out"
+# Each rank changes into its own folder before it writes here.
+out=$(cd "$out" && pwd)
 export SIRIUS_EXCHANGE_PEERS=$peers
 export SIRIUS_EXCHANGE_PAIRS_SECONDS=${SECONDS_PER_PHASE:-1.5}
 export SIRIUS_EXCHANGE_MNNVL=${SIRIUS_EXCHANGE_MNNVL:-require}
@@ -59,5 +61,11 @@ echo "logs: $out"
 srun -p "${PARTITION:-nvidia-part}" -w "$nodes" -N2 -n$((2 * per_node)) \
   --ntasks-per-node="$per_node" --distribution=block --gres=gpu:"$per_node" --time=20 \
   --immediate=600 --kill-on-bad-exit=1 "$here/distributed_test_nixl_pairs.sh" --rank "$out" ||
-  echo "srun failed: $?" >> "$out/config.txt"
-python3 "$here/nixl_pairs_summary.py" "$out" | tee "$out/summary.md"
+  status=$?
+[[ ${status:-0} == 0 ]] || echo "srun failed: $status" >> "$out/config.txt"
+if [[ ${TEST:-[nixl_pairs]} == *nixl_pairs* ]]; then
+  python3 "$here/nixl_pairs_summary.py" "$out" | tee "$out/summary.md" || status=${status:-1}
+else
+  grep -h BANDWIDTH "$out"/rank*.log | tee "$out/summary.md" || status=${status:-1}
+fi
+exit "${status:-0}"

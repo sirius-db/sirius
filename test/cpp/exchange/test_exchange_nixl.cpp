@@ -507,8 +507,8 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   REQUIRE(changed.wait_for(
     lock, std::chrono::minutes{2}, [&] { return error != nullptr || ended[99] == world; }));
   REQUIRE_FALSE(error);
-  // The last end this rank sent may still be queued in UCX: tearing down now could drop it and
-  // leave a slower peer waiting.
+  // The last end this rank sent may still be queued in UCX, and nixl_fabric::release() does not
+  // flush it: tearing down now could drop it and leave a slower peer waiting.
   lock.unlock();
   std::this_thread::sleep_for(std::chrono::seconds{2});
 }
@@ -564,13 +564,17 @@ std::shared_ptr<cucascade::data_batch> sequence_batch(big_env& e,
                                  sirius::telemetry::batch_telemetry_info{});
 }
 
-/// How many values of @p batch differ from @p first, @p first + 1, ...
-std::int64_t bad_values(std::shared_ptr<cucascade::data_batch> const& batch, std::int64_t first)
+/// How many of @p batch's @p rows values differ from @p first, @p first + 1, ...: all of them
+/// when the batch has another row count or a null, which the comparison would skip.
+std::int64_t bad_values(std::shared_ptr<cucascade::data_batch> const& batch,
+                        std::int64_t first,
+                        cudf::size_type rows)
 {
   auto ro = batch->to_read_only();
   REQUIRE(ro.get_current_tier() == Tier::GPU);
   if (cudaEvent_t writer = ro.get_writer_event()) { cudaEventSynchronize(writer); }
-  auto const view     = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+  auto const view = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+  if (view.num_rows() != rows || view.column(0).null_count() != 0) { return rows; }
   auto stream         = utils::default_stream();
   auto const expected = cudf::sequence(view.num_rows(),
                                        cudf::numeric_scalar<std::int64_t>(first, true, stream),
@@ -592,12 +596,13 @@ std::int64_t bad_values(std::shared_ptr<cucascade::data_batch> const& batch, std
 
 TEST_CASE("pairs of ranks on two nodes move batches at NVLink speed", "[.][nixl_pairs]")
 {
-  // A raw NIXL bandwidth benchmark's phases, through the exchange: world / 2 ranks on each of two
-  // nodes, rank r paired with rank (r + world / 2) % world, one rank per GPU. Each phase
-  // sends one batch size for SIRIUS_EXCHANGE_PAIRS_SECONDS from the ranks that take part, and
-  // each receiver reports what it received per second. Last, every rank sends its peer distinct
-  // batches, and the peer checks every value. Ring sizes and sirius_exchange_mnnvl come from
-  // SIRIUS_EXCHANGE_{FRAME_BYTES, SEND_FRAMES, RECV_FRAMES_PER_PEER, MNNVL} (default require).
+  // Bandwidth phases through the exchange: world / 2 ranks on each of two nodes, rank r paired
+  // with rank (r + world / 2) % world, one rank per GPU. Each phase sends one batch size for
+  // SIRIUS_EXCHANGE_PAIRS_SECONDS from the ranks that take part (the _4pair phases: every pair,
+  // which is 4 with 8 ranks), and each receiver reports what it received per second. Last, every
+  // rank sends its peer distinct batches, and the peer checks every value. The settings come from
+  // SIRIUS_EXCHANGE_{FRAME_BYTES, SEND_FRAMES, RECV_FRAMES_PER_PEER, MNNVL (default require),
+  // HOST_STAGING, PAIRS_GPU_GIB (default 40)}.
   auto const* rank  = std::getenv("SIRIUS_EXCHANGE_RANK");
   auto const* peers = std::getenv("SIRIUS_EXCHANGE_PEERS");
   REQUIRE(rank != nullptr);
@@ -780,7 +785,8 @@ TEST_CASE("pairs of ranks on two nodes move batches at NVLink speed", "[.][nixl_
     REQUIRE(from == peer);
     auto const first =
       (static_cast<std::int64_t>(from) << 40) + (static_cast<std::int64_t>(index) << 32);
-    bad += bad_values(batch, first);
+    bad +=
+      bad_values(batch, first, static_cast<cudf::size_type>(verify_bytes / sizeof(std::int64_t)));
   }
   kept.clear();
   std::printf("PAIRS verify rank %u <- %u: %d batches of %zu MiB, %lld bad values\n",
@@ -791,4 +797,7 @@ TEST_CASE("pairs of ranks on two nodes move batches at NVLink speed", "[.][nixl_
               static_cast<long long>(bad));
   CHECK(bad == 0);
   barrier(3);
+  // The last end this rank sent may still be queued in UCX, and nixl_fabric::release() does not
+  // flush it: tearing down now could drop it and leave a slower peer waiting.
+  std::this_thread::sleep_for(std::chrono::seconds{2});
 }

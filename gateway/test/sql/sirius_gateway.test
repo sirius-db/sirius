@@ -51,6 +51,22 @@ SET GLOBAL sirius_gateway_exchange_recv_frames_per_peer = 0;
 ----
 must be 1 to 1024
 
+statement error
+SET GLOBAL sirius_gateway_exchange_send_frames = 1025;
+----
+must be 1 to 1024
+
+statement error
+SET GLOBAL sirius_gateway_exchange_frame_bytes = 1073742080;
+----
+positive multiple of 256
+
+statement ok
+SET GLOBAL sirius_gateway_exchange_tcp_lanes = 64;
+
+statement ok
+RESET GLOBAL sirius_gateway_exchange_tcp_lanes;
+
 query IIIIII
 SELECT current_setting('sirius_gateway_exchange_host_staging'),
        current_setting('sirius_gateway_exchange_tcp_lanes'),
