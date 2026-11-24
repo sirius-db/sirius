@@ -4705,7 +4705,6 @@ TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU refe
     ~reset_hooks()
     {
       counters->preparation_provider_for_testing.reset();
-      counters->statement_dv_limit_for_testing.reset();
       counters->iceberg_preparation_route_for_testing = {};
       counters->iceberg_dv_phase_for_testing          = {};
     }
@@ -4729,21 +4728,74 @@ TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU refe
   CHECK(collect_rows(*remote_result) == expected);
   CHECK(deferred_route);
   CHECK(opened_path == remote + "/" + table + "/data/a.puffin");
-  if (table != "dv_two_blocks") return;
+}
 
-  // The statement ceiling counts the manifest's 140,000 positions. One below it, the remote
-  // scan is refused at planning, before its Puffin object is opened.
-  counters->statement_dv_limit_for_testing = 139'999;
-  opened_path.clear();
+TEST_CASE("S3 remote Puffin is admitted at the statement ceiling and refused one position below",
+          "[s3][integration][iceberg][scan_preparation][s3_dv]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  s3_sql_fixture fixture(*env);
+  auto& con = fixture.con;
+  require_query_ok(con, "LOAD avro");
+  require_query_ok(con, "LOAD iceberg");
+  require_query_ok(con, "SET unsafe_enable_version_guessing=true");
+  sirius::test::scratch_dir directory("s3_dv_ceiling");
+  std::string const prefix = "dv-ceiling";
+  auto const remote        = "s3://" + env->bucket + "/" + prefix;
+  // Neither argument holds a quote.
+  auto command = "python3 -B test/cpp/integration/data/generate_inventory_fixtures.py '" +
+                 directory.path().string() + "' '" + remote + "'";
+  REQUIRE(std::system(command.c_str()) == 0);
+  auto const local = directory.path() / "dv_bounded";
+  for (auto const& entry : fs::recursive_directory_iterator(local)) {
+    if (!entry.is_regular_file()) continue;
+    auto key = prefix + "/dv_bounded/" + fs::relative(entry.path(), local).generic_string();
+    if (!sirius::test::put_s3_test_object(key, read_binary_file(entry.path()))) {
+      if (sirius::test::s3::skip_or_fail_unless(false, "managed S3 backend required for DV upload"))
+        return;
+    }
+  }
+  auto metadata_bytes = read_binary_file(local / "metadata/v1.metadata.json");
+  std::string metadata(metadata_bytes.begin(), metadata_bytes.end());
+  auto colon = metadata.find(':', metadata.find("current-snapshot-id"));
+  REQUIRE(colon != std::string::npos);
+  auto sql = "SELECT fruit, count FROM iceberg_scan(" +
+             sql_quote(remote + "/dv_bounded/metadata/v1.metadata.json") +
+             ", snapshot_from_id=" + std::to_string(std::stoll(metadata.substr(colon + 1))) + ")";
+  auto& context         = require_sirius_context(fixture);
+  auto counters         = context.physical_counters();
+  auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
+  provider->grant_bytes = 1024 * 1024;
+  size_t reads_started  = 0;
+  struct reset_hooks {
+    decltype(counters) value;
+    ~reset_hooks()
+    {
+      value->preparation_provider_for_testing.reset();
+      value->statement_dv_limit_for_testing.reset();
+      value->iceberg_dv_phase_for_testing = {};
+    }
+  } reset{counters};
+  counters->preparation_provider_for_testing = provider;
+  counters->iceberg_dv_phase_for_testing = [&](auto const&, bool start) { reads_started += start; };
+  set_gpu_execution(con, true);
+  require_query_ok(con, "SET enable_duckdb_fallback=false");
+  // The table's one vector holds two positions. A scan over the ceiling leaves the deferred
+  // route, and a remote Puffin has no other: it is refused before its object is opened.
+  counters->statement_dv_limit_for_testing = 2;
+  CHECK(require_query_ok(con, sql)->RowCount() == 3);
+  CHECK(reads_started == 1);
+  counters->statement_dv_limit_for_testing = 1;
   auto const reason =
     static_cast<size_t>(sirius::op::scan::verdict_reason::iceberg_puffin_remote_eager);
   auto const before = context.get_transparent_execution_stats();
-  auto refused      = con.Query(remote_sql);
+  auto refused      = con.Query(sql);
   REQUIRE(refused);
   CHECK(refused->HasError());
   CHECK(context.get_transparent_execution_stats().semantic_declines[reason] ==
         before.semantic_declines[reason] + 1);
-  CHECK(opened_path.empty());
+  CHECK(reads_started == 1);
 }
 
 TEST_CASE("S3 mapped Parquet normalizes IDs on the bulk reader",

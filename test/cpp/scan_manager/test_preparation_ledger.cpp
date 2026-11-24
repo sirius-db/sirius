@@ -721,6 +721,48 @@ TEST_CASE("HOST adapter serves a multi-block request from blocks that are not ad
   CHECK(resource->get_free_blocks() == initial_free);
 }
 
+TEST_CASE("A block allocation that cannot hold the request fails and returns its charge",
+          "[scan_preparation][ledger]")
+{
+  // What the backing hands back for 16 bytes: one block too few, a null block, a zero block
+  // size, no owner.
+  auto fault = GENERATE(0, 1, 2, 3);
+  struct faulty_backing : reservation_backing {
+    explicit faulty_backing(int fault) : fault(fault) {}
+    uint64_t charge_size(uint64_t bytes) const override { return bytes; }
+    backing_allocation allocate(uint64_t) override { return {}; }
+    backing_blocks allocate_blocks(uint64_t) override
+    {
+      auto owner = std::make_shared<std::array<std::byte, 16>>();
+      backing_blocks result{{owner->data(), owner->data() + 8}, 8, owner};
+      if (fault == 0) result.blocks.pop_back();
+      if (fault == 1) result.blocks.back() = nullptr;
+      if (fault == 2) result.block_size = 0;
+      if (fault == 3) result.owner.reset();
+      return result;
+    }
+    int fault;
+  };
+  struct faulty_provider : reservation_provider {
+    std::optional<reservation_grant> request(memory_space_id space, uint64_t bytes) override
+    {
+      return reservation_grant{bytes, space, std::make_shared<faulty_backing>(fault)};
+    }
+    int fault = 0;
+  } provider;
+  provider.fault = fault;
+  preparation_ledger ledger(provider);
+  std::array<scan_envelope, 1> envelope{scan_envelope{{{{16}, 16}}, {}, true}};
+  REQUIRE(ledger.admit(envelope, host).deferred);
+  ledger.register_unit({1, 1}, 16);
+  auto permit    = ledger.acquire_permit({1, 1});
+  auto allocator = ledger.allocator(permit);
+  CHECK_THROWS_AS(allocator.allocate_retained_blocks(16), preparation_resource_error);
+  CHECK_THROWS_AS(allocator.allocate_blocks(16), preparation_resource_error);
+  CHECK(ledger.allocation_failures() == 2);
+  CHECK(ledger.charged_bytes(permit) == 0);
+}
+
 TEST_CASE("Closing during allocation keeps the grant alive until the allocation and result exit",
           "[scan_preparation][ledger]")
 {

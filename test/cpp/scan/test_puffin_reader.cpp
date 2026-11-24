@@ -1072,13 +1072,13 @@ TEST_CASE("Neutral DV payload obeys independent limits and retained grant",
   CHECK(ledger.charged_bytes({1, 1}) == 0);
 }
 
-TEST_CASE("Deletion vector bitmaps are sized as CRoaring sizes them",
-          "[scan_preparation][dv_payload]")
+TEST_CASE("Deletion vector bitmaps held in blocks are sized as CRoaring sizes them",
+          "[scan_preparation][iceberg][charged_reader]")
 {
-  using namespace sirius::scan_manager;
-  // The reader sizes a serialized bitmap itself, so that it can do so over blocks. Candidates:
-  // array, bitset and run containers (five, so the offset header is present) cut short at
-  // each length, cookies that are neither format, and a container count above 65,536.
+  // The reader sizes a serialized bitmap itself, so that it can do so over blocks. Candidates,
+  // read in 8-byte blocks: array, bitset and run containers (five, so the offset header is
+  // present) cut short at each length, cookies that are neither format, and a container count
+  // above 65,536.
   roaring::Roaring bitmap;
   for (uint32_t value : {1u, 5u, 3u * 65536 + 7, 4u * 65536 + 9})
     bitmap.add(value);
@@ -1108,16 +1108,7 @@ TEST_CASE("Deletion vector bitmaps are sized as CRoaring sizes them",
     push_u32_le(candidates.back(), i & 0xffff);
   candidates.back().resize(candidates.back().size() + 65537 * 6);
 
-  test::test_reservation_provider provider;
-  provider.grant_bytes = 1024 * 1024;
-  preparation_ledger ledger(provider);
-  auto const retained = bitmap.cardinality() * sizeof(int64_t);
-  std::array scans{scan_envelope{{{{0, 0, 0}, retained}}, {}, true}};
-  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
-  ledger.register_unit({1, 1}, retained);
-  auto permit    = ledger.acquire_permit({1, 1});
-  auto allocator = ledger.allocator(permit);
-  size_t valid   = 0;
+  size_t valid = 0;
   for (auto const& bytes : candidates) {
     CAPTURE(bytes.size());
     auto const size = roaring::api::roaring_bitmap_portable_deserialize_size(
@@ -1128,17 +1119,70 @@ TEST_CASE("Deletion vector bitmaps are sized as CRoaring sizes them",
     push_u32_be(blob, checksummed.size());
     blob.insert(blob.end(), checksummed.begin(), checksummed.end());
     push_u32_be(blob, crc32_of(checksummed));
+    auto path = write_puffin(blob, "sized_as_croaring", bitmap.cardinality());
+    auto ref  = synthetic_ref(path, blob, bitmap.cardinality());
     if (size) {
       REQUIRE(size == bytes.size());
-      CHECK(decode_deletion_vector_payload(blob, allocator)->positions().size() ==
-            bitmap.cardinality());
+      CHECK(read_for_test(ref, true, nullptr, 8).size() == bitmap.cardinality());
       ++valid;
     } else {
-      CHECK_THROWS_WITH(decode_deletion_vector_payload(blob, allocator),
+      CHECK_THROWS_WITH(read_for_test(ref, true, nullptr, 8),
                         Catch::Matchers::ContainsSubstring("no valid portable-Roaring bitmap"));
     }
   }
   CHECK(valid == 1);
+}
+
+TEST_CASE("A blob read that fails partway over blocks is reader I/O and frees its blocks",
+          "[scan_preparation][iceberg][charged_reader]")
+{
+  using namespace sirius::scan_manager;
+  // The 44-byte blob is read into 8-byte blocks; the third of those reads fails. Parsing the
+  // half-filled blob instead would report a corrupt deletion vector.
+  struct failing_source final : puffin_byte_source {
+    explicit failing_source(std::vector<std::byte> bytes) : inner(std::move(bytes)) {}
+    bool seek(std::streamoff offset) override { return inner.seek(offset); }
+    bool read(std::span<std::byte> out) override
+    {
+      return !(out.size() == 8 && ++block_reads == 3) && inner.read(out);
+    }
+    [[nodiscard]] std::streamoff size() const override { return inner.size(); }
+    vector_puffin_source inner;
+    int block_reads = 0;
+  };
+  auto ref               = fixture_ref();
+  ref.file_size_in_bytes = fs::file_size(ref.puffin_path);
+  std::ifstream input(ref.puffin_path, std::ios::binary);
+  std::vector<std::byte> bytes(static_cast<std::size_t>(ref.file_size_in_bytes));
+  input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  REQUIRE(input);
+  failing_source source(std::move(bytes));
+  test::test_reservation_provider provider;
+  provider.grant_bytes          = 1024 * 1024;
+  provider.quantum              = 8;
+  provider.seen->scatter_blocks = true;
+  preparation_ledger ledger(provider);
+  std::array scans{scan_envelope{{{{44, 64 * 1024, 0}, 16}}, {}, true}};
+  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  ledger.register_unit({1, 1}, 16);
+  auto permit    = ledger.acquire_permit({1, 1});
+  auto allocator = ledger.allocator(permit);
+  DeletionVectorRefView view{ref.puffin_path,
+                             ref.content_offset,
+                             ref.content_size_in_bytes,
+                             ref.referenced_data_file,
+                             ref.file_size_in_bytes,
+                             ref.record_count};
+  try {
+    (void)read_deletion_vector_charged(
+      view, allocator, ref.referenced_data_file, std::make_shared<int>(0), 1, source);
+    FAIL("the read succeeded");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == sirius::transparent::late_failure_cause::reader_io);
+  }
+  CHECK(source.block_reads == 3);
+  CHECK(provider.seen->allocated_bytes == 0);
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
 }
 
 namespace {
