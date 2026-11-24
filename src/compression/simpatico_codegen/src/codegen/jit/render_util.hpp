@@ -48,7 +48,7 @@ inline std::string replace_all(std::string s, std::string_view needle, std::stri
 inline void append_op_segment(std::ostringstream& oss, const FusedTree& node)
 {
   switch (node.op) {
-    case OpKind::Bitpack: oss << "bp"; break;
+    case OpKind::Bitpack: oss << (node.bitpack_gcd ? "bpg" : "bp"); break;
     case OpKind::Delta: oss << "dl"; break;
     case OpKind::Rle: oss << "rl"; break;
     case OpKind::Raw: oss << "rw"; break;

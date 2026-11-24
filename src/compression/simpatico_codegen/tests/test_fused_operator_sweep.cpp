@@ -202,7 +202,7 @@ std::string tag(const jit::FusedTree& t)
       default: return "?";
     }
   };
-  if (t.is_leaf()) return short_name(t.op);
+  if (t.is_leaf()) return t.bitpack_gcd ? "Bpg" : short_name(t.op);
   std::ostringstream os;
   os << short_name(t.op);
   if (t.op == OpKind::Delta) {
@@ -244,7 +244,10 @@ std::vector<Tree> compose_layer(const std::vector<Tree>& prev)
 std::vector<Tree> enumerate_shapes(int max_depth)
 {
   std::vector<std::vector<Tree>> by_depth(max_depth + 1);
-  by_depth[1].push_back(jit::FusedTree::make(OpKind::Bitpack));
+  // The leaf detects divisors, which kFactor makes divide; Rle's runs stay plain Bitpack.
+  auto leaf         = jit::FusedTree::make(OpKind::Bitpack);
+  leaf->bitpack_gcd = true;
+  by_depth[1].push_back(std::move(leaf));
   for (int d = 2; d <= max_depth; ++d)
     by_depth[d] = compose_layer(by_depth[d - 1]);
   std::vector<Tree> flat;

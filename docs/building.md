@@ -132,7 +132,7 @@ The wrapper owns the vcpkg dependency setup. Build and install the local static
 library without building the extension:
 
 ```bash
-git submodule update --init duckdb substrait cucascade sirius-duckdb/vcpkg
+git submodule update --init sirius-duckdb/duckdb substrait cucascade sirius-duckdb/vcpkg
 VCPKG_CUDA_ARCHITECTURES=100 pixi run -e vcpkg sirius-duckdb/vcpkg/vcpkg install \
   --x-manifest-root=sirius-duckdb \
   --x-install-root=build/static-install

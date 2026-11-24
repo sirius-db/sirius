@@ -16,6 +16,7 @@
 
 #include "scan_manager/native_reader_executor.hpp"
 
+#include "exec/thread_util.hpp"
 #include "transparent/replay_admission.hpp"
 
 #include <rmm/cuda_device.hpp>
@@ -97,7 +98,10 @@ struct native_reader_executor::state {
   }
 };
 
-native_reader_executor::native_reader_executor(size_t workers, size_t max_readers)
+native_reader_executor::native_reader_executor(size_t workers,
+                                               size_t max_readers,
+                                               std::vector<int> cpu_affinity)
+  : cpu_affinity_(std::move(cpu_affinity))
 {
   if (!workers || max_readers < workers)
     throw std::invalid_argument(
@@ -108,6 +112,7 @@ native_reader_executor::native_reader_executor(size_t workers, size_t max_reader
 void native_reader_executor::start_workers()
 {
   if (!state_->workers.empty()) return;
+  exec::scoped_startup_affinity affinity(cpu_affinity_);
   try {
     for (size_t i = 0; i < state_->worker_count; ++i) {
       if (before_thread_) before_thread_(i);

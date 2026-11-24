@@ -8,34 +8,51 @@ use sirius_ffi::{
 };
 
 #[test]
-fn object_store_debug_redacts_credentials() {
+fn object_store_debug_redacts_text() {
     let args = ObjectStoreConfigArgs {
-        endpoint: "https://debug-endpoint.invalid:9443".into(),
-        region: "debug-region".into(),
+        endpoint:
+            "https://user-733:pass-182@host-549.invalid:9443/path-892?X-Amz-Signature=sig-216"
+                .into(),
+        region: "REGION_SENTINEL_6e23".into(),
         access_key: "AKIA_SENTINEL_7f3a".into(),
         secret_key: "SECRET_SENTINEL_9b42".into(),
         session_token: "TOKEN_SENTINEL_c681".into(),
         transport: Transport::kRdma,
         signing_mode: SigningMode::kHeader,
-        ca_bundle_path: "/debug-ca-bundle.pem".into(),
-        uri_prefix: "s3://debug-bucket/allowed/".into(),
+        ca_bundle_path: "/CA_SENTINEL_c134.pem".into(),
+        uri_prefix: "s3://bucket/PREFIX_SENTINEL_95bd/".into(),
     };
-    for rendered in [format!("{args:?}"), format!("{args:#?}")] {
+    let mut leaks = Vec::new();
+    for (form, rendered) in [
+        ("compact", format!("{args:?}")),
+        ("pretty", format!("{args:#?}")),
+    ] {
+        assert!(rendered.contains("ObjectStoreConfigArgs"));
+        assert!(rendered.contains(&format!("{:?}", args.transport)));
+        assert!(rendered.contains(&format!("{:?}", args.signing_mode)));
         for credential in [&args.access_key, &args.secret_key, &args.session_token] {
             assert!(!rendered.contains(credential.as_str()));
         }
-        assert_eq!(rendered.matches("<redacted>").count(), 3);
-        for value in [
-            &args.endpoint,
-            &args.region,
-            &args.ca_bundle_path,
-            &args.uri_prefix,
+        for (field, value) in [
+            ("endpoint", args.endpoint.as_str()),
+            ("scheme", "https://"),
+            ("user", "user-733"),
+            ("password", "pass-182"),
+            ("host", "host-549"),
+            ("port", "9443"),
+            ("path", "path-892"),
+            ("query key", "X-Amz-Signature"),
+            ("signature", "sig-216"),
+            ("region", args.region.as_str()),
+            ("CA path", args.ca_bundle_path.as_str()),
+            ("prefix", args.uri_prefix.as_str()),
         ] {
-            assert!(rendered.contains(value.as_str()));
+            if rendered.contains(value) {
+                leaks.push((form, field));
+            }
         }
-        assert!(rendered.contains("kRdma"));
-        assert!(rendered.contains("kHeader"));
     }
+    assert!(leaks.is_empty(), "Debug disclosed fields: {leaks:?}");
 }
 
 #[test]

@@ -87,11 +87,19 @@ class numa_small_pinned_mr {
                  std::size_t bytes,
                  std::size_t alignment = alignof(std::max_align_t))
   {
-    auto& pool = pool_for_current_device();
-    void* ptr  = pool.allocate(stream, bytes, alignment);
+    auto& pool     = pool_for_current_device();
+    int const node = node_for_current_device();
+    void* ptr      = pool.allocate(stream, bytes, alignment);
     if (ptr != nullptr) {
-      std::lock_guard<std::mutex> lock(map_mutex_);
-      ptr_to_node_[ptr] = node_for_current_device();
+      try {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        ptr_to_node_[ptr] = node;
+      } catch (...) {
+        // The caller never sees this pointer, so nothing else would free it. Give it back to
+        // the pool that made it; unrecorded, deallocate() could not be trusted to find it.
+        pool.deallocate(stream, ptr, bytes, alignment);
+        throw;
+      }
     }
     return ptr;
   }

@@ -122,6 +122,9 @@ pipeline->get_sink()->sink(output_data, stream);
 4. Processing handles released automatically on scope exit
 
 The **destructor** calls `pipeline->mark_task_completed()` to update pipeline completion tracking.
+Completing the last task finalizes the pipeline's operators, which can throw. The destructor
+cannot propagate that, so it reports the exception to the query's completion handler: the query
+fails and the process keeps running.
 
 **`get_output_consumers()`** returns the first operator of each parent pipeline — these downstream operators are scheduled next by the GPU executor.
 
@@ -399,6 +402,26 @@ parent-cascade paths can finish a pipeline without returning through the GPU epi
 as a `std::weak_ptr`, preventing retired pipelines from retaining a handler.
 The pipeline obtains a strong reference under `_status_mutex` and calls `mark_completed()` only
 after releasing the lock and finishing all pipeline access.
+
+`pipeline_finished` is set only after the operators are finalized, so the lock-free
+`is_pipeline_finished()` never reports a pipeline whose finalize is still running or has failed.
+If `finalize_operator()` throws, the pipeline records the failure under `_status_mutex` and
+rethrows to its caller, which reports the error. The pipeline then stays unfinished: it is not
+finalized again, it never signals completion, and no downstream pipeline can treat its input as
+complete and finish the query in its place.
+
+An exhausted LIMIT is the one case where a terminal pipeline finishes without waiting for its
+upstream pipelines, so success can be signalled while an upstream finalize is still running. The
+handler accepts only the first signal and drops the later error. The pipeline keeps the
+exception (`finalize_error()`), and `sirius_engine::execute()` calls
+`rethrow_finalize_failure()` on the query's pipelines after `retire_query_work()` has waited for
+all work, so the query fails instead of returning its result.
+
+A query that has already failed drops a later finalize error the same way, and the handler's
+error callback, which marks the runtime unavailable after a fatal device error, never sees it.
+So when a failed or cancelled query retires its work, `sirius_engine::quiesce_plan_users()`
+passes every recorded finalize failure to `query_lifecycle_registry::report_failure()` through
+`report_finalize_failures()`.
 
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,
