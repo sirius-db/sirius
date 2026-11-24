@@ -294,12 +294,12 @@ std::byte* pinned_host(std::size_t bytes)
     nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
   if (at == MAP_FAILED) {
     throw sirius::internal_exception(
-      "exchange: mapping {} bytes of send slots failed: {}", bytes, std::strerror(errno));
+      "exchange: mapping {} bytes of pinned host memory failed: {}", bytes, std::strerror(errno));
   }
   if (auto const e = cudaHostRegister(at, bytes, cudaHostRegisterPortable); e != cudaSuccess) {
     ::munmap(at, bytes);
     throw sirius::internal_exception(
-      "exchange: pinning {} bytes of send slots failed: {}", bytes, cudaGetErrorString(e));
+      "exchange: pinning {} bytes of host memory failed: {}", bytes, cudaGetErrorString(e));
   }
   return static_cast<std::byte*>(at);
 }
@@ -737,8 +737,12 @@ void nixl_fabric::choose_route(rank_t r)
                           peer_access(self.pci_bus_id, p.pci_bus_id));
   if (p.route == path::shared_memory) { map_mirror(r); }
   if (p.route == path::tcp_lanes) {
-    // The peer's lanes write into the mirror, and this rank's lanes register it.
-    if (_mirror == nullptr) { make_mirror(); }
+    // The peer's lanes write into the mirror, and this rank's lanes register it. Only this
+    // process maps it, so it needs no name in /dev/shm.
+    if (_mirror == nullptr) {
+      pinned_scope near{_near_cpus};
+      _mirror = pinned_host(_recv.bytes());
+    }
     make_lanes();
   }
   SIRIUS_LOG_INFO("exchange: rank {} (GPU {}) -> rank {} (GPU {}{}, NVLink domain {}): {}",
