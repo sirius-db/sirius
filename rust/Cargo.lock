@@ -354,7 +354,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "prettyplease 0.3.0",
+ "prettyplease 0.2.37",
  "proc-macro2",
  "quote",
  "regex",
