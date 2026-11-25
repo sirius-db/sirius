@@ -71,6 +71,8 @@ struct file_statistics {
   std::uint64_t id;
   std::size_t num_rows = 0;
   std::vector<std::pair<duckdb::Identifier, duckdb::unique_ptr<duckdb::BaseStatistics>>> columns;
+  /// Decoded bytes per row, offset included, of the columns whose footer states it.
+  std::vector<std::pair<duckdb::Identifier, std::uint64_t>> string_widths;
 };
 
 bool is_strong_etag(std::string_view tag)
@@ -171,6 +173,9 @@ struct row_count_entry {
   /// The value spans of the scan's columns, shared with the copies of its plan. Null until the
   /// planning that counted the rows has merged the columns.
   std::shared_ptr<value_span_list const> value_spans;
+  /// Decoded bytes per row of the scan's string columns, by bound column; empty when no column
+  /// has one.
+  std::vector<std::optional<std::uint64_t>> string_widths;
 };
 
 /// Keyed by the file list of a scan's bind data, which a plan owns and each plan copy has anew, so
@@ -216,13 +221,16 @@ void sweep_row_counts_locked()
 void keep_row_count_locked(duckdb::shared_ptr<duckdb::MultiFileList> const& list,
                            std::size_t rows,
                            std::uint64_t serial,
+                           std::vector<std::optional<std::uint64_t>> string_widths,
                            std::shared_ptr<value_span_list const> value_spans = nullptr)
 {
   if (row_counts.size() >= row_count_sweep_at) { sweep_row_counts_locked(); }
-  row_counts.insert_or_assign(
-    list.get(),
-    row_count_entry{
-      duckdb::weak_ptr<duckdb::MultiFileList>(list), rows, serial, std::move(value_spans)});
+  row_counts.insert_or_assign(list.get(),
+                              row_count_entry{duckdb::weak_ptr<duckdb::MultiFileList>(list),
+                                              rows,
+                                              serial,
+                                              std::move(value_spans),
+                                              std::move(string_widths)});
 }
 
 std::string cache_key(std::string const& options_identity, std::string const& path)
@@ -292,6 +300,12 @@ std::shared_ptr<file_statistics const> statistics_of(
   for (auto const& column : reader.columns) {
     auto stats = reader.GetStatistics(context, column.name);
     if (stats) { result->columns.emplace_back(column.name, std::move(stats)); }
+  }
+  if (auto const* metadata = reader.GetFileMetadata()) {
+    auto const widths = detail::parquet_string_widths(*metadata, reader.columns.size());
+    for (std::size_t i = 0; i < widths.size(); ++i) {
+      if (widths[i]) { result->string_widths.emplace_back(reader.columns[i].name, *widths[i]); }
+    }
   }
   // The version describes the file as listed or opened before this read, so a rewrite between the
   // two leaves an entry that the next sighting of the new version misses.
@@ -421,6 +435,38 @@ duckdb::BaseStatistics const* find(file_statistics const& file, duckdb::Identifi
     if (column == name) { return stats.get(); }
   }
   return nullptr;
+}
+
+/// The decoded width of each of \p bind's columns over \p files, where every file with rows
+/// states one. Empty when no column has a width.
+std::vector<std::optional<std::uint64_t>> string_widths_of(
+  duckdb::MultiFileBindData const& bind,
+  std::vector<std::shared_ptr<file_statistics const>> const& files)
+{
+  // Most writers leave the size out; then there is nothing to look up.
+  if (std::ranges::all_of(files, [](auto const& file) { return file->string_widths.empty(); })) {
+    return {};
+  }
+  std::vector<std::optional<std::uint64_t>> widths(bind.names.size());
+  std::vector<std::pair<std::optional<std::uint64_t>, std::size_t>> per_file(files.size());
+  for (duckdb::idx_t i = 0; i < bind.names.size(); ++i) {
+    if (bind.IsGeneratedColumn(i)) { continue; }
+    for (std::size_t f = 0; f < files.size(); ++f) {
+      std::optional<std::uint64_t> width;
+      for (auto const& [column, bytes] : files[f]->string_widths) {
+        if (column == bind.names[i]) {
+          width = bytes;
+          break;
+        }
+      }
+      per_file[f] = {width, files[f]->num_rows};
+    }
+    widths[i] = detail::combined_string_width(per_file);
+  }
+  if (std::ranges::none_of(widths, [](auto const& width) { return width.has_value(); })) {
+    return {};
+  }
+  return widths;
 }
 
 std::string quoted(std::string const& name)
@@ -615,10 +661,12 @@ void forget_row_count(duckdb::MultiFileList const* list)
   row_counts.erase(list);
 }
 
-void remember_row_count(duckdb::shared_ptr<duckdb::MultiFileList> const& list, std::size_t rows)
+void remember_row_count(duckdb::shared_ptr<duckdb::MultiFileList> const& list,
+                        std::size_t rows,
+                        std::vector<std::optional<std::uint64_t>> string_widths)
 {
   std::lock_guard guard(cache_mutex);
-  keep_row_count_locked(list, rows, next_row_count_serial++);
+  keep_row_count_locked(list, rows, next_row_count_serial++, std::move(string_widths));
 }
 
 /// Adds the value spans of its scan's columns to the row count kept for \p list. They belong to
@@ -679,7 +727,7 @@ bool add_statistics(duckdb::ClientContext& context,
   for (auto const& file : scan.files) {
     total_rows += file->num_rows;
   }
-  remember_row_count(bind->file_list, total_rows);
+  remember_row_count(bind->file_list, total_rows, string_widths_of(*bind, scan.files));
   if (single_file) {
     // DuckDB has this file's statistics itself; only its value spans are kept.
     value_span_list spans(bind->names.size());
@@ -766,6 +814,17 @@ std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get)
   return std::nullopt;
 }
 
+std::vector<std::optional<std::uint64_t>> parquet_scan_string_widths(
+  std::string_view function_name, duckdb::FunctionData const* bind_data)
+{
+  auto const* list = file_list_of(function_name, bind_data);
+  if (!list) { return {}; }
+  std::lock_guard guard(cache_mutex);
+  auto const found = row_counts.find(list->get());
+  if (found == row_counts.end() || !answers(found->second, list->get())) { return {}; }
+  return found->second.string_widths;
+}
+
 void forget_parquet_scan_row_counts(duckdb::LogicalOperator const& plan)
 {
   if (plan.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
@@ -787,10 +846,12 @@ void copy_parquet_scan_row_count(duckdb::LogicalGet const& from, duckdb::Logical
     std::lock_guard guard(cache_mutex);
     auto const found = row_counts.find(source->get());
     if (found == row_counts.end() || !answers(found->second, source->get())) { return; }
+    // Copied out first: keeping the count may drop entries, the source's among them.
     auto const rows   = found->second.rows;
     auto const serial = found->second.serial;
+    auto widths       = found->second.string_widths;
     auto value_spans  = found->second.value_spans;
-    keep_row_count_locked(*target, rows, serial, std::move(value_spans));
+    keep_row_count_locked(*target, rows, serial, std::move(widths), std::move(value_spans));
   } catch (std::bad_alloc const&) {
     // The copy plans without the count.
   }
@@ -828,6 +889,72 @@ std::size_t parquet_files_row_count(duckdb::ClientContext& context,
     rows += file->num_rows;
   }
   return rows;
+}
+
+std::vector<std::optional<std::uint64_t>> detail::parquet_string_widths(
+  duckdb_parquet::FileMetaData const& metadata, std::size_t bound_columns)
+{
+  if (metadata.row_groups.empty()) { return {}; }
+  auto const num_leaves = metadata.row_groups.front().columns.size();
+  // Only flat schemas have one leaf per bound column.
+  if (num_leaves == 0 || num_leaves != bound_columns) { return {}; }
+  constexpr auto k_max = std::numeric_limits<std::uint64_t>::max();
+  std::vector<uint64_t> bytes(num_leaves, 0), values(num_leaves, 0);
+  std::vector<bool> complete(num_leaves, true);
+  for (auto const& row_group : metadata.row_groups) {
+    if (row_group.columns.size() != num_leaves) { return {}; }
+    for (std::size_t c = 0; c < num_leaves; ++c) {
+      auto const& chunk = row_group.columns[c];
+      auto const& meta  = chunk.meta_data;
+      if (row_group.num_rows == 0) { continue; }
+      // Encoded sizes (including DELTA and dictionary encodings) cannot describe decoded
+      // strings. Require unencoded size statistics for EVERY nonempty row group.
+      if (!chunk.__isset.meta_data || meta.type != duckdb_parquet::Type::BYTE_ARRAY ||
+          meta.num_values <= 0 || meta.num_values != row_group.num_rows ||
+          !meta.__isset.size_statistics ||
+          !meta.size_statistics.__isset.unencoded_byte_array_data_bytes ||
+          meta.size_statistics.unencoded_byte_array_data_bytes < 0) {
+        complete[c] = false;
+        continue;
+      }
+      auto const n    = static_cast<uint64_t>(meta.num_values);
+      auto const size = static_cast<uint64_t>(meta.size_statistics.unencoded_byte_array_data_bytes);
+      // Reject overflowing metadata rather than turning it into a small admission estimate.
+      if (bytes[c] > k_max - size || values[c] > k_max - n) {
+        complete[c] = false;
+        continue;
+      }
+      bytes[c] += size;
+      values[c] += n;
+    }
+  }
+  std::vector<std::optional<uint64_t>> widths(num_leaves);
+  for (std::size_t c = 0; c < num_leaves; ++c) {
+    if (!complete[c] || values[c] == 0) { continue; }
+    // Ceiling average of decoded chars plus cuDF's four-byte offset per row. Zero-byte
+    // statistics are valid for empty/all-null strings and still need offsets.
+    auto const chars = bytes[c] / values[c] + (bytes[c] % values[c] != 0);
+    widths[c]        = chars > k_max - 4 ? k_max : chars + 4;
+  }
+  return widths;
+}
+
+std::optional<std::uint64_t> detail::combined_string_width(
+  std::vector<std::pair<std::optional<std::uint64_t>, std::size_t>> const& files)
+{
+  constexpr auto k_max = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t bytes  = 0;
+  std::uint64_t rows   = 0;
+  for (auto const& [width, file_rows] : files) {
+    if (file_rows == 0) { continue; }
+    if (!width) { return std::nullopt; }
+    // Reject overflowing metadata rather than turning it into a small admission estimate.
+    if (*width > k_max / file_rows || bytes > k_max - *width * file_rows) { return std::nullopt; }
+    bytes += *width * file_rows;
+    rows += file_rows;
+  }
+  if (rows == 0) { return std::nullopt; }
+  return bytes / rows + (bytes % rows != 0);
 }
 
 std::size_t detail::merged_statistics_cache_size()

@@ -23,8 +23,6 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 
-#include <duckdb/common/multi_file/multi_file_list.hpp>
-#include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/node_statistics.hpp>
@@ -33,14 +31,6 @@
 #include <algorithm>
 #include <exception>
 #include <string>
-
-// <linux/fs.h> defines BLOCK_SIZE as a macro and reaches this file through the result collector
-// (sirius_context.hpp -> scan manager -> liburing). DuckDB's parquet_crypto.hpp, which
-// parquet_reader.hpp includes, declares a constant of that name; hide the macro around it.
-#pragma push_macro("BLOCK_SIZE")
-#undef BLOCK_SIZE
-#include <parquet_reader.hpp>
-#pragma pop_macro("BLOCK_SIZE")
 
 namespace sirius::planner {
 
@@ -86,22 +76,6 @@ std::optional<uint64_t> table_function_row_count(duckdb::ClientContext& context,
                      e.what());
   }
   return std::nullopt;
-}
-
-/// Only use an already-open footer when it covers the entire scan. Do not open additional
-/// files just to size admission; multi-file scans retain their configured width.
-std::vector<std::optional<uint64_t>> parquet_leaf_column_widths(const duckdb::FunctionData* bind)
-{
-  auto const* multi = dynamic_cast<const duckdb::MultiFileBindData*>(bind);
-  if (multi == nullptr || !multi->initial_reader || !multi->file_list) { return {}; }
-  auto const* reader = dynamic_cast<const duckdb::ParquetReader*>(multi->initial_reader.get());
-  if (reader == nullptr) { return {}; }
-  auto const* metadata = reader->GetFileMetadata();
-  if (metadata == nullptr) { return {}; }
-  return detail::parquet_column_widths(
-    *metadata,
-    multi->names.size(),
-    multi->file_list->GetExpandResult() == duckdb::FileExpandResult::SINGLE_FILE);
 }
 
 /// The table column behind output column @p output_idx of @p scan, or nullopt for virtual
@@ -150,54 +124,6 @@ std::optional<uint64_t> reported_row_count(const duckdb::NodeStatistics& stats)
   return rows;
 }
 
-std::vector<std::optional<uint64_t>> parquet_column_widths(
-  const duckdb_parquet::FileMetaData& metadata, std::size_t bound_columns, bool single_file)
-{
-  if (!single_file || metadata.row_groups.empty()) { return {}; }
-  auto const num_leaves = metadata.row_groups.front().columns.size();
-  // Only flat schemas have one leaf per bound column.
-  if (num_leaves == 0 || num_leaves != bound_columns) { return {}; }
-  std::vector<uint64_t> bytes(num_leaves, 0), values(num_leaves, 0);
-  std::vector<bool> complete(num_leaves, true);
-  for (auto const& row_group : metadata.row_groups) {
-    if (row_group.columns.size() != num_leaves) { return {}; }
-    for (std::size_t c = 0; c < num_leaves; ++c) {
-      auto const& chunk = row_group.columns[c];
-      auto const& meta  = chunk.meta_data;
-      if (row_group.num_rows == 0) { continue; }
-      // Encoded sizes (including DELTA and dictionary encodings) cannot describe decoded
-      // strings. Require unencoded size statistics for EVERY nonempty row group.
-      if (!chunk.__isset.meta_data || meta.type != duckdb_parquet::Type::BYTE_ARRAY ||
-          meta.num_values <= 0 || meta.num_values != row_group.num_rows ||
-          !meta.__isset.size_statistics ||
-          !meta.size_statistics.__isset.unencoded_byte_array_data_bytes ||
-          meta.size_statistics.unencoded_byte_array_data_bytes < 0) {
-        complete[c] = false;
-        continue;
-      }
-      auto const n    = static_cast<uint64_t>(meta.num_values);
-      auto const size = static_cast<uint64_t>(meta.size_statistics.unencoded_byte_array_data_bytes);
-      // Reject overflowing metadata rather than turning it into a small admission estimate.
-      constexpr auto k_max = std::numeric_limits<uint64_t>::max();
-      if (bytes[c] > k_max - size || values[c] > k_max - n) {
-        complete[c] = false;
-        continue;
-      }
-      bytes[c] += size;
-      values[c] += n;
-    }
-  }
-  std::vector<std::optional<uint64_t>> widths(num_leaves);
-  for (std::size_t c = 0; c < num_leaves; ++c) {
-    if (!complete[c] || values[c] == 0) { continue; }
-    // Ceiling average of decoded chars plus cuDF's four-byte offset per row. Zero-byte
-    // statistics are valid for empty/all-null strings and still need offsets.
-    auto const chars = bytes[c] / values[c] + (bytes[c] % values[c] != 0);
-    widths[c]        = accumulate_scan_bytes(chars, 1, 4);
-  }
-  return widths;
-}
-
 }  // namespace detail
 
 op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& context,
@@ -213,7 +139,9 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
                                                  : table_function_row_count(context, scan);
   hint.column_widths.assign(scan.types.size(), std::nullopt);
 
-  auto const leaf_widths = parquet_leaf_column_widths(scan.bind_data.get());
+  // String sizes come from the same footer pass, summed over every file of the scan.
+  auto const leaf_widths = transparent::parquet_scan_string_widths(
+    scan.function.GetName().GetIdentifierName(), scan.bind_data.get());
   // Bytes per row of table column `column`, read as `type`, where a source states one.
   auto const width_of = [&](duckdb::column_t column,
                             sirius::logical_type const& type) -> std::optional<uint64_t> {
@@ -249,9 +177,10 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
   }
   // One line per scan, so a run can show which source each estimate came from and, when the
   // table row count is missing, whether the callback or the bind data was absent.
+  auto const known = [](auto const& width) { return width.has_value(); };
   SIRIUS_LOG_DEBUG(
     "gpu_admission: scan of {} (cardinality callback {}, bind data {}): unfiltered rows {} ({}), "
-    "{} of {} column width(s) known, {} filter-only column(s)",
+    "{} of {} output and {} of {} filter-only column width(s) known",
     scan.function.GetName().GetIdentifierName(),
     scan.function.cardinality != nullptr ? "present" : "absent",
     scan.bind_data != nullptr ? "present" : "absent",
@@ -259,11 +188,10 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
     footer_rows.has_value()            ? "from Parquet footers"
     : hint.unfiltered_rows.has_value() ? "from the cardinality callback"
                                        : "no source",
-    std::count_if(hint.column_widths.begin(),
-                  hint.column_widths.end(),
-                  [](auto const& width) { return width.has_value(); }),
+    std::count_if(hint.column_widths.begin(), hint.column_widths.end(), known),
     hint.column_widths.size(),
-    hint.filter_only_types.size());
+    std::count_if(hint.filter_only_widths.begin(), hint.filter_only_widths.end(), known),
+    hint.filter_only_widths.size());
   return hint;
 }
 

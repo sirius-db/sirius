@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "planner/gpu_admission.hpp"
 #include "sirius_config.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 
 #include <duckdb/storage/statistics/node_statistics.hpp>
 #include <parquet_types.h>
@@ -409,22 +410,18 @@ duckdb_parquet::RowGroup admission_string_group(int64_t rows,
 TEST_CASE("Parquet admission requires decoded sizes for the entire scan", "[gpu_admission]")
 {
   using duckdb_parquet::Encoding;
-  using sirius::planner::detail::parquet_column_widths;
+  using sirius::transparent::detail::parquet_string_widths;
   duckdb_parquet::FileMetaData metadata;
   metadata.__set_row_groups({admission_string_group(10, 100, Encoding::PLAIN),
                              admission_string_group(30, 900, Encoding::RLE_DICTIONARY)});
-  auto widths = parquet_column_widths(metadata, 1, true);
+  auto widths = parquet_string_widths(metadata, 1);
   REQUIRE(widths.size() == 1);
   CHECK(widths[0] == 29);  // (100 + 900) / 40 chars + four-byte offsets
 
-  SECTION("first-file statistics never describe a multi-file scan")
-  {
-    CHECK(parquet_column_widths(metadata, 1, false).empty());
-  }
   SECTION("one missing row group invalidates the column width")
   {
     metadata.row_groups[1] = admission_string_group(30, std::nullopt, Encoding::PLAIN);
-    CHECK_FALSE(parquet_column_widths(metadata, 1, true)[0].has_value());
+    CHECK_FALSE(parquet_string_widths(metadata, 1)[0].has_value());
   }
   SECTION("encoded-only chunks retain the configured fallback")
   {
@@ -433,23 +430,41 @@ TEST_CASE("Parquet admission requires decoded sizes for the entire scan", "[gpu_
                           Encoding::DELTA_BYTE_ARRAY,
                           Encoding::RLE_DICTIONARY}) {
       metadata.__set_row_groups({admission_string_group(10, std::nullopt, encoding)});
-      CHECK_FALSE(parquet_column_widths(metadata, 1, true)[0].has_value());
+      CHECK_FALSE(parquet_string_widths(metadata, 1)[0].has_value());
     }
   }
   SECTION("decoded statistics work for delta-encoded strings")
   {
     metadata.__set_row_groups({admission_string_group(10, 101, Encoding::DELTA_BYTE_ARRAY)});
-    CHECK(parquet_column_widths(metadata, 1, true)[0] == 15);
+    CHECK(parquet_string_widths(metadata, 1)[0] == 15);
   }
   SECTION("empty and all-null strings still require offsets")
   {
     metadata.__set_row_groups({admission_string_group(10, 0, Encoding::PLAIN)});
-    CHECK(parquet_column_widths(metadata, 1, true)[0] == 4);
+    CHECK(parquet_string_widths(metadata, 1)[0] == 4);
   }
   SECTION("malformed and nested metadata cannot supply a width")
   {
-    CHECK(parquet_column_widths(metadata, 2, true).empty());
+    CHECK(parquet_string_widths(metadata, 2).empty());
     metadata.row_groups[1].columns.clear();
-    CHECK(parquet_column_widths(metadata, 1, true).empty());
+    CHECK(parquet_string_widths(metadata, 1).empty());
   }
+}
+
+TEST_CASE("Parquet admission sizes a string column over every file of a scan", "[gpu_admission]")
+{
+  using sirius::transparent::detail::combined_string_width;
+  using file = std::pair<std::optional<std::uint64_t>, std::size_t>;
+  // Row-weighted and rounded up: (29 * 40 + 15 * 10) / 50 = 26.2.
+  CHECK(combined_string_width({file{29, 40}, file{15, 10}}) == 27);
+  CHECK(combined_string_width({file{29, 40}}) == 29);
+  // One file with rows and no decoded size leaves the column on the configured width.
+  CHECK_FALSE(combined_string_width({file{29, 40}, file{std::nullopt, 10}}).has_value());
+  // A file without rows says nothing either way.
+  CHECK(combined_string_width({file{std::nullopt, 0}, file{29, 40}}) == 29);
+  CHECK_FALSE(combined_string_width({file{std::nullopt, 0}}).has_value());
+  CHECK_FALSE(combined_string_width({}).has_value());
+  // Overflowing metadata is rejected rather than wrapped into a small width.
+  CHECK_FALSE(
+    combined_string_width({file{std::numeric_limits<std::uint64_t>::max(), 2}}).has_value());
 }

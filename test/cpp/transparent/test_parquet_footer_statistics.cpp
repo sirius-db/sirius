@@ -2442,4 +2442,10 @@ TEST_CASE_METHOD(FooterAdmissionFixture,
   CHECK_FALSE(sirius::transparent::parquet_scan_row_count(name, nullptr));
   auto const detached = get->bind_data->Copy();
   CHECK_FALSE(sirius::transparent::parquet_scan_row_count(name, detached.get()));
+
+  // String widths are looked up the same way. These files have integer columns only, so no
+  // column has one.
+  CHECK(sirius::transparent::parquet_scan_string_widths(name, get->bind_data.get()).empty());
+  CHECK(sirius::transparent::parquet_scan_string_widths("seq_scan", get->bind_data.get()).empty());
+  CHECK(sirius::transparent::parquet_scan_string_widths(name, nullptr).empty());
 }

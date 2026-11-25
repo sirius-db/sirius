@@ -26,11 +26,16 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace duckdb {
 class LogicalGet;
 }  // namespace duckdb
+
+namespace duckdb_parquet {
+class FileMetaData;
+}  // namespace duckdb_parquet
 
 namespace sirius::transparent {
 
@@ -102,11 +107,22 @@ struct footer_read_limits {
 [[nodiscard]] std::optional<std::uint64_t> parquet_scan_value_span(duckdb::LogicalGet const& get,
                                                                    std::size_t column);
 
-/// \brief Make the row count of every Parquet scan in \p plan unknown, and its value spans.
+/// \brief Decoded bytes per row of the string columns of a Parquet scan that has a row count,
+/// indexed by the scan's bound column (`MultiFileBindData::names`): the average over the rows of
+/// all its files, plus cuDF's four-byte offset. An entry is set only when every file with rows
+/// states the column's decoded size (`unencoded_byte_array_data_bytes`) for every row group;
+/// encoded sizes do not describe decoded strings. Empty when no column has a width or the scan
+/// has no row count. The arguments are those of parquet_scan_row_count, and the widths are kept,
+/// copied and forgotten with the row count.
+[[nodiscard]] std::vector<std::optional<std::uint64_t>> parquet_scan_string_widths(
+  std::string_view function_name, duckdb::FunctionData const* bind_data);
+
+/// \brief Make the row count of every Parquet scan in \p plan unknown, and its value spans and
+/// string widths.
 void forget_parquet_scan_row_counts(duckdb::LogicalOperator const& plan);
 
 /// \brief Give \p to, the copy of the scan \p from in a copy of its plan, the row count of \p from
-/// and its value spans.
+/// and its value spans and string widths.
 void copy_parquet_scan_row_count(duckdb::LogicalGet const& from, duckdb::LogicalGet const& to);
 
 /// \brief Read the footer statistics of \p paths into the cache add_parquet_footer_statistics uses,
@@ -163,6 +179,16 @@ std::uint64_t inspected_file_count();
 cache_capacities set_cache_capacities_for_testing(cache_capacities replacement);
 /// For tests: drop every cached statistic, merged statistic and row count.
 void clear_caches_for_testing();
+/// Decoded bytes per row, plus the four-byte offset, of each leaf column of one file's footer that
+/// states a decoded string size for every nonempty row group. Empty when the schema is not flat
+/// (\p bound_columns differs from the number of leaves) or the file has no row group.
+std::vector<std::optional<std::uint64_t>> parquet_string_widths(
+  duckdb_parquet::FileMetaData const& metadata, std::size_t bound_columns);
+/// One column's bytes per row over several files, from each file's width and row count: the
+/// row-weighted average, rounded up. nullopt when a file with rows has no width or no file has
+/// rows.
+std::optional<std::uint64_t> combined_string_width(
+  std::vector<std::pair<std::optional<std::uint64_t>, std::size_t>> const& files);
 }  // namespace detail
 
 }  // namespace sirius::transparent

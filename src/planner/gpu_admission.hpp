@@ -33,10 +33,6 @@ class ClientContext;
 class NodeStatistics;
 }  // namespace duckdb
 
-namespace duckdb_parquet {
-class FileMetaData;
-}
-
 namespace sirius::op {
 class sirius_physical_operator;
 class sirius_physical_table_scan;
@@ -220,8 +216,6 @@ inline int gpu_count_for_bytes(uint64_t total_bytes, uint64_t bytes_per_gpu, int
 namespace detail {
 // Metadata-only helpers shared with admission regression tests.
 std::optional<uint64_t> reported_row_count(const duckdb::NodeStatistics& stats);
-std::vector<std::optional<uint64_t>> parquet_column_widths(
-  const duckdb_parquet::FileMetaData& metadata, std::size_t bound_columns, bool single_file);
 }  // namespace detail
 
 /**
@@ -231,10 +225,11 @@ std::vector<std::optional<uint64_t>> parquet_column_widths(
  * Rows, before any filter: for a Parquet scan, the sum of its files' footer row counts
  * (`transparent::parquet_scan_row_count`, present when `parquet_footer_statistics` is on);
  * otherwise the table function's `cardinality` callback (`TableScanCardinality` for DuckDB
- * tables). Widths, for variable-width output columns only: decoded byte-array size statistics
- * covering every row group of a single Parquet file, plus the 4-byte offset word; otherwise the
- * table statistics' maximum string length plus the offset. Unknown widths retain the configured
- * average.
+ * tables). Widths, for variable-width columns only: for a Parquet scan, the decoded byte-array
+ * size statistics of its footers when they cover every row group of every file
+ * (`transparent::parquet_scan_string_widths`), plus the 4-byte offset word; otherwise the table
+ * statistics' maximum string length plus the offset. Unknown widths retain the configured
+ * average. The columns the scan reads only for pushed-down filters are listed with their widths.
  */
 op::scan::scan_admission_hint derive_scan_admission_hint(
   duckdb::ClientContext& context, const op::sirius_physical_table_scan& scan);
