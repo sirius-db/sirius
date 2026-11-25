@@ -4176,7 +4176,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
 
   config.AddExtensionOption(
     "admission_bytes_per_gpu",
-    "Target projected scan-output bytes per GPU at admission; defaults to the smallest GPU's "
+    "Target projected scan bytes per GPU at admission; defaults to the smallest GPU's "
     "memory / 24 clamped to [1 GiB, 8 GiB]; 0 disables the estimate and leaves the allocation "
     "to topology.gpus_per_query",
     LogicalType::UBIGINT,

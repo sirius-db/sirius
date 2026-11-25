@@ -130,9 +130,10 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
                                                          const op::sirius_physical_table_scan& scan)
 {
   op::scan::scan_admission_hint hint;
-  // A Parquet scan's files were counted from their footers before DuckDB optimized the plan, when
-  // `parquet_footer_statistics` is on. That count is exact; the callback's is the first file's
-  // times the number of files, and is absent for a copied plan.
+  // A Parquet scan's files were counted from their footers before DuckDB optimized the plan,
+  // where the footer statistics pass covered the scan: `parquet_footer_statistics` on and no more
+  // uncached footers than its read limits allow. That count is exact; the callback's is the first
+  // file's times the number of files, and is absent for a copied plan.
   auto const footer_rows = transparent::parquet_scan_row_count(
     scan.function.GetName().GetIdentifierName(), scan.bind_data.get());
   hint.unfiltered_rows = footer_rows.has_value() ? std::optional<uint64_t>{*footer_rows}
@@ -176,7 +177,7 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
     hint.filter_only_widths.push_back(width_of(column, scan.returned_types[column]));
   }
   // One line per scan, so a run can show which source each estimate came from and, when the
-  // table row count is missing, whether the callback or the bind data was absent.
+  // unfiltered row count is missing, whether the callback or the bind data was absent.
   auto const known = [](auto const& width) { return width.has_value(); };
   SIRIUS_LOG_DEBUG(
     "gpu_admission: scan of {} (cardinality callback {}, bind data {}): unfiltered rows {} ({}), "

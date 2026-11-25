@@ -223,10 +223,10 @@ std::optional<uint64_t> reported_row_count(const duckdb::NodeStatistics& stats);
  *        generator still holds the function and bind data.
  *
  * Rows, before any filter: for a Parquet scan, the sum of its files' footer row counts
- * (`transparent::parquet_scan_row_count`, present when `parquet_footer_statistics` is on);
- * otherwise the table function's `cardinality` callback (`TableScanCardinality` for DuckDB
- * tables). Widths, for variable-width columns only: for a Parquet scan, the decoded byte-array
- * size statistics of its footers when they cover every row group of every file
+ * (`transparent::parquet_scan_row_count`, present when the footer statistics pass covered the
+ * scan); otherwise the table function's `cardinality` callback (`TableScanCardinality` for
+ * DuckDB tables). Widths, for variable-width columns only: for a Parquet scan, the decoded
+ * byte-array size statistics of its footers when they cover every row group of every file
  * (`transparent::parquet_scan_string_widths`), plus the 4-byte offset word; otherwise the table
  * statistics' maximum string length plus the offset. Unknown widths retain the configured
  * average. The columns the scan reads only for pushed-down filters are listed with their widths.

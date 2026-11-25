@@ -637,8 +637,8 @@ bool is_parquet_scan(duckdb::LogicalGet const& get)
   return is_parquet_scan(get.function.GetName().GetIdentifierName());
 }
 
-duckdb::shared_ptr<duckdb::MultiFileList> const* file_list_of(
-  std::string_view function_name, duckdb::FunctionData const* bind_data)
+duckdb::shared_ptr<duckdb::MultiFileList> const* file_list_of(std::string_view function_name,
+                                                              duckdb::FunctionData const* bind_data)
 {
   if (!is_parquet_scan(function_name)) { return nullptr; }
   auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
@@ -803,8 +803,8 @@ std::optional<std::size_t> parquet_scan_row_count(std::string_view function_name
 std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get)
 {
   if (!file_list_of(get)) { return std::nullopt; }
-  if (auto const rows = parquet_scan_row_count(get.function.GetName().GetIdentifierName(),
-                                               get.bind_data.get())) {
+  if (auto const rows =
+        parquet_scan_row_count(get.function.GetName().GetIdentifierName(), get.bind_data.get())) {
     return rows;
   }
   sirius::log::log_noexcept([&] {

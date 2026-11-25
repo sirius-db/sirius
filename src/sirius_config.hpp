@@ -81,8 +81,10 @@ constexpr uint64_t admission_bytes_per_gpu_for_memory(uint64_t gpu_total_bytes)
 /// visible GPU's total memory; 0 (admission off) when no GPU is visible. Memoized like
 /// derived_default_batch_size(). Anchored on a 4x GB200 (189 GiB per GPU -> 7.9 GiB), where
 /// 8 GiB was the largest value that left no TPC-H query at SF100 or SF1000 more than 5% slower
-/// than all four GPUs (2026-10-08, with the table-row-count scan estimate). Not narrowed by an
-/// explicit GPU capacity: this is a parallelism dial, not a memory budget.
+/// than all four GPUs (2026-10-08, with an estimate of unfiltered rows × output column widths;
+/// the estimate has since gained filter-only columns and Parquet footer string widths, and the
+/// value was not measured again there). Not narrowed by an explicit GPU capacity: this is a
+/// parallelism dial, not a memory budget.
 uint64_t derived_default_admission_bytes_per_gpu();
 
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE = DEFAULT_BATCH_SIZE;
@@ -406,9 +408,10 @@ struct operator_params {
   /// Share of GPU tier capacity for the histogram when the budget above is 0.
   double dense_count_join_memory_fraction = config::DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION;
 
-  /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
-  /// At query start, the engine estimates total scan output bytes from each scan's row count
-  /// (the larger of the planner's estimate and the table's unfiltered count) × per-column width,
+  /// Admission-time GPU allocation: target bytes of projected scan input per GPU.
+  /// At query start, the engine estimates the bytes the query's scans decode from each scan's
+  /// row count (the larger of the planner's estimate and the table's unfiltered count) × the
+  /// width of the columns it reads (output and filter-only),
   /// then assigns ceil(total_bytes / admission_bytes_per_gpu) GPUs, clamped to
   /// [1, active_gpu_count]. Defaults to config::derived_default_admission_bytes_per_gpu()
   /// (smallest GPU's memory / 24, clamped to [1 GiB, 8 GiB]); 0 disables the estimate and
