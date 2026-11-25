@@ -128,7 +128,7 @@ TEST_CASE("a peer on another host gets TCP lanes unless the NVLink fabric reache
     CHECK(choose_path(me, near, host_staging::always, mnnvl_mode::automatic, peer_access) ==
           path::shared_memory);
   }
-  // This host: as before.
+  // This host, off the fabric: NIXL with peer access, else shared memory.
   CHECK(choose_path(me, near, host_staging::automatic, mnnvl_mode::automatic, true) == path::nixl);
   CHECK(choose_path(me, near, host_staging::automatic, mnnvl_mode::automatic, false) ==
         path::shared_memory);
