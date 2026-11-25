@@ -2480,9 +2480,9 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
     push ? std::static_pointer_cast<arrow_batch_producer>(q)
          : std::static_pointer_cast<arrow_batch_producer>(pull);
   harness h(counters, producer, program);
-  int allocations = 0;
+  int allocations                = 0;
   constexpr auto late_read_error = "read failed after stop";
-  auto pause      = [&] {
+  auto pause                     = [&] {
     try {
       reading.wait();
     } catch (...) {
