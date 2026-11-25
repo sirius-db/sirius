@@ -3810,7 +3810,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_partial_aggregate_below_join",
-                    "aggregate below an inner join that only adds group-by payload",
+                    "aggregate below a join that only adds group-by payload",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_partial_aggregate_below_join),
                     SetEnablePartialAggregateBelowJoin);

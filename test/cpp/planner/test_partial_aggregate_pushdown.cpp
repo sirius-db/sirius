@@ -474,15 +474,37 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(why(per_customer("count(*), avg(o_weight)", "", "c_name")) ==
         reasons{"aggregate:count_star; aggregate:avg; sum:float; keys:not-fewer-than-groups; "
                 "keys:not-grouped"});
-  // The orders are the side every row of which the outer join keeps: only the join is in the way.
-  CHECK(why("SELECT o_custkey, c_name, sum(o_totalprice) FROM orders LEFT JOIN customer "
-            "ON o_custkey = c_custkey GROUP BY o_custkey, c_name") ==
-        reasons{"join:outer-preserved"});
-  // Grouped by the customers' key, every order without a customer falls into the one group
-  // whose key is NULL, so the groups are not the orders' keys.
+  // A full outer join pads the orders as well as the customers.
+  CHECK(why("SELECT c_custkey, c_name, sum(o_totalprice) FROM orders FULL JOIN customer "
+            "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == reasons{"join:full"});
+  // An outer join that keeps the orders leaves the customers' key NULL for every order without a
+  // customer. Grouped by it, those orders all fall into one group, so the groups are not the
+  // orders' keys.
   CHECK(why("SELECT c_custkey, c_name, sum(o_totalprice) FROM orders LEFT JOIN customer "
-            "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") ==
-        reasons{"join:outer-preserved; keys:not-grouped"});
+            "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == reasons{"keys:not-grouped"});
+}
+
+TEST_CASE_METHOD(pushdown_fixture,
+                 "partial aggregate pushdown passes outer joins that keep the aggregated side",
+                 "[partial_agg_pushdown][plan]")
+{
+  // The orders are the side every row of which the join keeps, on either hand of it.
+  auto const kept = [](std::string const& from) {
+    return "SELECT o_custkey, c_name, sum(o_totalprice) FROM " + from +
+           " ON o_custkey = c_custkey GROUP BY o_custkey, c_name";
+  };
+  CHECK(pushed(kept("orders LEFT JOIN customer")) == 1);
+  CHECK(pushed(kept("customer RIGHT JOIN orders")) == 1);
+  CHECK(shape(kept("orders LEFT JOIN customer"), true) == "AGG[2](JOIN(AGG[1](orders),customer))");
+  // The customers' key does not stand for the orders' here, as it does under an inner join: it is
+  // NULL for every order without a customer.
+  CHECK(pushed("SELECT c_custkey, c_name, sum(o_totalprice) FROM orders LEFT JOIN customer "
+               "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == 0);
+  CHECK(pushed("SELECT c_custkey, c_name, sum(o_totalprice) FROM orders JOIN customer "
+               "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == 1);
+  // The join pads the orders instead, or both sides.
+  CHECK(pushed(kept("customer LEFT JOIN orders")) == 0);
+  CHECK(pushed(kept("orders FULL JOIN customer")) == 0);
 }
 
 TEST_CASE_METHOD(pushdown_fixture,

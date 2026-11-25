@@ -402,8 +402,8 @@ struct path_step {
   duckdb::LogicalComparisonJoin* join;
   std::size_t side;                      ///< The child the arguments come from
   std::vector<ColumnBinding> forwarded;  ///< That child's columns the join outputs
-  /// An outer join that keeps every row of that child. The rule does not pass one yet; the walk
-  /// goes on through it only to report what else stands in the way.
+  /// An outer join that keeps every row of that child, and pads the other child's columns with
+  /// NULL where a row finds no match.
   bool preserves = false;
 };
 
@@ -552,12 +552,10 @@ void analyze(duckdb::ClientContext& context,
     result.combines.push_back(combine);
   }
 
-  // Down through joins, on the side that holds every argument. The rule passes inner joins: the
-  // first `passable` steps. The walk goes on through an outer join that keeps every row of that
-  // side, to report what else stands in the way.
+  // Down through joins, on the side that holds every argument: inner joins, and outer joins that
+  // keep every row of that side. Such an outer join repeats or pads the rows of the other side
+  // only, so a key's rows still reach the aggregate above together, as one row per match.
   auto* node               = folded.input->get();
-  std::size_t passable     = 0;
-  bool passing             = true;
   char const* stopped_here = nullptr;
   while (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
     auto& join = node->Cast<duckdb::LogicalComparisonJoin>();
@@ -614,15 +612,12 @@ void analyze(duckdb::ClientContext& context,
       why.add("plan:projection-map");
       return;
     }
-    passing = passing && !preserves;
-    if (passing) { ++passable; }
     result.path.push_back({&join, *side, std::move(*forwarded), preserves});
     node = join.children[*side].get();
   }
 
   // The lowest join whose other side supplies a variable-width group column. Below it each input
-  // row stands alone; from it upwards each carries that payload. It is looked for among the joins
-  // the rule passes first, so that the walk's going further never moves a push.
+  // row stands alone; from it upwards each carries that payload.
   auto const lowest_payload = [&](std::size_t begin, std::size_t end) {
     std::optional<std::size_t> payload;
     for (std::size_t i = end; i-- > begin && !payload;) {
@@ -637,15 +632,13 @@ void analyze(duckdb::ClientContext& context,
     }
     return payload;
   };
-  auto payload = lowest_payload(0, passable);
-  if (!payload) { payload = lowest_payload(passable, result.path.size()); }
+  auto const payload = lowest_payload(0, result.path.size());
   if (!payload) {
     why.add(stopped_here ? stopped_here : "path:no-payload");
     return;
   }
   result.path.erase(result.path.begin() + static_cast<std::ptrdiff_t>(*payload) + 1,
                     result.path.end());
-  if (std::ranges::any_of(result.path, &path_step::preserves)) { why.add("join:outer-preserved"); }
   auto const& under = result.path.back();
   auto& source      = *under.join->children[under.side];
 

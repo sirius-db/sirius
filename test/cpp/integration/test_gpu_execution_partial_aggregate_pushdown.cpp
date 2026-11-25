@@ -221,6 +221,35 @@ TEST_CASE_METHOD(PartialAggregatePushdownFixture,
 }
 
 TEST_CASE_METHOD(PartialAggregatePushdownFixture,
+                 "gpu_execution aggregate below an outer join that keeps its side",
+                 "[integration][gpu_execution][partial_agg_pushdown]")
+{
+  // Orders without a customer, and with a NULL key, stay in the result with a NULL name: one group
+  // per such key when the orders' key is grouped by.
+  compare_pushed_and_not(
+    "SELECT o_custkey, c_name, sum(o_totalprice) AS total, max(o_orderdate) AS latest "
+    "FROM orders LEFT JOIN customer ON c_custkey = o_custkey GROUP BY o_custkey, c_name",
+    true);
+  // The same join written from the customers' side.
+  compare_pushed_and_not(
+    "SELECT o_custkey, c_name, sum(o_totalprice) AS total, min(o_totalprice) AS low "
+    "FROM customer RIGHT JOIN orders ON c_custkey = o_custkey GROUP BY o_custkey, c_name",
+    true);
+  // No orders at all.
+  compare_pushed_and_not(
+    "SELECT o_custkey, c_name, sum(o_totalprice) AS total FROM orders LEFT JOIN customer "
+    "ON c_custkey = o_custkey WHERE o_orderdate > DATE '2100-01-01' GROUP BY o_custkey, c_name",
+    true);
+  // Grouped by the customers' key, the orders without a customer all fall into the one group
+  // whose key is NULL. The groups are then not the orders' keys, and the rule leaves it alone.
+  auto const before = pushdowns();
+  compare_gpu_vs_cpu(
+    "SELECT c_custkey, c_name, sum(o_totalprice) AS total, min(o_totalprice) AS low "
+    "FROM orders LEFT JOIN customer ON c_custkey = o_custkey GROUP BY c_custkey, c_name");
+  CHECK(pushdowns() == before);
+}
+
+TEST_CASE_METHOD(PartialAggregatePushdownFixture,
                  "gpu_execution aggregates the partial aggregate pushdown leaves alone",
                  "[integration][gpu_execution][partial_agg_pushdown]")
 {
