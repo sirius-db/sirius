@@ -109,6 +109,12 @@ class DistributedConfig(unittest.TestCase):
             done.stdout.splitlines(), ["export SIRIUS_CLUSTER=${SIRIUS_CLUSTER:-x}"]
         )
 
+    def test_rails(self):
+        done = self.read("sirius:\n  distributed:\n    ucx: { rails: true }\n")
+        self.assertEqual(
+            done.stdout, "export SIRIUS_UCX_RAILS=${SIRIUS_UCX_RAILS:-true}\n"
+        )
+
     def test_no_file(self):
         done = self.read()
         self.assertEqual((done.returncode, done.stdout), (0, ""))
@@ -155,12 +161,12 @@ class LauncherEnv(unittest.TestCase):
             )
 
     def test_rails_write_over_nixl(self):
-        done = self.source("mlx5_0:1,mlx5_1:1", {"UCX_NET_DEVICES": "rails"})
+        done = self.source("mlx5_0:1,mlx5_1:1", {"SIRIUS_UCX_RAILS": "1"})
         self.assertEqual(done.stdout, "all mlx5_0:1,mlx5_1:1 never\n", done.stderr)
 
     def test_rails_keep_a_set_host_staging(self):
         env = {
-            "UCX_NET_DEVICES": "rails",
+            "SIRIUS_UCX_RAILS": "true",
             "SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING": "auto",
         }
         done = self.source("mlx5_0:1,mlx5_1:1", env)
@@ -172,8 +178,18 @@ class LauncherEnv(unittest.TestCase):
             done.stdout, "cuda_copy,cuda_ipc,tcp,self bond0 unset\n", done.stderr
         )
 
+    def test_rails_keep_set_ucx_values(self):
+        env = {"SIRIUS_UCX_RAILS": "1", "UCX_TLS": "rc", "UCX_NET_DEVICES": "mlx5_0:1"}
+        done = self.source("mlx5_0:1,mlx5_1:1", env)
+        self.assertEqual(done.stdout, "rc mlx5_0:1 never\n", done.stderr)
+
+    def test_rails_takes_0_or_1(self):
+        done = self.source("mlx5_0:1,mlx5_1:1", {"SIRIUS_UCX_RAILS": "rails"})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, "")
+
     def test_rails_without_rail_nics_fail(self):
-        done = self.source("", {"UCX_NET_DEVICES": "rails"})
+        done = self.source("", {"SIRIUS_UCX_RAILS": "1"})
         self.assertNotEqual(done.returncode, 0)
         self.assertEqual(done.stdout, "")
 
