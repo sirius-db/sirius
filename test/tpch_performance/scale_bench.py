@@ -5,6 +5,7 @@ Table C preparation is CPU work outside query timing. Graph steps include
 checkpointed CPU materialization of explicitly GPU-computed SELECT results.
 """
 
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -237,15 +238,41 @@ class ScaleBench:
         self.benchmark_dir = None
         self.paths = {}
         self.query_metadata = {}
+        self.connection = None
+        self.termination_signal = None
 
     def __enter__(self):
-        self.previous_sigterm = signal.getsignal(signal.SIGTERM)
-        signal.signal(signal.SIGTERM, self._terminate)
+        self.previous_handlers = {
+            sig: signal.getsignal(sig)
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        }
+        for sig in self.previous_handlers:
+            signal.signal(sig, self._terminate)
         return self
 
-    @staticmethod
-    def _terminate(signum, frame):
+    def _terminate(self, signum, frame):
+        self.termination_signal = signum
+        if self.connection is not None:
+            try:
+                self.connection.interrupt()
+            except duckdb.Error:
+                pass  # A caller may already have closed the connection.
         raise SystemExit(128 + signum)
+
+    def close_connection(self, con):
+        try:
+            con.close()
+        finally:
+            if self.connection is con:
+                self.connection = None
+
+    @contextmanager
+    def connection_scope(self, con):
+        self.connection = con
+        try:
+            yield con
+        finally:
+            self.close_connection(con)
 
     def __exit__(self, exc_type, exc, traceback):
         cleanup_error = None
@@ -263,7 +290,12 @@ class ScaleBench:
                     )
                 self._save_metadata()
         finally:
-            signal.signal(signal.SIGTERM, self.previous_sigterm)
+            for sig, handler in self.previous_handlers.items():
+                signal.signal(sig, handler)
+        # DuckDB can translate an exception raised by a Python signal handler
+        # into RuntimeError("Query interrupted"). Preserve the signal exit code.
+        if self.termination_signal is not None:
+            raise SystemExit(128 + self.termination_signal)
         if cleanup_error is not None and exc_type is None:
             raise RuntimeError(
                 f"Temporary data could not be removed: {self.root}"
@@ -302,7 +334,7 @@ class ScaleBench:
         if "workflow" in self.queries:
             needed.update(TABLE_DIRECTORIES)
         started = time.perf_counter()
-        with duckdb.connect() as cpu:
+        with self.connection_scope(duckdb.connect()) as cpu:
             for table, directory in TABLE_DIRECTORIES.items():
                 if table not in needed:
                     continue
@@ -325,6 +357,16 @@ class ScaleBench:
                     "files": self.paths[table],
                     "bytes": sum(p.stat().st_size for p in files),
                 }
+            if any(q in GRAPH_QUERIES for q in self.queries):
+                null_edges = cpu.execute(
+                    "SELECT EXISTS (SELECT 1 FROM table_a "
+                    "WHERE col_b IS NULL OR col_d IS NULL)"
+                ).fetchone()[0]
+                if null_edges:
+                    raise ValueError(
+                        "BFS/PageRank require non-NULL table_a.col_b and col_d "
+                        "edge endpoints; correct the input or select only SQL queries"
+                    )
             if "workflow" in self.queries or any(
                 q in GRAPH_QUERIES for q in self.queries
             ):
@@ -518,8 +560,8 @@ FROM pr_vertices v LEFT JOIN pr_contribs c ON v.id = c.id""",
                     validation_scope="rank invariants only; unordered sample",
                 )
             else:
-                count, unique, minimum = con.execute(
-                    "SELECT count(*), count(DISTINCT vertex), min(distance) FROM bfs_visited"
+                count, unique, minimum, max_distance = con.execute(
+                    "SELECT count(*), count(DISTINCT vertex), min(distance), max(distance) FROM bfs_visited"
                 ).fetchone()
                 root = con.execute(
                     "SELECT count(*) FROM bfs_visited WHERE vertex=1000 AND distance=0"
@@ -527,8 +569,18 @@ FROM pr_vertices v LEFT JOIN pr_contribs c ON v.id = c.id""",
                 result = dict(
                     passed=count == unique and minimum == 0 and root == 1,
                     rows=count,
+                    max_distance=max_distance,
+                    reached_beyond_root=count - root,
+                    expanded=count > root,
                     validation_scope="unique vertices, nonnegative distances and root",
                 )
+                if not result["expanded"]:
+                    message = (
+                        "BFS reached only root 1000; no vertices beyond the root "
+                        "were reached. This run does not measure traversal performance."
+                    )
+                    result["warning"] = message
+                    warnings.warn(message, stacklevel=2)
             if not result["passed"]:
                 raise ValueError(f"{name} invariants failed: {result}")
             return result

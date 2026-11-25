@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -314,6 +315,179 @@ with ScaleBench(sys.argv[1], ['workflow'], sys.argv[3]) as workload:
         doc = json.loads((run / "metadata.json").read_text())["scale_bench"]
         self.assertEqual(doc["temporary_cleanup"], "failed")
         self.assertEqual(doc["temporary_directory"], str(workload.root))
+
+    def test_signals_interrupt_active_statements_and_clean_owned_files(self):
+        script = """import sys
+import performance_test as benchmark
+import scale_bench
+benchmark.log = lambda message: None
+
+def execute_long_query(con):
+    con.execute('SET threads=1')
+    def ready():
+        print(workload.root, flush=True)
+        return 0.0
+    con.create_function('signal_ready', ready, [], 'DOUBLE', side_effects=True)
+    con.execute('SELECT sum(sin(i) + (SELECT signal_ready())) FROM range(10000000000) t(i)')
+
+with scale_bench.ScaleBench(sys.argv[1], ['workflow'], sys.argv[3]) as workload:
+    if sys.argv[4] == 'prepare':
+        original = scale_bench.fingerprint_sql
+        def fingerprint(con, sql):
+            execute_long_query(con)
+            return original(con, sql)
+        scale_bench.fingerprint_sql = fingerprint
+        workload.prepare(sys.argv[2])
+    else:
+        workload.prepare(sys.argv[2])
+        con = benchmark.open_connection(sys.argv[1], workload=workload)
+        try:
+            execute_long_query(con)
+        finally:
+            workload.close_connection(con)
+"""
+        import selectors
+
+        for phase in ("prepare", "run"):
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                with self.subTest(phase=phase, signal=sig):
+                    run, _ = self.prepared(["workflow"])
+                    scratch = self.root / "scratch"
+                    scratch.mkdir(exist_ok=True)
+                    sentinel = scratch / "keep-me"
+                    sentinel.write_text("unrelated data")
+                    proc = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-c",
+                            script,
+                            str(self.source),
+                            str(run),
+                            str(scratch),
+                            phase,
+                        ],
+                        cwd=HERE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    try:
+                        # The UDF announces readiness from inside the active
+                        # statement, after the prepared C copy exists.
+                        with selectors.DefaultSelector() as selector:
+                            selector.register(proc.stdout, selectors.EVENT_READ)
+                            self.assertTrue(selector.select(timeout=20))
+                            prepared = Path(proc.stdout.readline().strip())
+                        self.assertTrue((prepared / "table_c_prep").exists())
+                        time.sleep(0.2)  # Let the UDF return into native SQL work.
+                        started = time.monotonic()
+                        proc.send_signal(sig)
+                        _, error = proc.communicate(timeout=5)
+                        self.assertLess(time.monotonic() - started, 5)
+                        self.assertEqual(proc.returncode, 128 + sig, error)
+                        self.assertFalse(prepared.exists())
+                        self.assertEqual(list(scratch.iterdir()), [sentinel])
+                        metadata = json.loads((run / "metadata.json").read_text())
+                        self.assertEqual(
+                            metadata["scale_bench"]["temporary_cleanup"], "removed"
+                        )
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                        proc.communicate()
+
+    def test_signal_handlers_and_active_connection_are_restored(self):
+        signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        handlers = {sig: signal.getsignal(sig) for sig in signals}
+        run, workload = self.prepared(["workflow"])
+        with workload:
+            workload.prepare(run)
+            self.assertIsNone(workload.connection)
+            with workload.connection_scope(duckdb.connect()) as con:
+                self.assertIs(workload.connection, con)
+            self.assertIsNone(workload.connection)
+            with patch.object(
+                benchmark,
+                "_configure_connection",
+                side_effect=ValueError("setup failed"),
+            ):
+                with self.assertRaisesRegex(ValueError, "setup failed"):
+                    benchmark.open_connection(str(self.source), workload=workload)
+            self.assertIsNone(workload.connection)
+        self.assertEqual({sig: signal.getsignal(sig) for sig in signals}, handlers)
+
+    def test_bfs_reports_traversal_depth_and_warns_for_root_only(self):
+        for edges, depth, reached in (
+            ([(5, 6)], 0, 0),
+            ([(5, 1000)], 0, 0),
+            ([(1000, 1000)], 0, 0),
+            ([(1000, 1), (1, 2)], 2, 2),
+        ):
+            with self.subTest(edges=edges):
+                run, workload = self.prepared(["bfs"])
+                with workload:
+                    workload.prepare(run)
+                    with workload.connection_scope(
+                        benchmark.open_connection(str(self.source), workload=workload)
+                    ) as con:
+                        con.execute("DROP VIEW table_a")
+                        con.execute("CREATE TABLE table_a (col_b BIGINT, col_d BIGINT)")
+                        con.executemany("INSERT INTO table_a VALUES (?, ?)", edges)
+                        workload.run_graph(con, "bfs", False)
+                        if reached == 0:
+                            with self.assertWarnsRegex(
+                                UserWarning, "does not measure traversal"
+                            ):
+                                result = workload.check_graph(con, "bfs", False)
+                            self.assertIn("warning", result)
+                        else:
+                            result = workload.check_graph(con, "bfs", False)
+                            self.assertNotIn("warning", result)
+                        self.assertTrue(result["passed"])
+                        self.assertEqual(result["max_distance"], depth)
+                        self.assertEqual(result["reached_beyond_root"], reached)
+                        self.assertEqual(result["expanded"], reached > 0)
+
+    def test_null_graph_endpoints_fail_preparation_but_sql_queries_run(self):
+        path = self.source / TABLE_DIRECTORIES["table_a"] / "part.parquet"
+        for column in ("col_b", "col_d"):
+            write_source = str(path).replace("'", "''")
+            with duckdb.connect() as con:
+                con.execute(f"CREATE TABLE a AS FROM read_parquet('{write_source}')")
+                con.execute("UPDATE a SET col_b=1000, col_d=1001")
+                con.execute(f"UPDATE a SET {column}=NULL")
+                con.execute(f"COPY a TO '{write_source}' (FORMAT PARQUET)")
+            for query in ("bfs", "pagerank"):
+                with self.subTest(column=column, query=query):
+                    run, workload = self.prepared([query, "workflow"])
+                    with workload, self.assertRaisesRegex(
+                        ValueError, "non-NULL.*col_b and col_d"
+                    ):
+                        workload.prepare(run)
+                    self.assertIsNone(workload.root)
+                    self.assertIsNone(workload.connection)
+            output = self.root / column
+            run_cli(self.source, output, "--queries", "gb2")
+
+    def test_root_only_bfs_warning_is_retained_in_iteration_metadata(self):
+        path = str(self.source / TABLE_DIRECTORIES["table_a"] / "part.parquet").replace(
+            "'", "''"
+        )
+        with duckdb.connect() as con:
+            con.execute(f"CREATE TABLE a AS FROM read_parquet('{path}')")
+            con.execute("UPDATE a SET col_b=5, col_d=6")
+            con.execute(f"COPY a TO '{path}' (FORMAT PARQUET)")
+        output = self.root / "root-only"
+        result = run_cli(self.source, output, "--queries", "bfs")
+        self.assertIn("does not measure traversal performance", result.stderr)
+        run = next(output.iterdir())
+        metadata = json.loads((run / "duckdb/bfs/metadata_iter0.json").read_text())
+        checks = metadata["invariants"]
+        self.assertTrue(checks["passed"])
+        self.assertFalse(checks["expanded"])
+        self.assertEqual(checks["max_distance"], 0)
+        self.assertEqual(checks["reached_beyond_root"], 0)
+        self.assertIn("only root 1000", checks["warning"])
 
     def test_named_queries_split_logs_and_preserve_tpch_names(self):
         log_dir = self.root / "logs"

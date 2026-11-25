@@ -801,12 +801,17 @@ def open_connection(
             workload.database(gpu_execution) if workload else ":memory:", config=config
         )
 
+    if workload is not None:
+        workload.connection = con
     try:
         return _configure_connection(
             con, source, gpu_execution, data_source, s3_input, workload
         )
     except BaseException:
-        con.close()
+        if workload is not None:
+            workload.close_connection(con)
+        else:
+            con.close()
         raise
 
 
@@ -1152,7 +1157,11 @@ def run_grouped(
                         _execute_multi(con, emit_unpin(qnum))
         finally:
             log("Closing connection")
-            con.close()
+            workload = getattr(writer, "workload", None)
+            if workload is not None:
+                workload.close_connection(con)
+            else:
+                con.close()
 
 
 def run_sequential(
@@ -1252,7 +1261,11 @@ def run_sequential(
                     _execute_multi(con, emit_unpin_all())
         finally:
             log("Closing connection")
-            con.close()
+            workload = getattr(writer, "workload", None)
+            if workload is not None:
+                workload.close_connection(con)
+            else:
+                con.close()
 
 
 # Keyed by a profile's "ordering", not by a user-facing choice --

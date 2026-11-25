@@ -79,6 +79,16 @@ and sample-size bounds instead of comparing IDs/checksums from different
 samples. `validation.csv` success for PageRank means those invariant checks
 passed, not exact CPU/GPU equality. Per-iteration graph checks state their scope.
 
+BFS and PageRank require non-NULL edge endpoints in `table_a.col_b` and
+`table_a.col_d`. Selecting either algorithm adds an untimed CPU input check;
+NULL endpoints cause preparation to fail before temporary files are created.
+Edges are never silently filtered. SQL-only selections skip this check.
+
+BFS retains the historical root `1000`. Per-iteration metadata records
+`max_distance` (the greatest distance from the root), `reached_beyond_root`, and
+`expanded`. A root-only result passes correctness checks but emits a warning,
+also saved in metadata: it provides no evidence of traversal performance.
+
 ### Prepared table C and temporary files
 
 Selecting `workflow` writes a CPU-prepared Parquet copy of C once per invocation,
@@ -90,8 +100,12 @@ and all iterations use that same `table_c_prep` copy.
 `scale_bench-*` child for prepared C and graph work databases; without this flag,
 the child is created beneath the benchmark run directory. The runner never
 reuses existing preparation or deletes the parent directory or unrelated files.
-It closes connections before removing its child on completion, exceptions,
-Ctrl-C and handled SIGTERM. Cleanup failures are recorded and reported; a failed
+It closes connections before removing its child on completion and exceptions.
+SIGINT (Ctrl-C), SIGTERM and SIGHUP request interruption of the active DuckDB
+connection, including during preparation, then exit with `128 + signal` and
+attempt cleanup. Previous signal handlers are restored afterward. Prompt
+cancellation through Sirius depends on the engine honoring interruption.
+Cleanup failures are recorded and reported; a failed
 cleanup makes an otherwise successful invocation fail. SIGKILL, process crashes
 and machine failure cannot guarantee cleanup: the run metadata retains the exact
 temporary path for manual recovery. Benchmark reports and exported result files

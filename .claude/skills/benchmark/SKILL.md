@@ -128,10 +128,16 @@ pixi run python test/tpch_performance/performance_test.py \
   close on completion or handled failure/termination. Reports and result exports
   are preserved. After SIGKILL/crash, inspect the recorded path before cleanup;
   never delete the supplied parent or unrelated files.
+  SIGINT, SIGTERM and SIGHUP request active-connection interruption before cleanup;
+  prompt GPU cancellation still depends on engine interruption support.
 - BFS uses `col_b -> col_d` from root 1000. PageRank uses an unordered sample of
   up to 10,000 edges and ten iterations. Graph timings include CPU intermediate
   materialization/checkpoints. PageRank validation checks rank invariants instead
   of exact cross-sample checksums; do not describe it as exhaustive CPU equality.
+  Graph selections reject NULL `col_b`/`col_d` endpoints during untimed preparation.
+  A root-only BFS result passes correctness checks but warns that traversal was
+  not exercised; inspect `expanded`, `reached_beyond_root` and `max_distance` in
+  per-iteration metadata before using its runtime as traversal evidence.
 - `--engine both --validation` enables CPU/GPU comparison with those scope
   limits. GPU fallback is disabled, but still inspect positive GPU evidence in
   the named logs, including each graph's explicit `gpu_execution` steps.
