@@ -51,12 +51,14 @@ void write_tables(fs::path const& dir)
   REQUIRE_FALSE(r->HasError());
 }
 
-void write_config(fs::path const& yaml_path)
+void write_config(fs::path const& yaml_path, int gpus = 1)
 {
   std::ofstream f(yaml_path);
   f << "sirius:\n"
        "  topology:\n"
-       "    num_gpus: 1\n"
+       "    num_gpus: "
+    << gpus
+    << "\n"
        "  memory:\n"
        "    gpu:\n"
        "      usage_limit_fraction: 0.2\n"
@@ -176,5 +178,25 @@ TEST_CASE("one peer plans and runs like no peer, and connects to nothing",
   auto ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(ctx);
   CHECK(ctx->distributed() == nullptr);
+  REQUIRE_FALSE(con.Query("SET sirius_exchange_peers = ''")->HasError());
+}
+
+TEST_CASE("a process with two GPUs is refused as a rank before it connects",
+          "[planner][one_rank_parity][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { SKIP("Requires two visible GPUs"); }
+  pause_shared_envs();
+  sirius::test::scratch_dir scratch{"two_gpu_rank"};
+  auto const config = scratch.path() / "sirius.yaml";
+  write_config(config, 2);
+  sirius::test::shared_test_env env(config);
+  auto con = env.make_connection();
+
+  // No listener is at these ports: without the refusal the SET waits out the connect timeout.
+  REQUIRE_FALSE(
+    con.Query("SET sirius_exchange_peers = '127.0.0.1:62998,127.0.0.1:62999'")->HasError());
+  auto refused = con.Query("SET sirius_exchange_rank = 0");
+  REQUIRE(refused->HasError());
+  CHECK(refused->GetError().find("runs on one GPU, but this process has 2") != std::string::npos);
   REQUIRE_FALSE(con.Query("SET sirius_exchange_peers = ''")->HasError());
 }
