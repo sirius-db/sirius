@@ -162,7 +162,14 @@ lanes were ported from, with UCX `tcp` on bond0; this code has not been measured
 
 On a cluster with RDMA between hosts and no fabric memory, set
 `sirius_exchange_host_staging = 'never'`: direct NIXL writes over the RDMA NICs are faster than
-lanes there, and `auto` does not yet tell such a cluster from one with TCP only.
+lanes there, and `auto` does not yet tell such a cluster from one with TCP only. The launch
+scripts set `never` for the gateway's ranks when `UCX_NET_DEVICES=rails` puts UCX on the rail
+NICs, unless `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING` is set. A lane is a UCX connection, so on
+the rails it is RDMA of the host copy, not TCP. On two GB200 nodes with 4 ranks each, the fabric
+off (`[nixl_bandwidth]`, every rank to every other), `never` moved 64.8 GB/s per rank and `auto`
+33.0; with all traffic across the link both ways (`[nixl_pairs]`, 4 pairs) 380 GB/s against 277.
+One way only, `never` was 2 to 27% slower, and TPC-H at SF3000 ran the same with both (73.0
+and 73.7 s warm).
 
 ### NVLink between nodes (MNNVL)
 
