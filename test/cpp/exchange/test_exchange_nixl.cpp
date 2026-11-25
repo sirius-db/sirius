@@ -536,6 +536,7 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   REQUIRE_FALSE(error);
   // The last end this rank sent may still be queued in UCX, and nixl_fabric::release() does not
   // flush it: tearing down now could drop it and leave a slower peer waiting.
+  // TODO(#2729): drop this sleep once release() flushes queued notifications.
   lock.unlock();
   std::this_thread::sleep_for(std::chrono::seconds{2});
 }
@@ -826,5 +827,6 @@ TEST_CASE("pairs of ranks on two nodes move batches at NVLink speed", "[.][nixl_
   barrier(3);
   // The last end this rank sent may still be queued in UCX, and nixl_fabric::release() does not
   // flush it: tearing down now could drop it and leave a slower peer waiting.
+  // TODO(#2729): drop this sleep once release() flushes queued notifications.
   std::this_thread::sleep_for(std::chrono::seconds{2});
 }
