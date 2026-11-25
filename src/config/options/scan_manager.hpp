@@ -755,6 +755,11 @@ struct scan_manager_options : block_base<scan_manager_options> {
       .fallback(detail::scan_manager_defaults().reserve_rest_reactor_cpus)
       .describe("keep other thread pools off REST reactor CPUs")
       .build();
+  config_option<bool> httpfs_external_file_cache =
+    option<bool>("httpfs_external_file_cache")
+      .fallback(detail::scan_manager_defaults().httpfs_external_file_cache)
+      .describe("let DuckDB's external file cache keep bytes read through sirius_httpfs")
+      .build();
   /// Unset: the cache and the backend decide; 0 turns readahead off.
   config_option<std::size_t> max_readahead_scans =
     option<std::size_t>("max_readahead_scans")
@@ -786,6 +791,7 @@ struct scan_manager_options : block_base<scan_manager_options> {
       uring_n_reactors,
       rest_n_reactors,
       reserve_rest_reactor_cpus,
+      httpfs_external_file_cache,
       max_readahead_scans,
       readahead_strategy,
       sub("uring", uring),

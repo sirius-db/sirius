@@ -89,6 +89,17 @@ struct at_most {
   }
 };
 
+/// Accepts values at or above a limit.
+template <class T>
+struct at_least {
+  T limit;
+  [[nodiscard]] bool operator()(const T& value) const { return !(value < limit); }
+  [[nodiscard]] std::string description() const
+  {
+    return "must be at least " + formatter<T>{}(limit);
+  }
+};
+
 /// Accepts a non-empty string.
 struct non_empty {
   [[nodiscard]] bool operator()(const std::string& value) const noexcept { return !value.empty(); }

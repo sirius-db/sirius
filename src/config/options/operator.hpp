@@ -259,6 +259,19 @@ struct operator_options : block_base<operator_options> {
       .fallback(defaults().enable_exists_from_aggregate)
       .describe("drop a correlated EXISTS covered by an aggregate subquery")
       .build();
+  /// Uncached footers the footer-statistics pass reads for one scan: -1 no limit, 0 cached only.
+  config_option<std::int64_t> parquet_footer_statistics_max_remote_reads =
+    option<std::int64_t>("parquet_footer_statistics_max_remote_reads")
+      .validate(at_least<std::int64_t>{-1})
+      .fallback(defaults().parquet_footer_statistics_max_remote_reads)
+      .describe("remote Parquet footers one scan may read for statistics")
+      .build();
+  config_option<std::int64_t> parquet_footer_statistics_max_local_reads =
+    option<std::int64_t>("parquet_footer_statistics_max_local_reads")
+      .validate(at_least<std::int64_t>{-1})
+      .fallback(defaults().parquet_footer_statistics_max_local_reads)
+      .describe("local Parquet footers one scan may read for statistics")
+      .build();
 
   // -- admission
   /// 0 turns the estimate off: topology.gpus_per_query decides.
@@ -337,6 +350,8 @@ struct operator_options : block_base<operator_options> {
       enable_partial_aggregate_below_join,
       enable_subquery_key_carry,
       enable_exists_from_aggregate,
+      parquet_footer_statistics_max_remote_reads,
+      parquet_footer_statistics_max_local_reads,
       admission_bytes_per_gpu,
       avg_variable_column_bytes,
       enable_runtime_size_estimation,

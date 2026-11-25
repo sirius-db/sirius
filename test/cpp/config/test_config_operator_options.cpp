@@ -253,6 +253,8 @@ TEST_CASE("every operator option's fallback and audience", "[config][config_oper
   check(op.enable_partial_aggregate_below_join, true);
   check(op.enable_subquery_key_carry, true);
   check(op.enable_exists_from_aggregate, true);
+  check(op.parquet_footer_statistics_max_remote_reads, true);
+  check(op.parquet_footer_statistics_max_local_reads, true);
   check(op.admission_bytes_per_gpu, true);
   check(op.avg_variable_column_bytes, true);
   check(op.enable_runtime_size_estimation, true);
@@ -267,7 +269,9 @@ TEST_CASE("operator validator boundaries", "[config][config_operator]")
                             "fused_scan_index_walk_max_selectivity: 0",
                             "avg_variable_column_bytes: 0",
                             "max_sort_partition_memory_fraction: 1.5",
-                            "mark_join_build_switch_ratio: -.inf"}) {
+                            "mark_join_build_switch_ratio: -.inf",
+                            "parquet_footer_statistics_max_remote_reads: -2",
+                            "parquet_footer_statistics_max_local_reads: -2"}) {
     std::string_view const text = entry;
     INFO(text);
     REQUIRE_THAT(read_error(std::string("sirius:\n  operator_params:\n    ") + entry + "\n"),
@@ -275,6 +279,10 @@ TEST_CASE("operator validator boundaries", "[config][config_operator]")
                                              std::string(text.substr(0, text.find(':'))) +
                                              "': value out of range"));
   }
+  REQUIRE(read_error(
+            "sirius:\n  operator_params:\n    parquet_footer_statistics_max_local_reads: -2\n") ==
+          "'sirius.operator_params.parquet_footer_statistics_max_local_reads': value out of range: "
+          "'-2' (must be at least -1); local Parquet footers one scan may read for statistics");
   auto const null_batch = read("sirius:\n  operator_params:\n    scan_task_batch_size: ~\n");
   REQUIRE(null_batch.operator_params.scan_task_batch_size.is_unset());
   // Sizes reach UINT64_MAX, as the engine's fields and the UBIGINT SET options do.

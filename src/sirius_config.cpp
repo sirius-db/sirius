@@ -527,7 +527,8 @@ try {
   sm_cfg.backend                       = sm.backend.get();
   assign_if_set(sm.uring_n_reactors, sm_cfg.uring_n_reactors);
   assign_if_set(sm.rest_n_reactors, sm_cfg.rest_n_reactors);
-  sm_cfg.reserve_rest_reactor_cpus = sm.reserve_rest_reactor_cpus.get();
+  sm_cfg.reserve_rest_reactor_cpus  = sm.reserve_rest_reactor_cpus.get();
+  sm_cfg.httpfs_external_file_cache = sm.httpfs_external_file_cache.get();
   if (auto const* scans = sm.max_readahead_scans.get_if()) { sm_cfg.max_readahead_scans = *scans; }
   if (auto const* strategy = sm.readahead_strategy.get_if()) {
     sm_cfg.readahead_strategy = *strategy;
@@ -682,10 +683,14 @@ try {
   ops.enable_partial_aggregate_below_join      = op.enable_partial_aggregate_below_join.get();
   ops.enable_subquery_key_carry                = op.enable_subquery_key_carry.get();
   ops.enable_exists_from_aggregate             = op.enable_exists_from_aggregate.get();
-  ops.admission_bytes_per_gpu                  = op.admission_bytes_per_gpu.get().count();
-  ops.avg_variable_column_bytes                = op.avg_variable_column_bytes.get().count();
-  ops.enable_runtime_size_estimation           = op.enable_runtime_size_estimation.get();
-  ops.use_hw_decompression                     = op.use_hw_decompression.get();
+  ops.parquet_footer_statistics_max_remote_reads =
+    op.parquet_footer_statistics_max_remote_reads.get();
+  ops.parquet_footer_statistics_max_local_reads =
+    op.parquet_footer_statistics_max_local_reads.get();
+  ops.admission_bytes_per_gpu        = op.admission_bytes_per_gpu.get().count();
+  ops.avg_variable_column_bytes      = op.avg_variable_column_bytes.get().count();
+  ops.enable_runtime_size_estimation = op.enable_runtime_size_estimation.get();
+  ops.use_hw_decompression           = op.use_hw_decompression.get();
   // Unset batch sizes are derived from GPU memory when the configuration is resolved.
   for (auto const& setting : batch_settings) {
     if (auto const* value = batch_option(op, setting).get_if()) {

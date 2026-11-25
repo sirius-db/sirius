@@ -152,9 +152,9 @@ std::string describe(const sirius::sirius_config& c, bool in_effect = false)
   describe_pool(d, "scan_manager", sm.thread_pool);
   d("sm.backend", sm.backend)("sm.uring_reactors", sm.uring_n_reactors)(
     "sm.rest_reactors", sm.rest_n_reactors)("sm.reserve", sm.reserve_rest_reactor_cpus)(
-    "sm.startup", sm.startup_cpus)("sm.worker_startup", sm.worker_startup_cpus)(
-    "sm.readahead", sm.max_readahead_scans)("sm.strategy", sm.readahead_strategy)(
-    "sm.width", sm.pipeline_width);
+    "sm.efc", sm.httpfs_external_file_cache)("sm.startup", sm.startup_cpus)(
+    "sm.worker_startup", sm.worker_startup_cpus)("sm.readahead", sm.max_readahead_scans)(
+    "sm.strategy", sm.readahead_strategy)("sm.width", sm.pipeline_width);
   auto const& u = sm.uring;
   d("uring.scans", u.n_max_concurrent_scans);
   if (!in_effect) { d("uring.explicit", u.n_max_concurrent_scans_explicit); }
@@ -257,8 +257,11 @@ std::string describe(const sirius::sirius_config& c, bool in_effect = false)
     "op.unique_bytes", o.unique_exact_max_bytes)("op.dense", o.enable_dense_count_join)(
     "op.delim", o.enable_delim_aggregate_reuse)("op.minmax", o.enable_exists_minmax_rewrite)(
     "op.partial", o.enable_partial_aggregate_below_join)("op.carry", o.enable_subquery_key_carry)(
-    "op.exists", o.enable_exists_from_aggregate)("op.dense_bytes", o.dense_count_join_max_bytes)(
-    "op.dense_fraction", o.dense_count_join_memory_fraction)(
+    "op.exists", o.enable_exists_from_aggregate)("op.footer_remote",
+                                                 o.parquet_footer_statistics_max_remote_reads)(
+    "op.footer_local", o.parquet_footer_statistics_max_local_reads)(
+    "op.dense_bytes", o.dense_count_join_max_bytes)("op.dense_fraction",
+                                                    o.dense_count_join_memory_fraction)(
     "op.admission", o.admission_bytes_per_gpu)("op.var_bytes", o.avg_variable_column_bytes);
 
   auto const& tel = c.get_telemetry_config();
@@ -463,6 +466,7 @@ TEST_CASE("every key of a configuration reaches its runtime field", "[config][co
   CHECK(sm.uring_n_reactors == 3);
   CHECK(sm.rest_n_reactors == 6);
   CHECK_FALSE(sm.reserve_rest_reactor_cpus);
+  CHECK(sm.httpfs_external_file_cache);
   CHECK(sm.max_readahead_scans == 5);
   CHECK(sm.readahead_strategy == sirius::scan_manager::prefetch_strategy::opportunistic);
 
@@ -612,6 +616,8 @@ TEST_CASE("every key of a configuration reaches its runtime field", "[config][co
   CHECK_FALSE(o.enable_partial_aggregate_below_join);
   CHECK(o.enable_subquery_key_carry);
   CHECK(o.enable_exists_from_aggregate);
+  CHECK(o.parquet_footer_statistics_max_remote_reads == 64);
+  CHECK(o.parquet_footer_statistics_max_local_reads == -1);
   CHECK(o.admission_bytes_per_gpu == 4 * GiB);
   CHECK(o.avg_variable_column_bytes == 48);
   CHECK(o.enable_runtime_size_estimation);

@@ -77,6 +77,7 @@ TEST_CASE("absent scan manager blocks take today's defaults", "[config][config_s
 
   REQUIRE(sm.backend.get() == sirius::scan_manager::io_backend::native);
   REQUIRE(sm.reserve_rest_reactor_cpus.get());
+  REQUIRE_FALSE(sm.httpfs_external_file_cache.get());
   REQUIRE(sm.uring.slices_per_pass.get() == 4);
   REQUIRE(sm.uring.range_batch_slices.get() == 8);
   REQUIRE(sm.rest.request_timeout.get() == 30s);
@@ -493,4 +494,5 @@ TEST_CASE("scan manager fallbacks equal the runtime defaults", "[config][config_
           runtime.preparation.interrupt_check_interval);
   REQUIRE(sm.backend.get() == runtime.backend);
   REQUIRE(sm.reserve_rest_reactor_cpus.get() == runtime.reserve_rest_reactor_cpus);
+  REQUIRE(sm.httpfs_external_file_cache.get() == runtime.httpfs_external_file_cache);
 }

@@ -34,6 +34,7 @@ sirius:
       uring_n_reactors: 3
       rest_n_reactors: 6
       reserve_rest_reactor_cpus: false
+      httpfs_external_file_cache: true
       max_readahead_scans: 5
       readahead_strategy: opportunistic
       uring:
@@ -181,6 +182,8 @@ sirius:
     enable_partial_aggregate_below_join: false
     enable_subquery_key_carry: true
     enable_exists_from_aggregate: true
+    parquet_footer_statistics_max_remote_reads: 64
+    parquet_footer_statistics_max_local_reads: -1
     admission_bytes_per_gpu: 4GiB
     avg_variable_column_bytes: 48
     enable_runtime_size_estimation: true
