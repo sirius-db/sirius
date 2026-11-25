@@ -31,7 +31,10 @@ are listed beside the right ones, so a failure says which rule broke:
   iceberg_v2_eq_v1_data_manifest    The partitioned table as an upgraded table carries it: format
                                     version 1 wrote the data manifest, which has no `content`
                                     field and no sequence numbers. A reader that needs `content`
-                                    cannot plan the partition-scoped delete.
+                                    cannot plan the partition-scoped delete. The manifest has no
+                                    bounds fields either, while the delete in partition A records
+                                    bounds: a reader that asks the manifest for them by name
+                                    fails that query and the reads after it.
   iceberg_v2_eq_float_partition     Data files in partitions -0.0, +0.0 and 1.5 of a float field,
                                     and two sibling snapshots. A delete stored in 1.5 is applied
                                     on the GPU. A delete stored in +0.0 is declined: DuckDB takes
@@ -574,8 +577,17 @@ def build_partitioned(name="iceberg_v2_eq_partitioned", v1_data_manifest=False):
         [[(1, "id", "long"), (2, "region", "string"), (3, "v", "long")]],
         [spec, []],
     )
+    in_a_metrics = None
     if v1_data_manifest:
+        # Written before the table recorded bounds, while the delete in partition A records them.
         t.v1_manifests.add("m-data-1.avro")
+        t.bare_manifests.add("m-data-1.avro")
+        one = struct.pack("<q", 1)
+        in_a_metrics = {
+            "lower_bounds": {1: one},
+            "upper_bounds": {1: one},
+            "null_value_counts": {1: 0},
+        }
 
     def data(region, values):
         return t.parquet(
@@ -605,7 +617,14 @@ def build_partitioned(name="iceberg_v2_eq_partitioned", v1_data_manifest=False):
     in_a = t.parquet("delete-eq-2-A.parquet", [(1, "id", pa.int64(), [1])])
     t.commit(
         "delete",
-        [("m-delete-2.avro", 1, 0, [(1, None, in_a, 2, {"region": "A"}, [1])])],
+        [
+            (
+                "m-delete-2.avro",
+                1,
+                0,
+                [(1, None, in_a, 2, {"region": "A"}, [1], in_a_metrics)],
+            )
+        ],
     )
     everywhere = t.parquet("delete-eq-3-global.parquet", [(1, "id", pa.int64(), [2])])
     t.commit(

@@ -1850,7 +1850,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
     INFO("a data manifest written by format version 1");
     // The table of "respect partitions" as an upgraded table carries it: the data manifest has
     // no `content` field and no sequence numbers. A reader that needs `content` cannot plan the
-    // partition-scoped delete and declines.
+    // partition-scoped delete and declines. It has no bounds fields either, while the delete in
+    // partition A records bounds: asking the manifest for them by name fails that query, aborts
+    // the transaction and declines.
     auto path = table("iceberg_v2_eq_v1_data_manifest");
     require_delete_files(path, 2);
     expect_equality_rows("SELECT id, region, v FROM " + pinned_scan(path) + " ORDER BY v;",
