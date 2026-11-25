@@ -2466,7 +2466,9 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   auto reason = GENERATE(
     sm::stop_reason::normal_eos, sm::stop_reason::user_cancel, sm::stop_reason::failure_induced);
   auto read_fails = GENERATE(false, true);
+  CAPTURE(kind, static_cast<int>(reason), read_fails);
   sirius::test::preparation::hold reading;
+  std::atomic<bool> read_wait_failed{false};
   std::atomic<int> failures{0};
   auto pull     = std::make_shared<pull_producer>();
   pull->rows    = {3, 3};
@@ -2479,9 +2481,15 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
          : std::static_pointer_cast<arrow_batch_producer>(pull);
   harness h(counters, producer, program);
   int allocations = 0;
+  constexpr auto late_read_error = "read failed after stop";
   auto pause      = [&] {
-    reading.wait();
-    if (read_fails) throw std::runtime_error("read failed after stop");
+    try {
+      reading.wait();
+    } catch (...) {
+      read_wait_failed = true;
+      throw;
+    }
+    if (read_fails) throw std::runtime_error(late_read_error);
   };
   pull->before_next = [&] {
     if (pull->calls == 2) pause();
@@ -2536,8 +2544,13 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
       std::lock_guard lock(reading.mutex);
       entered = reading.entered;
     }
-    if (entered || completion.has_error()) break;
+    // The second read can enter while the first batch is still queued for publication.
+    // Make the first commit part of the fixture before stopping the in-flight read.
+    if ((entered && publications.load() != 0) || completion.has_error()) break;
   }
+  auto const publications_before_stop = publications.load();
+  auto const error_before_stop        = completion.has_error();
+  CAPTURE(entered, publications_before_stop, error_before_stop);
   if (reason == sm::stop_reason::failure_induced)
     completion.report_error(std::make_exception_ptr(std::runtime_error("original failure")));
   coordinator.request_stop(reason);
@@ -2546,6 +2559,10 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   q->cancel();
   if (submitting.valid()) submitting.get();
   REQUIRE(entered);
+  // Only the release after request_stop may end the held read.
+  CHECK_FALSE(read_wait_failed.load());
+  CHECK_FALSE(error_before_stop);
+  CHECK(publications_before_stop == 1);
   CHECK(publications == 1);
   CHECK(completion.has_error() == (read_fails || reason != sm::stop_reason::normal_eos));
   if (reason == sm::stop_reason::user_cancel)
@@ -2558,6 +2575,20 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   CHECK(h.ledger->permits_in_flight() == 0);
   CHECK(h.ledger->tracked_units() == 0);
   CHECK(h.backing.seen->allocated_bytes == 0);
+  if (reason == sm::stop_reason::normal_eos && read_fails) {
+    auto terminal = completion.terminal_error();
+    REQUIRE(terminal);
+    if (push) {
+      try {
+        std::rethrow_exception(terminal);
+      } catch (sm::preparation_resource_error const& error) {
+        CHECK_FALSE(error.bound_exceeded);
+        terminal = error.original;
+      }
+      REQUIRE(terminal);
+    }
+    CHECK_THROWS_WITH(std::rethrow_exception(terminal), late_read_error);
+  }
 }
 
 TEST_CASE("Arrow independent cancellation survives a later coordinator normal stop",
