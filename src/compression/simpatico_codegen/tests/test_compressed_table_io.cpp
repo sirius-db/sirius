@@ -105,7 +105,7 @@ void io_roundtrip(char const* label,
     file.seekg(4);
     char version = 0;
     file.read(&version, 1);
-    expect(version == 15, "file version is independent of codec and nvCOMP build");
+    expect(version == 16, "file version is independent of codec and nvCOMP build");
   }
 
   // Metadata survives.
@@ -776,7 +776,7 @@ void test_nvcomp_payload_compatibility()
       bool const matches     = format == (NVCOMP_VER_MAJOR >= 6 ? 6 : 5);
       bool const unavailable = cascaded && NVCOMP_VER_MAJOR >= 6;
       if (matches && !unavailable) continue;
-      std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', 15};
+      std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', 16};
       auto append = [&](std::uint64_t value, int bytes) {
         for (int i = 0; i < bytes; ++i)
           header.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
@@ -1104,10 +1104,10 @@ void test_validity_header_integrity()
 void test_decimal128_bitpack_roundtrip()
 {
   auto t = make_decimal128_table(1, 4096, 17);
-  io_roundtrip("decimal128_bitpack", t->view(), "input -> bitpack\n");
+  io_roundtrip("decimal128_bitpack", t->view(), "input -> bitpack_gcd\n");
   // The spill path stages through build_compressed_table_header, not the file
   // writer, so cover that seam too.
-  memory_roundtrip("decimal128_bitpack_memory", t->view(), "input -> bitpack\n");
+  memory_roundtrip("decimal128_bitpack_memory", t->view(), "input -> bitpack_gcd\n");
 }
 
 // An identity leaf keeps its column's type, so a decimal read back must be rebuilt
@@ -1128,10 +1128,10 @@ void test_decimal128_bitpack_named_channels()
   auto t = make_decimal128_table(1, 4096, 19);
   io_roundtrip("decimal128_bitpack_named",
                t->view(),
-               "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+               "input -> bitpack_gcd -> chunk_min, chunk_count, chunk_bits, packed\n");
   memory_roundtrip("decimal128_bitpack_named_memory",
                    t->view(),
-                   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+                   "input -> bitpack_gcd -> chunk_min, chunk_count, chunk_bits, packed\n");
 }
 
 // Trees with a Bitpack or an Rle are measured and then packed straight into place, Raw
@@ -1146,6 +1146,7 @@ void test_measured_encode_roundtrip()
   tables.push_back(make_decimal128_table(1, rows, 7));
   std::string const plans[] = {
     "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> bitpack_gcd -> chunk_min, chunk_count, chunk_bits, packed\n",
     "input -> delta -> differences\n"
     "delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
     "input -> delta -> differences\n"

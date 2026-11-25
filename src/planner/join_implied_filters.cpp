@@ -24,6 +24,7 @@
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "log/logging.hpp"
 #include "planner/scan_column_origin.hpp"
+#include "planner/scan_source_names.hpp"
 
 #include <algorithm>
 #include <memory>
@@ -59,9 +60,11 @@ std::optional<key_column> footer_key_column(duckdb::LogicalOperator const& child
   if (column >= get.names.size() || column >= get.returned_types.size()) { return std::nullopt; }
   auto const& type = get.returned_types[column];
   if (!type.IsIntegral()) { return std::nullopt; }
-  auto statistics = bind->file_options.GetColumnStatistics(get.names[column], type);
+  // Footer statistics are kept under the bound name, which a column alias does not change.
+  duckdb::Identifier const name(scan_source_names(get)[column]);
+  auto statistics = bind->file_options.GetColumnStatistics(name, type);
   if (!statistics || !duckdb::NumericStats::HasMinMax(*statistics)) { return std::nullopt; }
-  return key_column{&get, duckdb::ProjectionIndex(index), get.names[column], std::move(statistics)};
+  return key_column{&get, duckdb::ProjectionIndex(index), name, std::move(statistics)};
 }
 
 struct key_range {

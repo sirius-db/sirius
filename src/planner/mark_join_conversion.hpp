@@ -31,7 +31,7 @@ namespace sirius::planner {
 /// Turn `FILTER(mark)` over a MARK join into a SEMI join, and `FILTER(NOT mark)` into an ANTI join,
 /// on Sirius's own copy of the logical plan (never the plan DuckDB executes on fallback).
 ///
-/// Why: with `delim_join_as_cte = true`, DuckDB wraps joins in identity projections that still
+/// Why: DuckDB's delim-to-CTE rewrite wraps joins in identity projections that still
 /// reference the mark column when its filter pushdown runs, so its own MARK-to-SEMI/ANTI conversion
 /// is switched off (`convert_mark_to_semi = false`). Column pruning drops those references later,
 /// but nothing re-enables the conversion. A MARK join cannot publish a dynamic filter; a SEMI join
@@ -61,9 +61,8 @@ namespace sirius::planner {
 /// plus a positional-consumer guard: every operator between the filter and the next projection or
 /// aggregate must address its input by binding, so dropping the (last) mark column shifts nothing.
 ///
-/// Acts only when `delim_join_as_cte` is true, the setting under which the CTE rewrite adds those
-/// projections, whether or not the delim CTE is still in the plan; under `false` the plan is
-/// returned untouched.
+/// Acts whether or not the delim CTE is still in the plan: DuckDB may inline the CTE later and
+/// keep the projections.
 ///
 /// Must run before column-binding resolution. Returns the number of joins converted.
 std::size_t convert_mark_joins(duckdb::ClientContext& context,

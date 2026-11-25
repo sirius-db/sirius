@@ -20,7 +20,8 @@
 #include <cudf/types.hpp>
 
 #include <rmm/aligned.hpp>
-#include <rmm/cuda_stream_view.hpp>
+
+#include <cuda/stream_ref>
 
 #include <cucascade/memory/column_metadata.hpp>
 
@@ -108,7 +109,7 @@ constexpr std::size_t stream_alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
  *         STRING.
  */
 [[nodiscard]] std::vector<cucascade::memory::column_metadata> plan_stream(
-  cudf::table_view const& table, rmm::cuda_stream_view stream, std::size_t& stream_bytes);
+  cudf::table_view const& table, ::cuda::stream_ref stream, std::size_t& stream_bytes);
 
 /// The device address of each of @p table's buffers in walk order, matching
 /// stream_map(@p columns), where @p columns is plan_stream(@p table).

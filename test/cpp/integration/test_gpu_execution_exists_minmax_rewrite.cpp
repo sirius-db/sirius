@@ -71,12 +71,9 @@ class ExistsMinmaxRewriteFixture : public sirius::test::GpuExecutionFixture {
   }
 
   // The CPU answer is @p expected; the rewritten GPU plan, which normal SQL must select, and the
-  // unrewritten one both match it, under both of DuckDB's representations of the delim join.
-  // With `delim_join_as_cte`, DuckDB keeps some shapes as MARK joins over a CTE, which the rewrite
-  // leaves alone; @p rewritten_as_cte requires the rewrite there too.
-  void compare_rewritten_and_not(std::string const& query,
-                                 rows expected,
-                                 bool rewritten_as_cte = false)
+  // unrewritten one both match it. DuckDB keeps some shapes as MARK joins over a CTE, which the
+  // rewrite leaves alone; @p rewritten requires the rewrite to fire.
+  void compare_rewritten_and_not(std::string const& query, rows expected, bool rewritten = false)
   {
     INFO(query);
     run_ok("SET gpu_execution = false;");
@@ -85,17 +82,13 @@ class ExistsMinmaxRewriteFixture : public sirius::test::GpuExecutionFixture {
     REQUIRE_FALSE(cpu->HasError());
     std::sort(expected.begin(), expected.end());
     REQUIRE(collect_rows(*cpu) == expected);
-    for (bool const as_cte : {false, true}) {
-      CAPTURE(as_cte);
-      sirius::test::scoped_sirius_setting representation{*con, "delim_join_as_cte", as_cte};
-      auto before = sirius::test::get_transparent_execution_stats(*con).exists_minmax_rewrites;
-      compare_gpu_vs_cpu(query);
-      auto after = sirius::test::get_transparent_execution_stats(*con).exists_minmax_rewrites;
-      if (!as_cte || rewritten_as_cte) { CHECK(after > before); }
-      sirius::test::scoped_sirius_setting off{*con, "enable_exists_minmax_rewrite", false};
-      compare_gpu_vs_cpu(query);
-      CHECK(sirius::test::get_transparent_execution_stats(*con).exists_minmax_rewrites == after);
-    }
+    auto before = sirius::test::get_transparent_execution_stats(*con).exists_minmax_rewrites;
+    compare_gpu_vs_cpu(query);
+    auto after = sirius::test::get_transparent_execution_stats(*con).exists_minmax_rewrites;
+    if (rewritten) { CHECK(after > before); }
+    sirius::test::scoped_sirius_setting off{*con, "enable_exists_minmax_rewrite", false};
+    compare_gpu_vs_cpu(query);
+    CHECK(sirius::test::get_transparent_execution_stats(*con).exists_minmax_rewrites == after);
   }
 
   std::optional<sirius::test::scoped_sirius_setting> enable_guard;

@@ -80,13 +80,6 @@ ColumnBinding binding_of(Expression const& expression)
   return expression.Cast<duckdb::BoundColumnRefExpression>().Binding();
 }
 
-bool contains_delim_get(LogicalOperator const& op)
-{
-  if (op.type == LogicalOperatorType::LOGICAL_DELIM_GET) { return true; }
-  return std::ranges::any_of(op.children,
-                             [](auto const& child) { return contains_delim_get(*child); });
-}
-
 duckdb::column_binding_set_t outputs_of(LogicalOperator& op)
 {
   auto const bindings = op.GetColumnBindings();
@@ -448,7 +441,6 @@ std::optional<pushdown> match(duckdb::ClientContext& context,
   auto const& under = result.path.back();
   auto& source      = *under.join->children[under.side];
 
-  if (contains_delim_get(aggregate)) { return decline("it is part of a correlated subquery"); }
   if (already_grouped(source)) { return decline("its input is already grouped"); }
 
   // The pushed aggregate groups by every column of its input that is read above it: by the joins

@@ -213,8 +213,16 @@ std::unique_ptr<node> translate_cast(duckdb::BoundFunctionExpression const& expr
     }
   }
 
+  // An equal-type cast bound to anything but a no-op, such as a JSON parse whose result type a
+  // COLLATE replaced, has no GPU equivalent.
+  auto const same_type = source_type == target_type;
+  if (same_type && !duckdb::BoundCastExpression::GetBoundCast(expr).IsNopCast()) { return nullptr; }
+
   auto child = from_duckdb(duckdb::BoundCastExpression::Child(expr));
   if (!child) { return nullptr; }
+  // DuckDB can wrap a literal in a no-op cast. Returning the child keeps that literal a constant
+  // for handlers that require one, such as a LIKE pattern.
+  if (same_type) { return child; }
   return std::make_unique<node>(cast{
     /*child=*/std::move(child),
     /*target_type=*/sirius::from_duckdb(target_type),

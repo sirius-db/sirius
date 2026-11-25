@@ -54,6 +54,11 @@ retaining providers and buffers for downstream consumers. This is separate from 
 
 ## Retirement
 
+Before submitting GPU work, the engine retains completion startup ownership through query
+creation and scan preparation startup. Startup records any exception before releasing that
+ownership. Normal GPU EOS and preparation retirement cannot publish success while it is held,
+including when a failed cached-worker wrap releases the last external preparation user.
+
 Logical completion may precede the final callback. `SiriusContext::retire_query_work()` is the
 shared coordinator used by engine completion/error handling, engine destruction and execution
 window cleanup. It keeps ownership intact while settling borrowers. The private

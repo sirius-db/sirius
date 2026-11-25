@@ -44,6 +44,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/query_context.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/database.hpp>
@@ -65,6 +66,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -195,6 +197,17 @@ pinned_segment_bytes extract_constant_bytes(duckdb::BaseStatistics const& stats,
 // so byte_offset never splits across chunks.
 //===----------------------------------------------------------------------===//
 
+// DuckDB v2.0.1 attributes the scan state's buffer pin to a query; v2.0.0 takes only the segment.
+template <class State = duckdb::roaring::RoaringScanState>
+State make_roaring_scan_state(duckdb::ColumnSegment& segment)
+{
+  if constexpr (std::is_constructible_v<State, duckdb::ColumnSegment&>) {
+    return State(segment);
+  } else {
+    return State(duckdb::QueryContext(), segment);
+  }
+}
+
 pinned_segment_bytes decode_roaring_validity(duckdb::DatabaseInstance& db,
                                              duckdb::BlockManager& block_manager,
                                              duckdb_segment_descriptor const& desc)
@@ -214,7 +227,7 @@ pinned_segment_bytes decode_roaring_validity(duckdb::DatabaseInstance& db,
   std::size_t const words = (row_count + 63) / 64;
   out.owned_bytes.assign(words * sizeof(uint64_t), 0xff);
 
-  duckdb::roaring::RoaringScanState rs(*seg);
+  auto rs = make_roaring_scan_state(*seg);
   duckdb::ValidityMask vm(CHUNK);
 
   for (duckdb::idx_t scanned = 0; scanned < row_count; scanned += CHUNK) {
