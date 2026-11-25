@@ -18,9 +18,9 @@
 #include "op/scan/arrow/arrow_input_copy.hpp"
 #include "op/scan/paimon/paimon_batch_cursor.hpp"
 namespace sirius::op::scan {
-// The factory must own separately admitted native planning/read resources and remain
-// on the native lane. Its pool-only/all-native qualification is not established here.
-// This producer charges detached Arrow data/staging and uses the shared driver's gate.
+// The factory owns separately admitted native planning and read resources. It opens
+// on the native lane. The producer charges detached Arrow data and staging.
+// Bind with arrow_import_binding::emit_empty_source = false for native EOF.
 class paimon_arrow_producer final : public arrow_batch_producer {
  public:
   using read_factory =

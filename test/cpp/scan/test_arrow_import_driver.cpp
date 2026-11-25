@@ -3065,7 +3065,7 @@ TEST_CASE("Paimon snapshot budget refusal aborts Arrow preparation before public
   program.input_types = program.output_types;
   auto producer =
     std::make_shared<paimon_arrow_producer>(program, arrow_copy_limits{1, 8192, 8192}, open);
-  harness h(producer, program);
+  harness h(producer, program, false);
   try {
     (void)h.next();
     FAIL("snapshot budget refusal completed Arrow preparation");
@@ -3086,13 +3086,29 @@ TEST_CASE("Paimon row-kind must be a live plain leaf before any copy", "[paimon_
   auto script     = std::make_shared<native_read_script>();
   script->batches = {input};
   auto producer   = scripted_paimon(script);
-  harness h(producer);
+  harness h(producer, integer_program(), false);
   CHECK_THROWS(h.next());
   CHECK(input->releases == 2);
   CHECK(h.backing.seen->allocations == 0);
   CHECK_THROWS(h.next());
   CHECK(script->reads == 1);
   producer->close();
+  CHECK(h.ledger->tracked_units() == 0);
+}
+
+TEST_CASE("Paimon producer checks its own row budget before inspecting row kinds",
+          "[paimon_kind_profile]")
+{
+  auto input      = std::make_shared<native_kind_tree>(-1);
+  input->kinds[0] = 3;
+  auto script     = std::make_shared<native_read_script>();
+  script->batches = {input};
+  // The cursor allows three rows, while this producer admits only one.
+  harness h(scripted_paimon(script, {1, 8192, 8192}), integer_program(), false);
+  CHECK_THROWS_WITH(h.next(), "Paimon batch exceeds its declared row bound");
+  CHECK(script->reads == 1);
+  CHECK(input->releases == 2);
+  CHECK(h.backing.seen->allocations == 0);
   CHECK(h.ledger->tracked_units() == 0);
 }
 
@@ -3365,7 +3381,7 @@ TEST_CASE("Paimon native lane detaches roots before GPU import and cancellation 
   };
   auto producer = std::make_shared<paimon_arrow_producer>(
     program, arrow_copy_limits{1, 8192, 8192}, std::move(open));
-  harness h(producer, program);
+  harness h(producer, program, false);
   auto manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   rmm::cuda_stream stream;
@@ -3373,6 +3389,8 @@ TEST_CASE("Paimon native lane detaches roots before GPU import and cancellation 
   sirius::exec::scoped_dispatcher dispatcher(pool);
   sirius::pipeline::completion_handler completion;
   sm::native_reader_executor readers(1, 1);
+  std::vector<int64_t> actual;
+  std::atomic<unsigned> stop_requests{0};
   sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1}, &readers);
   auto lane = h.driver->make_preparation_source({});
   REQUIRE(lane.execution == sm::preparation_execution_domain::native_reader);
@@ -3388,7 +3406,6 @@ TEST_CASE("Paimon native lane detaches roots before GPU import and cancellation 
     auto bytes = input->preparation_bytes();
     return sirius::test::preparation::make_publication(std::move(input), bytes);
   };
-  std::vector<int64_t> actual;
   coordinator.after_publication_for_testing([&](auto, auto const& input, auto) {
     auto result = h.driver->materialize_metadata_to_table(*input, *space, stream);
     auto n      = result.table.num_rows();
@@ -3401,9 +3418,12 @@ TEST_CASE("Paimon native lane detaches roots before GPU import and cancellation 
                             stream.value()) == cudaSuccess);
     stream.synchronize();
   });
-  if (stopped)
-    coordinator.before_publication_for_testing(
-      [&] { coordinator.request_stop(sm::stop_reason::user_cancel); });
+  if (stopped) {
+    coordinator.before_publication_for_testing([&] {
+      ++stop_requests;
+      coordinator.request_stop(sm::stop_reason::user_cancel);
+    });
+  }
   coordinator.add_source(std::move(source));
   h.driver->preflight_for_query();
   coordinator.arm();
@@ -3420,10 +3440,15 @@ TEST_CASE("Paimon native lane detaches roots before GPU import and cancellation 
   REQUIRE(finished);
   if (!stopped && completion.terminal_error()) std::rethrow_exception(completion.terminal_error());
   std::sort(actual.begin(), actual.end());
-  if (stopped)
+  if (stopped) {
+    CHECK(stop_requests == 1);
+    auto error = completion.terminal_error();
+    REQUIRE(error);
+    CHECK_THROWS_AS(std::rethrow_exception(error), duckdb::InterruptException);
     REQUIRE(actual.empty());
-  else
+  } else {
     REQUIRE(actual == std::vector<int64_t>{1, 1, 2});
+  }
   REQUIRE(h.profiles->counters->arrow_batches_imported == (stopped ? 0 : 3));
   REQUIRE(native_pool->CurrentUsage() == 0);
   REQUIRE(h.backing.seen->allocated_bytes == 0);

@@ -42,6 +42,8 @@ std::shared_ptr<owned_arrow_batch> detach(ArrowSchema const& schema,
                                           arrow_copy_limits const& bounds,
                                           admitted_arrow_input admitted)
 {
+  if (array.length > bounds.max_rows)
+    throw std::invalid_argument("Paimon batch exceeds its declared row bound");
   auto fields = program.input_types->size();
   if (!schema.format || std::strcmp(schema.format, "+s") || array.offset || array.null_count ||
       schema.n_children != static_cast<int64_t>(fields + 1) ||
