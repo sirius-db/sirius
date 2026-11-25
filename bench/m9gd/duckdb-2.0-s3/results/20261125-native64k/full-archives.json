@@ -1,0 +1,94 @@
+{
+  "sf10000-initial": {
+    "bytes": 188702077,
+    "complete": false,
+    "exit_code": 1,
+    "files": 253,
+    "iteration_coverage": [
+      {
+        "available_sum_s": 5265.8942910099995,
+        "iteration": 1,
+        "queries": 21,
+        "sum_s": null
+      },
+      {
+        "available_sum_s": 3575.3227716359984,
+        "iteration": 2,
+        "queries": 20,
+        "sum_s": null
+      }
+    ],
+    "measurements": 41,
+    "path": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000-full-results-native64.tar.gz",
+    "payload_bytes": 711014101,
+    "sha256": "f1ef0f28f2c3e30fcb728fe8abbcb64392abb5581282945e1353d8ef03832fc9"
+  },
+  "sf10000-q12-256gib": {
+    "bytes": 51472,
+    "complete": true,
+    "files": 33,
+    "measurements": 2,
+    "path": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-q12-256gib-20261125/results.tar.gz",
+    "sha256": "fa74c70896ec3b8b15767a37f911308111c82b002e5a9148d47201d85cc8c77c",
+    "totals": [
+      {
+        "available_sum_s": 231.05990769400523,
+        "iteration": 1,
+        "queries": 1,
+        "sum_s": 231.05990769400523
+      },
+      {
+        "available_sum_s": 57.27093342500302,
+        "iteration": 2,
+        "queries": 1,
+        "sum_s": 57.27093342500302
+      }
+    ]
+  },
+  "sf10000-q8-q12-retry": {
+    "bytes": 52481,
+    "complete": false,
+    "files": 39,
+    "measurements": 2,
+    "path": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-retry-20261125/results.tar.gz",
+    "sha256": "4b7d3701c1417a18de5279d52c332a363dd66e5cf3dd076179877b0a0c225623",
+    "totals": [
+      {
+        "available_sum_s": 290.9488425899981,
+        "iteration": 1,
+        "queries": 1,
+        "sum_s": null
+      },
+      {
+        "available_sum_s": 155.45469513399803,
+        "iteration": 2,
+        "queries": 1,
+        "sum_s": null
+      }
+    ]
+  },
+  "sf3000-initial": {
+    "bytes": 63321162,
+    "complete": true,
+    "exit_code": 0,
+    "files": 257,
+    "iteration_coverage": [
+      {
+        "available_sum_s": 1241.309344422,
+        "iteration": 1,
+        "queries": 22,
+        "sum_s": 1241.309344422
+      },
+      {
+        "available_sum_s": 325.1664124440001,
+        "iteration": 2,
+        "queries": 22,
+        "sum_s": 325.1664124440001
+      }
+    ],
+    "measurements": 44,
+    "path": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf3000-full-results-native64.tar.gz",
+    "payload_bytes": 225704953,
+    "sha256": "344974d0a7c6fd27a54272a514c133f3912bd994c63b32a7cb7914b587d04f12"
+  }
+}

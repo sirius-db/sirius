@@ -1,0 +1,74 @@
+{
+  "cmake_cache_sha256": "6503e047fccca3a7b26e94ae6cd19d9a46f6d2f6a7985c43567747905b4bcf19",
+  "compile_commands_sha256": "d7072d89ae5ac5ec06fec1b41fbf9c09d8254827a005d98759a3c52b21a5f7fc",
+  "compiler": "g++ (GCC) 11.5.0 20240719 (Red Hat 11.5.0-5)",
+  "execution_compile_samples": [
+    {
+      "command": "/usr/bin/g++ -DDUCKDB -DDUCKDB_BUILD_LIBRARY -DDUCKDB_HAVE_FDATASYNC=1 -DDUCKDB_MAIN_LIBRARY -DDUCKDB_MAJOR_VERSION=2 -DDUCKDB_MINOR_VERSION=0 -DDUCKDB_PATCH_VERSION=0 -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/src/include -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/fsst -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/fmt/include -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/hyperloglog -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/fastpforlib -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/skiplist -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/ska_sort -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/fast_float -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/re2 -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/miniz -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/utf8proc/include -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/concurrentqueue -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/pcg -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/pdqsort -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/tdigest -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/mbedtls/include -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/httplib -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/jaro_winkler -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/vergesort -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/yyjson/include -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/zstd/include -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/jemalloc/include  -mcpu=native -DDUCKDB_ENABLE_JEMALLOC -O3 -DNDEBUG -ffunction-sections -fdata-sections -O3 -DNDEBUG   -std=c++17 -fPIC -o duckdb/src/execution/CMakeFiles/duckdb_execution.dir/ub_duckdb_execution.cpp.o -c /mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/build/cpython-311/duckdb/src/execution/ub_duckdb_execution.cpp",
+      "directory": "/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/build/cpython-311",
+      "file": "/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/build/cpython-311/duckdb/src/execution/ub_duckdb_execution.cpp",
+      "output": "/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/build/cpython-311/duckdb/src/execution/CMakeFiles/duckdb_execution.dir/ub_duckdb_execution.cpp.o"
+    },
+    {
+      "command": "/usr/bin/g++ -DDUCKDB -DDUCKDB_BUILD_LIBRARY -DDUCKDB_HAVE_FDATASYNC=1 -DDUCKDB_MAIN_LIBRARY -DDUCKDB_MAJOR_VERSION=2 -DDUCKDB_MINOR_VERSION=0 -DDUCKDB_PATCH_VERSION=0 -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/src/include -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/fsst -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/fmt/include -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/hyperloglog -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/fastpforlib -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/skiplist -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/ska_sort -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/fast_float -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/re2 -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/miniz -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/utf8proc/include -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/concurrentqueue -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/pcg -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/pdqsort -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/tdigest -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/mbedtls/include -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/httplib -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/jaro_winkler -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/vergesort -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/yyjson/include -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/zstd/include -I/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/external/duckdb/third_party/jemalloc/include  -mcpu=native -DDUCKDB_ENABLE_JEMALLOC -O3 -DNDEBUG -ffunction-sections -fdata-sections -O3 -DNDEBUG   -std=c++17 -fPIC -o duckdb/src/execution/expression_executor/CMakeFiles/duckdb_expression_executor.dir/ub_duckdb_expression_executor.cpp.o -c /mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/build/cpython-311/duckdb/src/execution/expression_executor/ub_duckdb_expression_executor.cpp",
+      "directory": "/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/build/cpython-311",
+      "file": "/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/build/cpython-311/duckdb/src/execution/expression_executor/ub_duckdb_expression_executor.cpp",
+      "output": "/mnt/nvme/builds/duckdb-native64k-20261125/duckdb-python/build/cpython-311/duckdb/src/execution/expression_executor/CMakeFiles/duckdb_expression_executor.dir/ub_duckdb_expression_executor.cpp.o"
+    }
+  ],
+  "kernel": "6.12.115-native64k-exp-20261125",
+  "module_bytes": 59720072,
+  "module_elf_loads": [
+    "  LOAD           0x000000 0x0000000000000000 0x0000000000000000 0x845da8 0x845da8 R   0x10000",
+    "  LOAD           0x850000 0x0000000000850000 0x0000000000850000 0x2711e48 0x2711e48 R E 0x10000",
+    "  LOAD           0x2f70000 0x0000000002f70000 0x0000000002f70000 0x8c45fc 0x8c45fc R   0x10000",
+    "  LOAD           0x38350a0 0x00000000038450a0 0x00000000038450a0 0x0be7d0 0x151650 RW  0x10000"
+  ],
+  "module_path": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/native-venv/lib64/python3.11/site-packages/_duckdb.cpython-311-aarch64-linux-gnu.so",
+  "module_sha256": "50f4434f90be08ac3d188ad895b01795a5058ca0ce8a9b7e6ecfd3f0b39d7fda",
+  "native_arch_on": true,
+  "native_mcpu_verified": true,
+  "nvme_devices": {
+    "blockdevices": [
+      {
+        "children": [
+          {
+            "model": "Amazon EC2 NVMe Instance Storage",
+            "name": "/dev/nvme1n1",
+            "size": "1.7T",
+            "type": "disk"
+          },
+          {
+            "model": "Amazon EC2 NVMe Instance Storage",
+            "name": "/dev/nvme3n1",
+            "size": "1.7T",
+            "type": "disk"
+          },
+          {
+            "model": "Amazon EC2 NVMe Instance Storage",
+            "name": "/dev/nvme0n1",
+            "size": "1.7T",
+            "type": "disk"
+          }
+        ],
+        "model": null,
+        "name": "/dev/md127",
+        "size": "5.2T",
+        "type": "raid0"
+      }
+    ]
+  },
+  "original_boot_default": "/boot/vmlinuz-6.12.115-140.210.amzn2023.aarch64",
+  "page_size": 65536,
+  "pragma_version": [
+    [
+      "v2.0.0",
+      "d54cbbe3df",
+      "Cyanoptera"
+    ]
+  ],
+  "python": "3.11.18 (main, Oct 26 2026, 00:00:00) [GCC 11.5.0 20240719 (Red Hat 11.5.0-5)]",
+  "source_core_commit": "d54cbbe3df17e8e5ce68312f483b4155836112aa",
+  "source_python_commit": "83c719961098611e769dc4bab0bda2bf149a2d1e",
+  "version": "2.0.0"
+}

@@ -1,0 +1,371 @@
+{
+  "answer_validation": [
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 12,
+      "seconds": 231.05990769400523
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 12,
+      "seconds": 57.27093342500302
+    }
+  ],
+  "archive": {
+    "bytes": 51472,
+    "complete": true,
+    "files": 33,
+    "measurements": 2,
+    "path": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-q12-256gib-20261125/results.tar.gz",
+    "sha256": "fa74c70896ec3b8b15767a37f911308111c82b002e5a9148d47201d85cc8c77c",
+    "totals": [
+      {
+        "available_sum_s": 231.05990769400523,
+        "iteration": 1,
+        "queries": 1,
+        "sum_s": 231.05990769400523
+      },
+      {
+        "available_sum_s": 57.27093342500302,
+        "iteration": 2,
+        "queries": 1,
+        "sum_s": 57.27093342500302
+      }
+    ]
+  },
+  "archive_verification": {
+    "all_payload_hashes_verified": true,
+    "archive_bytes": 51472,
+    "archive_sha256": "fa74c70896ec3b8b15767a37f911308111c82b002e5a9148d47201d85cc8c77c",
+    "files": 33
+  },
+  "cache_clears": {
+    "12": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        390073856 kB\nMemAvailable:   372049984 kB\nBuffers:               0 kB\nCached:           172352 kB\nSwapCached:            0 kB\nActive:            94272 kB\nInactive:         668352 kB\nActive(anon):       3328 kB\nInactive(anon):   596032 kB\nActive(file):      90944 kB\nInactive(file):    72320 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                 0 kB\nWriteback:          1344 kB\nAnonPages:        610368 kB\nMapped:           141824 kB\nShmem:             19840 kB\nKReclaimable:     123712 kB\nSlab:            1266304 kB\nSReclaimable:     123712 kB\nSUnreclaim:      1142592 kB\nKernelStack:       73792 kB\nPageTables:        17088 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1094208 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126208 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        389908160 kB\nMemAvailable:   371959936 kB\nBuffers:               0 kB\nCached:           341696 kB\nSwapCached:            0 kB\nActive:           191296 kB\nInactive:         899328 kB\nActive(anon):       3328 kB\nInactive(anon):   772736 kB\nActive(file):     187968 kB\nInactive(file):   126592 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:             19072 kB\nWriteback:             0 kB\nAnonPages:        839296 kB\nMapped:           141824 kB\nShmem:             19840 kB\nKReclaimable:     123712 kB\nSlab:            1266304 kB\nSReclaimable:     123712 kB\nSUnreclaim:      1142592 kB\nKernelStack:       75968 kB\nPageTables:        17088 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1094208 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      147392 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 12,
+      "wall_ns": 1795621084795527335
+    }
+  },
+  "events_by_query": {
+    "12": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 62535,
+        "query": 12,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "256.0 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-d1a6ab690c0748aaa3fc140a5795bde6/q12",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795621086218457283
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 62535,
+        "query": 12,
+        "wall_ns": 1795621086218588105
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 62535,
+        "query": 12,
+        "rows": 2,
+        "seconds": 231.05990769400523,
+        "wall_ns": 1795621317282802686
+      },
+      {
+        "cache": {
+          "bytes": 320915351375,
+          "entries": 305556,
+          "loaded_bytes": 251412344080,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 62535,
+        "query": 12,
+        "wall_ns": 1795621317485397513
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 62535,
+        "query": 12,
+        "wall_ns": 1795621317485633073
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 62535,
+        "query": 12,
+        "rows": 2,
+        "seconds": 57.27093342500302,
+        "wall_ns": 1795621374762075816
+      },
+      {
+        "cache": {
+          "bytes": 320915351375,
+          "entries": 305556,
+          "loaded_bytes": 251398564059,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 62535,
+        "query": 12,
+        "wall_ns": 1795621374960612682
+      },
+      {
+        "event": "engine_closed",
+        "pid": 62535,
+        "query": 12,
+        "wall_ns": 1795621376843024765
+      },
+      {
+        "event": "complete",
+        "pid": 62535,
+        "query": 12,
+        "wall_ns": 1795621376843255440
+      }
+    ]
+  },
+  "postflight": {
+    "manifest": {
+      "files": 868,
+      "sha256": "d11c67d39a1e0309ffa4bd1c0ee9cff22cd72cc560d051c63a9b2e2206ba27da",
+      "tables": {
+        "customer": 1500000000,
+        "lineitem": 59999994267,
+        "nation": 25,
+        "orders": 15000000000,
+        "part": 2000000000,
+        "partsupp": 8000000000,
+        "region": 5,
+        "supplier": 100000000
+      }
+    },
+    "sources_unchanged": true
+  },
+  "preflight": {
+    "bucket": {
+      "bucket": "sae-dataproc-aws-dev-sirius-scratch-us-east-1",
+      "region": "us-east-1",
+      "tables_present": [
+        "region",
+        "nation",
+        "supplier",
+        "customer",
+        "part",
+        "partsupp",
+        "orders",
+        "lineitem"
+      ]
+    },
+    "counts_before_initial_cache_clear": true,
+    "generation_manifest": {
+      "files": 868,
+      "sha256": "d11c67d39a1e0309ffa4bd1c0ee9cff22cd72cc560d051c63a9b2e2206ba27da",
+      "tables": {
+        "customer": 1500000000,
+        "lineitem": 59999994267,
+        "nation": 25,
+        "orders": 15000000000,
+        "part": 2000000000,
+        "partsupp": 8000000000,
+        "region": 5,
+        "supplier": 100000000
+      }
+    },
+    "identity": {
+      "accountId": "772385118201",
+      "architecture": "arm64",
+      "availabilityZone": "us-east-1a",
+      "billingProducts": null,
+      "devpayProductCodes": null,
+      "imageId": "ami-0272643e149bb16d0",
+      "instanceId": "i-0ac1da908cae3af37",
+      "instanceType": "m9gd.24xlarge",
+      "kernelId": null,
+      "marketplaceProductCodes": null,
+      "pendingTime": "2026-11-24T22:22:18Z",
+      "privateIp": "172.31.10.218",
+      "ramdiskId": null,
+      "region": "us-east-1",
+      "version": "2017-09-30"
+    },
+    "parquet_footer_counts": {
+      "customer": 1500000000,
+      "lineitem": 59999994267,
+      "nation": 25,
+      "orders": 15000000000,
+      "part": 2000000000,
+      "partsupp": 8000000000,
+      "region": 5,
+      "supplier": 100000000
+    },
+    "storage": [
+      {
+        "allow_ebs": false,
+        "devices": [
+          {
+            "children": [
+              {
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "name": "/dev/nvme1n1",
+                "type": "disk"
+              },
+              {
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "name": "/dev/nvme3n1",
+                "type": "disk"
+              },
+              {
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "name": "/dev/nvme0n1",
+                "type": "disk"
+              }
+            ],
+            "model": null,
+            "name": "/dev/md127",
+            "type": "raid0"
+          }
+        ],
+        "free_bytes": 5644281040896,
+        "mount": {
+          "source": "/dev/md127",
+          "target": "/mnt/nvme"
+        },
+        "path": "/mnt/nvme/duckdb-spill"
+      }
+    ]
+  },
+  "processes": [
+    {
+      "cache_clear_ns": 1795621084795527335,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-q12-256gib-20261125/run/runner/results/q12",
+      "exit_code": 0,
+      "pid": 62535,
+      "query": 12,
+      "timed_out": false
+    }
+  ],
+  "replay_plan": {
+    "adapter": {
+      "controller_changes": {
+        "Q1 Q1 clear/restart Q2 Q2 clear/restart ... Q22 Q22": "Q12 Q12",
+        "for q in range(1,query+1):": "for q in [v for v in (12,) if v<=query]:",
+        "for query in range(1,23):": "for query in (12,):",
+        "len(measured)==44": "len(measured)==2",
+        "len(values)==22": "len(values)==1"
+      },
+      "fixed_memory_limit_bytes": 274877906944,
+      "new_spill": "/mnt/nvme/duckdb-spill/sf10000-replay-d1a6ab690c0748aaa3fc140a5795bde6",
+      "old_spill": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124",
+      "required_page_size": 65536,
+      "retry_queries": [
+        12
+      ],
+      "worker_changes_beyond_original_native64_adapter": "memory limit reduced to 274877906944 bytes (256 GiB), user approved"
+    },
+    "changes_to_measured_worker": "unique spill directory; user-approved 256 GiB memory limit; require/log 65536-byte page kernel",
+    "controller_sha256": "0015566e267672bdf9c10ba315af94142496788faeb022704c037572ebce5fc1",
+    "engine": "DuckDB 2.0.0",
+    "input": "s3://sae-dataproc-aws-dev-sirius-scratch-us-east-1/datasets/tpch_sf10000_regenerated",
+    "iterations": 2,
+    "ordering": "Q12 Q12",
+    "original_campaign": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125",
+    "output": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-q12-256gib-20261125/run",
+    "purpose": "Run Q12 twice with user-approved 256 GiB memory budget after repeated OS OOM at 296.7 GiB.",
+    "retry_queries": [
+      12
+    ],
+    "scale_factor": 10000,
+    "sources": {
+      "parquet_output.py": "ab07fe91b3d3e86d683853410696b6167489501c5159b31e607171171c50d1d5",
+      "performance_test.py": "ad4af1a647e08a063959f63acaee2d42024e7d348c7603b6c4ffbc1ee52be44e",
+      "queries.py": "c9ae5a51870ced2e1f7aec82eb58517536fa66615c94ba1d3e3953d6b41d0e8b",
+      "run.py": "8258d3b7d63697282481f7bd3d4c053ada39464c48c718c000cc584611cca8e1",
+      "tpch_pin_columns.py": "3a8f64241345f22aa1761c0efc43d86cce2624766d6b5bfb394d8f38b50339fc",
+      "worker.py": "ad800472bd8e7a10f29a3a1709c5864a345e6a9da46437fda50a1f4ab6631a00"
+    },
+    "spill": "/mnt/nvme/duckdb-spill/sf10000-replay-d1a6ab690c0748aaa3fc140a5795bde6",
+    "worker_sha256": "06b6263c75392fbe5aceb4507b4a22f6ffffc89f1f589266fc09f9383f9fcbc3"
+  },
+  "settings_by_query": {
+    "12": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "256.0 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-d1a6ab690c0748aaa3fc140a5795bde6/q12",
+      "threads": "96"
+    }
+  },
+  "summary": {
+    "complete": true,
+    "measurements": [
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-q12-256gib-20261125/run/runner/results/q12/iteration1/duckdb/q12/result.txt",
+        "answer_sha256": "94cfa5ba17d6b37020982da865eec7c118efc3ab8e7ea7a747c8bb195274f2e5",
+        "iteration": 1,
+        "query": 12,
+        "rows": 2,
+        "seconds": 231.05990769400523
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-q12-256gib-20261125/run/runner/results/q12/iteration2/duckdb/q12/result.txt",
+        "answer_sha256": "94cfa5ba17d6b37020982da865eec7c118efc3ab8e7ea7a747c8bb195274f2e5",
+        "iteration": 2,
+        "query": 12,
+        "rows": 2,
+        "seconds": 57.27093342500302
+      }
+    ],
+    "totals": [
+      {
+        "available_sum_s": 231.05990769400523,
+        "iteration": 1,
+        "queries": 1,
+        "sum_s": 231.05990769400523
+      },
+      {
+        "available_sum_s": 57.27093342500302,
+        "iteration": 2,
+        "queries": 1,
+        "sum_s": 57.27093342500302
+      }
+    ]
+  }
+}

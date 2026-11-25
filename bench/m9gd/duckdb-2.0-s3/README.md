@@ -1,5 +1,13 @@
 # DuckDB 2.0.0 on M9gd, reading S3
 
+The [selected results](results/SELECTED.md) now use the
+[November 25 native / 64 KiB measurements](results/20261125-native64k/RESULTS.md)
+for SF3000 and SF10000. The latter is assembled with retries and **Q12 at
+256 GiB**, while other queries use 296.7 GiB. Exact source phases, memory
+budgets, kernel/native build evidence, executed scripts and validation proofs
+are saved with that snapshot. The historical replay instructions below target
+the original November 24 wheel/default-memory baseline.
+
 This recipe reproduces the [November 24, 2026 results](results/20261124/RESULTS.md)
 for SF1000, SF3000 and SF10000 on `m9gd.24xlarge`, Amazon Linux 2023 ARM64, in
 `us-east-1a`. It uses 96 DuckDB threads and the engine's default `296.7 GiB`

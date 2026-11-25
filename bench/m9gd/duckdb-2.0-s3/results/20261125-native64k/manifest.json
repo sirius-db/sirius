@@ -1,0 +1,59 @@
+{
+  "date": "2026-11-25",
+  "engine": "DuckDB 2.0.0",
+  "files": {
+    "RESULTS.md": {
+      "bytes": 3929,
+      "sha256": "f17db30bcce826c4da5b6e5f6d4416835d349c2985c7b541b6ee1be8e31c80ca"
+    },
+    "build.json": {
+      "bytes": 8553,
+      "sha256": "cecf6ebdb67292c5efb2bc0633aa58c95f15307aaa5260b619039eee89010578"
+    },
+    "executed-scripts.json": {
+      "bytes": 26266,
+      "sha256": "38bdd6cd458b4bb20585cfe7577c898ce63c36ff69b952d09145ec997267d42e"
+    },
+    "failures.json": {
+      "bytes": 624,
+      "sha256": "567633725cc0c10046bbebc9256878af6bcacafc2c8eb177b4843549d91997a0"
+    },
+    "full-archives.json": {
+      "bytes": 2502,
+      "sha256": "9ed102a494d607326553ced21e2a2d2e743591da2f042638a10e783e6025ac95"
+    },
+    "kernel.json": {
+      "bytes": 7345,
+      "sha256": "84c4873e64cf914187016b5aaafd4fb67d59d140350424f997ce79538e62ba1b"
+    },
+    "per-query.csv": {
+      "bytes": 2155,
+      "sha256": "9b364783c9f3187529c2522b8e6eedfb1ba5fefe77acc89c11494375410bd963"
+    },
+    "phases/sf10000-initial.json": {
+      "bytes": 169521,
+      "sha256": "8eb53ac0f920930b4b9be5befd8814704c15997b1dce0593542f3fc64f40b1af"
+    },
+    "phases/sf10000-q12-256gib.json": {
+      "bytes": 14185,
+      "sha256": "e819cf5271c600fbaa7fdf1851a352d1eec75f16e749658f7d216b43657893a2"
+    },
+    "phases/sf10000-q8-q12-retry.json": {
+      "bytes": 19159,
+      "sha256": "2c7f0cecb84065edf2ac8d28add81014d78b022483c9a4a0aaf5f5df57290614"
+    },
+    "phases/sf3000-initial.json": {
+      "bytes": 173309,
+      "sha256": "957972144a93c88f955885c791e75c5fe61cfef69c605a7e592331e48616082c"
+    },
+    "sf10000.json": {
+      "bytes": 20146,
+      "sha256": "9c75648e4d26c263db7e29478c9d47b8e0f8cdff3ab96d071b80171029f51b0a"
+    },
+    "sf3000.json": {
+      "bytes": 18444,
+      "sha256": "6f56e2bbbad1e9bdd90bfeebb4d2662500c0eefd1a7758175628f462b3dc4edf"
+    }
+  },
+  "selected_timings": 88
+}

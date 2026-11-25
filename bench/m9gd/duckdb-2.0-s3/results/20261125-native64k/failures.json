@@ -1,0 +1,39 @@
+{
+  "original": [
+    {
+      "exit_code": -9,
+      "linux_oom_kill": true,
+      "missing_iterations": [
+        2
+      ],
+      "pid": 29732,
+      "query": 8,
+      "timed_out": false
+    },
+    {
+      "exit_code": -9,
+      "linux_oom_kill": true,
+      "missing_iterations": [
+        1,
+        2
+      ],
+      "pid": 34506,
+      "query": 12,
+      "timed_out": false
+    }
+  ],
+  "q12_lower_budget": [],
+  "retry": [
+    {
+      "exit_code": -9,
+      "linux_oom_kill": true,
+      "missing_iterations": [
+        1,
+        2
+      ],
+      "pid": 60701,
+      "query": 12,
+      "timed_out": false
+    }
+  ]
+}

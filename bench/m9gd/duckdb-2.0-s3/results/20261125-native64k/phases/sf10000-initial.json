@@ -1,0 +1,3579 @@
+{
+  "answer_validation": [
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 1,
+      "seconds": 129.63940177099994
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 1,
+      "seconds": 38.63715706799985
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 2,
+      "seconds": 22.842194140000174
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 2,
+      "seconds": 2.765867483999955
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "correct ordered answer including legal LIMIT-boundary ties",
+        "expanded_cpu_rows": 14,
+        "rows": 10
+      },
+      "iteration": 1,
+      "query": 3,
+      "seconds": 312.36493470899995
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "correct ordered answer including legal LIMIT-boundary ties",
+        "expanded_cpu_rows": 14,
+        "rows": 10
+      },
+      "iteration": 2,
+      "query": 3,
+      "seconds": 311.39759667399994
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 4,
+      "seconds": 169.44178754700033
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 4,
+      "seconds": 17.18601386499995
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 5,
+      "seconds": 258.21993152799996
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 5,
+      "seconds": 118.96505254799968
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 6,
+      "seconds": 147.78995822200022
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 6,
+      "seconds": 15.948348487999738
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 7,
+      "seconds": 286.29540038000005
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 7,
+      "seconds": 171.45859612699996
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 8,
+      "seconds": 271.9724350710003
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 9,
+      "seconds": 550.9331731259999
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 9,
+      "seconds": 545.1615736929998
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 10,
+      "seconds": 289.7619104539999
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 10,
+      "seconds": 315.42444168099973
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "matches pinned harness tolerance (float abs=1e-10, other values exact)",
+        "rows": 9365098
+      },
+      "iteration": 1,
+      "query": 11,
+      "seconds": 19.01679078699999
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "matches pinned harness tolerance (float abs=1e-10, other values exact)",
+        "rows": 9365098
+      },
+      "iteration": 2,
+      "query": 11,
+      "seconds": 4.89042706500004
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 13,
+      "seconds": 113.64102832200024
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 13,
+      "seconds": 101.77363584699924
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 14,
+      "seconds": 270.6400607739997
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 14,
+      "seconds": 154.29089485000077
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 15,
+      "seconds": 226.37636123599987
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 15,
+      "seconds": 138.41674270600015
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 16,
+      "seconds": 16.52348539400009
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 16,
+      "seconds": 7.577533544999824
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 17,
+      "seconds": 253.25259823499982
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 17,
+      "seconds": 114.18911374700019
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "correct ordered answer including legal LIMIT-boundary ties",
+        "expanded_cpu_rows": 105,
+        "rows": 100
+      },
+      "iteration": 1,
+      "query": 18,
+      "seconds": 671.1780945229993
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "correct ordered answer including legal LIMIT-boundary ties",
+        "expanded_cpu_rows": 105,
+        "rows": 100
+      },
+      "iteration": 2,
+      "query": 18,
+      "seconds": 650.9253576909996
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 19,
+      "seconds": 284.9576800289997
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 19,
+      "seconds": 95.86070729499988
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 20,
+      "seconds": 256.110396303
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 20,
+      "seconds": 147.8111919460007
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 21,
+      "seconds": 689.5670525160003
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 21,
+      "seconds": 613.3521795510005
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 22,
+      "seconds": 25.3696159430001
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 22,
+      "seconds": 9.290339764998862
+    }
+  ],
+  "archive": {
+    "bytes": 188702077,
+    "complete": false,
+    "exit_code": 1,
+    "files": 253,
+    "iteration_coverage": [
+      {
+        "available_sum_s": 5265.8942910099995,
+        "iteration": 1,
+        "queries": 21,
+        "sum_s": null
+      },
+      {
+        "available_sum_s": 3575.3227716359984,
+        "iteration": 2,
+        "queries": 20,
+        "sum_s": null
+      }
+    ],
+    "measurements": 41,
+    "path": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000-full-results-native64.tar.gz",
+    "payload_bytes": 711014101,
+    "sha256": "f1ef0f28f2c3e30fcb728fe8abbcb64392abb5581282945e1353d8ef03832fc9"
+  },
+  "archive_verification": {
+    "all_payload_hashes_verified": true,
+    "archive_bytes": 188702077,
+    "archive_sha256": "f1ef0f28f2c3e30fcb728fe8abbcb64392abb5581282945e1353d8ef03832fc9",
+    "files": 253
+  },
+  "cache_clears": {
+    "1": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        366983680 kB\nMemAvailable:   348950400 kB\nBuffers:               0 kB\nCached:           183040 kB\nSwapCached:            0 kB\nActive:           123072 kB\nInactive:         611904 kB\nActive(anon):       2496 kB\nInactive(anon):   563008 kB\nActive(file):     120576 kB\nInactive(file):    48896 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              6144 kB\nWriteback:          2112 kB\nAnonPages:        566912 kB\nMapped:           158464 kB\nShmem:             19456 kB\nKReclaimable:      98752 kB\nSlab:            1087296 kB\nSReclaimable:      98752 kB\nSUnreclaim:       988544 kB\nKernelStack:       73536 kB\nPageTables:        18624 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1089408 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      127616 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        366616640 kB\nMemAvailable:   348641856 kB\nBuffers:               0 kB\nCached:           303872 kB\nSwapCached:            0 kB\nActive:           203328 kB\nInactive:         827840 kB\nActive(anon):       2496 kB\nInactive(anon):   742208 kB\nActive(file):     200832 kB\nInactive(file):    85632 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              7424 kB\nWriteback:             0 kB\nAnonPages:        789504 kB\nMapped:           158464 kB\nShmem:             19456 kB\nKReclaimable:      98752 kB\nSlab:            1087296 kB\nSReclaimable:      98752 kB\nSUnreclaim:       988544 kB\nKernelStack:       75584 kB\nPageTables:        18624 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1089408 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      147968 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 1,
+      "wall_ns": 1795589839145599332
+    },
+    "10": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        380387264 kB\nMemAvailable:   362337024 kB\nBuffers:               0 kB\nCached:           107008 kB\nSwapCached:            0 kB\nActive:            46080 kB\nInactive:         566080 kB\nActive(anon):       2688 kB\nInactive(anon):   523008 kB\nActive(file):      43392 kB\nInactive(file):    43072 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:             12608 kB\nWriteback:             0 kB\nAnonPages:        506176 kB\nMapped:            57088 kB\nShmem:             19520 kB\nKReclaimable:     147776 kB\nSlab:            1269440 kB\nSReclaimable:     147776 kB\nSUnreclaim:      1121664 kB\nKernelStack:       73088 kB\nPageTables:        19712 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1090944 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      124992 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        376760128 kB\nMemAvailable:   359924416 kB\nBuffers:               0 kB\nCached:           126080 kB\nSwapCached:            0 kB\nActive:            79936 kB\nInactive:         559360 kB\nActive(anon):       2880 kB\nInactive(anon):   521792 kB\nActive(file):      77056 kB\nInactive(file):    37568 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               384 kB\nWriteback:             0 kB\nAnonPages:        505152 kB\nMapped:            44032 kB\nShmem:             19520 kB\nKReclaimable:    2548672 kB\nSlab:            3844416 kB\nSReclaimable:    2548672 kB\nSUnreclaim:      1295744 kB\nKernelStack:       72896 kB\nPageTables:        23808 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1100928 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125824 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 10,
+      "wall_ns": 1795593333563621587
+    },
+    "11": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        375983680 kB\nMemAvailable:   357898944 kB\nBuffers:               0 kB\nCached:            63360 kB\nSwapCached:            0 kB\nActive:            22016 kB\nInactive:         544064 kB\nActive(anon):       2688 kB\nInactive(anon):   522368 kB\nActive(file):      19328 kB\nInactive(file):    21696 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              5184 kB\nWriteback:             0 kB\nAnonPages:        505536 kB\nMapped:            43968 kB\nShmem:             19520 kB\nKReclaimable:     124224 kB\nSlab:            1222464 kB\nSReclaimable:     124224 kB\nSUnreclaim:      1098240 kB\nKernelStack:       73472 kB\nPageTables:        19712 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1100992 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126208 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        375014464 kB\nMemAvailable:   357207872 kB\nBuffers:               0 kB\nCached:           119232 kB\nSwapCached:            0 kB\nActive:            75712 kB\nInactive:         567296 kB\nActive(anon):       5760 kB\nInactive(anon):   530880 kB\nActive(file):      69952 kB\nInactive(file):    36416 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               384 kB\nWriteback:             0 kB\nAnonPages:        508544 kB\nMapped:            33408 kB\nShmem:             19520 kB\nKReclaimable:     615296 kB\nSlab:            1722688 kB\nSReclaimable:     615296 kB\nSUnreclaim:      1107392 kB\nKernelStack:       75584 kB\nPageTables:        19584 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1100992 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      129024 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 11,
+      "wall_ns": 1795593945943037448
+    },
+    "12": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        377729408 kB\nMemAvailable:   359643008 kB\nBuffers:               0 kB\nCached:            71808 kB\nSwapCached:            0 kB\nActive:            29504 kB\nInactive:         541696 kB\nActive(anon):       2624 kB\nInactive(anon):   516224 kB\nActive(file):      26880 kB\nInactive(file):    25472 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                 0 kB\nWriteback:          1664 kB\nAnonPages:        499520 kB\nMapped:            46528 kB\nShmem:             19520 kB\nKReclaimable:     109696 kB\nSlab:            1208128 kB\nSReclaimable:     109696 kB\nSUnreclaim:      1098432 kB\nKernelStack:       73472 kB\nPageTables:        19008 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1127488 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126208 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        376559552 kB\nMemAvailable:   359031232 kB\nBuffers:               0 kB\nCached:           885120 kB\nSwapCached:            0 kB\nActive:            52032 kB\nInactive:        2018112 kB\nActive(anon):       2688 kB\nInactive(anon):   899008 kB\nActive(file):      49344 kB\nInactive(file):  1119104 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:            630976 kB\nWriteback:            64 kB\nAnonPages:        866816 kB\nMapped:            52800 kB\nShmem:             19520 kB\nKReclaimable:     109696 kB\nSlab:            1208384 kB\nSReclaimable:     109696 kB\nSUnreclaim:      1098688 kB\nKernelStack:       75904 kB\nPageTables:        26816 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1100992 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      129408 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 12,
+      "wall_ns": 1795593996822088914
+    },
+    "13": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        390970432 kB\nMemAvailable:   372865280 kB\nBuffers:               0 kB\nCached:            48768 kB\nSwapCached:            0 kB\nActive:             3456 kB\nInactive:         533376 kB\nActive(anon):       2496 kB\nInactive(anon):   517312 kB\nActive(file):        960 kB\nInactive(file):    16064 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              8832 kB\nWriteback:             0 kB\nAnonPages:        500288 kB\nMapped:            28928 kB\nShmem:             19520 kB\nKReclaimable:     107520 kB\nSlab:            1203968 kB\nSReclaimable:     107520 kB\nSUnreclaim:      1096448 kB\nKernelStack:       73600 kB\nPageTables:        18944 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1089984 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126208 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        390982720 kB\nMemAvailable:   372876032 kB\nBuffers:               0 kB\nCached:            44288 kB\nSwapCached:            0 kB\nActive:             9984 kB\nInactive:         534400 kB\nActive(anon):       8896 kB\nInactive(anon):   521536 kB\nActive(file):       1088 kB\nInactive(file):    12864 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              6208 kB\nWriteback:             0 kB\nAnonPages:        505472 kB\nMapped:            21440 kB\nShmem:             19520 kB\nKReclaimable:     107520 kB\nSlab:            1203968 kB\nSReclaimable:     107520 kB\nSUnreclaim:      1096448 kB\nKernelStack:       73472 kB\nPageTables:        19136 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1091136 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126208 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 13,
+      "wall_ns": 1795594220221681824
+    },
+    "14": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        373859456 kB\nMemAvailable:   355787712 kB\nBuffers:               0 kB\nCached:            82304 kB\nSwapCached:            0 kB\nActive:            44160 kB\nInactive:         544000 kB\nActive(anon):       2688 kB\nInactive(anon):   522880 kB\nActive(file):      41472 kB\nInactive(file):    21120 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              4416 kB\nWriteback:             0 kB\nAnonPages:        506112 kB\nMapped:            62912 kB\nShmem:             19520 kB\nKReclaimable:     128768 kB\nSlab:            1236352 kB\nSReclaimable:     128768 kB\nSUnreclaim:      1107584 kB\nKernelStack:       73536 kB\nPageTables:        19712 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1091264 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126272 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        372938432 kB\nMemAvailable:   355160576 kB\nBuffers:               0 kB\nCached:           177536 kB\nSwapCached:            0 kB\nActive:           145792 kB\nInactive:         629632 kB\nActive(anon):      11968 kB\nInactive(anon):   558528 kB\nActive(file):     133824 kB\nInactive(file):    71104 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              2112 kB\nWriteback:             0 kB\nAnonPages:        557568 kB\nMapped:            60992 kB\nShmem:             19520 kB\nKReclaimable:     574208 kB\nSlab:            1684544 kB\nSReclaimable:     574208 kB\nSUnreclaim:      1110336 kB\nKernelStack:       75008 kB\nPageTables:        24960 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1091136 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      128640 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 14,
+      "wall_ns": 1795594440021660996
+    },
+    "15": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        377424128 kB\nMemAvailable:   359351680 kB\nBuffers:               0 kB\nCached:            91008 kB\nSwapCached:            0 kB\nActive:            55552 kB\nInactive:         546560 kB\nActive(anon):       2624 kB\nInactive(anon):   519936 kB\nActive(file):      52928 kB\nInactive(file):    26624 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                 0 kB\nWriteback:             0 kB\nAnonPages:        503104 kB\nMapped:            68288 kB\nShmem:             19520 kB\nKReclaimable:     110336 kB\nSlab:            1219648 kB\nSReclaimable:     110336 kB\nSUnreclaim:      1109312 kB\nKernelStack:       73088 kB\nPageTables:        19264 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1090880 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125888 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        377176768 kB\nMemAvailable:   359189568 kB\nBuffers:               0 kB\nCached:           275136 kB\nSwapCached:            0 kB\nActive:           103808 kB\nInactive:         675264 kB\nActive(anon):       2624 kB\nInactive(anon):   526336 kB\nActive(file):     101184 kB\nInactive(file):   148928 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               448 kB\nWriteback:             0 kB\nAnonPages:        503936 kB\nMapped:            72960 kB\nShmem:             19520 kB\nKReclaimable:     110336 kB\nSlab:            1219648 kB\nSReclaimable:     110336 kB\nSUnreclaim:      1109312 kB\nKernelStack:       73024 kB\nPageTables:        23424 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1090752 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      129024 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 15,
+      "wall_ns": 1795594868957030499
+    },
+    "16": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        365211264 kB\nMemAvailable:   347137088 kB\nBuffers:               0 kB\nCached:            96000 kB\nSwapCached:            0 kB\nActive:            50688 kB\nInactive:         545024 kB\nActive(anon):       2432 kB\nInactive(anon):   516672 kB\nActive(file):      48256 kB\nInactive(file):    28352 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                 0 kB\nWriteback:             0 kB\nAnonPages:        499648 kB\nMapped:            73536 kB\nShmem:             19520 kB\nKReclaimable:     109760 kB\nSlab:            1220032 kB\nSReclaimable:     109760 kB\nSUnreclaim:      1110272 kB\nKernelStack:       72896 kB\nPageTables:        18496 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1100864 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125760 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        364915200 kB\nMemAvailable:   346937536 kB\nBuffers:               0 kB\nCached:           288768 kB\nSwapCached:            0 kB\nActive:            99776 kB\nInactive:         690688 kB\nActive(anon):       2688 kB\nInactive(anon):   518144 kB\nActive(file):      97088 kB\nInactive(file):   172544 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               320 kB\nWriteback:             0 kB\nAnonPages:        501696 kB\nMapped:            80512 kB\nShmem:             19520 kB\nKReclaimable:     109760 kB\nSlab:            1220032 kB\nSReclaimable:     109760 kB\nSUnreclaim:      1110272 kB\nKernelStack:       72896 kB\nPageTables:        26112 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1100736 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126336 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 16,
+      "wall_ns": 1795595238021970515
+    },
+    "17": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        354249792 kB\nMemAvailable:   336179392 kB\nBuffers:               0 kB\nCached:            97792 kB\nSwapCached:            0 kB\nActive:            52224 kB\nInactive:         553536 kB\nActive(anon):       2368 kB\nInactive(anon):   516928 kB\nActive(file):      49856 kB\nInactive(file):    36608 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              4992 kB\nWriteback:          1920 kB\nAnonPages:        499968 kB\nMapped:            73792 kB\nShmem:             19520 kB\nKReclaimable:     107456 kB\nSlab:            1217856 kB\nSReclaimable:     107456 kB\nSUnreclaim:      1110400 kB\nKernelStack:       73024 kB\nPageTables:        18880 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1091008 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125760 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        353941312 kB\nMemAvailable:   335949248 kB\nBuffers:               0 kB\nCached:           266688 kB\nSwapCached:            0 kB\nActive:            86080 kB\nInactive:         686528 kB\nActive(anon):       2432 kB\nInactive(anon):   526976 kB\nActive(file):      83648 kB\nInactive(file):   159552 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:             14400 kB\nWriteback:             0 kB\nAnonPages:        506432 kB\nMapped:            79680 kB\nShmem:             19520 kB\nKReclaimable:     107456 kB\nSlab:            1217920 kB\nSReclaimable:     107456 kB\nSUnreclaim:      1110464 kB\nKernelStack:       72960 kB\nPageTables:        24064 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1091008 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      128896 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 17,
+      "wall_ns": 1795595265323679459
+    },
+    "18": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        378821632 kB\nMemAvailable:   360751296 kB\nBuffers:               0 kB\nCached:           105088 kB\nSwapCached:            0 kB\nActive:            52672 kB\nInactive:         552512 kB\nActive(anon):       2688 kB\nInactive(anon):   517888 kB\nActive(file):      49984 kB\nInactive(file):    34624 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                 0 kB\nWriteback:          3456 kB\nAnonPages:        506880 kB\nMapped:            81344 kB\nShmem:             19520 kB\nKReclaimable:     109504 kB\nSlab:            1222400 kB\nSReclaimable:     109504 kB\nSUnreclaim:      1112896 kB\nKernelStack:       73216 kB\nPageTables:        26496 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1101440 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126144 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        378642368 kB\nMemAvailable:   360664768 kB\nBuffers:               0 kB\nCached:           290560 kB\nSwapCached:            0 kB\nActive:           149440 kB\nInactive:         641216 kB\nActive(anon):       2688 kB\nInactive(anon):   517888 kB\nActive(file):     146752 kB\nInactive(file):   123328 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:             11968 kB\nWriteback:             0 kB\nAnonPages:        506880 kB\nMapped:            81344 kB\nShmem:             19520 kB\nKReclaimable:     109504 kB\nSlab:            1222912 kB\nSReclaimable:     109504 kB\nSUnreclaim:      1113408 kB\nKernelStack:       73856 kB\nPageTables:        26496 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1101440 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      129152 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 18,
+      "wall_ns": 1795595637405885059
+    },
+    "19": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        379662528 kB\nMemAvailable:   361587200 kB\nBuffers:               0 kB\nCached:            84480 kB\nSwapCached:            0 kB\nActive:            35648 kB\nInactive:         555776 kB\nActive(anon):       2624 kB\nInactive(anon):   524608 kB\nActive(file):      33024 kB\nInactive(file):    31168 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              4352 kB\nWriteback:             0 kB\nAnonPages:        507776 kB\nMapped:            65024 kB\nShmem:             19520 kB\nKReclaimable:     119936 kB\nSlab:            1239232 kB\nSReclaimable:     119936 kB\nSUnreclaim:      1119296 kB\nKernelStack:       73344 kB\nPageTables:        19520 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1091456 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126016 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        379311040 kB\nMemAvailable:   361442944 kB\nBuffers:               0 kB\nCached:           169408 kB\nSwapCached:            0 kB\nActive:           100672 kB\nInactive:         579968 kB\nActive(anon):       2880 kB\nInactive(anon):   523392 kB\nActive(file):      97792 kB\nInactive(file):    56576 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              6784 kB\nWriteback:             0 kB\nAnonPages:        503168 kB\nMapped:            60992 kB\nShmem:             19520 kB\nKReclaimable:     444288 kB\nSlab:            1566592 kB\nSReclaimable:     444288 kB\nSUnreclaim:      1122304 kB\nKernelStack:       74368 kB\nPageTables:        23232 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1091456 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126528 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 19,
+      "wall_ns": 1795596964732358982
+    },
+    "2": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        379151936 kB\nMemAvailable:   361119424 kB\nBuffers:               0 kB\nCached:           182656 kB\nSwapCached:            0 kB\nActive:           137408 kB\nInactive:         551296 kB\nActive(anon):       2560 kB\nInactive(anon):   514752 kB\nActive(file):     134848 kB\nInactive(file):    36544 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                 0 kB\nWriteback:          3392 kB\nAnonPages:        497984 kB\nMapped:           158912 kB\nShmem:             19456 kB\nKReclaimable:      98432 kB\nSlab:            1090688 kB\nSReclaimable:      98432 kB\nSUnreclaim:       992256 kB\nKernelStack:       73408 kB\nPageTables:        19008 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1088960 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126208 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        378949440 kB\nMemAvailable:   360975936 kB\nBuffers:               0 kB\nCached:           303232 kB\nSwapCached:            0 kB\nActive:           151232 kB\nInactive:         662144 kB\nActive(anon):       2624 kB\nInactive(anon):   521408 kB\nActive(file):     148608 kB\nInactive(file):   140736 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              3840 kB\nWriteback:             0 kB\nAnonPages:        502080 kB\nMapped:           162624 kB\nShmem:             19456 kB\nKReclaimable:      98432 kB\nSlab:            1090688 kB\nSReclaimable:      98432 kB\nSUnreclaim:       992256 kB\nKernelStack:       73344 kB\nPageTables:        24256 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1088832 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      129344 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 2,
+      "wall_ns": 1795590011179232675
+    },
+    "20": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        377676032 kB\nMemAvailable:   359603008 kB\nBuffers:               0 kB\nCached:            84416 kB\nSwapCached:            0 kB\nActive:            40448 kB\nInactive:         552768 kB\nActive(anon):       2624 kB\nInactive(anon):   517568 kB\nActive(file):      37824 kB\nInactive(file):    35200 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               192 kB\nWriteback:             0 kB\nAnonPages:        500736 kB\nMapped:            62592 kB\nShmem:             19520 kB\nKReclaimable:     115648 kB\nSlab:            1232448 kB\nSReclaimable:     115648 kB\nSUnreclaim:      1116800 kB\nKernelStack:       73024 kB\nPageTables:        18880 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1091200 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125824 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        377498624 kB\nMemAvailable:   359510272 kB\nBuffers:               0 kB\nCached:           261824 kB\nSwapCached:            0 kB\nActive:            88832 kB\nInactive:         673728 kB\nActive(anon):       2624 kB\nInactive(anon):   517568 kB\nActive(file):      86208 kB\nInactive(file):   156160 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               384 kB\nWriteback:             0 kB\nAnonPages:        500736 kB\nMapped:            62592 kB\nShmem:             19520 kB\nKReclaimable:     115648 kB\nSlab:            1232448 kB\nSReclaimable:     115648 kB\nSUnreclaim:      1116800 kB\nKernelStack:       72896 kB\nPageTables:        18880 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1101312 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125824 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 20,
+      "wall_ns": 1795597350525141029
+    },
+    "21": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        378726400 kB\nMemAvailable:   360645120 kB\nBuffers:               0 kB\nCached:            76032 kB\nSwapCached:            0 kB\nActive:            31936 kB\nInactive:         548416 kB\nActive(anon):       2688 kB\nInactive(anon):   521216 kB\nActive(file):      29248 kB\nInactive(file):    27200 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                 0 kB\nWriteback:             0 kB\nAnonPages:        505344 kB\nMapped:            50112 kB\nShmem:             19520 kB\nKReclaimable:     115840 kB\nSlab:            1232448 kB\nSReclaimable:     115840 kB\nSUnreclaim:      1116608 kB\nKernelStack:       73088 kB\nPageTables:        19200 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1138432 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125824 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        378664512 kB\nMemAvailable:   360626688 kB\nBuffers:               0 kB\nCached:           157184 kB\nSwapCached:            0 kB\nActive:            83712 kB\nInactive:         590208 kB\nActive(anon):       8576 kB\nInactive(anon):   522048 kB\nActive(file):      75136 kB\nInactive(file):    68160 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:             19648 kB\nWriteback:             0 kB\nAnonPages:        509376 kB\nMapped:            50496 kB\nShmem:             19520 kB\nKReclaimable:     115840 kB\nSlab:            1232448 kB\nSReclaimable:     115840 kB\nSUnreclaim:      1116608 kB\nKernelStack:       72960 kB\nPageTables:        22400 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1111552 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125824 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 21,
+      "wall_ns": 1795597759857580965
+    },
+    "22": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        378251520 kB\nMemAvailable:   360182784 kB\nBuffers:               0 kB\nCached:            86720 kB\nSwapCached:            0 kB\nActive:            42944 kB\nInactive:         549312 kB\nActive(anon):       2688 kB\nInactive(anon):   522816 kB\nActive(file):      40256 kB\nInactive(file):    26496 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              7040 kB\nWriteback:          2240 kB\nAnonPages:        507392 kB\nMapped:            65536 kB\nShmem:             19584 kB\nKReclaimable:     130496 kB\nSlab:            1266496 kB\nSReclaimable:     130496 kB\nSUnreclaim:      1136000 kB\nKernelStack:       73152 kB\nPageTables:        18624 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1107840 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125696 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        378022912 kB\nMemAvailable:   360018688 kB\nBuffers:               0 kB\nCached:           158784 kB\nSwapCached:            0 kB\nActive:           114176 kB\nInactive:         563776 kB\nActive(anon):       8448 kB\nInactive(anon):   526784 kB\nActive(file):     105728 kB\nInactive(file):    36992 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              2112 kB\nWriteback:             0 kB\nAnonPages:        511104 kB\nMapped:            61824 kB\nShmem:             19520 kB\nKReclaimable:     183680 kB\nSlab:            1322048 kB\nSReclaimable:     183680 kB\nSUnreclaim:      1138368 kB\nKernelStack:       72960 kB\nPageTables:        21888 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1101504 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      128960 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 22,
+      "wall_ns": 1795599068263074003
+    },
+    "3": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        375269632 kB\nMemAvailable:   357236864 kB\nBuffers:               0 kB\nCached:           182016 kB\nSwapCached:            0 kB\nActive:           137280 kB\nInactive:         551360 kB\nActive(anon):       2560 kB\nInactive(anon):   515328 kB\nActive(file):     134720 kB\nInactive(file):    36032 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                 0 kB\nWriteback:             0 kB\nAnonPages:        498560 kB\nMapped:           158976 kB\nShmem:             19456 kB\nKReclaimable:      98560 kB\nSlab:            1090944 kB\nSReclaimable:      98560 kB\nSUnreclaim:       992384 kB\nKernelStack:       73408 kB\nPageTables:        19008 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1116480 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126208 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        375140288 kB\nMemAvailable:   357163008 kB\nBuffers:               0 kB\nCached:           294528 kB\nSwapCached:            0 kB\nActive:           137216 kB\nInactive:         672128 kB\nActive(anon):       2624 kB\nInactive(anon):   524992 kB\nActive(file):     134592 kB\nInactive(file):   147136 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:             10944 kB\nWriteback:             0 kB\nAnonPages:        508800 kB\nMapped:           162688 kB\nShmem:             19456 kB\nKReclaimable:      98560 kB\nSlab:            1090944 kB\nSReclaimable:      98560 kB\nSUnreclaim:       992384 kB\nKernelStack:       73344 kB\nPageTables:        25344 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1089472 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126272 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 3,
+      "wall_ns": 1795590038922129898
+    },
+    "4": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        369274688 kB\nMemAvailable:   351200640 kB\nBuffers:               0 kB\nCached:            92992 kB\nSwapCached:            0 kB\nActive:            63936 kB\nInactive:         532608 kB\nActive(anon):       2624 kB\nInactive(anon):   522112 kB\nActive(file):      61312 kB\nInactive(file):    10496 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              4224 kB\nWriteback:             0 kB\nAnonPages:        505280 kB\nMapped:            73152 kB\nShmem:             19456 kB\nKReclaimable:     114880 kB\nSlab:            1171392 kB\nSReclaimable:     114880 kB\nSUnreclaim:      1056512 kB\nKernelStack:       73152 kB\nPageTables:        19584 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1099904 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125888 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        368244288 kB\nMemAvailable:   350601600 kB\nBuffers:               0 kB\nCached:           141568 kB\nSwapCached:            0 kB\nActive:           115008 kB\nInactive:         578880 kB\nActive(anon):      14016 kB\nInactive(anon):   533824 kB\nActive(file):     100992 kB\nInactive(file):    45056 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              5440 kB\nWriteback:             0 kB\nAnonPages:        520320 kB\nMapped:            67200 kB\nShmem:             19456 kB\nKReclaimable:     903424 kB\nSlab:            1979136 kB\nSReclaimable:     903424 kB\nSUnreclaim:      1075712 kB\nKernelStack:       73152 kB\nPageTables:        20032 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1099648 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126016 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 4,
+      "wall_ns": 1795590667770667559
+    },
+    "5": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        379595456 kB\nMemAvailable:   361524544 kB\nBuffers:               0 kB\nCached:           101120 kB\nSwapCached:            0 kB\nActive:            72000 kB\nInactive:         539392 kB\nActive(anon):       2496 kB\nInactive(anon):   519104 kB\nActive(file):      69504 kB\nInactive(file):    20288 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                 0 kB\nWriteback:             0 kB\nAnonPages:        502208 kB\nMapped:            77696 kB\nShmem:             19456 kB\nKReclaimable:     103168 kB\nSlab:            1154624 kB\nSReclaimable:     103168 kB\nSUnreclaim:      1051456 kB\nKernelStack:       74112 kB\nPageTables:        19008 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1115904 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126080 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        379364928 kB\nMemAvailable:   361370368 kB\nBuffers:               0 kB\nCached:           261952 kB\nSwapCached:            0 kB\nActive:           158656 kB\nInactive:         608896 kB\nActive(anon):       2560 kB\nInactive(anon):   522432 kB\nActive(file):     156096 kB\nInactive(file):    86464 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               256 kB\nWriteback:             0 kB\nAnonPages:        505600 kB\nMapped:            83456 kB\nShmem:             19456 kB\nKReclaimable:     103168 kB\nSlab:            1154624 kB\nSReclaimable:     103168 kB\nSUnreclaim:      1051456 kB\nKernelStack:       74816 kB\nPageTables:        19328 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1089024 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      128320 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 5,
+      "wall_ns": 1795590858488281164
+    },
+    "6": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        377806912 kB\nMemAvailable:   359720384 kB\nBuffers:               0 kB\nCached:            74816 kB\nSwapCached:            0 kB\nActive:            24064 kB\nInactive:         559552 kB\nActive(anon):       3136 kB\nInactive(anon):   524160 kB\nActive(file):      20928 kB\nInactive(file):    35392 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               384 kB\nWriteback:             0 kB\nAnonPages:        507392 kB\nMapped:            51712 kB\nShmem:             19456 kB\nKReclaimable:     105472 kB\nSlab:            1159744 kB\nSReclaimable:     105472 kB\nSUnreclaim:      1054272 kB\nKernelStack:       74176 kB\nPageTables:        19968 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1099648 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      126016 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        377731072 kB\nMemAvailable:   359684864 kB\nBuffers:               0 kB\nCached:           163520 kB\nSwapCached:            0 kB\nActive:            32128 kB\nInactive:         632128 kB\nActive(anon):       3136 kB\nInactive(anon):   524160 kB\nActive(file):      28992 kB\nInactive(file):   107968 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               384 kB\nWriteback:             0 kB\nAnonPages:        507392 kB\nMapped:            51712 kB\nShmem:             19456 kB\nKReclaimable:     105472 kB\nSlab:            1159744 kB\nSReclaimable:     105472 kB\nSUnreclaim:      1054272 kB\nKernelStack:       75008 kB\nPageTables:        19968 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1099520 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      128960 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 6,
+      "wall_ns": 1795591239969994145
+    },
+    "7": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        377548416 kB\nMemAvailable:   359468992 kB\nBuffers:               0 kB\nCached:            89664 kB\nSwapCached:            0 kB\nActive:            26816 kB\nInactive:         566080 kB\nActive(anon):       2688 kB\nInactive(anon):   519872 kB\nActive(file):      24128 kB\nInactive(file):    46208 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                 0 kB\nWriteback:             0 kB\nAnonPages:        503232 kB\nMapped:            62336 kB\nShmem:             19456 kB\nKReclaimable:     105536 kB\nSlab:            1162240 kB\nSReclaimable:     105536 kB\nSUnreclaim:      1056704 kB\nKernelStack:       73152 kB\nPageTables:        18944 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1100416 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125888 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        377295296 kB\nMemAvailable:   359310080 kB\nBuffers:               0 kB\nCached:           274880 kB\nSwapCached:            0 kB\nActive:            70976 kB\nInactive:         711552 kB\nActive(anon):       2752 kB\nInactive(anon):   521024 kB\nActive(file):      68224 kB\nInactive(file):   190528 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               384 kB\nWriteback:             0 kB\nAnonPages:        507648 kB\nMapped:            68032 kB\nShmem:             19456 kB\nKReclaimable:     105536 kB\nSlab:            1162304 kB\nSReclaimable:     105536 kB\nSUnreclaim:      1056768 kB\nKernelStack:       73024 kB\nPageTables:        20096 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1110656 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      129024 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 7,
+      "wall_ns": 1795591408093768974
+    },
+    "8": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        378722880 kB\nMemAvailable:   360650624 kB\nBuffers:               0 kB\nCached:            88896 kB\nSwapCached:            0 kB\nActive:            48448 kB\nInactive:         557696 kB\nActive(anon):       5440 kB\nInactive(anon):   516160 kB\nActive(file):      43008 kB\nInactive(file):    41536 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              6208 kB\nWriteback:             0 kB\nAnonPages:        501120 kB\nMapped:            65280 kB\nShmem:             19456 kB\nKReclaimable:     105728 kB\nSlab:            1167360 kB\nSReclaimable:     105728 kB\nSUnreclaim:      1061632 kB\nKernelStack:       73216 kB\nPageTables:        26048 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1090432 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125888 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        378598912 kB\nMemAvailable:   360599232 kB\nBuffers:               0 kB\nCached:           242112 kB\nSwapCached:            0 kB\nActive:           185536 kB\nInactive:         568768 kB\nActive(anon):       5440 kB\nInactive(anon):   519168 kB\nActive(file):     180096 kB\nInactive(file):    49600 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              6656 kB\nWriteback:             0 kB\nAnonPages:        504128 kB\nMapped:            65280 kB\nShmem:             19456 kB\nKReclaimable:     105728 kB\nSlab:            1167360 kB\nSReclaimable:     105728 kB\nSUnreclaim:      1061632 kB\nKernelStack:       74752 kB\nPageTables:        26048 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1090432 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      128960 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 8,
+      "wall_ns": 1795591870336480345
+    },
+    "9": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        391339840 kB\nMemAvailable:   373243136 kB\nBuffers:               0 kB\nCached:            60416 kB\nSwapCached:            0 kB\nActive:            18048 kB\nInactive:         538368 kB\nActive(anon):       2624 kB\nInactive(anon):   515712 kB\nActive(file):      15424 kB\nInactive(file):    22656 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              3008 kB\nWriteback:             0 kB\nAnonPages:        498688 kB\nMapped:            32640 kB\nShmem:             19456 kB\nKReclaimable:     103296 kB\nSlab:            1167488 kB\nSReclaimable:     103296 kB\nSUnreclaim:      1064192 kB\nKernelStack:       73024 kB\nPageTables:        18944 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1090304 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125056 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        391285568 kB\nMemAvailable:   373191616 kB\nBuffers:               0 kB\nCached:            66496 kB\nSwapCached:            0 kB\nActive:            24256 kB\nInactive:         544896 kB\nActive(anon):       8832 kB\nInactive(anon):   516736 kB\nActive(file):      15424 kB\nInactive(file):    28160 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:             11008 kB\nWriteback:             0 kB\nAnonPages:        506496 kB\nMapped:            23424 kB\nShmem:             19456 kB\nKReclaimable:     103296 kB\nSlab:            1167360 kB\nSReclaimable:     103296 kB\nSUnreclaim:      1064064 kB\nKernelStack:       73024 kB\nPageTables:        22208 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1090176 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125120 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 9,
+      "wall_ns": 1795592153884979188
+    }
+  },
+  "events_by_query": {
+    "1": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 23411,
+        "query": 1,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q01",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795589840569687806
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 23411,
+        "query": 1,
+        "wall_ns": 1795589840572129255
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 23411,
+        "query": 1,
+        "rows": 4,
+        "seconds": 129.63940177099994,
+        "wall_ns": 1795589970214469574
+      },
+      {
+        "cache": {
+          "bytes": 404228041475,
+          "entries": 226207,
+          "loaded_bytes": 317463761335,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 23411,
+        "query": 1,
+        "wall_ns": 1795589970362115690
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 23411,
+        "query": 1,
+        "wall_ns": 1795589970362360958
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 23411,
+        "query": 1,
+        "rows": 4,
+        "seconds": 38.63715706799985,
+        "wall_ns": 1795590009002357357
+      },
+      {
+        "cache": {
+          "bytes": 404228041475,
+          "entries": 226207,
+          "loaded_bytes": 317438274666,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 23411,
+        "query": 1,
+        "wall_ns": 1795590009149908428
+      },
+      {
+        "event": "engine_closed",
+        "pid": 23411,
+        "query": 1,
+        "wall_ns": 1795590011053699561
+      },
+      {
+        "event": "complete",
+        "pid": 23411,
+        "query": 1,
+        "wall_ns": 1795590011053934196
+      }
+    ],
+    "10": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 32768,
+        "query": 10,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q10",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795593335531355536
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 32768,
+        "query": 10,
+        "wall_ns": 1795593335531487497
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 32768,
+        "query": 10,
+        "rows": 20,
+        "seconds": 289.7619104539999,
+        "wall_ns": 1795593625305542081
+      },
+      {
+        "cache": {
+          "bytes": 710197095045,
+          "entries": 405480,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 32768,
+        "query": 10,
+        "wall_ns": 1795593625566469905
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 32768,
+        "query": 10,
+        "wall_ns": 1795593625567532382
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 32768,
+        "query": 10,
+        "rows": 20,
+        "seconds": 315.42444168099973,
+        "wall_ns": 1795593941021031038
+      },
+      {
+        "cache": {
+          "bytes": 705185299077,
+          "entries": 410385,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 32768,
+        "query": 10,
+        "wall_ns": 1795593942116517046
+      },
+      {
+        "event": "engine_closed",
+        "pid": 32768,
+        "query": 10,
+        "wall_ns": 1795593944772084970
+      },
+      {
+        "event": "complete",
+        "pid": 32768,
+        "query": 10,
+        "wall_ns": 1795593944772272121
+      }
+    ],
+    "11": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 33996,
+        "query": 11,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q11",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795593948285397469
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 33996,
+        "query": 11,
+        "wall_ns": 1795593948285527221
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 33996,
+        "query": 11,
+        "rows": 9365098,
+        "seconds": 19.01679078699999,
+        "wall_ns": 1795593974270566779
+      },
+      {
+        "cache": {
+          "bytes": 48317118994,
+          "entries": 31022,
+          "loaded_bytes": 48317118994,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 33996,
+        "query": 11,
+        "wall_ns": 1795593977383293479
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 33996,
+        "query": 11,
+        "wall_ns": 1795593977383522779
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 33996,
+        "query": 11,
+        "rows": 9365098,
+        "seconds": 4.89042706500004,
+        "wall_ns": 1795593989252490352
+      },
+      {
+        "cache": {
+          "bytes": 48317118994,
+          "entries": 31022,
+          "loaded_bytes": 48317118994,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 33996,
+        "query": 11,
+        "wall_ns": 1795593992357329325
+      },
+      {
+        "event": "engine_closed",
+        "pid": 33996,
+        "query": 11,
+        "wall_ns": 1795593992734096343
+      },
+      {
+        "event": "complete",
+        "pid": 33996,
+        "query": 11,
+        "wall_ns": 1795593992734319916
+      }
+    ],
+    "12": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 34506,
+        "query": 12,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q12",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795593999120057655
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 34506,
+        "query": 12,
+        "wall_ns": 1795593999120195717
+      }
+    ],
+    "13": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 35469,
+        "query": 13,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q13",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795594222299799341
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 35469,
+        "query": 13,
+        "wall_ns": 1795594222299930311
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 35469,
+        "query": 13,
+        "rows": 10,
+        "seconds": 113.64102832200024,
+        "wall_ns": 1795594336037151424
+      },
+      {
+        "cache": {
+          "bytes": 414891852112,
+          "entries": 207293,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 35469,
+        "query": 13,
+        "wall_ns": 1795594336159433597
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 35469,
+        "query": 13,
+        "wall_ns": 1795594336159677133
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 35469,
+        "query": 13,
+        "rows": 10,
+        "seconds": 101.77363584699924,
+        "wall_ns": 1795594438022972674
+      },
+      {
+        "cache": {
+          "bytes": 410570428752,
+          "entries": 207456,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 35469,
+        "query": 13,
+        "wall_ns": 1795594438150517861
+      },
+      {
+        "event": "engine_closed",
+        "pid": 35469,
+        "query": 13,
+        "wall_ns": 1795594438872956639
+      },
+      {
+        "event": "complete",
+        "pid": 35469,
+        "query": 13,
+        "wall_ns": 1795594438873131579
+      }
+    ],
+    "14": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 36302,
+        "query": 14,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q14",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795594441851116342
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 36302,
+        "query": 14,
+        "wall_ns": 1795594441851251602
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 36302,
+        "query": 14,
+        "rows": 1,
+        "seconds": 270.6400607739997,
+        "wall_ns": 1795594712495868668
+      },
+      {
+        "cache": {
+          "bytes": 551473659097,
+          "entries": 343106,
+          "loaded_bytes": 165847899257,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 36302,
+        "query": 14,
+        "wall_ns": 1795594712729323259
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 36302,
+        "query": 14,
+        "wall_ns": 1795594712729545169
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 36302,
+        "query": 14,
+        "rows": 1,
+        "seconds": 154.29089485000077,
+        "wall_ns": 1795594867026557241
+      },
+      {
+        "cache": {
+          "bytes": 551473659097,
+          "entries": 343106,
+          "loaded_bytes": 165550648243,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 36302,
+        "query": 14,
+        "wall_ns": 1795594867259504979
+      },
+      {
+        "event": "engine_closed",
+        "pid": 36302,
+        "query": 14,
+        "wall_ns": 1795594868846800292
+      },
+      {
+        "event": "complete",
+        "pid": 36302,
+        "query": 14,
+        "wall_ns": 1795594868847044885
+      }
+    ],
+    "15": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 37501,
+        "query": 15,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q15",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795594871088118071
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 37501,
+        "query": 15,
+        "wall_ns": 1795594871088255032
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 37501,
+        "query": 15,
+        "rows": 1,
+        "seconds": 226.37636123599987,
+        "wall_ns": 1795595097492703015
+      },
+      {
+        "cache": {
+          "bytes": 523142867715,
+          "entries": 284747,
+          "loaded_bytes": 185606916548,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 37501,
+        "query": 15,
+        "wall_ns": 1795595097685524085
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 37501,
+        "query": 15,
+        "wall_ns": 1795595097685771762
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 37501,
+        "query": 15,
+        "rows": 1,
+        "seconds": 138.41674270600015,
+        "wall_ns": 1795595236135261883
+      },
+      {
+        "cache": {
+          "bytes": 523142867715,
+          "entries": 284747,
+          "loaded_bytes": 185691667912,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 37501,
+        "query": 15,
+        "wall_ns": 1795595236338999369
+      },
+      {
+        "event": "engine_closed",
+        "pid": 37501,
+        "query": 15,
+        "wall_ns": 1795595237901331563
+      },
+      {
+        "event": "complete",
+        "pid": 37501,
+        "query": 15,
+        "wall_ns": 1795595237901559440
+      }
+    ],
+    "16": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 38597,
+        "query": 16,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q16",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795595240284442939
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 38597,
+        "query": 16,
+        "wall_ns": 1795595240284574333
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 38597,
+        "query": 16,
+        "rows": 27840,
+        "seconds": 16.52348539400009,
+        "wall_ns": 1795595256840314720
+      },
+      {
+        "cache": {
+          "bytes": 20646050792,
+          "entries": 15187,
+          "loaded_bytes": 20646050792,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 38597,
+        "query": 16,
+        "wall_ns": 1795595256870335544
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 38597,
+        "query": 16,
+        "wall_ns": 1795595256870509676
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 38597,
+        "query": 16,
+        "rows": 27840,
+        "seconds": 7.577533544999824,
+        "wall_ns": 1795595264470046266
+      },
+      {
+        "cache": {
+          "bytes": 20646050792,
+          "entries": 15187,
+          "loaded_bytes": 20646050792,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 38597,
+        "query": 16,
+        "wall_ns": 1795595264500330342
+      },
+      {
+        "event": "engine_closed",
+        "pid": 38597,
+        "query": 16,
+        "wall_ns": 1795595265150641351
+      },
+      {
+        "event": "complete",
+        "pid": 38597,
+        "query": 16,
+        "wall_ns": 1795595265150894404
+      }
+    ],
+    "17": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 39178,
+        "query": 17,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q17",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795595267270478590
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 39178,
+        "query": 17,
+        "wall_ns": 1795595267270604177
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 39178,
+        "query": 17,
+        "rows": 1,
+        "seconds": 253.25259823499982,
+        "wall_ns": 1795595520540162268
+      },
+      {
+        "cache": {
+          "bytes": 451229674713,
+          "entries": 288747,
+          "loaded_bytes": 312046726218,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 39178,
+        "query": 17,
+        "wall_ns": 1795595520729348928
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 39178,
+        "query": 17,
+        "wall_ns": 1795595520729600686
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 39178,
+        "query": 17,
+        "rows": 1,
+        "seconds": 114.18911374700019,
+        "wall_ns": 1795595634937818019
+      },
+      {
+        "cache": {
+          "bytes": 453522844889,
+          "entries": 292220,
+          "loaded_bytes": 312032152872,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 39178,
+        "query": 17,
+        "wall_ns": 1795595635127056914
+      },
+      {
+        "event": "engine_closed",
+        "pid": 39178,
+        "query": 17,
+        "wall_ns": 1795595637259570239
+      },
+      {
+        "event": "complete",
+        "pid": 39178,
+        "query": 17,
+        "wall_ns": 1795595637259787711
+      }
+    ],
+    "18": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 40298,
+        "query": 18,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q18",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795595639177231230
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 40298,
+        "query": 18,
+        "wall_ns": 1795595639177396225
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 40298,
+        "query": 18,
+        "rows": 100,
+        "seconds": 671.1780945229993,
+        "wall_ns": 1795596310364257252
+      },
+      {
+        "cache": {
+          "bytes": 453135395461,
+          "entries": 312869,
+          "loaded_bytes": 204533705804,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 40298,
+        "query": 18,
+        "wall_ns": 1795596310574129346
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 40298,
+        "query": 18,
+        "wall_ns": 1795596310574384773
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 40298,
+        "query": 18,
+        "rows": 100,
+        "seconds": 650.9253576909996,
+        "wall_ns": 1795596961514058368
+      },
+      {
+        "cache": {
+          "bytes": 466354870917,
+          "entries": 350658,
+          "loaded_bytes": 204494344192,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 40298,
+        "query": 18,
+        "wall_ns": 1795596961757610311
+      },
+      {
+        "event": "engine_closed",
+        "pid": 40298,
+        "query": 18,
+        "wall_ns": 1795596963876647432
+      },
+      {
+        "event": "complete",
+        "pid": 40298,
+        "query": 18,
+        "wall_ns": 1795596963876821626
+      }
+    ],
+    "19": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 43131,
+        "query": 19,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q19",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795596966741381979
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 43131,
+        "query": 19,
+        "wall_ns": 1795596966741509547
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 43131,
+        "query": 19,
+        "rows": 1,
+        "seconds": 284.9576800289997,
+        "wall_ns": 1795597251702847517
+      },
+      {
+        "cache": {
+          "bytes": 546111212761,
+          "entries": 401546,
+          "loaded_bytes": 316754366609,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 43131,
+        "query": 19,
+        "wall_ns": 1795597251969459457
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 43131,
+        "query": 19,
+        "wall_ns": 1795597251969708249
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 43131,
+        "query": 19,
+        "rows": 1,
+        "seconds": 95.86070729499988,
+        "wall_ns": 1795597347833670548
+      },
+      {
+        "cache": {
+          "bytes": 546111212761,
+          "entries": 401546,
+          "loaded_bytes": 316396764922,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 43131,
+        "query": 19,
+        "wall_ns": 1795597348099467599
+      },
+      {
+        "event": "engine_closed",
+        "pid": 43131,
+        "query": 19,
+        "wall_ns": 1795597350367889412
+      },
+      {
+        "event": "complete",
+        "pid": 43131,
+        "query": 19,
+        "wall_ns": 1795597350368100020
+      }
+    ],
+    "2": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 24161,
+        "query": 2,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q02",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795590012797831091
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 24161,
+        "query": 2,
+        "wall_ns": 1795590012797963301
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 24161,
+        "query": 2,
+        "rows": 100,
+        "seconds": 22.842194140000174,
+        "wall_ns": 1795590035650635916
+      },
+      {
+        "cache": {
+          "bytes": 45130202088,
+          "entries": 32690,
+          "loaded_bytes": 45130202088,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 24161,
+        "query": 2,
+        "wall_ns": 1795590035678804565
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 24161,
+        "query": 2,
+        "wall_ns": 1795590035679006742
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 24161,
+        "query": 2,
+        "rows": 100,
+        "seconds": 2.765867483999955,
+        "wall_ns": 1795590038454319443
+      },
+      {
+        "cache": {
+          "bytes": 45130202088,
+          "entries": 32690,
+          "loaded_bytes": 45130202088,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 24161,
+        "query": 2,
+        "wall_ns": 1795590038481491435
+      },
+      {
+        "event": "engine_closed",
+        "pid": 24161,
+        "query": 2,
+        "wall_ns": 1795590038793403234
+      },
+      {
+        "event": "complete",
+        "pid": 24161,
+        "query": 2,
+        "wall_ns": 1795590038793608146
+      }
+    ],
+    "20": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 44011,
+        "query": 20,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q20",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795597352590543380
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 44011,
+        "query": 20,
+        "wall_ns": 1795597352590675879
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 44011,
+        "query": 20,
+        "rows": 380400,
+        "seconds": 256.110396303,
+        "wall_ns": 1795597608806216544
+      },
+      {
+        "cache": {
+          "bytes": 650531976477,
+          "entries": 368204,
+          "loaded_bytes": 301141918420,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 44011,
+        "query": 20,
+        "wall_ns": 1795597609170073293
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 44011,
+        "query": 20,
+        "wall_ns": 1795597609170313788
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 44011,
+        "query": 20,
+        "rows": 380400,
+        "seconds": 147.8111919460007,
+        "wall_ns": 1795597757092371054
+      },
+      {
+        "cache": {
+          "bytes": 650531976477,
+          "entries": 368204,
+          "loaded_bytes": 300746285232,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 44011,
+        "query": 20,
+        "wall_ns": 1795597757515454894
+      },
+      {
+        "event": "engine_closed",
+        "pid": 44011,
+        "query": 20,
+        "wall_ns": 1795597759582619906
+      },
+      {
+        "event": "complete",
+        "pid": 44011,
+        "query": 20,
+        "wall_ns": 1795597759582843945
+      }
+    ],
+    "21": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 44903,
+        "query": 21,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q21",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795597762012738447
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 44903,
+        "query": 21,
+        "wall_ns": 1795597762015140497
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 44903,
+        "query": 21,
+        "rows": 100,
+        "seconds": 689.5670525160003,
+        "wall_ns": 1795598451736091420
+      },
+      {
+        "cache": {
+          "bytes": 419938391887,
+          "entries": 305984,
+          "loaded_bytes": 237769915468,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 44903,
+        "query": 21,
+        "wall_ns": 1795598451952157273
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 44903,
+        "query": 21,
+        "wall_ns": 1795598451954143740
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 44903,
+        "query": 21,
+        "rows": 100,
+        "seconds": 613.3521795510005,
+        "wall_ns": 1795599065466924906
+      },
+      {
+        "cache": {
+          "bytes": 419938391887,
+          "entries": 305984,
+          "loaded_bytes": 237743439872,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 44903,
+        "query": 21,
+        "wall_ns": 1795599065689263215
+      },
+      {
+        "event": "engine_closed",
+        "pid": 44903,
+        "query": 21,
+        "wall_ns": 1795599067991532337
+      },
+      {
+        "event": "complete",
+        "pid": 44903,
+        "query": 21,
+        "wall_ns": 1795599067991700193
+      }
+    ],
+    "22": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 46774,
+        "query": 22,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q22",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795599070354018894
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 46774,
+        "query": 22,
+        "wall_ns": 1795599070354145095
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 46774,
+        "query": 22,
+        "rows": 7,
+        "seconds": 25.3696159430001,
+        "wall_ns": 1795599095764346811
+      },
+      {
+        "cache": {
+          "bytes": 88818250064,
+          "entries": 46611,
+          "loaded_bytes": 88818250064,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 46774,
+        "query": 22,
+        "wall_ns": 1795599095803588379
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 46774,
+        "query": 22,
+        "wall_ns": 1795599095803790252
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 46774,
+        "query": 22,
+        "rows": 7,
+        "seconds": 9.290339764998862,
+        "wall_ns": 1795599105140895263
+      },
+      {
+        "cache": {
+          "bytes": 88818250064,
+          "entries": 46611,
+          "loaded_bytes": 88818250064,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 46774,
+        "query": 22,
+        "wall_ns": 1795599105178197865
+      },
+      {
+        "event": "engine_closed",
+        "pid": 46774,
+        "query": 22,
+        "wall_ns": 1795599105872039085
+      },
+      {
+        "event": "complete",
+        "pid": 46774,
+        "query": 22,
+        "wall_ns": 1795599105872262424
+      }
+    ],
+    "3": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 24690,
+        "query": 3,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q03",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795590040418005766
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 24690,
+        "query": 3,
+        "wall_ns": 1795590040418131099
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 24690,
+        "query": 3,
+        "rows": 10,
+        "seconds": 312.36493470899995,
+        "wall_ns": 1795590352829947555
+      },
+      {
+        "cache": {
+          "bytes": 647326468741,
+          "entries": 378000,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 24690,
+        "query": 3,
+        "wall_ns": 1795590353320462293
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 24690,
+        "query": 3,
+        "wall_ns": 1795590353320730616
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 24690,
+        "query": 3,
+        "rows": 10,
+        "seconds": 311.39759667399994,
+        "wall_ns": 1795590664734441799
+      },
+      {
+        "cache": {
+          "bytes": 656116140677,
+          "entries": 385986,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 24690,
+        "query": 3,
+        "wall_ns": 1795590665032849570
+      },
+      {
+        "event": "engine_closed",
+        "pid": 24690,
+        "query": 3,
+        "wall_ns": 1795590665993875234
+      },
+      {
+        "event": "complete",
+        "pid": 24690,
+        "query": 3,
+        "wall_ns": 1795590665994049257
+      }
+    ],
+    "4": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 25950,
+        "query": 4,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q04",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795590669505189052
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 25950,
+        "query": 4,
+        "wall_ns": 1795590669505334628
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 25950,
+        "query": 4,
+        "rows": 5,
+        "seconds": 169.44178754700033,
+        "wall_ns": 1795590839002478688
+      },
+      {
+        "cache": {
+          "bytes": 229855790927,
+          "entries": 204156,
+          "loaded_bytes": 229855790927,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 25950,
+        "query": 4,
+        "wall_ns": 1795590839137050143
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 25950,
+        "query": 4,
+        "wall_ns": 1795590839137303635
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 25950,
+        "query": 4,
+        "rows": 5,
+        "seconds": 17.18601386499995,
+        "wall_ns": 1795590856339964601
+      },
+      {
+        "cache": {
+          "bytes": 229855790927,
+          "entries": 204156,
+          "loaded_bytes": 229855790927,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 25950,
+        "query": 4,
+        "wall_ns": 1795590856471178964
+      },
+      {
+        "event": "engine_closed",
+        "pid": 25950,
+        "query": 4,
+        "wall_ns": 1795590858366231919
+      },
+      {
+        "event": "complete",
+        "pid": 25950,
+        "query": 4,
+        "wall_ns": 1795590858366478291
+      }
+    ],
+    "5": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 26640,
+        "query": 5,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q05",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795590860075497672
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 26640,
+        "query": 5,
+        "wall_ns": 1795590860075653078
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 26640,
+        "query": 5,
+        "rows": 5,
+        "seconds": 258.21993152799996,
+        "wall_ns": 1795591118298150619
+      },
+      {
+        "cache": {
+          "bytes": 538470279813,
+          "entries": 331644,
+          "loaded_bytes": 293602971780,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 26640,
+        "query": 5,
+        "wall_ns": 1795591118514253097
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 26640,
+        "query": 5,
+        "wall_ns": 1795591118514505124
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 26640,
+        "query": 5,
+        "rows": 5,
+        "seconds": 118.96505254799968,
+        "wall_ns": 1795591237493532556
+      },
+      {
+        "cache": {
+          "bytes": 538470279813,
+          "entries": 331644,
+          "loaded_bytes": 292997852566,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 26640,
+        "query": 5,
+        "wall_ns": 1795591237751772711
+      },
+      {
+        "event": "engine_closed",
+        "pid": 26640,
+        "query": 5,
+        "wall_ns": 1795591239833536312
+      },
+      {
+        "event": "complete",
+        "pid": 26640,
+        "query": 5,
+        "wall_ns": 1795591239833773336
+      }
+    ],
+    "6": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 27756,
+        "query": 6,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q06",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795591242116204430
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 27756,
+        "query": 6,
+        "wall_ns": 1795591242116329071
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 27756,
+        "query": 6,
+        "rows": 1,
+        "seconds": 147.78995822200022,
+        "wall_ns": 1795591389908890295
+      },
+      {
+        "cache": {
+          "bytes": 350084246275,
+          "entries": 226207,
+          "loaded_bytes": 317479357187,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 27756,
+        "query": 6,
+        "wall_ns": 1795591390064298453
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 27756,
+        "query": 6,
+        "wall_ns": 1795591390064529321
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 27756,
+        "query": 6,
+        "rows": 1,
+        "seconds": 15.948348487999738,
+        "wall_ns": 1795591406015345628
+      },
+      {
+        "cache": {
+          "bytes": 350084246275,
+          "entries": 226207,
+          "loaded_bytes": 317485808387,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 27756,
+        "query": 6,
+        "wall_ns": 1795591406165362129
+      },
+      {
+        "event": "engine_closed",
+        "pid": 27756,
+        "query": 6,
+        "wall_ns": 1795591407994103000
+      },
+      {
+        "event": "complete",
+        "pid": 27756,
+        "query": 6,
+        "wall_ns": 1795591407994318661
+      }
+    ],
+    "7": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 28498,
+        "query": 7,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q07",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795591409986636139
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 28498,
+        "query": 7,
+        "wall_ns": 1795591409986767613
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 28498,
+        "query": 7,
+        "rows": 4,
+        "seconds": 286.29540038000005,
+        "wall_ns": 1795591696287735200
+      },
+      {
+        "cache": {
+          "bytes": 606774307461,
+          "entries": 376644,
+          "loaded_bytes": 259183180541,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 28498,
+        "query": 7,
+        "wall_ns": 1795591696533984119
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 28498,
+        "query": 7,
+        "wall_ns": 1795591696534197274
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 28498,
+        "query": 7,
+        "rows": 4,
+        "seconds": 171.45859612699996,
+        "wall_ns": 1795591868001163575
+      },
+      {
+        "cache": {
+          "bytes": 606774307461,
+          "entries": 376644,
+          "loaded_bytes": 258735329979,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 28498,
+        "query": 7,
+        "wall_ns": 1795591868246807295
+      },
+      {
+        "event": "engine_closed",
+        "pid": 28498,
+        "query": 7,
+        "wall_ns": 1795591870212778400
+      },
+      {
+        "event": "complete",
+        "pid": 28498,
+        "query": 7,
+        "wall_ns": 1795591870213016771
+      }
+    ],
+    "8": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 29732,
+        "query": 8,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q08",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795591872228199419
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 29732,
+        "query": 8,
+        "wall_ns": 1795591872228331189
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 29732,
+        "query": 8,
+        "rows": 2,
+        "seconds": 271.9724350710003,
+        "wall_ns": 1795592144203680525
+      },
+      {
+        "cache": {
+          "bytes": 784632339547,
+          "entries": 448543,
+          "loaded_bytes": 275211811728,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 29732,
+        "query": 8,
+        "wall_ns": 1795592144489750952
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 29732,
+        "query": 8,
+        "wall_ns": 1795592144490004335
+      }
+    ],
+    "9": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 30676,
+        "query": 9,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q09",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795592155976695408
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 30676,
+        "query": 9,
+        "wall_ns": 1795592155976833185
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 30676,
+        "query": 9,
+        "rows": 175,
+        "seconds": 550.9331731259999,
+        "wall_ns": 1795592743510980352
+      },
+      {
+        "cache": {
+          "bytes": 817971548521,
+          "entries": 510348,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 30676,
+        "query": 9,
+        "wall_ns": 1795592743852604615
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 30676,
+        "query": 9,
+        "wall_ns": 1795592743852840483
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 30676,
+        "query": 9,
+        "rows": 175,
+        "seconds": 545.1615736929998,
+        "wall_ns": 1795593326530612120
+      },
+      {
+        "cache": {
+          "bytes": 817971548521,
+          "entries": 510348,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 30676,
+        "query": 9,
+        "wall_ns": 1795593326889124335
+      },
+      {
+        "event": "engine_closed",
+        "pid": 30676,
+        "query": 9,
+        "wall_ns": 1795593329123296550
+      },
+      {
+        "event": "complete",
+        "pid": 30676,
+        "query": 9,
+        "wall_ns": 1795593329123463418
+      }
+    ]
+  },
+  "postflight": {
+    "manifest": {
+      "files": 868,
+      "sha256": "d11c67d39a1e0309ffa4bd1c0ee9cff22cd72cc560d051c63a9b2e2206ba27da",
+      "tables": {
+        "customer": 1500000000,
+        "lineitem": 59999994267,
+        "nation": 25,
+        "orders": 15000000000,
+        "part": 2000000000,
+        "partsupp": 8000000000,
+        "region": 5,
+        "supplier": 100000000
+      }
+    },
+    "sources_unchanged": true
+  },
+  "preflight": {
+    "bucket": {
+      "bucket": "sae-dataproc-aws-dev-sirius-scratch-us-east-1",
+      "region": "us-east-1",
+      "tables_present": [
+        "region",
+        "nation",
+        "supplier",
+        "customer",
+        "part",
+        "partsupp",
+        "orders",
+        "lineitem"
+      ]
+    },
+    "counts_before_initial_cache_clear": true,
+    "generation_manifest": {
+      "files": 868,
+      "sha256": "d11c67d39a1e0309ffa4bd1c0ee9cff22cd72cc560d051c63a9b2e2206ba27da",
+      "tables": {
+        "customer": 1500000000,
+        "lineitem": 59999994267,
+        "nation": 25,
+        "orders": 15000000000,
+        "part": 2000000000,
+        "partsupp": 8000000000,
+        "region": 5,
+        "supplier": 100000000
+      }
+    },
+    "identity": {
+      "accountId": "772385118201",
+      "architecture": "arm64",
+      "availabilityZone": "us-east-1a",
+      "billingProducts": null,
+      "devpayProductCodes": null,
+      "imageId": "ami-0272643e149bb16d0",
+      "instanceId": "i-0ac1da908cae3af37",
+      "instanceType": "m9gd.24xlarge",
+      "kernelId": null,
+      "marketplaceProductCodes": null,
+      "pendingTime": "2026-11-24T22:22:18Z",
+      "privateIp": "172.31.10.218",
+      "ramdiskId": null,
+      "region": "us-east-1",
+      "version": "2017-09-30"
+    },
+    "parquet_footer_counts": {
+      "customer": 1500000000,
+      "lineitem": 59999994267,
+      "nation": 25,
+      "orders": 15000000000,
+      "part": 2000000000,
+      "partsupp": 8000000000,
+      "region": 5,
+      "supplier": 100000000
+    },
+    "storage": [
+      {
+        "allow_ebs": false,
+        "devices": [
+          {
+            "children": [
+              {
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "name": "/dev/nvme1n1",
+                "type": "disk"
+              },
+              {
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "name": "/dev/nvme3n1",
+                "type": "disk"
+              },
+              {
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "name": "/dev/nvme0n1",
+                "type": "disk"
+              }
+            ],
+            "model": null,
+            "name": "/dev/md127",
+            "type": "raid0"
+          }
+        ],
+        "free_bytes": 5644281044992,
+        "mount": {
+          "source": "/dev/md127",
+          "target": "/mnt/nvme"
+        },
+        "path": "/mnt/nvme/duckdb-spill"
+      }
+    ]
+  },
+  "processes": [
+    {
+      "cache_clear_ns": 1795589839145599332,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q01",
+      "exit_code": 0,
+      "pid": 23411,
+      "query": 1,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795590011179232675,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q02",
+      "exit_code": 0,
+      "pid": 24161,
+      "query": 2,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795590038922129898,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q03",
+      "exit_code": 0,
+      "pid": 24690,
+      "query": 3,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795590667770667559,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q04",
+      "exit_code": 0,
+      "pid": 25950,
+      "query": 4,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795590858488281164,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q05",
+      "exit_code": 0,
+      "pid": 26640,
+      "query": 5,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795591239969994145,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q06",
+      "exit_code": 0,
+      "pid": 27756,
+      "query": 6,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795591408093768974,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q07",
+      "exit_code": 0,
+      "pid": 28498,
+      "query": 7,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795591870336480345,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q08",
+      "exit_code": -9,
+      "pid": 29732,
+      "query": 8,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795592153884979188,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q09",
+      "exit_code": 0,
+      "pid": 30676,
+      "query": 9,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795593333563621587,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q10",
+      "exit_code": 0,
+      "pid": 32768,
+      "query": 10,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795593945943037448,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q11",
+      "exit_code": 0,
+      "pid": 33996,
+      "query": 11,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795593996822088914,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q12",
+      "exit_code": -9,
+      "pid": 34506,
+      "query": 12,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795594220221681824,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q13",
+      "exit_code": 0,
+      "pid": 35469,
+      "query": 13,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795594440021660996,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q14",
+      "exit_code": 0,
+      "pid": 36302,
+      "query": 14,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795594868957030499,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q15",
+      "exit_code": 0,
+      "pid": 37501,
+      "query": 15,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795595238021970515,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q16",
+      "exit_code": 0,
+      "pid": 38597,
+      "query": 16,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795595265323679459,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q17",
+      "exit_code": 0,
+      "pid": 39178,
+      "query": 17,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795595637405885059,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q18",
+      "exit_code": 0,
+      "pid": 40298,
+      "query": 18,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795596964732358982,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q19",
+      "exit_code": 0,
+      "pid": 43131,
+      "query": 19,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795597350525141029,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q20",
+      "exit_code": 0,
+      "pid": 44011,
+      "query": 20,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795597759857580965,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q21",
+      "exit_code": 0,
+      "pid": 44903,
+      "query": 21,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795599068263074003,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q22",
+      "exit_code": 0,
+      "pid": 46774,
+      "query": 22,
+      "timed_out": false
+    }
+  ],
+  "replay_plan": {
+    "adapter": {
+      "fixed_baseline_memory_limit_bytes": 318617491865,
+      "new_spill": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a",
+      "old_spill": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124",
+      "required_page_size": 65536
+    },
+    "changes_to_measured_worker": "unique spill directory; exact baseline memory limit; require/log 65536-byte page kernel",
+    "controller_sha256": "0015566e267672bdf9c10ba315af94142496788faeb022704c037572ebce5fc1",
+    "engine": "DuckDB 2.0.0",
+    "input": "s3://sae-dataproc-aws-dev-sirius-scratch-us-east-1/datasets/tpch_sf10000_regenerated",
+    "iterations": 2,
+    "ordering": "Q1 Q1 clear/restart Q2 Q2 ... Q22 Q22",
+    "output": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000",
+    "scale_factor": 10000,
+    "sources": {
+      "parquet_output.py": "ab07fe91b3d3e86d683853410696b6167489501c5159b31e607171171c50d1d5",
+      "performance_test.py": "ad4af1a647e08a063959f63acaee2d42024e7d348c7603b6c4ffbc1ee52be44e",
+      "queries.py": "c9ae5a51870ced2e1f7aec82eb58517536fa66615c94ba1d3e3953d6b41d0e8b",
+      "run.py": "0015566e267672bdf9c10ba315af94142496788faeb022704c037572ebce5fc1",
+      "tpch_pin_columns.py": "3a8f64241345f22aa1761c0efc43d86cce2624766d6b5bfb394d8f38b50339fc",
+      "worker.py": "e7242e266fc8fc5b9eecc1eec6d5ac0e63a4e363847260778aaff38081fdbcce"
+    },
+    "spill": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a",
+    "worker_sha256": "06b6263c75392fbe5aceb4507b4a22f6ffffc89f1f589266fc09f9383f9fcbc3"
+  },
+  "settings_by_query": {
+    "1": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q01",
+      "threads": "96"
+    },
+    "10": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q10",
+      "threads": "96"
+    },
+    "11": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q11",
+      "threads": "96"
+    },
+    "12": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q12",
+      "threads": "96"
+    },
+    "13": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q13",
+      "threads": "96"
+    },
+    "14": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q14",
+      "threads": "96"
+    },
+    "15": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q15",
+      "threads": "96"
+    },
+    "16": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q16",
+      "threads": "96"
+    },
+    "17": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q17",
+      "threads": "96"
+    },
+    "18": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q18",
+      "threads": "96"
+    },
+    "19": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q19",
+      "threads": "96"
+    },
+    "2": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q02",
+      "threads": "96"
+    },
+    "20": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q20",
+      "threads": "96"
+    },
+    "21": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q21",
+      "threads": "96"
+    },
+    "22": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q22",
+      "threads": "96"
+    },
+    "3": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q03",
+      "threads": "96"
+    },
+    "4": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q04",
+      "threads": "96"
+    },
+    "5": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q05",
+      "threads": "96"
+    },
+    "6": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q06",
+      "threads": "96"
+    },
+    "7": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q07",
+      "threads": "96"
+    },
+    "8": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q08",
+      "threads": "96"
+    },
+    "9": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-842a706efff1426ab96e166781d9763a/q09",
+      "threads": "96"
+    }
+  },
+  "summary": {
+    "complete": false,
+    "measurements": [
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q01/iteration1/duckdb/q1/result.txt",
+        "answer_sha256": "25b3e126b7991fd33cc165f49f09222194c93051e249c4322e4659ac3ac91e48",
+        "iteration": 1,
+        "query": 1,
+        "rows": 4,
+        "seconds": 129.63940177099994
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q01/iteration2/duckdb/q1/result.txt",
+        "answer_sha256": "25b3e126b7991fd33cc165f49f09222194c93051e249c4322e4659ac3ac91e48",
+        "iteration": 2,
+        "query": 1,
+        "rows": 4,
+        "seconds": 38.63715706799985
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q02/iteration1/duckdb/q2/result.txt",
+        "answer_sha256": "d0b803f17ed6c0248192f5d0773dbb6df8e7d7b35008c48e682ccc0f208dacef",
+        "iteration": 1,
+        "query": 2,
+        "rows": 100,
+        "seconds": 22.842194140000174
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q02/iteration2/duckdb/q2/result.txt",
+        "answer_sha256": "d0b803f17ed6c0248192f5d0773dbb6df8e7d7b35008c48e682ccc0f208dacef",
+        "iteration": 2,
+        "query": 2,
+        "rows": 100,
+        "seconds": 2.765867483999955
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q03/iteration1/duckdb/q3/result.txt",
+        "answer_sha256": "130a2fbaf64559ac252dc83c4c0ef6bc7afbc41858c80fee48ed2f526c1ff2d6",
+        "iteration": 1,
+        "query": 3,
+        "rows": 10,
+        "seconds": 312.36493470899995
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q03/iteration2/duckdb/q3/result.txt",
+        "answer_sha256": "3be02b0f956bf2dbc0bb5e5d2cce6e39fb711118a91fc485d3472bbd94683f79",
+        "iteration": 2,
+        "query": 3,
+        "rows": 10,
+        "seconds": 311.39759667399994
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q04/iteration1/duckdb/q4/result.txt",
+        "answer_sha256": "6964da0085a480b4b84d4468688a654d438bdbb0db37aa6a06f254f5b7cdb3dd",
+        "iteration": 1,
+        "query": 4,
+        "rows": 5,
+        "seconds": 169.44178754700033
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q04/iteration2/duckdb/q4/result.txt",
+        "answer_sha256": "6964da0085a480b4b84d4468688a654d438bdbb0db37aa6a06f254f5b7cdb3dd",
+        "iteration": 2,
+        "query": 4,
+        "rows": 5,
+        "seconds": 17.18601386499995
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q05/iteration1/duckdb/q5/result.txt",
+        "answer_sha256": "dd073e73c494e4f266db844167817f215d97144e289631d5c3ff1ef99ed95b45",
+        "iteration": 1,
+        "query": 5,
+        "rows": 5,
+        "seconds": 258.21993152799996
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q05/iteration2/duckdb/q5/result.txt",
+        "answer_sha256": "dd073e73c494e4f266db844167817f215d97144e289631d5c3ff1ef99ed95b45",
+        "iteration": 2,
+        "query": 5,
+        "rows": 5,
+        "seconds": 118.96505254799968
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q06/iteration1/duckdb/q6/result.txt",
+        "answer_sha256": "97fc2082cc68b6e57b0e9f69823ba2ce158054612c95bf4a548efd3b2f859bbb",
+        "iteration": 1,
+        "query": 6,
+        "rows": 1,
+        "seconds": 147.78995822200022
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q06/iteration2/duckdb/q6/result.txt",
+        "answer_sha256": "97fc2082cc68b6e57b0e9f69823ba2ce158054612c95bf4a548efd3b2f859bbb",
+        "iteration": 2,
+        "query": 6,
+        "rows": 1,
+        "seconds": 15.948348487999738
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q07/iteration1/duckdb/q7/result.txt",
+        "answer_sha256": "5671942c476cc540d7adb1a3e1f6bf6c5c70fb41578cddd144363653315eceee",
+        "iteration": 1,
+        "query": 7,
+        "rows": 4,
+        "seconds": 286.29540038000005
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q07/iteration2/duckdb/q7/result.txt",
+        "answer_sha256": "5671942c476cc540d7adb1a3e1f6bf6c5c70fb41578cddd144363653315eceee",
+        "iteration": 2,
+        "query": 7,
+        "rows": 4,
+        "seconds": 171.45859612699996
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q08/iteration1/duckdb/q8/result.txt",
+        "answer_sha256": "a1f396bb24d30415ad79b7964291774e1237ed73c929c592c549eba2d663047d",
+        "iteration": 1,
+        "query": 8,
+        "rows": 2,
+        "seconds": 271.9724350710003
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q09/iteration1/duckdb/q9/result.txt",
+        "answer_sha256": "e74dba15bdaf62d95dc5afe407d69222297381c06d25abe9014579e188994915",
+        "iteration": 1,
+        "query": 9,
+        "rows": 175,
+        "seconds": 550.9331731259999
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q09/iteration2/duckdb/q9/result.txt",
+        "answer_sha256": "e74dba15bdaf62d95dc5afe407d69222297381c06d25abe9014579e188994915",
+        "iteration": 2,
+        "query": 9,
+        "rows": 175,
+        "seconds": 545.1615736929998
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q10/iteration1/duckdb/q10/result.txt",
+        "answer_sha256": "fe8c7b99f28fb0236154560b0c5ecc3209f90b16d6309f56379d6fdbe0d83500",
+        "iteration": 1,
+        "query": 10,
+        "rows": 20,
+        "seconds": 289.7619104539999
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q10/iteration2/duckdb/q10/result.txt",
+        "answer_sha256": "fe8c7b99f28fb0236154560b0c5ecc3209f90b16d6309f56379d6fdbe0d83500",
+        "iteration": 2,
+        "query": 10,
+        "rows": 20,
+        "seconds": 315.42444168099973
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q11/iteration1/duckdb/q11/result.txt",
+        "answer_sha256": "723cf8a6a5a038de515efd566fa8337282874ac49cbd5ff12ae4027f48b3467d",
+        "iteration": 1,
+        "query": 11,
+        "rows": 9365098,
+        "seconds": 19.01679078699999
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q11/iteration2/duckdb/q11/result.txt",
+        "answer_sha256": "1dfe585cf8c514f4d11f3cbcc8a1aa1160998c89e1b82bedf76d0bf29fe98cb5",
+        "iteration": 2,
+        "query": 11,
+        "rows": 9365098,
+        "seconds": 4.89042706500004
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q13/iteration1/duckdb/q13/result.txt",
+        "answer_sha256": "f578158d7c3170b81b54417ff6ff0505d854926086962dad9a96c7c1004e4be2",
+        "iteration": 1,
+        "query": 13,
+        "rows": 10,
+        "seconds": 113.64102832200024
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q13/iteration2/duckdb/q13/result.txt",
+        "answer_sha256": "f578158d7c3170b81b54417ff6ff0505d854926086962dad9a96c7c1004e4be2",
+        "iteration": 2,
+        "query": 13,
+        "rows": 10,
+        "seconds": 101.77363584699924
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q14/iteration1/duckdb/q14/result.txt",
+        "answer_sha256": "5841b620a07d7517c0b311b93875672d1e08651071e761b801502bf9e8a71c48",
+        "iteration": 1,
+        "query": 14,
+        "rows": 1,
+        "seconds": 270.6400607739997
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q14/iteration2/duckdb/q14/result.txt",
+        "answer_sha256": "5841b620a07d7517c0b311b93875672d1e08651071e761b801502bf9e8a71c48",
+        "iteration": 2,
+        "query": 14,
+        "rows": 1,
+        "seconds": 154.29089485000077
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q15/iteration1/duckdb/q15/result.txt",
+        "answer_sha256": "8b92601cc311648a29249e0264b90b718ace38f63b257721337acd1c7b9fc069",
+        "iteration": 1,
+        "query": 15,
+        "rows": 1,
+        "seconds": 226.37636123599987
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q15/iteration2/duckdb/q15/result.txt",
+        "answer_sha256": "8b92601cc311648a29249e0264b90b718ace38f63b257721337acd1c7b9fc069",
+        "iteration": 2,
+        "query": 15,
+        "rows": 1,
+        "seconds": 138.41674270600015
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q16/iteration1/duckdb/q16/result.txt",
+        "answer_sha256": "304334a679132ee989a0eae0ec53cc59e38f8699bbf53a01f223cfb3d825479c",
+        "iteration": 1,
+        "query": 16,
+        "rows": 27840,
+        "seconds": 16.52348539400009
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q16/iteration2/duckdb/q16/result.txt",
+        "answer_sha256": "304334a679132ee989a0eae0ec53cc59e38f8699bbf53a01f223cfb3d825479c",
+        "iteration": 2,
+        "query": 16,
+        "rows": 27840,
+        "seconds": 7.577533544999824
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q17/iteration1/duckdb/q17/result.txt",
+        "answer_sha256": "80f672868c7aa1b1fbc20374e5bf23e65f894647f262cb9ef72a69ad14c9e767",
+        "iteration": 1,
+        "query": 17,
+        "rows": 1,
+        "seconds": 253.25259823499982
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q17/iteration2/duckdb/q17/result.txt",
+        "answer_sha256": "80f672868c7aa1b1fbc20374e5bf23e65f894647f262cb9ef72a69ad14c9e767",
+        "iteration": 2,
+        "query": 17,
+        "rows": 1,
+        "seconds": 114.18911374700019
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q18/iteration1/duckdb/q18/result.txt",
+        "answer_sha256": "3673d28d7bb49cb4db7e3cec0728b08dd40439477463d831712b086466ff2b0b",
+        "iteration": 1,
+        "query": 18,
+        "rows": 100,
+        "seconds": 671.1780945229993
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q18/iteration2/duckdb/q18/result.txt",
+        "answer_sha256": "2ae11f55cf912aca0df2ff16e43bc407ca553a4c39d2fe1fa6909e47b4bf99fe",
+        "iteration": 2,
+        "query": 18,
+        "rows": 100,
+        "seconds": 650.9253576909996
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q19/iteration1/duckdb/q19/result.txt",
+        "answer_sha256": "ee5d87a186b788cd627403d755553c43309be9189f0339da760d566801cc145d",
+        "iteration": 1,
+        "query": 19,
+        "rows": 1,
+        "seconds": 284.9576800289997
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q19/iteration2/duckdb/q19/result.txt",
+        "answer_sha256": "ee5d87a186b788cd627403d755553c43309be9189f0339da760d566801cc145d",
+        "iteration": 2,
+        "query": 19,
+        "rows": 1,
+        "seconds": 95.86070729499988
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q20/iteration1/duckdb/q20/result.txt",
+        "answer_sha256": "a1bfef476a503855b2fa6b724afa4a4d095e09c6f8924690c30cce4aa8ba591e",
+        "iteration": 1,
+        "query": 20,
+        "rows": 380400,
+        "seconds": 256.110396303
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q20/iteration2/duckdb/q20/result.txt",
+        "answer_sha256": "a1bfef476a503855b2fa6b724afa4a4d095e09c6f8924690c30cce4aa8ba591e",
+        "iteration": 2,
+        "query": 20,
+        "rows": 380400,
+        "seconds": 147.8111919460007
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q21/iteration1/duckdb/q21/result.txt",
+        "answer_sha256": "cd447cd19cd7c72a883f5a6435e3ce9f78753ea14554fdcbf469943f8db1d846",
+        "iteration": 1,
+        "query": 21,
+        "rows": 100,
+        "seconds": 689.5670525160003
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q21/iteration2/duckdb/q21/result.txt",
+        "answer_sha256": "cd447cd19cd7c72a883f5a6435e3ce9f78753ea14554fdcbf469943f8db1d846",
+        "iteration": 2,
+        "query": 21,
+        "rows": 100,
+        "seconds": 613.3521795510005
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q22/iteration1/duckdb/q22/result.txt",
+        "answer_sha256": "f47db5fd0b17d1a508274421fcec2494979b6b805e85ba2df81f4d0b897ef61c",
+        "iteration": 1,
+        "query": 22,
+        "rows": 7,
+        "seconds": 25.3696159430001
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125/sf10000/runner/results/q22/iteration2/duckdb/q22/result.txt",
+        "answer_sha256": "f47db5fd0b17d1a508274421fcec2494979b6b805e85ba2df81f4d0b897ef61c",
+        "iteration": 2,
+        "query": 22,
+        "rows": 7,
+        "seconds": 9.290339764998862
+      }
+    ],
+    "totals": [
+      {
+        "available_sum_s": 5265.8942910099995,
+        "iteration": 1,
+        "queries": 21,
+        "sum_s": null
+      },
+      {
+        "available_sum_s": 3575.3227716359984,
+        "iteration": 2,
+        "queries": 20,
+        "sum_s": null
+      }
+    ]
+  }
+}

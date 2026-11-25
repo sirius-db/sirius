@@ -1,0 +1,436 @@
+{
+  "answer_validation": [
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 1,
+      "query": 8,
+      "seconds": 290.9488425899981
+    },
+    {
+      "answer_validation": {
+        "correct": true,
+        "detail": "byte-exact independent CPU answer"
+      },
+      "iteration": 2,
+      "query": 8,
+      "seconds": 155.45469513399803
+    }
+  ],
+  "archive": {
+    "bytes": 52481,
+    "complete": false,
+    "files": 39,
+    "measurements": 2,
+    "path": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-retry-20261125/results.tar.gz",
+    "sha256": "4b7d3701c1417a18de5279d52c332a363dd66e5cf3dd076179877b0a0c225623",
+    "totals": [
+      {
+        "available_sum_s": 290.9488425899981,
+        "iteration": 1,
+        "queries": 1,
+        "sum_s": null
+      },
+      {
+        "available_sum_s": 155.45469513399803,
+        "iteration": 2,
+        "queries": 1,
+        "sum_s": null
+      }
+    ]
+  },
+  "archive_verification": {
+    "all_payload_hashes_verified": true,
+    "archive_bytes": 52481,
+    "archive_sha256": "4b7d3701c1417a18de5279d52c332a363dd66e5cf3dd076179877b0a0c225623",
+    "files": 39
+  },
+  "cache_clears": {
+    "12": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        375596416 kB\nMemAvailable:   357524352 kB\nBuffers:               0 kB\nCached:            81600 kB\nSwapCached:            0 kB\nActive:            24896 kB\nInactive:         614080 kB\nActive(anon):       2560 kB\nInactive(anon):   566848 kB\nActive(file):      22336 kB\nInactive(file):    47232 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              1792 kB\nWriteback:             0 kB\nAnonPages:        550720 kB\nMapped:            50304 kB\nShmem:             19712 kB\nKReclaimable:     121088 kB\nSlab:            1259648 kB\nSReclaimable:     121088 kB\nSUnreclaim:      1138560 kB\nKernelStack:       73280 kB\nPageTables:        17472 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1119424 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      125760 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        375439872 kB\nMemAvailable:   357405504 kB\nBuffers:               0 kB\nCached:           164992 kB\nSwapCached:            0 kB\nActive:            40896 kB\nInactive:         674048 kB\nActive(anon):       2624 kB\nInactive(anon):   567296 kB\nActive(file):      38272 kB\nInactive(file):   106752 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               320 kB\nWriteback:             0 kB\nAnonPages:        550208 kB\nMapped:            56512 kB\nShmem:             19712 kB\nKReclaimable:     121088 kB\nSlab:            1259648 kB\nSReclaimable:     121088 kB\nSUnreclaim:      1138560 kB\nKernelStack:       72960 kB\nPageTables:        24896 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1092672 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      128896 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 12,
+      "wall_ns": 1795620685216853563
+    },
+    "8": {
+      "after": "MemTotal:       395417856 kB\nMemFree:        381510400 kB\nMemAvailable:   363478272 kB\nBuffers:               0 kB\nCached:           183488 kB\nSwapCached:            0 kB\nActive:           120128 kB\nInactive:         774272 kB\nActive(anon):       3648 kB\nInactive(anon):   745280 kB\nActive(file):     116480 kB\nInactive(file):    28992 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              6208 kB\nWriteback:             0 kB\nAnonPages:        797120 kB\nMapped:           155584 kB\nShmem:             19712 kB\nKReclaimable:     125056 kB\nSlab:            1267456 kB\nSReclaimable:     125056 kB\nSUnreclaim:      1142400 kB\nKernelStack:       75136 kB\nPageTables:        17152 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1112960 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      144064 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "before": "MemTotal:       395417856 kB\nMemFree:        380112640 kB\nMemAvailable:   362774144 kB\nBuffers:               0 kB\nCached:          1568448 kB\nSwapCached:            0 kB\nActive:          1440384 kB\nInactive:         857024 kB\nActive(anon):       3584 kB\nInactive(anon):   761088 kB\nActive(file):    1436800 kB\nInactive(file):    95936 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:             14080 kB\nWriteback:             0 kB\nAnonPages:        822016 kB\nMapped:           155584 kB\nShmem:             19712 kB\nKReclaimable:     125056 kB\nSlab:            1267456 kB\nSReclaimable:     125056 kB\nSUnreclaim:      1142400 kB\nKernelStack:       75712 kB\nPageTables:        17152 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    197708928 kB\nCommitted_AS:    1112960 kB\nVmallocTotal:   137301581824 kB\nVmallocUsed:      146432 kB\nVmallocChunk:          0 kB\nPercpu:           104448 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:         524288 kB\nCmaFree:          327680 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:     524288 kB\nHugetlb:               0 kB\n",
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 8,
+      "wall_ns": 1795620234500449728
+    }
+  },
+  "events_by_query": {
+    "12": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 60701,
+        "query": 12,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-5938d35176944051b0479c0bdcf15dbc/q12",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795620687349951610
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 60701,
+        "query": 12,
+        "wall_ns": 1795620687350081456
+      }
+    ],
+    "8": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "kernel": "6.12.115-native64k-exp-20261125",
+        "page_size": 65536,
+        "pid": 59555,
+        "query": 8,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-5938d35176944051b0479c0bdcf15dbc/q08",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795620235940218431
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 59555,
+        "query": 8,
+        "wall_ns": 1795620235940362831
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 59555,
+        "query": 8,
+        "rows": 2,
+        "seconds": 290.9488425899981,
+        "wall_ns": 1795620526892025385
+      },
+      {
+        "cache": {
+          "bytes": 784632339547,
+          "entries": 448543,
+          "loaded_bytes": 275234749172,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 59555,
+        "query": 8,
+        "wall_ns": 1795620527174460847
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 59555,
+        "query": 8,
+        "wall_ns": 1795620527174698656
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 59555,
+        "query": 8,
+        "rows": 2,
+        "seconds": 155.45469513399803,
+        "wall_ns": 1795620682648689875
+      },
+      {
+        "cache": {
+          "bytes": 789123857499,
+          "entries": 448973,
+          "loaded_bytes": 274395551050,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 59555,
+        "query": 8,
+        "wall_ns": 1795620683009950239
+      },
+      {
+        "event": "engine_closed",
+        "pid": 59555,
+        "query": 8,
+        "wall_ns": 1795620685038063037
+      },
+      {
+        "event": "complete",
+        "pid": 59555,
+        "query": 8,
+        "wall_ns": 1795620685038292541
+      }
+    ]
+  },
+  "postflight": {
+    "manifest": {
+      "files": 868,
+      "sha256": "d11c67d39a1e0309ffa4bd1c0ee9cff22cd72cc560d051c63a9b2e2206ba27da",
+      "tables": {
+        "customer": 1500000000,
+        "lineitem": 59999994267,
+        "nation": 25,
+        "orders": 15000000000,
+        "part": 2000000000,
+        "partsupp": 8000000000,
+        "region": 5,
+        "supplier": 100000000
+      }
+    },
+    "sources_unchanged": true
+  },
+  "preflight": {
+    "bucket": {
+      "bucket": "sae-dataproc-aws-dev-sirius-scratch-us-east-1",
+      "region": "us-east-1",
+      "tables_present": [
+        "region",
+        "nation",
+        "supplier",
+        "customer",
+        "part",
+        "partsupp",
+        "orders",
+        "lineitem"
+      ]
+    },
+    "counts_before_initial_cache_clear": true,
+    "generation_manifest": {
+      "files": 868,
+      "sha256": "d11c67d39a1e0309ffa4bd1c0ee9cff22cd72cc560d051c63a9b2e2206ba27da",
+      "tables": {
+        "customer": 1500000000,
+        "lineitem": 59999994267,
+        "nation": 25,
+        "orders": 15000000000,
+        "part": 2000000000,
+        "partsupp": 8000000000,
+        "region": 5,
+        "supplier": 100000000
+      }
+    },
+    "identity": {
+      "accountId": "772385118201",
+      "architecture": "arm64",
+      "availabilityZone": "us-east-1a",
+      "billingProducts": null,
+      "devpayProductCodes": null,
+      "imageId": "ami-0272643e149bb16d0",
+      "instanceId": "i-0ac1da908cae3af37",
+      "instanceType": "m9gd.24xlarge",
+      "kernelId": null,
+      "marketplaceProductCodes": null,
+      "pendingTime": "2026-11-24T22:22:18Z",
+      "privateIp": "172.31.10.218",
+      "ramdiskId": null,
+      "region": "us-east-1",
+      "version": "2017-09-30"
+    },
+    "parquet_footer_counts": {
+      "customer": 1500000000,
+      "lineitem": 59999994267,
+      "nation": 25,
+      "orders": 15000000000,
+      "part": 2000000000,
+      "partsupp": 8000000000,
+      "region": 5,
+      "supplier": 100000000
+    },
+    "storage": [
+      {
+        "allow_ebs": false,
+        "devices": [
+          {
+            "children": [
+              {
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "name": "/dev/nvme1n1",
+                "type": "disk"
+              },
+              {
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "name": "/dev/nvme3n1",
+                "type": "disk"
+              },
+              {
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "name": "/dev/nvme0n1",
+                "type": "disk"
+              }
+            ],
+            "model": null,
+            "name": "/dev/md127",
+            "type": "raid0"
+          }
+        ],
+        "free_bytes": 5644281040896,
+        "mount": {
+          "source": "/dev/md127",
+          "target": "/mnt/nvme"
+        },
+        "path": "/mnt/nvme/duckdb-spill"
+      }
+    ]
+  },
+  "processes": [
+    {
+      "cache_clear_ns": 1795620234500449728,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-retry-20261125/run/runner/results/q08",
+      "exit_code": 0,
+      "pid": 59555,
+      "query": 8,
+      "timed_out": false
+    },
+    {
+      "cache_clear_ns": 1795620685216853563,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-retry-20261125/run/runner/results/q12",
+      "exit_code": -9,
+      "pid": 60701,
+      "query": 12,
+      "timed_out": false
+    }
+  ],
+  "replay_plan": {
+    "adapter": {
+      "controller_changes": {
+        "Q1 Q1 clear/restart Q2 Q2 clear/restart ... Q22 Q22": "Q8 Q8 clear/restart Q12 Q12",
+        "for q in range(1,query+1):": "for q in [v for v in (8,12) if v<=query]:",
+        "for query in range(1,23):": "for query in (8,12):",
+        "len(measured)==44": "len(measured)==4",
+        "len(values)==22": "len(values)==2"
+      },
+      "fixed_baseline_memory_limit_bytes": 318617491865,
+      "new_spill": "/mnt/nvme/duckdb-spill/sf10000-replay-5938d35176944051b0479c0bdcf15dbc",
+      "old_spill": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124",
+      "required_page_size": 65536,
+      "retry_queries": [
+        8,
+        12
+      ],
+      "worker_changes_beyond_original_native64_adapter": false
+    },
+    "changes_to_measured_worker": "unique spill directory; exact baseline memory limit; require/log 65536-byte page kernel",
+    "controller_sha256": "0015566e267672bdf9c10ba315af94142496788faeb022704c037572ebce5fc1",
+    "engine": "DuckDB 2.0.0",
+    "input": "s3://sae-dataproc-aws-dev-sirius-scratch-us-east-1/datasets/tpch_sf10000_regenerated",
+    "iterations": 2,
+    "ordering": "Q8 Q8 clear/restart Q12 Q12",
+    "original_campaign": "/home/ec2-user/m9gd24-duckdb200-native64k-20261125",
+    "output": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-retry-20261125/run",
+    "purpose": "Retry missing SF10000 Q8 iteration2 and Q12 both iterations; Q8 iteration1 supplies the required warm-cache predecessor.",
+    "retry_queries": [
+      8,
+      12
+    ],
+    "scale_factor": 10000,
+    "sources": {
+      "parquet_output.py": "ab07fe91b3d3e86d683853410696b6167489501c5159b31e607171171c50d1d5",
+      "performance_test.py": "ad4af1a647e08a063959f63acaee2d42024e7d348c7603b6c4ffbc1ee52be44e",
+      "queries.py": "c9ae5a51870ced2e1f7aec82eb58517536fa66615c94ba1d3e3953d6b41d0e8b",
+      "run.py": "ca1161f1f9075ae855a5ffc3ae174c28334c5a442f73de8cdb046cc7d344c0b7",
+      "tpch_pin_columns.py": "3a8f64241345f22aa1761c0efc43d86cce2624766d6b5bfb394d8f38b50339fc",
+      "worker.py": "eeba1ae6a178225d8cbe7b43c5ff3c3ebd14247f39a2a274f8f882a980027cae"
+    },
+    "spill": "/mnt/nvme/duckdb-spill/sf10000-replay-5938d35176944051b0479c0bdcf15dbc",
+    "worker_sha256": "06b6263c75392fbe5aceb4507b4a22f6ffffc89f1f589266fc09f9383f9fcbc3"
+  },
+  "settings_by_query": {
+    "12": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-5938d35176944051b0479c0bdcf15dbc/q12",
+      "threads": "96"
+    },
+    "8": {
+      "cache_local_files": "false",
+      "enable_external_file_cache": "true",
+      "enable_http_metadata_cache": "false",
+      "external_threads": "1",
+      "max_temp_directory_size": "90% of available disk space",
+      "memory_limit": "296.7 GiB",
+      "parquet_metadata_cache": "true",
+      "pin_threads": "auto",
+      "temp_directory": "/mnt/nvme/duckdb-spill/sf10000-replay-5938d35176944051b0479c0bdcf15dbc/q08",
+      "threads": "96"
+    }
+  },
+  "summary": {
+    "complete": false,
+    "measurements": [
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-retry-20261125/run/runner/results/q08/iteration1/duckdb/q8/result.txt",
+        "answer_sha256": "a1f396bb24d30415ad79b7964291774e1237ed73c929c592c549eba2d663047d",
+        "iteration": 1,
+        "query": 8,
+        "rows": 2,
+        "seconds": 290.9488425899981
+      },
+      {
+        "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf10k-retry-20261125/run/runner/results/q08/iteration2/duckdb/q8/result.txt",
+        "answer_sha256": "a1f396bb24d30415ad79b7964291774e1237ed73c929c592c549eba2d663047d",
+        "iteration": 2,
+        "query": 8,
+        "rows": 2,
+        "seconds": 155.45469513399803
+      }
+    ],
+    "totals": [
+      {
+        "available_sum_s": 290.9488425899981,
+        "iteration": 1,
+        "queries": 1,
+        "sum_s": null
+      },
+      {
+        "available_sum_s": 155.45469513399803,
+        "iteration": 2,
+        "queries": 1,
+        "sum_s": null
+      }
+    ]
+  }
+}
