@@ -246,6 +246,7 @@ def setup_benchmark_dir(
       <output_root>/
         <benchmark_name>/
           config.yml         (copy of Sirius config, if provided)
+          resolved_config.yaml  (what Sirius ran with, written by Sirius at startup)
           metadata.json
           queries/q<N>.sql           (effective query text)
           csv/runtimes.csv
@@ -2634,6 +2635,10 @@ def _main(args, workload=None):
         log("Preparing scale_bench inputs outside query timing")
         workload.prepare(benchmark_dir)
     os.environ["SIRIUS_LOG_DIR"] = log_dir
+    # Sirius writes the configuration it resolved here instead of ~/.sirius at startup.
+    os.environ["SIRIUS_WRITE_EFFECTIVE_CONFIG"] = os.path.join(
+        benchmark_dir, "resolved_config.yaml"
+    )
     if uses_concurrent_runner(args):
         runtime_csv = os.path.join(benchmark_dir, "csv", "concurrent_runtimes.csv")
     with open(os.path.join(benchmark_dir, "result_mode.json"), "w") as result_mode:

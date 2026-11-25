@@ -718,6 +718,8 @@ class parsed_sirius_config {
   /// fallbacks fill in the rest and every block's rules hold, also for a configuration built in
   /// code. @throws configuration_input_error when a value or a rule fails.
   static parsed_sirius_config from_user_config(const config::user_config& user);
+  /// What the user configured, read back: the values the user defined, fallbacks for the rest.
+  [[nodiscard]] const config::user_config& get_user_config() const noexcept;
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
@@ -764,18 +766,22 @@ class parsed_sirius_config {
                                                         const sirius_config& resolved);
 
 /**
- * @brief The YAML text of the effective configuration of @p resolved, resolved from an empty
- * configuration file: effective_user_config with every value spelled out, behind a comment saying
- * what the file is. Developer-only settings are left out unless @p developer; the rest still
- * resolves to the same values, since only fallbacks and values derived alike are left out.
+ * @brief The YAML text of the effective configuration of @p resolved, resolved from @p user:
+ * effective_user_config with every value spelled out, behind a comment saying what the file is.
+ * Developer-only settings the user did not define are left out unless @p developer; the rest
+ * still resolves to the same values, since only fallbacks and values derived alike are left out.
  */
-[[nodiscard]] std::string effective_config_text(const sirius_config& resolved, bool developer);
+[[nodiscard]] std::string effective_config_text(const sirius_config& resolved,
+                                                const config::user_config& user,
+                                                bool developer);
 
 /**
  * @brief Write effective_config_text (developer-only settings in developer mode only) to @p path:
  * creates the directory and replaces the file whole. @throws std::exception when it cannot be
  * written.
  */
-void write_effective_config(const std::filesystem::path& path, const sirius_config& resolved);
+void write_effective_config(const std::filesystem::path& path,
+                            const sirius_config& resolved,
+                            const config::user_config& user);
 
 }  // namespace sirius

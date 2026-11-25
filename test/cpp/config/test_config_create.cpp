@@ -780,7 +780,8 @@ TEST_CASE("the effective configuration file resolves alike in every build",
       INFO(m.name << (developer ? ", developer mode" : ""));
       auto const resolved =
         sirius::create_sirius_config(sirius::config::default_user_config(), m.topology, m.probe);
-      auto const text = sirius::effective_config_text(resolved, developer);
+      auto const text =
+        sirius::effective_config_text(resolved, sirius::config::default_user_config(), developer);
       REQUIRE(text.starts_with("# "));
       // Settings left out outside developer mode are re-derived as they were the first time.
       auto const reread = sirius::config::read_user_config(text);
@@ -800,29 +801,63 @@ TEST_CASE("the effective configuration file resolves alike in every build",
   }
 }
 
+TEST_CASE("the effective configuration keeps what the config file named", "[config][config_create]")
+{
+  // A production setting, developer-only ones, and a developer-only block.
+  auto const file  = sirius::parsed_sirius_config::from_document(sirius::config::parse_yaml(R"(
+sirius:
+  memory:
+    gpu:
+      usage_limit_fraction: 0.5
+  executor:
+    scan_manager:
+      uring:
+        n_max_concurrent_scans: 7
+  operator_params:
+    enable_late_materialization: false
+)"));
+  auto const& user = file.get_user_config();
+  REQUIRE(user.operator_params.enable_late_materialization.user_defined());
+  REQUIRE_FALSE(user.operator_params.enable_fused_scan_filter.user_defined());
+  auto const resolved = sirius::create_sirius_config(user, this_machine(), no_nic);
+  for (bool const developer : {false, true}) {
+    INFO((developer ? "developer mode" : "production"));
+    auto const text    = sirius::effective_config_text(resolved, user, developer);
+    auto const written = sirius::config::read_user_config(text);
+    REQUIRE(written.memory.gpu.usage_limit.get<double>() == 0.5);
+    REQUIRE(written.executor.scan_manager.uring.n_max_concurrent_scans.get() == 7);
+    REQUIRE_FALSE(written.operator_params.enable_late_materialization.get());
+    // Developer-only settings the file did not name are written in developer mode only.
+    REQUIRE(written.operator_params.enable_fused_scan_filter.user_defined() == developer);
+    REQUIRE(describe(sirius::create_sirius_config(written, this_machine(), no_nic),
+                     /*in_effect=*/true) == describe(resolved, /*in_effect=*/true));
+  }
+}
+
 TEST_CASE("the effective configuration file", "[config][config_create]")
 {
   auto const dir = std::filesystem::temp_directory_path() /
                    ("sirius_effective_config_test_" + std::to_string(getpid()));
-  auto const path = dir / "nested" / "config.yml";
+  auto const path = dir / "nested" / "effective_config.yaml";
   std::filesystem::remove_all(dir);
-  auto const resolved =
-    sirius::create_sirius_config(sirius::config::default_user_config(), this_machine(), no_nic);
-  sirius::write_effective_config(path, resolved);
+  auto const user     = sirius::config::default_user_config();
+  auto const resolved = sirius::create_sirius_config(user, this_machine(), no_nic);
+  sirius::write_effective_config(path, resolved, user);
   REQUIRE(std::filesystem::exists(path));
   auto const files = [&] {
     return std::distance(std::filesystem::directory_iterator(path.parent_path()),
                          std::filesystem::directory_iterator{});
   };
   REQUIRE(files() == 1);  // no temporary left behind
-  REQUIRE(slurp(path) == sirius::effective_config_text(resolved, sirius::config::developer_mode()));
+  REQUIRE(slurp(path) ==
+          sirius::effective_config_text(resolved, user, sirius::config::developer_mode()));
 
   auto const written = sirius::config::read_user_config(slurp(path));
   REQUIRE(written.executor.pipeline.num_threads.get() ==
           resolved.get_gpu_pipeline_executor_config().num_threads);
   REQUIRE(written.memory.gpu.usage_limit.user_defined());  // fallbacks are spelled out too
 
-  sirius::write_effective_config(path, resolved);  // a second start replaces it
+  sirius::write_effective_config(path, resolved, user);  // a second start replaces it
   REQUIRE(files() == 1);
   REQUIRE(sirius::config::read_user_config(slurp(path)).memory.gpu.usage_limit.user_defined());
   std::filesystem::remove_all(dir);

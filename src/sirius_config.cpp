@@ -332,6 +332,8 @@ struct parsed_sirius_config::Impl {
   host_mem_config host_cfg;
   disk_mem_config disk_cfg;
   std::filesystem::path source_path;
+  /// What the user configured, read back: user-defined values, fallbacks for the rest.
+  config::user_config user;
   bool use_effective_gpu_capacity = false;
   struct {
     bool pipeline{}, task_creator{}, downgrade{}, scan_manager{}, uring{}, rest{};
@@ -343,12 +345,23 @@ struct parsed_sirius_config::Impl {
   std::vector<uint64_t operator_params::*> explicit_batch_settings;
 };
 
-parsed_sirius_config::parsed_sirius_config() : impl_(std::make_shared<Impl>()) {}
+parsed_sirius_config::parsed_sirius_config()
+  : impl_([] {
+      auto impl = std::make_shared<Impl>();
+      impl->user.read(config::node{}, config::user_config_root);
+      return impl;
+    }())
+{
+}
 parsed_sirius_config::parsed_sirius_config(std::shared_ptr<const Impl> impl)
   : impl_(std::move(impl))
 {
 }
 
+const config::user_config& parsed_sirius_config::get_user_config() const noexcept
+{
+  return impl_->user;
+}
 const operator_params& parsed_sirius_config::get_operator_params() const noexcept
 {
   return impl_->settings.get_operator_params();
@@ -453,10 +466,9 @@ parsed_sirius_config parsed_sirius_config::from_user_config(
 try {
   // Read back what the user defined: fallbacks fill in the rest and every block checks its rules,
   // for a configuration built in code (or never read) as much as for one read from a file.
-  config::user_config user;
-  user.read(input.write(false), config::user_config_root);
-
-  auto impl         = std::make_shared<Impl>();
+  auto impl = std::make_shared<Impl>();
+  impl->user.read(input.write(false), config::user_config_root);
+  auto const& user  = impl->user;
   impl->source_path = source_path;
   auto& settings    = impl->settings;
   auto& named       = impl->explicit_threads;
@@ -838,18 +850,50 @@ config::user_config effective_user_config(const config::user_config& user,
   return out;
 }
 
-std::string effective_config_text(const sirius_config& resolved, bool developer)
+namespace {
+
+/// Add to @p into what only @p from has: keys of mappings, and the same inside elements of
+/// sequences of equal length. A value @p into holds is kept.
+void add_missing(config::node& into, const config::node& from)
 {
-  return "# The configuration Sirius ran with on this machine, written at startup because no\n"
-         "# config file was found; rewritten on every such start. Values derived from this\n"
-         "# machine's hardware are spelled out. To use it, copy it to ~/.sirius/sirius.yaml.\n" +
-         config::write_user_config(effective_user_config(config::default_user_config(), resolved),
-                                   config::write_options{/*fallbacks=*/true, developer});
+  if (into.is_mapping() && from.is_mapping()) {
+    for (auto& [key, value] : into.entries()) {
+      if (auto const* other = from.find(key)) { add_missing(value, *other); }
+    }
+    for (auto const& [key, value] : from.entries()) {
+      if (into.find(key) == nullptr) { into.set(key, value); }
+    }
+  } else if (into.is_sequence() && from.is_sequence() &&
+             into.elements().size() == from.elements().size()) {
+    for (std::size_t i = 0; i < into.elements().size(); ++i) {
+      add_missing(into.elements()[i], from.elements()[i]);
+    }
+  }
 }
 
-void write_effective_config(const std::filesystem::path& path, const sirius_config& resolved)
+}  // namespace
+
+std::string effective_config_text(const sirius_config& resolved,
+                                  const config::user_config& user,
+                                  bool developer)
 {
-  auto const text = effective_config_text(resolved, config::developer_mode());
+  auto document = effective_user_config(user, resolved)
+                    .write(config::write_options{/*fallbacks=*/true, developer});
+  // What the user wrote stays in the file, developer-only settings included.
+  add_missing(document, user.write(false));
+  auto root = config::node::mapping();
+  root.set(std::string(config::user_config_root), std::move(document));
+  return "# The configuration Sirius runs with on this machine, rewritten at every start: the\n"
+         "# values the config file named, and every other setting's default or the value derived\n"
+         "# from this machine's hardware. To use it, copy it to ~/.sirius/sirius.yaml.\n" +
+         config::emit_yaml(root);
+}
+
+void write_effective_config(const std::filesystem::path& path,
+                            const sirius_config& resolved,
+                            const config::user_config& user)
+{
+  auto const text = effective_config_text(resolved, user, config::developer_mode());
   if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
   // Replace the file whole, so a reader never sees half of it. mkstemp gives this writer a
   // temporary no other process (on this host or one sharing the directory) can open.

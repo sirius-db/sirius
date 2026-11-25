@@ -98,10 +98,10 @@ namespace {
 static constexpr std::string_view CONFIG_FILE_NAME     = "sirius.yaml";
 static constexpr std::string_view CONFIG_FILE_DIR      = ".sirius";
 static constexpr std::string_view CONFIG_FILE_ENV_NAME = "SIRIUS_CONFIG_FILE";
-/// Written to ~/.sirius when Sirius starts without a config file: what it runs with.
-static constexpr std::string_view EFFECTIVE_CONFIG_FILE_NAME = "config.yml";
-/// Set to 0 (or false, off, no) to keep Sirius from writing the effective configuration (tests
-/// do).
+/// Written to ~/.sirius at every start: the configuration Sirius runs with.
+static constexpr std::string_view EFFECTIVE_CONFIG_FILE_NAME = "effective_config.yaml";
+/// 0 (or false, off, no) keeps Sirius from writing the effective configuration (tests set it);
+/// any other value but 1 (true, on, yes) is the path to write it to instead.
 static constexpr std::string_view EFFECTIVE_CONFIG_ENV_NAME = "SIRIUS_WRITE_EFFECTIVE_CONFIG";
 
 optional_ptr<TableCatalogEntry> find_update_target(PhysicalOperator const& op)
@@ -226,23 +226,30 @@ std::optional<std::string> get_config_file_path()
   return std::nullopt;
 }
 
-/// Record what Sirius runs with in ~/.sirius/config.yml when the user gave no config file. A
-/// failure to write is logged, never fatal.
-void write_effective_config_file(const sirius::sirius_config& resolved)
+/// Record what Sirius runs with: in ~/.sirius/effective_config.yaml, or where
+/// SIRIUS_WRITE_EFFECTIVE_CONFIG says. A failure to write is logged, never fatal.
+void write_effective_config_file(const sirius::sirius_config& resolved,
+                                 const sirius::config::user_config& user)
 {
+  std::filesystem::path path;
   if (auto const* write = std::getenv(std::string(EFFECTIVE_CONFIG_ENV_NAME).c_str())) {
     std::string value(write);
     std::ranges::transform(value, value.begin(), [](unsigned char c) { return std::tolower(c); });
     if (value == "0" || value == "false" || value == "off" || value == "no") { return; }
+    if (!value.empty() && value != "1" && value != "true" && value != "on" && value != "yes") {
+      path = write;
+    }
   }
-  auto const dir = sirius_home_dir();
-  if (!dir) {
-    SIRIUS_LOG_INFO("HOME is not an absolute path; not writing the effective configuration");
-    return;
+  if (path.empty()) {
+    auto const dir = sirius_home_dir();
+    if (!dir) {
+      SIRIUS_LOG_INFO("HOME is not an absolute path; not writing the effective configuration");
+      return;
+    }
+    path = *dir / std::string(EFFECTIVE_CONFIG_FILE_NAME);
   }
-  auto const path = *dir / std::string(EFFECTIVE_CONFIG_FILE_NAME);
   try {
-    sirius::write_effective_config(path, resolved);
+    sirius::write_effective_config(path, resolved, user);
     SIRIUS_LOG_INFO("Wrote the effective configuration to {}", path.string());
   } catch (const std::exception& e) {
     SIRIUS_LOG_WARN(
@@ -2577,7 +2584,7 @@ void SiriusContextExtensionCallback::initialize_context()
 
   auto context = duckdb::make_shared_ptr<SiriusContext>();
   context->initialize(config_);
-  if (!config_file_found_) { write_effective_config_file(context->get_config()); }
+  write_effective_config_file(context->get_config(), config_.get_user_config());
   context_ = std::move(context);
 }
 
@@ -2635,8 +2642,7 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
 
   auto config_path = get_config_file_path();
   if (config_path && std::filesystem::exists(*config_path)) {
-    config_            = sirius::parsed_sirius_config::from_file(*config_path);
-    config_file_found_ = true;
+    config_ = sirius::parsed_sirius_config::from_file(*config_path);
     SIRIUS_LOG_INFO("Loaded Sirius configuration from file: {}", *config_path);
   } else if (config_path) {
     // SIRIUS_CONFIG_FILE was explicitly set but points to a non-existent file — error
