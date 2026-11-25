@@ -39,6 +39,8 @@
 #include "log/logging.hpp"
 #include "planner/aggregate_binding.hpp"
 #include "planner/dynamic_filter/build_key_domain.hpp"
+#include "planner/proven_unique_scan_columns.hpp"
+#include "sirius_context.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 
 #include <algorithm>
@@ -478,6 +480,51 @@ std::optional<double> most_distinct_values(duckdb::ClientContext& context,
   return std::nullopt;
 }
 
+/// Whether one of @p keys is proven to hold no value twice in @p source, so that an aggregate
+/// grouped by them would have a group for every row and combine nothing. The proof is a scan's:
+/// a column its pinned copy found distinct, or a native table's PRIMARY KEY. It holds only for
+/// the scan's own rows, under filters and projections, since a join below @p source could repeat
+/// them.
+bool key_never_repeats(duckdb::ClientContext& context,
+                       LogicalOperator& source,
+                       std::vector<ColumnBinding> keys)
+{
+  auto* op = &source;
+  while (op->type != LogicalOperatorType::LOGICAL_GET) {
+    if (op->children.size() != 1) { return false; }
+    if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+      auto const& projection = op->Cast<duckdb::LogicalProjection>();
+      std::vector<ColumnBinding> below;
+      for (auto const& key : keys) {
+        auto const index = key.column_index.GetIndex();
+        if (key.table_index == projection.table_index && index < projection.expressions.size() &&
+            is_column(*projection.expressions[index])) {
+          below.push_back(binding_of(*projection.expressions[index]));
+        }
+      }
+      keys = std::move(below);
+    } else if (op->type != LogicalOperatorType::LOGICAL_FILTER) {
+      return false;
+    }
+    op = op->children[0].get();
+  }
+  auto& get = op->Cast<duckdb::LogicalGet>();
+  try {
+    // Pin-time facts count as proofs only with pin_table_prove_unique_keys, as for a join.
+    auto const runtime    = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    auto* const pin_facts = runtime && duckdb::query_operator_options(context)->prove_unique_keys
+                              ? runtime.get()
+                              : nullptr;
+    auto const outputs    = get.GetColumnBindings();
+    return std::ranges::any_of(proven_unique_scan_outputs(pin_facts, get), [&](auto position) {
+      return position < outputs.size() && std::ranges::find(keys, outputs[position]) != keys.end();
+    });
+  } catch (...) {
+    // A scan whose facts cannot be read proves nothing.
+    return false;
+  }
+}
+
 /// The rows of @p source that one group of @p keys is estimated to combine, at least: its row
 /// estimate over the most groups the keys can form. 1 when the statistics cannot show that keys
 /// repeat, which includes a key nothing limits.
@@ -855,6 +902,9 @@ void analyze(duckdb::ClientContext& context,
   auto const repeat   = !result.sums_floats && options.min_rows_per_key > 0 &&
                       result.rows_per_key >= options.min_rows_per_key;
   if (!repeat && !std::ranges::all_of(result.keys, grouped)) { why.add("keys:not-grouped"); }
+  // Whatever is grouped by above, an aggregate with a group for every row of its input combines
+  // nothing: it is one more pass over the rows the aggregate above groups anyway.
+  if (key_never_repeats(context, source, result.keys)) { why.add("keys:unique"); }
   // A join that computes its key sees one row of each group where it saw every row. That is the
   // same only when the rows of a group cannot differ in the columns the key is computed from.
   std::vector<ColumnBinding> computed_from;

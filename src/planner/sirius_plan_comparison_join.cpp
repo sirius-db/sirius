@@ -51,6 +51,7 @@
 #include "planner/gpu_admission.hpp"
 #include "planner/join_implied_filters.hpp"
 #include "planner/join_key_nullability.hpp"
+#include "planner/proven_unique_scan_columns.hpp"
 #include "planner/scan_source_names.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_join_utils.hpp"
@@ -414,6 +415,16 @@ static unique_keys prove_unique_columns(duckdb::SiriusContext* sirius_context,
 
     default: return {};
   }
+}
+
+std::vector<duckdb::idx_t> proven_unique_scan_outputs(duckdb::SiriusContext* sirius_context,
+                                                      duckdb::LogicalGet& get)
+{
+  std::vector<duckdb::idx_t> outputs;
+  for (auto const& key : prove_unique_columns(sirius_context, get)) {
+    if (key.size() == 1) { outputs.push_back(*key.begin()); }
+  }
+  return outputs;
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>

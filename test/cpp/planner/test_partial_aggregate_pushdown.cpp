@@ -168,7 +168,10 @@ struct pushdown_fixture {
           "CASE WHEN range % 2 = 0 THEN 'R' ELSE 'N' END FROM range(12000)",
           // 100 visits per customer key, in five regions.
           "CREATE TABLE visits (v_custkey BIGINT, v_region INTEGER, v_amount DECIMAL(15, 2))",
-          "INSERT INTO visits SELECT range % 300 + 1, range % 5, range % 100 FROM range(30000)"}) {
+          "INSERT INTO visits SELECT range % 300 + 1, range % 5, range % 100 FROM range(30000)",
+          // One account per customer key.
+          "CREATE TABLE accounts (a_custkey BIGINT PRIMARY KEY, a_balance DECIMAL(15, 2))",
+          "INSERT INTO accounts SELECT range, range * 2.5 FROM range(1, 301)"}) {
       auto result = con->Query(sql);
       INFO(sql);
       REQUIRE_FALSE(result->HasError());
@@ -550,6 +553,27 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(pushed(two_extra, {.max_extra_keys = std::numeric_limits<std::size_t>::max()}) == 1);
   CHECK(why(per_customer("sum(o_totalprice)", "", "c_custkey, c_name, o_shippriority"),
             {.max_extra_keys = 0}) == reasons{"keys:too-many-extra"});
+}
+
+TEST_CASE_METHOD(pushdown_fixture,
+                 "partial aggregate pushdown leaves alone a key proven unique",
+                 "[partial_agg_pushdown][plan]")
+{
+  // Every account has its own customer key, a PRIMARY KEY. The aggregate above groups by that
+  // key, but one below the join would have a group for every account and combine nothing.
+  auto const per_account =
+    "SELECT c_custkey, c_name, sum(a_balance) FROM accounts, customer "
+    "WHERE a_custkey = c_custkey GROUP BY c_custkey, c_name";
+  CHECK(pushed(per_account) == 0);
+  CHECK(why(per_account) == reasons{"keys:unique"});
+  // A filter on the accounts keeps the proof.
+  CHECK(why("SELECT c_custkey, c_name, sum(a_balance) FROM accounts, customer "
+            "WHERE a_custkey = c_custkey AND a_balance > 100 GROUP BY c_custkey, c_name") ==
+        reasons{"keys:unique"});
+  // The statistics cannot outvote it: they show one account per key as well.
+  CHECK(pushed(per_account, {.min_rows_per_key = 0.5}) == 0);
+  // The orders' customer key repeats, and nothing proves otherwise.
+  CHECK(pushed(per_customer("sum(o_totalprice)")) == 1);
 }
 
 TEST_CASE_METHOD(pushdown_fixture,
