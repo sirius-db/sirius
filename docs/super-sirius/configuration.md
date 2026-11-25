@@ -281,8 +281,12 @@ prediction: cuFile can still serve a file on such a mount in compatibility mode,
 works but is slower than io_uring; set `allow_gds: false` to rule it out. The context
 owns its reactor teardown and its staging; see
 [DISK I/O and ownership](memory-management.md#disk-io-and-ownership).
-On a GDS host it also takes a registered GPU arena when it starts, after the GPU memory
-pools exist (see [arena memory](#scan_managercufile--local-cufile-reads-iocufileconfighpp)).
+On a GDS host it also takes a registered GPU arena per visible GPU when it starts at the
+first spill; Sirius reserves that arena on its GPUs at startup, before the GPU memory pools
+exist, when a space allows GDS on a GDS mount (see
+[arena memory](#scan_managercufile--local-cufile-reads-iocufileconfighpp)). If the cuFile
+context cannot be built then (no room left for an arena, a driver that does not open), a
+warning is logged and the space spills through the shared io_uring context instead.
 
 The existing `disk_id`, `capacity_bytes`, and `downgrade_root_dirs` keys and spill-file
 layouts are unchanged. Apart from `allow_gds`, there are no DISK-backend or per-mount
@@ -741,11 +745,14 @@ and globs still use native REST. The context has one reactor per GPU, and each d
 is routed to the reactor of its destination GPU.
 
 A reactor owns two sets of `lanes` lanes, one reading and one writing. A lane is a thread
-that owns a `lane_bytes` slot of registered GPU memory and blocks in one synchronous
-`cuFileRead` / `cuFileWrite` at a time, so `lanes` is the GPU's read depth (and its write
-depth). A device read is cut into 4 KiB-aligned segments of at most one slot; a lane reads
-a segment into its slot and copies the wanted bytes into the destinations device-to-device.
-Host reads go through a host-only io_uring reactor that needs no staging memory.
+that takes a `lane_bytes` slot of registered GPU memory per segment and blocks in one
+synchronous `cuFileRead` / `cuFileWrite` at a time, so `lanes` is the GPU's read depth (and
+its write depth). A device read is cut into 4 KiB-aligned segments of at most one slot; a
+lane reads a segment into its slot (never past the end of the file) and copies the wanted
+bytes into the destinations device-to-device, on a stream of the segment's own; a
+completion thread gives the slot back once the copies are done, while the lane goes on
+reading into another slot. Host reads go through a host-only io_uring reactor that needs
+no staging memory.
 
 <!-- scan-cufile-example -->
 ```yaml
@@ -761,6 +768,8 @@ sirius:
         lane_bytes: 8MiB              # the most one cuFile read moves
         coalesce_gap_bytes: 1MiB
         coalesce_gap_ratio: 0.15
+        read_slots_per_lane: 2        # read slots per lane: one reading, one draining its copies
+        register_per_slot: true       # one cuFile registration per slot (96 per GPU)
 ```
 
 | Key | Type | Default | Description |
@@ -769,11 +778,15 @@ sirius:
 | `lane_bytes` | bytes (**> 0, multiple of 4KiB**) | 8MiB | A lane's slot of registered GPU memory: the most one cuFile call moves. Larger device reads are split into segments of this size so several lanes read them at once. Keep it at most cuFile's `max_direct_io_size_kb`. |
 | `coalesce_gap_bytes` | bytes | 1MiB | Neighbouring device slices of one vectored read share one `cuFileRead` when the gap between them is at most this many bytes (the gap is read and dropped). `0` coalesces only contiguous slices. |
 | `coalesce_gap_ratio` | fraction in [0, 1] | 0.15 | Most of such a read that may be gaps. |
-| `devices` | list of CUDA ordinals | empty | GPUs the context serves, one reactor and one arena each. Empty means the GPU Sirius reads into (not every visible GPU). Ids must be non-negative, unique, and GPUs Sirius reads into; startup fails otherwise. |
+| `read_slots_per_lane` | int (**> 0**) | 2 | Read slots in the arena per read lane. A slot stays taken until the copies out of it are done, so 2 lets a lane read again while its last copies drain; 1 shrinks the arena by a third. The arena, `(read_slots_per_lane + 1) × lanes × lane_bytes`, must be representable. |
+| `register_per_slot` | bool | true | Register every arena slot with cuFile on its own (`(read_slots_per_lane + 1) × lanes` registrations per GPU) instead of the arena as one buffer. GPFS / WekaFS userspace RDMA keeps a read direct only while its registration has no other I/O in flight. |
+| `devices` | list of CUDA ordinals | empty | GPUs the context serves, one reactor and one arena each. Empty means the GPUs Sirius reads into (not every visible GPU). Ids must be non-negative, unique, and exactly the GPUs Sirius reads into, in any order (scans are placed on every one of them, and a device read on a GPU the context does not serve fails); startup fails otherwise. |
 
 Unknown keys are rejected, including the keys of the previous cuFile pool
 (`reactors_per_device`, `staging_*`, `max_inflight`, `gds_threshold`, `compat_mode`,
-`fused_reads`, `host_batch`, ...) and `scan_manager.cufile_n_reactors`.
+`fused_reads`, `host_batch`, ...) and `scan_manager.cufile_n_reactors`. The copy-completion
+internals of `cucascade::io::cufile::config` (`async_copies`, `copy_poll_us`,
+`high_priority_copies`) keep cuCascade's defaults and are not YAML settings.
 
 cuFile cannot fill fragmented pinned-cache destinations, so it never arms `fs_cache`
 or scan readahead, **even with `cache.mode: cucs`**. Neither `max_readahead_scans` nor
@@ -782,18 +795,29 @@ or scan readahead, **even with `cache.mode: cucs`**. Neither `max_readahead_scan
 publish a usable cache/readahead budget. Tune read concurrency with `cufile.lanes`
 instead.
 
-**Arena memory.** Each GPU's lane slots are one arena of `2 × lanes × lane_bytes`
-(512 MiB with the defaults), `cudaMalloc`ed outside RMM, registered with cuFile once and
-kept for the life of the process. Sirius reserves the arena at startup **before** the GPU
-memory pools are created, so it comes on top of `sirius.memory.gpu.usage_limit_*`; on a
-small GPU, lower the usage limit, `lanes` or `lane_bytes`. The
+**Arena memory.** Each GPU's lane slots are one arena of
+`(read_slots_per_lane + 1) × lanes × lane_bytes` (768 MiB with the defaults: 64 read
+slots and 32 write slots of 8 MiB), `cudaMalloc`ed outside RMM, registered with cuFile
+(96 registrations per GPU with the defaults, or one with `register_per_slot: false`) and
+kept for the life of the process. Lanes take registered slots before any whose
+registration failed. Sirius reserves the arena at startup **before** the GPU memory pools
+are created, so it comes on top of `sirius.memory.gpu.usage_limit_*`; on a small GPU,
+lower the usage limit, `lanes`, `lane_bytes` or `read_slots_per_lane`. The
 [DISK tier's default context](#disk-memory-siriusmemorydisk) on a GDS host is a second
 cuFile context with cuCascade's defaults over every visible GPU. An arena belongs to
-the GPU, not to a context: with the default `lanes` and `lane_bytes` here too, both
-contexts share the GPU's arena and its slots. A different `lanes` or `lane_bytes`, or a
-GPU Sirius does not read into, costs the DISK context another arena (512 MiB) when it
-starts at the first spill, from whatever the pools left free, so leave room for it in
-the `usage_limit_*` headroom.
+the GPU, not to a context: it serves every context on the GPU that it covers (at least as
+many lanes, read slots and slot bytes, registered the same way), and their lanes share its
+slots. A context it does not cover gets an arena that covers both (logged as a warning);
+contexts still on the old one keep it until they stop. When a DISK space allows GDS on a
+GDS mount, Sirius also reserves, ahead of the pools, an arena covering the DISK context's
+shape (768 MiB with cuCascade's defaults), also with the native scan backend: with the
+default `cufile` block the scan arena already covers it. That spill reservation is
+optional. If it fails, startup goes on with a warning; the first spill through cuFile
+tries again and spills through io_uring if that fails too. It is skipped (with a warning)
+when `register_per_slot` differs from the DISK context's (`true`), since replacing the scan
+arena would leave the scan context to allocate again after the pools. A GPU Sirius does not read into
+still costs the DISK context an arena (768 MiB) at the first spill, from whatever the pools
+left free; restrict the visible GPUs (`CUDA_VISIBLE_DEVICES`) to avoid that.
 
 **Coalescing and Sirius's scan.** Coalescing happens inside one vectored request, so
 `scan_manager.cufile_bulk_read` (default `on`) sends cuFile Parquet scans down the
@@ -809,8 +833,15 @@ REST scans do.
 **Requirements and failures.** The context needs libcufile with an openable driver
 (cuFile's compatibility mode is enough to run, without GPUDirect transfers) and a usable
 io_uring; otherwise startup fails rather than rerouting to another backend. A file cuFile
-cannot register still opens and serves host reads, but device reads of it fail. There is
-no POSIX fallback for device reads.
+cannot register still opens; its device reads and writes go through a pinned host bounce
+buffer of the lane (`pread` / `pwrite`, at most 1 MiB at a time) instead of cuFile.
+
+**Read concurrency.** A Sirius GPU worker reads one split at a time: it waits for the
+work already queued on its stream, starts one vectored read per file of the split (up to
+32 files at once) and waits for them. The waiting keeps a read from holding arena slots while
+the stream still decodes the previous split. With one coalesced window per file, the
+cuFile reads in flight on a GPU are therefore at most the workers' files in flight, which
+is below `lanes` for small splits; there is no cuFile scan readahead.
 
 **IBM Storage Scale checklist.** On GPFS only the synchronous `cuFileRead` /
 `cuFileWrite` take the RDMA path, which is why the lanes use them.

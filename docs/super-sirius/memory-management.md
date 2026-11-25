@@ -91,8 +91,11 @@ backend is not supported for reads or writes.
 A uring factory context owns private staging rather than borrowing Sirius's HOST allocator
 (64 MiB of portable pinned staging per reactor). A cuFile one needs no host staging: device
 reads and writes go through the lane slots of a registered GPU arena per GPU, which the
-default context takes when it starts at the first spill, after the GPU memory pools exist
-(see [cuFile arena memory](configuration.md#scan_managercufile--local-cufile-reads-iocufileconfighpp)).
+default context takes when it starts at the first spill. On Sirius's GPUs, Sirius tries to
+reserve it at startup before the GPU memory pools when a space allows GDS on a GDS mount (a
+failure there only logs a warning); when the context cannot be built at the first spill,
+the space spills through io_uring instead (see
+[cuFile arena memory](configuration.md#scan_managercufile--local-cufile-reads-iocufileconfighpp)).
 Destruction stops/drains reactor
 workers before releasing their staging. The weak default cache does not prolong that
 lifetime; spill representations and contexts must still be released before CUDA/RMM global

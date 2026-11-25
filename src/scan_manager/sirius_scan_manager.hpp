@@ -1413,19 +1413,34 @@ class sirius_scan_manager {
 };
 
 /**
- * @brief Reserve the registered cuFile arena of each GPU the default cufile context
- *        will serve, before the GPU memory pools claim the devices.
+ * @brief Reserve the registered cuFile arena of each GPU Sirius reads into for the
+ *        default cufile context and for spills through cuCascade's shared cuFile DISK
+ *        context, before the GPU memory pools claim the devices.
  *
  * A cuFile reactor's arena is allocated with @c cudaMalloc outside RMM
- * (@c cufile.lanes x @c cufile.lane_bytes for each of its two lane sets) and kept for
- * the life of the process.  The context takes it when it starts, which is after the
- * memory manager's pools took their share of each GPU; called first, this takes the
- * arenas for @p gpu_ids while the memory is still free, and the context then reuses
- * them.  Does nothing unless @c backend is @c cufile.
+ * (@c cufile::config::arena_bytes(): @c cufile.lane_bytes for each of
+ * @c cufile.read_slots_per_lane read slots and one write slot per lane) and kept for the
+ * life of the process.  A context takes it when it starts, which is after the memory
+ * manager's pools took their share of each GPU (for the DISK context: at the first
+ * spill); called first, this takes the arenas for @p gpu_ids while the memory is still
+ * free, and every context on the GPU the arena covers (see @c cufile::reserve_arena) then
+ * shares them.  Does nothing unless @c backend is @c cufile or @p spills_through_cufile.
+ *
+ * The scan reservation is mandatory and throws when it fails.  The spill reservation is
+ * optional: it asks for an arena covering the DISK context's shape (cuCascade's default
+ * @c cufile::config), which the scan arena already is with the default @c cufile block;
+ * when it cannot be had -- or when @c cufile.register_per_slot differs from the DISK
+ * context's, since replacing the scan arena would leave the scan context to allocate again
+ * after the pools -- a warning is logged and the first spill tries again (and spills
+ * through io_uring if that fails too).
  *
  * @param config The scan manager configuration the default context is built from.
  * @param gpu_ids The GPUs Sirius reads into (the default for @c cufile.devices).
+ * @param spills_through_cufile Whether a DISK space adopts the shared cuFile context
+ *        (it allows GDS and its mount serves GDS: @c cucascade::disk_mount_uses_gds).
  */
-void reserve_cufile_arenas(scan_manager_config const& config, std::span<int const> gpu_ids);
+void reserve_cufile_arenas(scan_manager_config const& config,
+                           std::span<int const> gpu_ids,
+                           bool spills_through_cufile = false);
 
 }  // namespace sirius::scan_manager

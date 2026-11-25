@@ -18,6 +18,7 @@
 
 #ifdef CUCASCADE_HAS_CUFILE
 
+#include "cuda/device_health.hpp"
 #include "io/bulk_read.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_materialize.hpp"
@@ -39,6 +40,7 @@
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/cufile/cufile_api.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
+#include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
@@ -52,7 +54,9 @@
 #include <cstdint>
 #include <fstream>
 #include <future>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <span>
 #include <string>
@@ -87,7 +91,7 @@ scan_manager_config reader_config(io_backend backend)
   config.backend                 = backend;
   config.thread_pool.num_threads = 3;
   config.uring_n_reactors        = 1;
-  // A small arena: 2 x 4 lanes of 1 MiB.
+  // A small arena: (2 read + 1 write) slots x 4 lanes of 1 MiB.
   config.cufile.lanes      = 4;
   config.cufile.lane_bytes = 1UL << 20;
   // Request a cache deliberately: native must get one, cuFile must still bypass it.
@@ -106,13 +110,111 @@ bool cufile_usable()
   return cufile::cufile_api::get() != nullptr && cufile::cufile_api::open_driver();
 }
 
-/// Whether cuFile registered the file behind @p source: its device reads fail otherwise.
+/// Whether cuFile registered the file behind @p source: its device reads go through host memory
+/// otherwise.
 bool registered(cucascade::io::datasource const& source)
 {
   auto const* file =
     dynamic_cast<cucascade::io::cufile::cufile_io_object const*>(&source.get_io_object());
   return file != nullptr && file->cufile_registered();
 }
+
+/// No cuFile arena is kept for any GPU during the scope, nor after it (see
+/// cucascade::io::cufile::reserve_arena): the case's reservations allocate their own.
+struct fresh_arenas {
+  fresh_arenas() { cucascade::io::cufile::detail::release_arenas_for_testing(); }
+  ~fresh_arenas() { cucascade::io::cufile::detail::release_arenas_for_testing(); }
+  fresh_arenas(fresh_arenas const&)            = delete;
+  fresh_arenas& operator=(fresh_arenas const&) = delete;
+};
+
+std::atomic<int> buffer_registrations{0};
+/// cuFileRead of this file handle fails with EIO (null: none).
+std::atomic<void const*> failing_handle{nullptr};
+std::mutex files_in_flight_mutex;
+std::map<void const*, int> files_in_flight;  // cuFile handle -> its cuFileRead calls in flight
+std::size_t most_files_in_flight{0};
+
+/// libcufile's table, counting cuFileBufRegister calls and the files whose cuFileRead calls are
+/// in flight at once.  A read lingers (up to 300 ms) until another file's read has joined it, so
+/// reads issued together are seen together.  Installed for a scope: declare it before the
+/// contexts and files it serves.
+class counting_cufile_api {
+ public:
+  counting_cufile_api()
+  {
+    namespace cufile   = cucascade::io::cufile;
+    table              = *cufile::cufile_api::loaded();
+    table.buf_register = [](void const* base, std::size_t size, int flags) -> CUfileError_t {
+      ++buffer_registrations;
+      return cufile::cufile_api::loaded()->buf_register(base, size, flags);
+    };
+    table.read = [](CUfileHandle_t handle,
+                    void* base,
+                    std::size_t size,
+                    off_t file_offset,
+                    off_t base_offset) -> ssize_t {
+      if (handle == failing_handle.load()) {
+        errno = EIO;
+        return -1;
+      }
+      auto const files = [] {
+        std::lock_guard const lock(files_in_flight_mutex);
+        return files_in_flight.size();
+      };
+      {
+        std::lock_guard const lock(files_in_flight_mutex);
+        ++files_in_flight[handle];
+        most_files_in_flight = std::max(most_files_in_flight, files_in_flight.size());
+      }
+      auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{300};
+      while (files() < 2 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+      }
+      auto const n =
+        cufile::cufile_api::loaded()->read(handle, base, size, file_offset, base_offset);
+      {
+        std::lock_guard const lock(files_in_flight_mutex);
+        if (--files_in_flight[handle] == 0) { files_in_flight.erase(handle); }
+      }
+      return n;
+    };
+    buffer_registrations = 0;
+    failing_handle       = nullptr;
+    {
+      std::lock_guard const lock(files_in_flight_mutex);
+      files_in_flight.clear();
+      most_files_in_flight = 0;
+    }
+    cufile::detail::set_cufile_api_for_testing(&table);
+  }
+  ~counting_cufile_api() { cucascade::io::cufile::detail::set_cufile_api_for_testing(nullptr); }
+  counting_cufile_api(counting_cufile_api const&)            = delete;
+  counting_cufile_api& operator=(counting_cufile_api const&) = delete;
+
+  cucascade::io::cufile::cufile_api table;
+};
+
+/// Holds every byte of the current GPU's memory it can get, in 16 MiB pieces, for its scope.
+struct gpu_memory_hog {
+  gpu_memory_hog()
+  {
+    for (void* chunk = nullptr; cudaMalloc(&chunk, 16UL << 20) == cudaSuccess; chunk = nullptr) {
+      chunks.push_back(chunk);
+    }
+    std::ignore = cudaGetLastError();
+  }
+  ~gpu_memory_hog()
+  {
+    for (auto* chunk : chunks) {
+      std::ignore = cudaFree(chunk);
+    }
+  }
+  gpu_memory_hog(gpu_memory_hog const&)            = delete;
+  gpu_memory_hog& operator=(gpu_memory_hog const&) = delete;
+
+  std::vector<void*> chunks;
+};
 
 std::size_t free_device_bytes(int device)
 {
@@ -123,7 +225,8 @@ std::size_t free_device_bytes(int device)
   return free;
 }
 
-void write_parquet(sirius::test::scratch_dir const& directory)
+void write_parquet(sirius::test::scratch_dir const& directory,
+                   std::string const& name = "input.parquet")
 {
   sirius::test::scoped_sirius_disable disable;
   duckdb::DuckDB db(nullptr);
@@ -133,7 +236,7 @@ void write_parquet(sirius::test::scratch_dir const& directory)
   auto result = connection.Query(
     "COPY (SELECT i::BIGINT id, (17*i*i + 31*i + 7)::BIGINT value, -i AS ignored "
     "FROM range(262144) t(i) ORDER BY i) TO " +
-    directory.file_literal("input.parquet") +
+    directory.file_literal(name) +
     " (FORMAT PARQUET, COMPRESSION UNCOMPRESSED, ROW_GROUP_SIZE 65536)");
   REQUIRE(result);
   if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
@@ -352,7 +455,7 @@ TEST_CASE("cuFile scan reads and decodes selected Parquet chunks like native", "
   source->fadvise(ranges, 0);
   CHECK(source->cache_chunk_count() == 0);
   CHECK(source->prepare_prefetch(false) == cucascade::io::prepare_result::nothing_to_prepare);
-  if (!registered(*source)) { SKIP("cuFile did not register the file here; device reads fail"); }
+  if (!registered(*source)) { SKIP("cuFile did not register the file here"); }
 
   rmm::cuda_stream caller(rmm::cuda_stream::flags::non_blocking);
   rmm::cuda_stream observer(rmm::cuda_stream::flags::non_blocking);
@@ -435,7 +538,7 @@ TEST_CASE("cuFile lanes read every column chunk of one vectored request", "[cufi
   REQUIRE(source);
   REQUIRE(baseline);
   REQUIRE(source->io_ctx().get() == reader.io_ctx());
-  if (!registered(*source)) { SKIP("cuFile did not register the file here; device reads fail"); }
+  if (!registered(*source)) { SKIP("cuFile did not register the file here"); }
 
   auto options = cudf::io::parquet_reader_options::builder().column_names({"id", "value"}).build();
   auto footer  = cudf::io::parquet::fetch_footer_to_host(*baseline);
@@ -469,18 +572,16 @@ TEST_CASE("the cuFile arena is reserved ahead of the pool, on Sirius's GPU only"
   auto memory = initialize_memory_manager(1);
   std::vector<int> const gpu_0{0};
 
-  // An idle arena is kept per GPU for the process: start from a tiny one, so an arena an
-  // earlier case left behind cannot satisfy the checks below.
-  auto tiny              = reader_config(io_backend::cufile);
-  tiny.cufile.lanes      = 1;
-  tiny.cufile.lane_bytes = 4096;
-  sirius::scan_manager::reserve_cufile_arenas(tiny, gpu_0);
+  // An idle arena is kept per GPU for the process, and serves any later context whose
+  // segments fit its slots: start without one, so an arena an earlier case left behind cannot
+  // satisfy the checks below.
+  fresh_arenas const fresh;
 
   auto config              = reader_config(io_backend::cufile);
   config.cufile.lanes      = 3;
   config.cufile.lane_bytes = 16UL << 20;
   auto const arena         = config.cufile.arena_bytes();
-  REQUIRE(arena == (96UL << 20));
+  REQUIRE(arena == (144UL << 20));  // (2 read slots + 1 write slot) x 3 lanes x 16 MiB
   auto const used_since = [](int gpu, std::size_t free_before) {
     auto const free_now = free_device_bytes(gpu);
     return free_before > free_now ? free_before - free_now : std::size_t{0};
@@ -504,6 +605,80 @@ TEST_CASE("the cuFile arena is reserved ahead of the pool, on Sirius's GPU only"
   sirius::exec::query_lifecycle_registry lifecycle;
   sirius_scan_manager reader{lifecycle, config, *memory, single_gpu_index()};
   CHECK(used_since(0, reserved) < arena / 2);
+}
+
+TEST_CASE("spills through cuFile get their arena reserved ahead of the pool",
+          "[cufile][scan][scan_manager]")
+{
+  if (!cufile_usable()) { SKIP("the cuFile arena requires a CUDA device and a cuFile driver"); }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  std::vector<int> const gpu_0{0};
+  fresh_arenas const fresh;
+  counting_cufile_api const api;
+  // The shape of the DISK tier's shared cuFile context: cuCascade's defaults.
+  auto disk    = cucascade::io::io_config{}.cufile;
+  disk.devices = gpu_0;
+  auto const registrations =
+    static_cast<int>((disk.read_slots_per_lane + 1) * disk.lanes);  // one per slot
+
+  // Native scans: only the spills want an arena.
+  auto const native = reader_config(io_backend::native);
+  sirius::scan_manager::reserve_cufile_arenas(native, gpu_0, /*spills_through_cufile=*/false);
+  CHECK(buffer_registrations == 0);
+  sirius::scan_manager::reserve_cufile_arenas(native, gpu_0, /*spills_through_cufile=*/true);
+  CHECK(buffer_registrations == registrations);
+
+  // The shared context, as cuCascade builds it at the first spill, takes that arena.
+  cucascade::io::cufile::cufile_ioctx spill_context{disk};
+  spill_context.start();
+  CHECK(buffer_registrations == registrations);
+  spill_context.shutdown();
+}
+
+TEST_CASE("a spill arena that cannot be reserved leaves startup and the scan arena alone",
+          "[cufile][scan][scan_manager]")
+{
+  if (!cufile_usable()) { SKIP("the cuFile arena requires a CUDA device and a cuFile driver"); }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  std::vector<int> const gpu_0{0};
+  fresh_arenas const fresh;
+  counting_cufile_api const api;
+  // A scan arena too small for the DISK context: covering both takes another allocation.
+  auto const config = reader_config(io_backend::cufile);
+  sirius::scan_manager::reserve_cufile_arenas(config, gpu_0);
+  auto const reserved = buffer_registrations.load();
+  REQUIRE(reserved > 0);
+  {
+    gpu_memory_hog const hog;
+    CHECK_NOTHROW(
+      sirius::scan_manager::reserve_cufile_arenas(config, gpu_0, /*spills_through_cufile=*/true));
+  }
+
+  // The scan arena is still the GPU's: a scan context of its shape registers nothing new.
+  cucascade::io::cufile::cufile_ioctx scans{config.resolved_cufile(gpu_0)};
+  scans.start();
+  CHECK(buffer_registrations == reserved);
+  scans.shutdown();
+}
+
+TEST_CASE("a spill arena registered differently from the scan arena is not reserved",
+          "[cufile][scan][scan_manager]")
+{
+  if (!cufile_usable()) { SKIP("the cuFile arena requires a CUDA device and a cuFile driver"); }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  std::vector<int> const gpu_0{0};
+  fresh_arenas const fresh;
+  counting_cufile_api const api;
+  auto config                     = reader_config(io_backend::cufile);
+  config.cufile.register_per_slot = false;  // the DISK context registers per slot
+  sirius::scan_manager::reserve_cufile_arenas(config, gpu_0, /*spills_through_cufile=*/true);
+  CHECK(buffer_registrations == 1);  // the scan arena, registered as a whole, and nothing else
+
+  // The scan context takes the reserved arena instead of allocating after the pools.
+  cucascade::io::cufile::cufile_ioctx scans{config.resolved_cufile(gpu_0)};
+  scans.start();
+  CHECK(buffer_registrations == 1);
+  scans.shutdown();
 }
 
 TEST_CASE("cufile_bulk_read picks the Parquet read route of cuFile scans",
@@ -552,17 +727,13 @@ TEST_CASE("cufile_bulk_read picks the Parquet read route of cuFile scans",
     CHECK(sirius::op::scan::prefers_bulk_materialize(sources, options) == expected);
 
     // Both routes return the same rows.
-    if (registered(*source)) {
-      rmm::cuda_stream decoder(rmm::cuda_stream::flags::non_blocking);
-      auto table = sirius::op::scan::materialize_parquet(
-        sources, options, {}, decoder, cudf::get_current_device_resource_ref());
-      REQUIRE(table);
-      auto const actual = host_columns(table->view(), decoder);
-      auto const rows   = expected_rows(*metadata, groups);
-      CHECK(std::equal(actual.begin(), actual.end(), rows.begin(), rows.end()));
-    } else {
-      WARN("cuFile did not register the file here; its device reads fail");
-    }
+    rmm::cuda_stream decoder(rmm::cuda_stream::flags::non_blocking);
+    auto table = sirius::op::scan::materialize_parquet(
+      sources, options, {}, decoder, cudf::get_current_device_resource_ref());
+    REQUIRE(table);
+    auto const actual = host_columns(table->view(), decoder);
+    auto const rows   = expected_rows(*metadata, groups);
+    CHECK(std::equal(actual.begin(), actual.end(), rows.begin(), rows.end()));
   }
   // The registration ends with the scan manager that made it.
   CHECK(sirius::io::detail::bulk_read_registry().count.load() == 0);
@@ -572,6 +743,108 @@ TEST_CASE("cufile_bulk_read picks the Parquet read route of cuFile scans",
   auto local = native.create_datasource(path);
   REQUIRE(local);
   CHECK_FALSE(sirius::io::prefers_bulk_read(*local));
+}
+
+TEST_CASE("a multi-file split on the cuFile bulk route reads every file at once",
+          "[cufile][scan][scan_manager][bulk_read]")
+{
+  if (!cufile_usable()) {
+    SKIP("cuFile scan integration requires a CUDA device and a cuFile driver");
+  }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  sirius::test::scratch_dir directory("cufile_bulk_files");
+  std::array<std::string, 3> const names{"first.parquet", "second.parquet", "third.parquet"};
+  for (auto const& name : names) {
+    write_parquet(directory, name);
+  }
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index();
+  sirius::exec::query_lifecycle_registry lifecycle;
+  counting_cufile_api const api;
+  sirius_scan_manager reader{lifecycle, reader_config(io_backend::cufile), *memory, topology};
+
+  auto options = cudf::io::parquet_reader_options::builder().column_names({"id", "value"}).build();
+  std::vector<parquet_source> sources;
+  std::vector<std::vector<std::int64_t>> rows(2);
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    auto source = reader.create_datasource(directory.file(names[i]));
+    REQUIRE(source);
+    auto footer = cudf::io::parquet::fetch_footer_to_host(*source);
+    cudf::io::parquet::experimental::hybrid_scan_reader footer_reader(
+      cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), options);
+    auto const metadata =
+      std::make_shared<cudf::io::parquet::FileMetaData const>(footer_reader.parquet_metadata());
+    // A different row group of each file.
+    std::vector<cudf::size_type> const groups{static_cast<cudf::size_type>(i)};
+    auto const expected = expected_rows(*metadata, groups);
+    for (std::size_t column = 0; column < rows.size(); ++column) {
+      rows[column].insert(rows[column].end(), expected[column].begin(), expected[column].end());
+    }
+    sources.push_back(parquet_source{std::move(source), metadata, groups});
+  }
+  REQUIRE(sirius::op::scan::prefers_bulk_materialize(sources, options));
+
+  rmm::cuda_stream decoder(rmm::cuda_stream::flags::non_blocking);
+  auto table = sirius::op::scan::materialize_parquet(
+    sources, options, {}, decoder, cudf::get_current_device_resource_ref());
+  REQUIRE(table);
+  CHECK(host_columns(table->view(), decoder) == rows);
+  // The files' reads were in flight together, not one file after another.
+  std::lock_guard const lock(files_in_flight_mutex);
+  CHECK(most_files_in_flight >= 2);
+}
+
+TEST_CASE("a multi-file split reports a fatal device failure over an ordinary one",
+          "[cufile][scan][scan_manager][bulk_read]")
+{
+  if (!cufile_usable()) {
+    SKIP("cuFile scan integration requires a CUDA device and a cuFile driver");
+  }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  sirius::test::scratch_dir directory("cufile_bulk_fatal");
+  std::array<std::string, 2> const names{"ordinary.parquet", "fatal.parquet"};
+  for (auto const& name : names) {
+    write_parquet(directory, name);
+  }
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index();
+  sirius::exec::query_lifecycle_registry lifecycle;
+  fresh_arenas const fresh;  // the fatal read retires a slot
+  counting_cufile_api const api;
+  sirius_scan_manager reader{lifecycle, reader_config(io_backend::cufile), *memory, topology};
+
+  auto options = cudf::io::parquet_reader_options::builder().column_names({"id", "value"}).build();
+  std::vector<parquet_source> sources;
+  for (auto const& name : names) {
+    auto source = reader.create_datasource(directory.file(name));
+    REQUIRE(source);
+    if (!registered(*source)) { SKIP("cuFile did not register the file here"); }
+    auto footer = cudf::io::parquet::fetch_footer_to_host(*source);
+    cudf::io::parquet::experimental::hybrid_scan_reader footer_reader(
+      cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), options);
+    auto const metadata =
+      std::make_shared<cudf::io::parquet::FileMetaData const>(footer_reader.parquet_metadata());
+    sources.push_back(parquet_source{std::move(source), metadata, {0}});
+  }
+  // The first file's cuFileRead fails (an ordinary I/O error); the second file's copies end in a
+  // status CUDA documents as terminal.
+  failing_handle = dynamic_cast<cucascade::io::cufile::cufile_io_object const&>(
+                     sources[0].datasource->get_io_object())
+                     .cufile_handle();
+  struct lift_injection {
+    ~lift_injection() { cucascade::io::cufile::detail::fail_copy_queries_for_testing(0, 0); }
+  } const lifted;
+  cucascade::io::cufile::detail::fail_copy_queries_for_testing(cudaErrorLaunchFailure,
+                                                               cudaErrorIllegalAddress);
+
+  rmm::cuda_stream decoder(rmm::cuda_stream::flags::non_blocking);
+  try {
+    std::ignore = sirius::op::scan::materialize_parquet(
+      sources, options, {}, decoder, cudf::get_current_device_resource_ref());
+    FAIL("the split was read despite its failures");
+  } catch (...) {
+    CHECK(sirius::fatal_device_status(std::current_exception()) == cudaErrorIllegalAddress);
+  }
 }
 
 TEST_CASE("a SQL scan through the cuFile backend reads on its lanes",
@@ -620,7 +893,7 @@ TEST_CASE("a SQL scan through the cuFile backend reads on its lanes",
     REQUIRE(dynamic_cast<cucascade::io::cufile::cufile_ioctx const*>(scans.io_ctx()) != nullptr);
     auto const source = scans.create_datasource(directory.file("input.parquet"));
     REQUIRE(source);
-    if (!registered(*source)) { SKIP("cuFile did not register the file here; device reads fail"); }
+    if (!registered(*source)) { SKIP("cuFile did not register the file here"); }
 
     auto const run = [&](std::string const& sql) {
       auto result = con.Query(sql);

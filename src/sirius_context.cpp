@@ -58,6 +58,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -1057,15 +1058,33 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   }
 
   // cuFile's registered arenas live outside RMM for the life of the process. Take them
-  // before the GPU pools claim the devices, rather than from what the pools leave free.
+  // before the GPU pools claim the devices, rather than from what the pools leave free:
+  // for cuFile scans, and for spills to a DISK space that adopts cuCascade's shared cuFile
+  // context (it allows GDS on a GDS mount), which would otherwise take them at the first spill.
   {
     std::vector<int> gpu_ids;
+    bool spills_through_cufile = false;
     for (auto const& space : config_.get_memory_space_configs()) {
       if (auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
         gpu_ids.push_back(gpu->device_id);
       }
+      auto const* disk = std::get_if<cucascade::memory::disk_memory_space_config>(&space);
+      if (disk == nullptr || disk->io_context != nullptr || !disk->allow_gds ||
+          spills_through_cufile) {
+        continue;
+      }
+      try {
+        spills_through_cufile = cucascade::disk_mount_uses_gds(disk->mount_paths);
+      } catch (std::exception const& e) {
+        SIRIUS_LOG_WARN(
+          "SiriusContext: cannot tell whether DISK mount '{}' serves GPUDirect Storage ({}); no "
+          "cuFile arena is reserved for its spills ahead of the GPU memory pools",
+          disk->mount_paths,
+          e.what());
+      }
     }
-    sirius::scan_manager::reserve_cufile_arenas(config_.get_scan_manager_config(), gpu_ids);
+    sirius::scan_manager::reserve_cufile_arenas(
+      config_.get_scan_manager_config(), gpu_ids, spills_through_cufile);
   }
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(

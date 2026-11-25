@@ -693,24 +693,30 @@ See [cuFile configuration](configuration.md#scan_managercufile--local-cufile-rea
 for a YAML example and all read tunables.
 
 The scan manager builds a `cufile::cufile_ioctx` with one reactor per GPU in
-`cufile.devices`, which defaults to the GPU Sirius reads into rather than every
-visible GPU. Each GPU has an arena of `2 x cufile.lanes x cufile.lane_bytes` of
-`cudaMalloc` memory registered with cuFile once, and a reactor has two sets of
+`cufile.devices`, which defaults to (and must list exactly) the GPUs Sirius reads into
+rather than every visible GPU. Each GPU has an arena of
+`(cufile.read_slots_per_lane + 1) x cufile.lanes x cufile.lane_bytes` of `cudaMalloc`
+memory registered with cuFile (per slot by default), and a reactor has two sets of
 `cufile.lanes` lanes, one reading and one writing. A lane is a thread, pinned to the CPUs
 of the GPU's NUMA node, that takes one slot of the arena and blocks in one synchronous
 `cuFileRead` / `cuFileWrite` at a time, so the lane count is the GPU's queue depth. The
 arena lives
 outside RMM for the life of the process; `SiriusContext::initialize` reserves it
-(`reserve_cufile_arenas`) before the GPU memory pools claim the device.
+(`reserve_cufile_arenas`) before the GPU memory pools claim the device, for cuFile scans
+and for spills to a DISK space on a GDS mount.
 
 A device read is cut on the submitting thread into 4 KiB-aligned segments of at most
 `lane_bytes` (8 MiB); the destinations of one request that lie within
 `coalesce_gap_bytes` of each other share a segment. A lane reads the segment into its
-slot and copies each destination's bytes out device-to-device on its own stream.
+slot, never past the end of the file, and copies each destination's bytes out
+device-to-device on a stream of the segment's own; a completion thread frees the slot once
+the copies are done.
 Coalescing is per request, so `scan_manager.cufile_bulk_read` (default `on`)
 sends cuFile scans down the bulk route of `materialize_parquet`: one vectored
 `device_read_ranges_async` per file per split, decoded by cuDF's hybrid scan reader, as REST
-scans are. The scan manager registers its cuFile context for that route
+scans are; the files of a multi-file split are read together, after the worker's stream
+has drained (so no read holds arena slots behind the previous split's decode). The scan
+manager registers its cuFile context for that route
 (`sirius::io::bulk_read_registration`), and `sirius::io::prefers_bulk_read` is the one
 decision both `prefers_bulk_materialize` and the Iceberg reader-position eligibility read.
 With the knob `off` the scan keeps cuDF's general reader, which issues one
@@ -720,8 +726,8 @@ but never coalesced with each other.
 A device read is ordered after the work already queued on the caller's stream, through
 an event recorded on the submitting thread. Completion is host-observed: the read future
 settles only when the destination is ready. Host reads go through a host-only io_uring
-reactor the cuFile reactor owns. There is no POSIX fallback for device reads: a file
-cuFile could not register serves host reads only, and its device reads fail. Neither
+reactor the cuFile reactor owns. A file cuFile could not register moves its device bytes
+through a pinned host bounce buffer of the lane (`pread` / `pwrite`) instead. Neither
 cache mode nor an explicit readahead budget enables cuFile scan readahead. To inspect
 `cufile.log`, configure cuFile's JSON logging settings via `CUFILE_ENV_PATH_JSON` before
 first initialization; see the configuration section above.

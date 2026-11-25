@@ -4606,22 +4606,61 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
   return std::nullopt;
 }
 
-void reserve_cufile_arenas(scan_manager_config const& config, std::span<int const> gpu_ids)
+void reserve_cufile_arenas(scan_manager_config const& config,
+                           std::span<int const> gpu_ids,
+                           bool spills_through_cufile)
 {
 #ifdef CUCASCADE_HAS_CUFILE
-  if (config.backend != io_backend::cufile) { return; }
-  auto const cfg = config.resolved_cufile(gpu_ids);
-  for (int const gpu : cfg.devices) {
-    cucascade::io::cufile::reserve_arena(gpu, cfg);
-    SIRIUS_LOG_INFO(
-      "[sirius_scan_manager] reserved the cuFile arena on GPU {} ahead of its memory pool: "
-      "{} MiB outside RMM",
-      gpu,
-      cfg.arena_bytes() >> 20);
+  namespace cufile = cucascade::io::cufile;
+  if (config.backend == io_backend::cufile) {
+    // Mandatory: the scan context needs it.  Its shape is the scan's alone.
+    auto const cfg = config.resolved_cufile(gpu_ids);
+    for (int const gpu : cfg.devices) {
+      cufile::reserve_arena(gpu, cfg);
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager] reserved the cuFile arena on GPU {} ahead of its memory pool, for "
+        "scans: {} MiB outside RMM",
+        gpu,
+        cfg.arena_bytes() >> 20);
+    }
+  }
+  if (!spills_through_cufile) { return; }
+  // Optional: the DISK tier's shared cuFile context runs with cuCascade's defaults and takes the
+  // GPU's arena when it covers that shape (the scan's does with the default block).  Otherwise
+  // the GPU gets one arena covering both; when that cannot be allocated now, the first spill
+  // tries again and spills through io_uring if it fails too.
+  auto const spill = cucascade::io::io_config{}.cufile;
+  if (config.backend == io_backend::cufile &&
+      config.cufile.register_per_slot != spill.register_per_slot) {
+    // An arena covering both would be registered the spills' way, which the scan arena does not
+    // cover: its replacement would leave the scan context to allocate again after the pools.
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager] cufile.register_per_slot differs from the DISK tier's cuFile context; "
+      "no arena is reserved for spills ahead of the memory pools (the first spill through cuFile "
+      "takes one, or spills through io_uring)");
+    return;
+  }
+  for (int const gpu : gpu_ids) {
+    try {
+      cufile::reserve_arena(gpu, spill);
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager] the cuFile arena on GPU {} serves spills too (at least {} MiB "
+        "outside RMM)",
+        gpu,
+        spill.arena_bytes() >> 20);
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[sirius_scan_manager] cannot reserve a cuFile arena for spills on GPU {} ahead of its "
+        "memory pool ({}); the first spill through cuFile tries again, and spills through io_uring "
+        "if that fails",
+        gpu,
+        e.what());
+    }
   }
 #else
   (void)config;
   (void)gpu_ids;
+  (void)spills_through_cufile;
 #endif
 }
 

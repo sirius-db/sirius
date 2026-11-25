@@ -190,6 +190,18 @@ TEST_CASE("fatal device classification requires CUDA exception evidence", "[devi
     std::make_exception_ptr(cudf::cuda_error("cudaErrorIllegalAddress", cudaErrorInvalidValue))));
   CHECK(sirius::fatal_device_status(
     std::make_exception_ptr(sirius::fatal_device_error(cudaErrorAssert))));
+  // cuCascade's I/O keeps the status of a CUDA failure it reports.
+  CHECK(sirius::fatal_device_status(std::make_exception_ptr(cucascade::cuda_status_error(
+          cudaErrorIllegalAddress, "CUDA error: illegal address"))) == cudaErrorIllegalAddress);
+  CHECK_FALSE(sirius::fatal_device_status(std::make_exception_ptr(
+    cucascade::cuda_status_error(cudaErrorMemoryAllocation, "CUDA error: out of memory"))));
+  // Every status the CUDA runtime documents as terminal is fatal, the newer ones included.
+  for (auto status : {static_cast<cudaError_t>(226),  // cudaErrorContained
+                      static_cast<cudaError_t>(721),  // cudaErrorTensorMemoryLeak
+                      cudaErrorMpsClientTerminated}) {
+    CAPTURE(static_cast<int>(status));
+    CHECK(sirius::fatal_cuda_status(status));
+  }
   CHECK_FALSE(sirius::fatal_device_status(std::make_exception_ptr(std::bad_alloc())));
   CHECK_FALSE(sirius::fatal_device_status(
     std::make_exception_ptr(rmm::cuda_error("operator input contains cudaErrorAssert"))));

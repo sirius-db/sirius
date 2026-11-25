@@ -941,6 +941,9 @@ TEST_CASE("scan_manager_config defaults to the native backend", "[scan_manager][
   CHECK(cfg.cufile.lane_bytes == (8UL << 20));
   CHECK(cfg.cufile.coalesce_gap_bytes == (1UL << 20));
   CHECK(cfg.cufile.coalesce_gap_ratio == 0.15);
+  CHECK(cfg.cufile.read_slots_per_lane == 2);
+  CHECK(cfg.cufile.register_per_slot);
+  CHECK(cfg.cufile.arena_bytes() == (768UL << 20));
   CHECK(cfg.cufile.devices.empty());
   CHECK_NOTHROW(sirius::scan_manager::validate_scan_manager_config(cfg));
 }
@@ -951,13 +954,17 @@ TEST_CASE("the default cuFile pool serves the GPUs Sirius reads into",
   scan_manager_config cfg{};
   std::vector<int> const sirius_gpus{0, 1};
   CHECK(cfg.resolved_cufile(sirius_gpus).devices == sirius_gpus);
-  // An explicit list is kept as configured when Sirius reads into those GPUs...
-  cfg.cufile.devices = {1};
-  CHECK(cfg.resolved_cufile(sirius_gpus).devices == std::vector<int>{1});
-  // ...and refused when it names another one.
+  // An explicit list is kept as configured when it names the GPUs Sirius reads into...
+  cfg.cufile.devices = {1, 0};
+  CHECK(cfg.resolved_cufile(sirius_gpus).devices == std::vector<int>{1, 0});
+  // ...refused when it names another one...
   cfg.cufile.devices = {1, 2};
   CHECK_THROWS_WITH(cfg.resolved_cufile(sirius_gpus),
                     Catch::Matchers::ContainsSubstring("'cufile.devices': GPU 2"));
+  // ...and when it leaves one out: scans are placed on every GPU Sirius reads into.
+  cfg.cufile.devices = {1};
+  CHECK_THROWS_WITH(cfg.resolved_cufile(sirius_gpus),
+                    Catch::Matchers::ContainsSubstring("'cufile.devices': must list GPU 0"));
 }
 
 TEST_CASE("cuFile C++ config is validated before starting the scan manager",
@@ -965,6 +972,11 @@ TEST_CASE("cuFile C++ config is validated before starting the scan manager",
 {
   scan_manager_config cfg{};
   SECTION("no lanes") { cfg.cufile.lanes = 0; }
+  SECTION("no read slots") { cfg.cufile.read_slots_per_lane = 0; }
+  SECTION("an arena larger than the address space")
+  {
+    cfg.cufile.read_slots_per_lane = std::size_t{1} << 60;
+  }
   SECTION("zero lane size") { cfg.cufile.lane_bytes = 0; }
   SECTION("unaligned lane size") { cfg.cufile.lane_bytes = (8UL << 20) + 512; }
   CHECK_THROWS_AS(sirius::scan_manager::validate_scan_manager_config(cfg), std::invalid_argument);
@@ -1043,6 +1055,8 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
                                                    "        lane_bytes: 4 MiB\n"
                                                    "        coalesce_gap_bytes: 64 KiB\n"
                                                    "        coalesce_gap_ratio: 0.5\n"
+                                                   "        read_slots_per_lane: 3\n"
+                                                   "        register_per_slot: false\n"
                                                    "        devices: [1]\n"));
   CHECK(cfg.backend == io_backend::cufile);
   auto const io = cfg.to_io_config();
@@ -1051,12 +1065,16 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
   CHECK(cfg.cufile.lane_bytes == (4UL << 20));
   CHECK(cfg.cufile.coalesce_gap_bytes == (64UL << 10));
   CHECK(cfg.cufile.coalesce_gap_ratio == 0.5);
+  CHECK(cfg.cufile.read_slots_per_lane == 3);
+  CHECK_FALSE(cfg.cufile.register_per_slot);
   CHECK(cfg.cufile.devices == std::vector<int>{1});
 #ifdef CUCASCADE_HAS_CUFILE
   CHECK(io.cufile.lanes == cfg.cufile.lanes);
   CHECK(io.cufile.lane_bytes == cfg.cufile.lane_bytes);
   CHECK(io.cufile.coalesce_gap_bytes == cfg.cufile.coalesce_gap_bytes);
   CHECK(io.cufile.coalesce_gap_ratio == cfg.cufile.coalesce_gap_ratio);
+  CHECK(io.cufile.read_slots_per_lane == cfg.cufile.read_slots_per_lane);
+  CHECK(io.cufile.register_per_slot == cfg.cufile.register_per_slot);
   CHECK(io.cufile.devices == cfg.cufile.devices);
 #endif
 }
@@ -1072,6 +1090,11 @@ TEST_CASE("sirius_config rejects invalid cuFile settings with key context",
         std::pair{"      cufile:\n        lane_bytes: -4096\n", "cufile.lane_bytes"},
         std::pair{"      cufile:\n        coalesce_gap_bytes: -1\n", "cufile.coalesce_gap_bytes"},
         std::pair{"      cufile:\n        coalesce_gap_ratio: 1.5\n", "cufile.coalesce_gap_ratio"},
+        std::pair{"      cufile:\n        read_slots_per_lane: 0\n", "cufile.read_slots_per_lane"},
+        std::pair{"      cufile:\n        read_slots_per_lane: 576460752303423488\n",
+                  "cufile.read_slots_per_lane"},
+        std::pair{"      cufile:\n        register_per_slot: maybe\n", "cufile.register_per_slot"},
+        std::pair{"      cufile:\n        copy_poll_us: 5\n", "copy_poll_us"},
         std::pair{"      cufile:\n        n_max_concurrent_scans: 0\n", "not configurable"},
         std::pair{"      cufile:\n        n_max_concurrent_scans: 4\n", "not configurable"},
         std::pair{"      cufile:\n        devices: [-1]\n", "cufile.devices"},

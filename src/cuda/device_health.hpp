@@ -24,6 +24,8 @@
 #include <thrust/system/cuda/error.h>
 #include <thrust/system_error.h>
 
+#include <cucascade/error.hpp>
+
 #include <exception>
 #include <optional>
 #include <stdexcept>
@@ -35,6 +37,8 @@ namespace sirius {
 // invalid SQL/operator input remain ordinary per-query failures.
 inline bool fatal_cuda_status(cudaError_t status) noexcept
 {
+  // Every status the CUDA runtime documents as terminal (cuCascade's I/O classifies the same).
+  if (cucascade::terminal_cuda_status(status)) return true;
   switch (status) {
     case cudaErrorIllegalInstruction:
     case cudaErrorMisalignedAddress:
@@ -110,6 +114,10 @@ inline std::optional<cudaError_t> fatal_device_status(std::exception_ptr error) 
   try {
     if (error) std::rethrow_exception(error);
   } catch (fatal_device_error const& e) {
+    status = e.error_code();
+  } catch (cucascade::cuda_status_error const& e) {
+    // cuCascade's I/O reports a device failure with its status (e.g. a cuFile read whose GPU
+    // context went out of service).
     status = e.error_code();
   } catch (cudf::cuda_error const& e) {
     status = e.error_code();

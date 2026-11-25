@@ -392,8 +392,10 @@ struct scan_manager_config {
   /// with an empty @c devices list narrowed to @p gpu_ids (the GPUs Sirius reads
   /// into), so a reactor and its arena exist only on those.
   ///
-  /// @throws std::invalid_argument when @c cufile.devices names a GPU outside
-  ///         @p gpu_ids: its reactor and arena would serve no read.
+  /// @throws std::invalid_argument when @c cufile.devices is not @p gpu_ids (in any
+  ///         order): a GPU outside them would hold a reactor and arena that serve no
+  ///         read, and scans are placed on every one of them, while a device read on a
+  ///         GPU the context does not serve fails.
   [[nodiscard]] cucascade::io::cufile::config resolved_cufile(std::span<int const> gpu_ids) const
   {
     auto out = cufile;
@@ -405,6 +407,12 @@ struct scan_manager_config {
       if (std::ranges::find(gpu_ids, device) == gpu_ids.end()) {
         throw std::invalid_argument("'cufile.devices': GPU " + std::to_string(device) +
                                     " is not one Sirius reads into");
+      }
+    }
+    for (int const device : gpu_ids) {
+      if (std::ranges::find(out.devices, device) == out.devices.end()) {
+        throw std::invalid_argument("'cufile.devices': must list GPU " + std::to_string(device) +
+                                    " too: Sirius places scans on every GPU it reads into");
       }
     }
     return out;
@@ -460,14 +468,33 @@ inline int resolve_scan_manager_num_threads(scan_manager_config const& config, s
   return std::max(workers, static_cast<int>(domains));
 }
 
+/// Whether the cuFile arena @p cfg asks for ((read_slots_per_lane + 1) x lanes x lane_bytes
+/// bytes) is representable.
+[[nodiscard]] inline bool cufile_arena_fits(cucascade::io::cufile::config const& cfg) noexcept
+{
+  std::size_t slots = 0;
+  std::size_t bytes = 0;
+  return !__builtin_add_overflow(cfg.read_slots_per_lane, std::size_t{1}, &slots) &&
+         !__builtin_mul_overflow(slots, cfg.lanes, &slots) &&
+         !__builtin_mul_overflow(slots, cfg.lane_bytes, &bytes);
+}
+
 // Validate before any pool/reactor starts. Both defaults and explicit C++ overrides use this path.
 inline scan_manager_config validate_scan_manager_config(scan_manager_config config)
 {
   (void)config.preparation.resolve(config.thread_pool.num_threads);
   if (config.cufile.lanes == 0) { throw std::invalid_argument("'cufile.lanes': must be positive"); }
+  if (config.cufile.read_slots_per_lane == 0) {
+    throw std::invalid_argument("'cufile.read_slots_per_lane': must be positive");
+  }
   if (config.cufile.lane_bytes == 0 ||
       config.cufile.lane_bytes % cucascade::io::IO_BLOCK_SIZE != 0) {
     throw std::invalid_argument("'cufile.lane_bytes': must be a positive multiple of 4 KiB");
+  }
+  if (!cufile_arena_fits(config.cufile)) {
+    throw std::invalid_argument(
+      "'cufile.read_slots_per_lane': the arena ((read_slots_per_lane + 1) x lanes x lane_bytes) "
+      "is larger than the address space");
   }
   return config;
 }
