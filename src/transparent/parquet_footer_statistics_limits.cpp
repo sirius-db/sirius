@@ -41,14 +41,18 @@ std::int64_t limit_of(duckdb::ClientContext& context, char const* setting, std::
 
 footer_read_limits footer_read_limits_of(duckdb::ClientContext& context)
 {
-  footer_read_limits engine;
+  auto const limits = [&](operator_params const& engine) {
+    return footer_read_limits{limit_of(context,
+                                       "parquet_footer_statistics_max_remote_reads",
+                                       engine.parquet_footer_statistics_max_remote_reads),
+                              limit_of(context,
+                                       "parquet_footer_statistics_max_local_reads",
+                                       engine.parquet_footer_statistics_max_local_reads)};
+  };
   if (auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
-    auto const& params = runtime->get_config().get_operator_params();
-    engine.remote      = params.parquet_footer_statistics_max_remote_reads;
-    engine.local       = params.parquet_footer_statistics_max_local_reads;
+    return limits(runtime->get_config().get_operator_params());
   }
-  return {limit_of(context, "parquet_footer_statistics_max_remote_reads", engine.remote),
-          limit_of(context, "parquet_footer_statistics_max_local_reads", engine.local)};
+  return limits(operator_params{});
 }
 
 }  // namespace sirius::transparent

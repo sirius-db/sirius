@@ -114,9 +114,9 @@ struct cache_capacities {
 };
 /// No capacity limit.
 inline constexpr std::size_t unbounded = std::numeric_limits<std::size_t>::max();
-/// No limit on per-file statistics or on the files merged statistics refer to: with the read
-/// limits unlimited by default, scans that together exceed a limit would read or merge the excess
-/// again at every planning.
+/// No limit on per-file statistics or on the files merged statistics refer to. An evicted
+/// per-file record is a miss at the next planning: its footer is read again, or it counts against
+/// a read limit. Merged statistics evicted for their references are merged again.
 inline constexpr cache_capacities default_cache_capacities{unbounded, 128, unbounded};
 /// The most sets of scan paths whose merged statistics are kept.
 inline constexpr std::size_t merged_statistics_cache_capacity = default_cache_capacities.merges;

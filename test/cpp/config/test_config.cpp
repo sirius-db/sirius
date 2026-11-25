@@ -67,18 +67,56 @@ TEST_CASE("operator parameters start with hardware-independent defaults", "[conf
   CHECK(params.max_dynamic_filter_bloom_bytes_per_gpu() == 4 * params.scan_task_batch_size);
 }
 
-TEST_CASE("Footer admission starts unlimited with no per-file or reference cache capacity",
-          "[config_opt][parquet_footer_statistics][footer_admission_feature]")
+TEST_CASE("Footer reads start bounded with no per-file or reference cache capacity",
+          "[config_opt][parquet_footer_statistics][footer_admission_feature][footer_defaults]")
 {
   operator_params const params;
-  CHECK(params.parquet_footer_statistics_max_remote_reads == -1);
-  CHECK(params.parquet_footer_statistics_max_local_reads == -1);
+  CHECK(params.parquet_footer_statistics_max_remote_reads == 1024);
+  CHECK(params.parquet_footer_statistics_max_local_reads == 16384);
+  CHECK_FALSE(scan_manager::scan_manager_config{}.httpfs_external_file_cache);
   using sirius::transparent::detail::unbounded;
   CHECK(unbounded == std::numeric_limits<std::size_t>::max());
   auto const capacities = sirius::transparent::detail::default_cache_capacities;
   CHECK(capacities.statistics == unbounded);
   CHECK(capacities.merges == 128);
   CHECK(capacities.merge_references == unbounded);
+}
+
+TEST_CASE("Footer policy YAML distinguishes omitted keys from compatibility settings",
+          "[config_opt][parquet_footer_statistics][footer_defaults]")
+{
+  auto const path =
+    std::filesystem::temp_directory_path() /
+    ("sirius_footer_defaults_" +
+     std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".yaml");
+  struct cleanup {
+    std::filesystem::path path;
+    ~cleanup()
+    {
+      std::error_code ignored;
+      std::filesystem::remove(path, ignored);
+    }
+  } remove_file{path};
+  auto const rollback = GENERATE(false, true);
+  CAPTURE(rollback);
+  {
+    std::ofstream out(path);
+    out << "sirius:\n  executor:\n    scan_manager:\n      backend: native\n";
+    if (rollback) {
+      out << "      httpfs_external_file_cache: true\n"
+             "  operator_params:\n"
+             "    parquet_footer_statistics_max_remote_reads: -1\n"
+             "    parquet_footer_statistics_max_local_reads: -1\n";
+    }
+    REQUIRE(out.good());
+  }
+  sirius_config cfg;
+  cfg.load_from_file(path);
+  CHECK(cfg.get_operator_params().parquet_footer_statistics_max_remote_reads ==
+        (rollback ? -1 : 1024));
+  CHECK(cfg.get_operator_params().parquet_footer_statistics_max_local_reads ==
+        (rollback ? -1 : 16384));
+  CHECK(cfg.get_scan_manager_config().httpfs_external_file_cache == rollback);
 }
 
 TEST_CASE("Footer admission YAML loads limits and rejects unsupported negative values",

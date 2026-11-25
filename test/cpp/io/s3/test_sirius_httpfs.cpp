@@ -552,7 +552,7 @@ int64_t httpfs_cached_bytes(duckdb::Connection& con, std::string const& uri)
 
 namespace {
 
-enum class footer_cache_fixture_mode { probe, compatibility_default, configured };
+enum class footer_cache_fixture_mode { probe, engine_default, configured };
 
 void check_footer_cache_consumers(bool bypass,
                                   bool validate,
@@ -716,7 +716,7 @@ void check_footer_cache_fallback(std::optional<bool> policy, std::string const& 
   if (shape == "large_footer") {
     CHECK(std::find(ranges.begin(), ranges.end(), "bytes=-8") != ranges.end());
   }
-  if (!policy.value_or(true)) { CHECK(httpfs_cached_bytes(fixture.con, uri) == 0); }
+  if (!policy.value_or(false)) { CHECK(httpfs_cached_bytes(fixture.con, uri) == 0); }
   WARN("footer-cache shape=" << shape
                              << " policy=" << (policy ? (*policy ? "true" : "false") : "default")
                              << " GETs=" << ranges.size() << " HEADs=" << server.head_count()
@@ -734,17 +734,17 @@ TEST_CASE("Sirius filesystem deadline probe reaches LIST binds and Parquet delet
   check_footer_cache_consumers(bypass, validate, statistics, footer_cache_fixture_mode::probe);
 }
 
-TEST_CASE("Sirius HTTPFS compatibility default keeps whole objects and validators",
-          "[.][s3][integration][filesystem][httpfs_efc_legacy]")
+TEST_CASE("Sirius HTTPFS bypasses cached bytes by default and preserves validators",
+          "[.][s3][integration][filesystem][footer_defaults]")
 {
   auto const validate   = GENERATE(false, true);
   auto const statistics = GENERATE(false, true);
   check_footer_cache_consumers(
-    false, validate, statistics, footer_cache_fixture_mode::compatibility_default);
+    true, validate, statistics, footer_cache_fixture_mode::engine_default);
 }
 
 TEST_CASE("Sirius HTTPFS startup cache policy governs bind and delete reads",
-          "[.][s3][integration][filesystem][httpfs_efc_feature]")
+          "[.][s3][integration][filesystem][httpfs_efc_feature][footer_defaults]")
 {
   auto const bypass     = GENERATE(false, true);
   auto const validate   = GENERATE(false, true);
@@ -752,8 +752,8 @@ TEST_CASE("Sirius HTTPFS startup cache policy governs bind and delete reads",
   check_footer_cache_consumers(bypass, validate, statistics, footer_cache_fixture_mode::configured);
 }
 
-TEST_CASE("Sirius HTTPFS compatibility default reads fallback footer shapes",
-          "[.][s3][integration][filesystem][httpfs_efc_legacy]")
+TEST_CASE("Sirius HTTPFS reads fallback footer shapes without retaining bytes by default",
+          "[.][s3][integration][filesystem][footer_defaults]")
 {
   auto const shape = std::string(GENERATE("large_footer", "no_list_size", "unusable_suffix"));
   check_footer_cache_fallback(std::nullopt, shape);
@@ -985,7 +985,7 @@ TEST_CASE("DuckDB external file cache invalidates an overwritten S3 range by ETa
     return;
   }
 
-  sirius_httpfs_fixture fixture(*env);
+  sirius_httpfs_fixture fixture(*env, true);
   set_gpu_execution(fixture.con, true);
   require_query_ok(fixture.con, "SET enable_external_file_cache = true");
   auto const uri = s3_uri(env->bucket, key);

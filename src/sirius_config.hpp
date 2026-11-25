@@ -393,8 +393,8 @@ struct operator_params {
 
   /// Most uncached footers the footer-statistics pass reads for one scan, remote and local files
   /// apart: -1 no limit, 0 cached only. Explicit analysis and pin warming are exempt.
-  std::int64_t parquet_footer_statistics_max_remote_reads = -1;
-  std::int64_t parquet_footer_statistics_max_local_reads  = -1;
+  std::int64_t parquet_footer_statistics_max_remote_reads = 1024;
+  std::int64_t parquet_footer_statistics_max_local_reads  = 16384;
 };
 
 struct telemetry_config {

@@ -1222,6 +1222,38 @@ TEST_CASE("Footer admission SQL limits inherit engine values and isolate connect
   expect(first, false);
 }
 
+TEST_CASE("Effective footer limits follow the engine until a connection overrides them",
+          "[integration][isolated_context][parquet_footer_statistics][footer_defaults]")
+{
+  auto const custom = GENERATE(false, true);
+  CAPTURE(custom);
+  sirius::test::scratch_dir directory("effective_footer_limits");
+  auto const config =
+    footer_engine_config(directory.path(),
+                         custom ? "    parquet_footer_statistics_max_remote_reads: 7\n"
+                                  "    parquet_footer_statistics_max_local_reads: 1\n"
+                                : "    enable_dynamic_filter: false\n");
+  auto db = sirius::test::open_sirius_db(nullptr, config);
+  duckdb::Connection first(*db), second(*db);
+  auto const remote = custom ? 7 : 1024;
+  auto check        = [&](duckdb::Connection& connection, int expected_remote) {
+    REQUIRE(connection.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"));
+    auto const limits = sirius::transparent::footer_read_limits_of(*connection.context);
+    CHECK(limits.remote == expected_remote);
+    CHECK(limits.local == (custom ? 1 : 16384));
+  };
+  check(first, remote);
+  footer_query_ok(first, "SET parquet_footer_statistics_max_remote_reads=-1");
+  check(first, -1);
+  check(second, remote);
+  footer_query_ok(first, "RESET parquet_footer_statistics_max_remote_reads");
+  check(first, remote);
+  footer_query_ok(first, "SET parquet_footer_statistics_max_remote_reads=0");
+  check(first, 0);
+  footer_query_ok(first, "SET parquet_footer_statistics_max_remote_reads=NULL");
+  check(first, remote);
+}
+
 TEST_CASE_METHOD(
   FooterAdmissionFixture,
   "Footer admission preserves GPU join results with a skipped Parquet build scan",
@@ -1286,6 +1318,7 @@ std::size_t footer_fix_collect(duckdb::Connection& connection, duckdb::LogicalOp
 
 class footer_listing_observer final : public duckdb::FileSystem {
  public:
+  explicit footer_listing_observer(unsigned count = 4) : count_(count) {}
   std::string GetName() const override { return "footer-listing-observer"; }
   bool IsManuallySet() override { return true; }
   bool CanHandleFile(std::string const& path) override
@@ -1296,7 +1329,7 @@ class footer_listing_observer final : public duckdb::FileSystem {
   {
     ++lists;
     duckdb::vector<duckdb::OpenFileInfo> files;
-    for (unsigned i = 0; i < 4; ++i) {
+    for (unsigned i = 0; i < count_; ++i) {
       auto& f         = files.emplace_back("s3a://footer-guard/" + std::to_string(i) + ".parquet");
       f.extended_info = duckdb::make_shared_ptr<duckdb::ExtendedOpenFileInfo>();
       f.extended_info->options["file_size"] = duckdb::Value::BIGINT(100);
@@ -1309,6 +1342,7 @@ class footer_listing_observer final : public duckdb::FileSystem {
                                                   duckdb::optional_ptr<duckdb::FileOpener>) override
   {
     ++requests;
+    ++opens;
     throw duckdb::IOException("unexpected remote footer open");
   }
   duckdb::optional<duckdb::FileMetadata> GetStatsIfExists(
@@ -1319,6 +1353,10 @@ class footer_listing_observer final : public duckdb::FileSystem {
   }
   unsigned lists = 0;
   std::atomic<unsigned> requests{0};
+  std::atomic<unsigned> opens{0};
+
+ private:
+  unsigned count_;
 };
 
 class footer_reused_list final : public duckdb::SimpleMultiFileList {
@@ -1443,6 +1481,40 @@ TEST_CASE_METHOD(FooterAdmissionFixture,
   auto retained = plan(scan({0, 5}));
   check_footer_scan(*retained, 2, 200);
   CHECK(footer_detail::footer_read_count() - before == 2);
+}
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "Remote footer opens distinguish the inclusive default from unlimited admission",
+                 "[integration][gpu_execution][parquet_footer_statistics][footer_defaults]")
+{
+  auto const count    = GENERATE(1024U, 1025U);
+  auto const rollback = GENERATE(false, true);
+  CAPTURE(count, rollback);
+  footer_cache_scope caches;
+  if (rollback) { run_ok("SET parquet_footer_statistics_max_remote_reads=-1"); }
+  run_ok("SET parquet_footer_statistics=false");
+  auto plan = con->ExtractPlan("SELECT x FROM v");
+  REQUIRE(plan);
+  auto& bind = footer_fix_bind(*plan);
+  auto& fsys = con->context->db->GetFileSystem();
+  auto mock  = duckdb::make_uniq<footer_listing_observer>(count);
+  auto& seen = *mock;
+  scoped_footer_observer registration{fsys, seen.GetName()};
+  fsys.RegisterSubSystem(std::move(mock));
+  auto files = fsys.Glob("s3a://footer-guard/*.parquet", nullptr);
+  REQUIRE(files.size() == count);
+  REQUIRE(duckdb::FileSystem::IsRemoteFile(files[0].path));
+  bind.file_list = duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(std::move(files));
+  run_ok("SET parquet_footer_statistics=true");
+  auto const before = footer_detail::inspected_file_count();
+  (void)footer_fix_collect(*con, *plan);
+  CHECK(footer_detail::inspected_file_count() - before == count);
+  if (rollback || count == 1024) {
+    CHECK(seen.opens.load() > 0);
+  } else {
+    CHECK(seen.requests.load() == 0);
+    check_footer_scan(*plan, count, std::nullopt);
+  }
 }
 
 TEST_CASE_METHOD(FooterAdmissionFixture,
