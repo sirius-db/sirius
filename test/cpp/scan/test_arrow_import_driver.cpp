@@ -16,7 +16,7 @@
 
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
-#ifdef SIRIUS_ENABLE_PAIMON_SDK
+#ifdef SIRIUS_PAIMON_LOCAL_MODULE
 #include "op/scan/paimon/paimon_arrow_producer.hpp"
 #include "scan/paimon_native_test_fixture.hpp"
 
@@ -2842,7 +2842,7 @@ TEST_CASE("Arrow children share preparation identities with retained slots",
   b->finish_preparation();
 }
 
-#ifdef SIRIUS_ENABLE_PAIMON_SDK
+#ifdef SIRIUS_PAIMON_LOCAL_MODULE
 namespace {
 struct native_kind_tree {
   integer_tree values;
