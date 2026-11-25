@@ -159,7 +159,8 @@ lanes by a peer it reaches another way fails to connect, saying so. On two GB200
 19.0 GB/s each way instead of 0.19, and 4+4 ranks with 4 lanes about 10 GB/s per rank, 23 GB/s
 across the link each way; raw TCP reaches 24.75 there. These figures are from the branch the
 lanes were ported from, with UCX `tcp` on bond0. On this code, two GB200 nodes with 4 ranks each
-and 4 lanes per rank moved 33 to 38 GB/s per rank with the lanes on the rail NICs
+and 4 lanes per rank moved 8.9 GB/s per rank over `tcp` on bond0 (8 receive frames per peer, 20
+GB/s across the link each way), and 33 to 38 GB/s per rank with the lanes on the rail NICs
 (`SIRIUS_UCX_RAILS=1`), where UCX carries them over RDMA.
 
 On a cluster with RDMA between hosts and no fabric memory, set
