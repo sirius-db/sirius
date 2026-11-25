@@ -39,11 +39,13 @@ namespace {
 constexpr double nvlink_probe_min_gbps = 150;
 /// A smaller write is over before its bandwidth shows.
 constexpr std::size_t nvlink_probe_min_bytes = std::size_t{32} << 20;
+/// Timed writes to one peer, at most.
+constexpr int nvlink_probe_tries = 8;
 
 /**
- * @brief Times one write, as large as the transport's largest, to each peer on the NVLink
- * fabric path. UCX takes another transport without a word when `cuda_ipc` cannot map the peer's
- * memory; this says so at connect instead of in a slow query.
+ * @brief Times writes, as large as the transport's largest, to each peer on the NVLink fabric
+ * path, until one reaches the bar. UCX takes another transport without a word when `cuda_ipc`
+ * cannot map the peer's memory; this says so at connect instead of in a slow query.
  *
  * Runs before the transport starts: each write lands in this rank's own credit frames on the
  * peer, which no other rank writes, and carries no notification. Does nothing when the
@@ -69,9 +71,17 @@ void probe_nvlink_peers(nixl_fabric& fab, nixl_exchange_options const& opts)
     double gbps     = 0;
     // The first write also maps the peer's memory.
     if (fab.timed_write(peer, dst, bytes)) {
-      gbps = gbps_of(fab.timed_write(peer, dst, bytes));
-      // Another rank may be probing the same peer: one more try before calling it slow.
-      if (gbps < nvlink_probe_min_gbps) { gbps = gbps_of(fab.timed_write(peer, dst, bytes)); }
+      // Every rank connects to its peers and maps their rings at the same time, and a write
+      // timed meanwhile can read 2 to 60 ms in place of 0.2. That only makes it read slow: no
+      // other path reaches the bar, so the first write at it settles the peer.
+      for (int t = 0; t < nvlink_probe_tries && gbps < nvlink_probe_min_gbps; ++t) {
+        auto const seconds = fab.timed_write(peer, dst, bytes);
+        if (!seconds) {
+          gbps = 0;
+          break;
+        }
+        gbps = std::max(gbps, gbps_of(seconds));
+      }
     }
     if (gbps >= nvlink_probe_min_gbps) {
       SIRIUS_LOG_INFO("exchange: probe to rank {}: {} MiB at {:.0f} GB/s", peer, bytes >> 20, gbps);
