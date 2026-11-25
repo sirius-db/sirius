@@ -24,6 +24,7 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/distributed/bloom_all_gather_merge.hpp"
 #include "op/distributed/sample_all_gather_boundaries.hpp"
+#include "op/dynamic_filter/bloom_sizing.hpp"
 #include "op/scan/parquet_scan_types.hpp"
 #include "op/scan/scan_plan.hpp"
 #include "op/sirius_physical_cte.hpp"
@@ -74,8 +75,10 @@ enum class placement {
   rank0,   ///< On rank 0; what other ranks hold is not part of the result.
 };
 
-/// A join's Bloom filters are sized for its estimated build rows, within these bounds: the same
-/// size on every rank, since every rank plans the same estimate.
+/// A join's Bloom filters are sized for its estimated build rows, within these bounds and
+/// merged_bloom_keys()'s budget: the same size on every rank, since every rank plans the same
+/// estimate and, with like GPUs and settings, the same budget. Where the budgets differ the sizes
+/// do, and the key publishes nothing.
 constexpr std::size_t min_bloom_keys = std::size_t{1} << 16;
 constexpr std::size_t max_bloom_keys = std::size_t{1} << 30;
 /// A hash join whose estimated build has fewer rows publishes no merged Bloom filters.
@@ -216,11 +219,14 @@ struct rewriter {
     // One stream per admitted key: key k merges on first + k. The keys are fixed while planning,
     // so every rank reserves the same streams.
     auto const first = exchange::make_stream_id(query, next_stream);
-    next_stream += static_cast<std::uint32_t>(join.dynamic_filter_plan().admitted_keys().size());
+    auto const keys  = join.dynamic_filter_plan().admitted_keys().size();
+    next_stream += static_cast<std::uint32_t>(keys);
     install_filter_merge(join,
-                         std::make_shared<op::bloom_all_gather_merge>(
-                           service, first, join.dynamic_filter_plan().admitted_keys().size(), *gpu),
-                         std::clamp(build_rows, min_bloom_keys, max_bloom_keys));
+                         std::make_shared<op::bloom_all_gather_merge>(service, first, keys, *gpu),
+                         merged_bloom_keys(build_rows,
+                                           join.dynamic_filter_plan().max_bloom_bytes_per_gpu(),
+                                           service->world_size(),
+                                           keys));
     shape += "F";
   }
 
@@ -586,6 +592,18 @@ void check_distributed_scan(op::sirius_physical_table_scan const& scan,
     throw sirius::not_implemented_exception(
       "distributed execution: a plan that carries its own byte ranges");
   }
+}
+
+std::size_t merged_bloom_keys(std::size_t build_rows,
+                              std::uint64_t budget_bytes,
+                              std::size_t world,
+                              std::size_t keys)
+{
+  constexpr std::size_t bytes_per_key = op::bloom_target_bits_per_key / 8;
+  auto const within_budget =
+    static_cast<std::size_t>(budget_bytes / ((world + 1) * keys) / bytes_per_key);
+  return std::clamp(
+    build_rows, min_bloom_keys, std::clamp(within_budget, min_bloom_keys, max_bloom_keys));
 }
 
 void install_filter_merge(op::sirius_physical_hash_join& join,

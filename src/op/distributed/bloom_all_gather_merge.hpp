@@ -81,7 +81,7 @@ class bloom_all_gather_merge final : public cross_rank_filter_merge {
  *
  * max_bloom_bytes_per_gpu does not cut the size: the merged Bloom holds every rank's keys, and
  * Q05 at SF3000 on 2 GPUs, cut to 256 MiB, got ~1.5 bits per key, filtered almost nothing and ran
- * 3.5x slower. The planner's clamp bounds it until the streaming OR (#2375).
+ * 3.5x slower. The planner bounds it (planner::merged_bloom_keys()) until the streaming OR (#2375).
  */
 [[nodiscard]] dynamic_filter_publication_policy merged_bloom_policy(
   dynamic_filter_publication_policy policy, std::size_t bloom_keys) noexcept;
