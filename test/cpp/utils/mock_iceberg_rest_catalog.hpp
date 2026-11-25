@@ -25,6 +25,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -88,6 +89,13 @@ class mock_iceberg_rest_catalog {
     _replacements["/v1/namespaces/" + schema + "/tables/" + name] = std::move(value);
   }
 
+  /// The table is dropped once its next loadTable has been answered.
+  void remove_after_next_load(std::string const& schema, std::string const& name)
+  {
+    std::lock_guard lock(_mutex);
+    _removals.insert("/v1/namespaces/" + schema + "/tables/" + name);
+  }
+
   [[nodiscard]] std::string uri() const { return "http://127.0.0.1:" + std::to_string(_port); }
   [[nodiscard]] std::size_t load_table_requests() const { return _load_table_requests; }
 
@@ -144,6 +152,7 @@ class mock_iceberg_rest_catalog {
     if (auto replacement = _replacements.extract(path)) {
       found->second = std::move(replacement.mapped());
     }
+    if (_removals.erase(path) != 0) { _tables.erase(found); }
     return {200, std::move(body)};
   }
 
@@ -184,6 +193,7 @@ class mock_iceberg_rest_catalog {
   std::mutex _mutex;
   std::map<std::string, table> _tables;
   std::map<std::string, table> _replacements;
+  std::set<std::string> _removals;
   std::atomic<std::size_t> _load_table_requests{0};
   std::atomic<bool> _stop{false};
   int _listener{-1};

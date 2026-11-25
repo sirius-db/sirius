@@ -1519,6 +1519,8 @@ sirius_scan_manager::sirius_scan_manager(
 
 sirius_scan_manager::~sirius_scan_manager()
 {
+  // A file handle DuckDB still holds may ask for a sweep at any time: from here on it gets none.
+  _idle_rest_sweeper->detach();
   if (_io_ctx && _io_ctx->cache()) {
     try {
       SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
@@ -2617,6 +2619,20 @@ void sirius_scan_manager::release_idle_rest_contexts() noexcept
   retired_io_ctxs retired;
   std::lock_guard lk{_routed_io_ctxs_mtx};
   detach_idle_rest_contexts(retired);
+}
+
+void sirius_scan_manager::idle_rest_context_sweeper::sweep() noexcept
+{
+  // Shared, so that sweeps do not wait for each other; the manager's destructor takes it
+  // exclusively and so waits for every sweep that has started.
+  std::shared_lock lk{_mtx};
+  if (_manager != nullptr) { _manager->release_idle_rest_contexts(); }
+}
+
+void sirius_scan_manager::idle_rest_context_sweeper::detach() noexcept
+{
+  std::unique_lock lk{_mtx};
+  _manager = nullptr;
 }
 
 std::size_t sirius_scan_manager::rest_context_count() const
@@ -3744,16 +3760,21 @@ void sirius_scan_manager::insert_pinned_entry_device(
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
-  pin_registry_mutation_scope const registry_mutation{*this};
-  // Safe mid-query by construction: dropping the map slot only removes visibility to new
-  // queries and releases this map's reference. A query serving the exact entry holds its own
-  // shared_ptr, and the entry's weak late-mat handle continues to resolve through that owner.
-  std::lock_guard pin_lk{_pinned_entries_mutex};
-  _pinned_entries.erase(name);
-  // Dropping the datasources releases their prefetching handles, which disposes
-  // each request's consumer and hands the chunks back to the evictor. That is
-  // the whole of unpinning a parquet-tier entry.
-  _pinned_parquet_sources.erase(name);
+  {
+    pin_registry_mutation_scope const registry_mutation{*this};
+    // Safe mid-query by construction: dropping the map slot only removes visibility to new
+    // queries and releases this map's reference. A query serving the exact entry holds its own
+    // shared_ptr, and the entry's weak late-mat handle continues to resolve through that owner.
+    std::lock_guard pin_lk{_pinned_entries_mutex};
+    _pinned_entries.erase(name);
+    // Dropping the datasources releases their prefetching handles, which disposes
+    // each request's consumer and hands the chunks back to the evictor. That is
+    // the whole of unpinning a parquet-tier entry.
+    _pinned_parquet_sources.erase(name);
+  }
+  // Those datasources may have been the last readers of their REST contexts, and nothing need
+  // follow an unpin: drop the idle contexts beyond the bound, outside the registry lock.
+  release_idle_rest_contexts();
 }
 void sirius_scan_manager::publish_pinned_entry(const std::string& name, pinned_entry entry)
 {

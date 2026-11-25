@@ -422,9 +422,9 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
     // compared. The statement may read a retained snapshot of a table that has no current
     // snapshot: the inner binding then publishes a UUID and no snapshot ID. Which snapshot is
     // read stays the inventory's choice, made from the snapshot ID the statement bound.
-    std::function<std::string(duckdb::ClientContext&)> other_table;
+    std::function<std::string(duckdb::ClientContext&)> unconfirmed_table;
     if (catalog_name && bound) {
-      other_table = [&](duckdb::ClientContext& inner) -> std::string {
+      unconfirmed_table = [&](duckdb::ClientContext& inner) -> std::string {
         duckdb::EntryLookupInfo lookup(duckdb::CatalogType::TABLE_ENTRY, *catalog_name);
         auto entry = duckdb::Catalog::GetEntry(inner, lookup, duckdb::OnEntryNotFound::RETURN_NULL);
         std::optional<std::string> resolved;
@@ -438,9 +438,16 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
           }
         }
         if (resolved && *resolved == bound->table_uuid) { return {}; }
-        return "Table UUID mismatch: " + table_path + " was bound as table " + bound->table_uuid +
-               " and now resolves to " +
-               (resolved ? "table " + *resolved : "a table whose identity is unknown");
+        // Another UUID is another table. No table under the name, or one that publishes no
+        // UUID, is not known to be another table: its identity is unknown, and the text says so.
+        if (resolved) {
+          return "Table UUID mismatch: " + table_path + " was bound as table " + bound->table_uuid +
+                 " and now resolves to table " + *resolved +
+                 ", so its delete files would be read from another table";
+        }
+        return table_path + " was bound as table " + bound->table_uuid +
+               ", and the delete lookup could not identify the table that name now resolves "
+               "to, so its delete files cannot be tied to the bound table";
       };
     }
     auto result = op::scan::read_delete_inventory(
@@ -449,7 +456,7 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
       snapshot_id,
       injection,
       bound ? std::string_view(bound->table_uuid) : std::string_view{},
-      other_table);
+      unconfirmed_table);
     auto const n_delete_files = result.equality_count;
     if (n_delete_files > 0) {
       if (!result.inventory) {
@@ -474,12 +481,11 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
         "inspected",
         scan_verdict::incomplete);
     }
-    if (e.other_table) {
-      // The metadata was readable. It belongs to another table than the one the scan bound.
+    if (e.unconfirmed_table) {
+      // The metadata was readable, but not shown to be the bound table's: the lookup reached
+      // another table, or one it could not identify. what() says which.
       return iceberg_decline(
-        scan_reason::evidence_missing,
-        std::string(e.what()) + ", so its delete files would be read from another table",
-        scan_verdict::incomplete);
+        scan_reason::evidence_missing, std::string(e.what()), scan_verdict::incomplete);
     }
     return iceberg_decline(scan_reason::evidence_missing,
                            "the iceberg delete probe could not read this table's metadata (" +

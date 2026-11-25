@@ -54,16 +54,28 @@ constexpr std::string_view kScheme = "s3://";
 /// @c Read/Seek bookkeeping; the parquet reader uses positional reads.
 class sirius_httpfs_file_handle : public duckdb::FileHandle {
  public:
-  sirius_httpfs_file_handle(duckdb::FileSystem& fs,
-                            std::string path,
-                            duckdb::FileOpenFlags flags,
-                            std::shared_ptr<cucascade::io::datasource> datasource,
-                            bool external_file_cache)
+  sirius_httpfs_file_handle(
+    duckdb::FileSystem& fs,
+    std::string path,
+    duckdb::FileOpenFlags flags,
+    std::shared_ptr<cucascade::io::datasource> datasource,
+    bool external_file_cache,
+    std::shared_ptr<sirius::scan_manager::sirius_scan_manager::idle_rest_context_sweeper>
+      idle_rest_sweeper)
     : duckdb::FileHandle(fs, std::move(path), flags),
       datasource_(std::move(datasource)),
       version_tag_(datasource_->get_io_object().validation_tag()),
-      external_file_cache_(external_file_cache)
+      external_file_cache_(external_file_cache),
+      idle_rest_sweeper_(std::move(idle_rest_sweeper))
   {
+  }
+
+  /// The handle may be the last reader of its REST context, and DuckDB closes it when it likes:
+  /// release the datasource, then have the scan manager drop its idle contexts beyond the bound.
+  ~sirius_httpfs_file_handle() override
+  {
+    datasource_.reset();
+    if (idle_rest_sweeper_) { idle_rest_sweeper_->sweep(); }
   }
 
   void Close() override {}
@@ -72,6 +84,9 @@ class sirius_httpfs_file_handle : public duckdb::FileHandle {
   std::string version_tag_;
   /// scan_manager.httpfs_external_file_cache of the engine that opened the handle.
   bool external_file_cache_;
+  /// From the scan manager that opened the handle; usable after that manager is gone.
+  std::shared_ptr<sirius::scan_manager::sirius_scan_manager::idle_rest_context_sweeper>
+    idle_rest_sweeper_;
   duckdb::idx_t cursor_{0};
 };
 
@@ -278,7 +293,8 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
     path,
     flags,
     std::move(datasource),
-    sirius_ctx->get_config().get_scan_manager_config().httpfs_external_file_cache);
+    sirius_ctx->get_config().get_scan_manager_config().httpfs_external_file_cache,
+    sirius_ctx->get_scan_manager().idle_rest_sweeper());
 }
 
 duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
@@ -319,7 +335,8 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
     file.path,
     flags,
     std::move(datasource),
-    sirius_ctx->get_config().get_scan_manager_config().httpfs_external_file_cache);
+    sirius_ctx->get_config().get_scan_manager_config().httpfs_external_file_cache,
+    sirius_ctx->get_scan_manager().idle_rest_sweeper());
 }
 
 void sirius_httpfs::Read(duckdb::FileHandle& handle,

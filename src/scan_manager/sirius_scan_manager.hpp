@@ -71,6 +71,7 @@ class fixed_size_host_memory_resource;
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -981,6 +982,30 @@ class sirius_scan_manager {
   /// REST contexts the manager keeps for S3 configurations, in use or idle.
   [[nodiscard]] std::size_t rest_context_count() const;
 
+  /// For a reader that may outlive the manager, such as a DuckDB file handle: asks the manager
+  /// to drop its idle REST contexts beyond the bound once that reader is gone.
+  class idle_rest_context_sweeper {
+   public:
+    explicit idle_rest_context_sweeper(sirius_scan_manager& manager) noexcept : _manager(&manager)
+    {
+    }
+    /// The caller must hold none of the manager's locks. Does nothing once the manager is gone.
+    void sweep() noexcept;
+
+   private:
+    friend class sirius_scan_manager;
+    /// Called by the manager's destructor; waits for the sweeps in flight.
+    void detach() noexcept;
+
+    std::shared_mutex _mtx;
+    sirius_scan_manager* _manager;
+  };
+
+  [[nodiscard]] std::shared_ptr<idle_rest_context_sweeper> const& idle_rest_sweeper() const noexcept
+  {
+    return _idle_rest_sweeper;
+  }
+
   /// Resolve only the registered backend type for @p path. This is a planning
   /// query: it does not construct or start an ioctx, open an object, issue a
   /// HEAD, warm a backend, or probe credentials/network.
@@ -1283,9 +1308,12 @@ class sirius_scan_manager {
   /// map, so the move cannot fail half way; if that reservation fails, none is moved.
   void detach_idle_rest_contexts(retired_io_ctxs& retired) noexcept;
   /// Drops the idle REST contexts beyond the bound, and destroys them on the calling thread
-  /// once the map is unlocked. Called when a query's scans are released (@ref reset); a build
-  /// detaches them under the locks it already holds.
+  /// once the map is unlocked. Called when a query's scans are released (@ref reset), when a
+  /// Parquet pin is removed and when a file handle is closed; a build detaches them under the
+  /// locks it already holds.
   void release_idle_rest_contexts() noexcept;
+  std::shared_ptr<idle_rest_context_sweeper> _idle_rest_sweeper =
+    std::make_shared<idle_rest_context_sweeper>(*this);
   /// Backends that failed to build, keyed like `_routed_io_ctxs`; the value is
   /// `ioctx_failure::by_configuration`.  A failure the configuration explains is
   /// final for that key: a config snapshot is immutable, so a retry could only

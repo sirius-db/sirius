@@ -1658,7 +1658,14 @@ TEST_CASE("S3 planned read opens with its own config after the path's is replace
                                          s3_uri(env->bucket, "glob/multi/nation_a.parquet"),
                                          s3_uri(env->bucket, "glob/multi/nation_b.parquet")};
   auto const counters = sirius_ctx->physical_counters();
+  // The install callback below runs wherever a file is opened, and DuckDB may read the footers
+  // of a glob's files on several of its workers: every access to `replaced` takes the mutex.
+  std::mutex replaced_mutex;
   std::vector<std::string> replaced;
+  auto const installs_of = [&](std::string const& installed) {
+    std::lock_guard lock{replaced_mutex};
+    return std::ranges::count(replaced, installed);
+  };
   std::size_t planned_statements = 0;
   struct reset_hooks {
     std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
@@ -1671,7 +1678,10 @@ TEST_CASE("S3 planned read opens with its own config after the path's is replace
   // Fires after every install that a read follows: the bind, the glob, and each file DuckDB's
   // own reader opens through sirius_httpfs.
   counters->s3_config_installed_for_testing = [&](std::string const& installed) {
-    replaced.push_back(installed);
+    {
+      std::lock_guard lock{replaced_mutex};
+      replaced.push_back(installed);
+    }
     manager.install_s3_config(installed, other);
   };
   // Fires once every scan of a statement is lowered. By then the statement has installed and
@@ -1687,15 +1697,17 @@ TEST_CASE("S3 planned read opens with its own config after the path's is replace
     fixture.con.Query("SELECT sum(n_nationkey) FROM " + s3_sirius_parquet_scan(*env, "nation"));
   auto const planned_after_bound = planned_statements;
   auto globbed                   = fixture.con.Query(glob_query);
-  auto const bind_installs       = std::ranges::count(replaced, path);
-  auto const glob_installs =
-    std::ranges::count(replaced, s3_uri(env->bucket, "glob/multi/nation_*.parquet"));
+  auto const bind_installs       = installs_of(path);
+  auto const glob_installs       = installs_of(s3_uri(env->bucket, "glob/multi/nation_*.parquet"));
   // A transparent read of the one file: DuckDB's binder opens it through sirius_httpfs before
   // the statement is planned, and the GPU scan opens it again when it runs.
-  replaced.clear();
+  {
+    std::lock_guard lock{replaced_mutex};
+    replaced.clear();
+  }
   auto direct =
     fixture.con.Query("SELECT sum(n_nationkey) FROM " + s3_parquet_scan(*env, "nation"));
-  auto const opened_by_duckdb               = std::ranges::count(replaced, path);
+  auto const opened_by_duckdb               = installs_of(path);
   auto const planned_at_end                 = planned_statements;
   counters->s3_config_installed_for_testing = {};
   counters->after_lowering_for_testing      = {};
@@ -1837,13 +1849,77 @@ TEST_CASE("S3 idle REST contexts are released when the statement that held them 
   REQUIRE_FALSE(region_context.expired());
   CHECK(nation_context.lock() != region_context.lock());
 
-  // A lower bound, and the same statement again. It finds both contexts cached and configures
-  // nothing; while it runs, both are in use and neither can be dropped. Once its scans are
+  // The same statement again, with the bound lowered once its scans are lowered. By then its
+  // bind has closed its file handles, so nothing gives a context back before the scans take
+  // both; while it runs, both are in use and neither can be dropped. Once its scans are
   // released, one of the two is given back, without a later statement having to ask.
-  counters->idle_rest_context_limit_for_testing = 1;
+  struct reset_hook {
+    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
+    ~reset_hook() { counters->after_lowering_for_testing = {}; }
+  } reset_lowering{counters};
+  counters->after_lowering_for_testing = [&] { counters->idle_rest_context_limit_for_testing = 1; };
   run();
   CHECK(manager.rest_context_count() == 1);
   CHECK(nation_context.expired() != region_context.expired());
+}
+
+TEST_CASE(
+  "S3 idle REST contexts are released when a file handle closes or retained Parquet sources "
+  "are dropped",
+  "[s3][integration][sql][secret][rotation]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("sirius"));
+  auto sirius_ctx =
+    fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& manager = sirius_ctx->get_scan_manager();
+  set_gpu_execution(fixture.con, true);
+  // Two files, each under a secret of its own. The secrets differ in a field the store does not
+  // check, so each file has a REST context of its own.
+  auto const nation = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto const region = s3_uri(env->bucket, "parquet/region.parquet");
+  auto const secret = [&](std::string const& name, std::string const& scope, bool verify_ssl) {
+    auto sql = create_sirius_s3_secret_sql(*env, name, scope);
+    sql.pop_back();
+    return sql + ", VERIFY_SSL " + (verify_ssl ? "true" : "false") + ")";
+  };
+  require_query_ok(fixture.con, secret("reader_nation", nation, true));
+  require_query_ok(fixture.con, secret("reader_region", region, false));
+  // A planned query latches the counters' test hooks.
+  require_query_ok(fixture.con,
+                   "SELECT sum(n_nationkey) FROM read_parquet(" + sql_quote(nation) + ")");
+  auto const counters = sirius_ctx->physical_counters();
+  struct reset_limit {
+    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
+    ~reset_limit() { counters->idle_rest_context_limit_for_testing.reset(); }
+  } reset{counters};
+  counters->idle_rest_context_limit_for_testing = 1;
+
+  // From here on no statement runs, and no context is built after the readers of a step are
+  // open: a context that goes is given back because its last reader went.
+  {
+    auto& fs           = duckdb::FileSystem::GetFileSystem(*fixture.con.context);
+    auto nation_handle = fs.OpenFile(nation, duckdb::FileFlags::FILE_FLAGS_READ);
+    auto region_handle = fs.OpenFile(region, duckdb::FileFlags::FILE_FLAGS_READ);
+    // Each handle holds its context: neither is idle.
+    CHECK(manager.rest_context_count() == 2);
+    nation_handle.reset();
+    // One idle context is within the bound.
+    CHECK(manager.rest_context_count() == 2);
+    region_handle.reset();
+    CHECK(manager.rest_context_count() == 1);
+  }
+  // The same for Parquet pins, which hold the datasources of their files until removed.
+  REQUIRE(manager.pin_parquet_ranges("reader_nation", {nation}, std::nullopt) > 0);
+  REQUIRE(manager.pin_parquet_ranges("reader_region", {region}, std::nullopt) > 0);
+  CHECK(manager.rest_context_count() == 2);
+  manager.remove_pinned_entry("reader_nation");
+  CHECK(manager.rest_context_count() == 2);
+  manager.remove_pinned_entry("reader_region");
+  CHECK(manager.rest_context_count() == 1);
 }
 
 TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
@@ -5189,6 +5265,29 @@ TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credenti
       {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}},
       1,
       eq_data);
+
+    // The table dropped once the statement has bound it. The delete lookup finds no table under
+    // the name: which table it would read is unknown, not known to be another one, and the
+    // refusal says that rather than reporting a mismatch. The table sits in a namespace of its
+    // own: this catalog answers 404 for a namespace as well, and the client then takes the
+    // whole namespace for missing.
+    catalog.put("dropped", "eq", eq_metadata("v1.metadata.json"));
+    catalog.remove_after_next_load("dropped", "eq");
+    auto const before_dropped = stats();
+    auto dropped             = con.Query("SELECT fruit, count FROM lake.dropped.eq ORDER BY count");
+    auto const after_dropped = stats();
+    REQUIRE(dropped);
+    REQUIRE(dropped->HasError());
+    auto const unknown = dropped->GetError();
+    CAPTURE(unknown);
+    if (!extension_checks_uuid) {
+      CHECK(unknown.find("could not identify the table") != std::string::npos);
+      CHECK(unknown.find("Table UUID mismatch") == std::string::npos);
+      CHECK(unknown.find("another table") == std::string::npos);
+    }
+    CHECK(after_dropped.semantic_declines[unverified] ==
+          before_dropped.semantic_declines[unverified] + 1);
+    CHECK(after_dropped.executions == before_dropped.executions);
   }
 
   // An internal connection reads by path with the secret of the statement that opened it; an

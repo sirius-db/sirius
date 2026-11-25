@@ -236,7 +236,7 @@ inventory_result read_delete_inventory(
   std::optional<int64_t> snapshot_id,
   std::string_view injection,
   std::string_view expected_table_uuid,
-  std::function<std::string(duckdb::ClientContext&)> const& other_table)
+  std::function<std::string(duckdb::ClientContext&)> const& unconfirmed_table)
 {
   auto counters = iceberg_counters(context);
   iceberg_metadata_connection metadata_conn(context);
@@ -260,12 +260,12 @@ inventory_result read_delete_inventory(
   // Injection is latched by the planning attempt, after the original scan bound successfully.
   if (injection == "missing") throw inventory_query_error("", true);
   if (injection == "fail") throw inventory_query_error("injected inventory query failure", false);
-  if (other_table && !extension_checks_uuid) {
+  if (unconfirmed_table && !extension_checks_uuid) {
     // Returned, not thrown: an exception from the callback would invalidate this connection's
     // transaction, which the inventory query below runs in.
     std::string reason;
-    conn.read_catalog([&](duckdb::ClientContext& inner) { reason = other_table(inner); });
-    if (!reason.empty()) throw inventory_query_error(reason, false, /*another_table=*/true);
+    conn.read_catalog([&](duckdb::ClientContext& inner) { reason = unconfirmed_table(inner); });
+    if (!reason.empty()) throw inventory_query_error(reason, false, /*unconfirmed=*/true);
   }
   // One query supplies the equality count and the inventory the equality plan is checked against.
   if (counters) ++counters->iceberg_manifest_walks;

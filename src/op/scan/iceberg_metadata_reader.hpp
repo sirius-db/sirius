@@ -97,13 +97,14 @@ struct inventory_result {
   uint64_t equality_count = 0;
 };
 struct inventory_query_error : std::runtime_error {
-  inventory_query_error(std::string const& message, bool missing, bool another_table = false)
-    : std::runtime_error(message), missing_result(missing), other_table(another_table)
+  inventory_query_error(std::string const& message, bool missing, bool unconfirmed = false)
+    : std::runtime_error(message), missing_result(missing), unconfirmed_table(unconfirmed)
   {
   }
   bool missing_result;
-  /// The lookup resolved a table that is not the one the scan bound; what() says which.
-  bool other_table;
+  /// The lookup did not confirm that it reads the table the scan bound: it resolved another
+  /// table, or one it could not identify. what() says which.
+  bool unconfirmed_table;
 };
 // Inspect only Avro manifest schemas (LIMIT 0), once per data manifest. Empty
 // partition records prove missing columns cannot be supplied by partition metadata.
@@ -111,16 +112,16 @@ std::unordered_set<std::string> iceberg_files_without_partition_values(
   duckdb::ClientContext&, iceberg_delete_inventory const&);
 
 /// @p expected_table_uuid is checked by iceberg_metadata() when the loaded extension accepts it.
-/// When it does not and @p other_table is set, that runs first on the connection that reads the
-/// inventory, in the same transaction, and says why the table resolved there is not the bound
-/// one (empty when it is); a reason fails the read.
+/// When it does not and @p unconfirmed_table is set, that runs first on the connection that
+/// reads the inventory, in the same transaction, and says why the table resolved there is not
+/// confirmed to be the bound one (empty when it is the bound one); a reason fails the read.
 inventory_result read_delete_inventory(
   duckdb::ClientContext&,
   std::string const&,
   std::optional<int64_t>,
-  std::string_view injection                                            = {},
-  std::string_view expected_table_uuid                                  = {},
-  std::function<std::string(duckdb::ClientContext&)> const& other_table = {});
+  std::string_view injection                                                  = {},
+  std::string_view expected_table_uuid                                        = {},
+  std::function<std::string(duckdb::ClientContext&)> const& unconfirmed_table = {});
 
 /// Ceilings on the equality deletes one statement loads, charged from the manifests' record
 /// counts and file sizes before any delete file is opened; a table above them is declined. The
