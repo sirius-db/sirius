@@ -129,6 +129,23 @@ inline uint64_t estimate_bytes_per_row(const std::vector<sirius::logical_type>& 
 }
 
 /**
+ * @brief Bytes per row a scan decodes: its output columns plus the columns it reads only to
+ * evaluate pushed-down filters, each sized by estimate_bytes_per_row. Saturates instead of
+ * wrapping.
+ */
+inline uint64_t scan_bytes_per_row(const std::vector<sirius::logical_type>& output_types,
+                                   const std::vector<std::optional<uint64_t>>& output_widths,
+                                   const std::vector<sirius::logical_type>& filter_only_types,
+                                   const std::vector<std::optional<uint64_t>>& filter_only_widths,
+                                   uint64_t avg_var_bytes)
+{
+  constexpr auto k_max = std::numeric_limits<uint64_t>::max();
+  auto const output    = estimate_bytes_per_row(output_types, avg_var_bytes, output_widths);
+  auto const filters = estimate_bytes_per_row(filter_only_types, avg_var_bytes, filter_only_widths);
+  return output > k_max - filters ? k_max : output + filters;
+}
+
+/**
  * @brief The row count admission sizes a scan from: the planner's filtered estimate, raised to
  * the table function's unfiltered count when that is known and larger.
  * Under-estimating rows puts a large query on too few GPUs; over-estimating only keeps today's
@@ -164,7 +181,7 @@ struct scan_estimate {
 };
 
 /**
- * @brief Total projected scan-output bytes, or nullopt when the plan cannot be sized.
+ * @brief Total projected bytes the scans decode, or nullopt when the plan cannot be sized.
  *
  * Zero rows is ambiguous — provably empty, or simply unestimated — and the two want
  * opposite treatments. Sirius already reads it as "cannot size" (sirius_physical_sort_sample

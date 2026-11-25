@@ -90,29 +90,29 @@ std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& p
   estimates.reserve(scans.size());
   std::size_t scans_with_table_rows   = 0;
   std::size_t scans_with_known_widths = 0;
+  op::scan::scan_admission_hint const no_hint{};
   for (auto const* scan : scans) {
     // The plan generator stamped each GPU scan with the table function's unfiltered row count
     // and any column widths its source could state (see scan_admission_hint). Rows never drop
     // below the planner estimate; widths only replace the configured variable-width average.
-    std::optional<uint64_t> unfiltered_rows;
-    std::vector<std::optional<uint64_t>> const* widths = nullptr;
-    if (auto const* gpu_scan = dynamic_cast<const op::scan::sirius_gpu_scan_operator*>(scan)) {
-      auto const& hint = gpu_scan->admission_hint();
-      unfiltered_rows  = hint.unfiltered_rows;
-      widths           = &hint.column_widths;
+    // The hint also lists the columns the scan reads only for pushed-down filters, which it
+    // decodes but does not output.
+    auto const* gpu_scan = dynamic_cast<const op::scan::sirius_gpu_scan_operator*>(scan);
+    auto const& hint     = gpu_scan != nullptr ? gpu_scan->admission_hint() : no_hint;
+    if (hint.unfiltered_rows.has_value()) { ++scans_with_table_rows; }
+    auto const known = [](auto const& width) { return width.has_value(); };
+    if (std::any_of(hint.column_widths.begin(), hint.column_widths.end(), known) ||
+        std::any_of(hint.filter_only_widths.begin(), hint.filter_only_widths.end(), known)) {
+      ++scans_with_known_widths;
     }
-    if (unfiltered_rows.has_value()) { ++scans_with_table_rows; }
-    bool const any_width =
-      widths != nullptr &&
-      std::any_of(widths->begin(), widths->end(), [](auto const& w) { return w.has_value(); });
-    if (any_width) { ++scans_with_known_widths; }
 
     auto const rows = planner::admission_row_count(
-      static_cast<uint64_t>(scan->estimated_cardinality), unfiltered_rows);
-    auto const bytes_per_row =
-      widths != nullptr
-        ? planner::estimate_bytes_per_row(scan->types, op_params.avg_variable_column_bytes, *widths)
-        : planner::estimate_bytes_per_row(scan->types, op_params.avg_variable_column_bytes);
+      static_cast<uint64_t>(scan->estimated_cardinality), hint.unfiltered_rows);
+    auto const bytes_per_row = planner::scan_bytes_per_row(scan->types,
+                                                           hint.column_widths,
+                                                           hint.filter_only_types,
+                                                           hint.filter_only_widths,
+                                                           op_params.avg_variable_column_bytes);
     estimates.push_back({rows, bytes_per_row});
   }
 

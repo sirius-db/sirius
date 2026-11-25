@@ -33,6 +33,7 @@ using sirius::planner::admission_row_count;
 using sirius::planner::apply_gpu_cap;
 using sirius::planner::estimate_bytes_per_row;
 using sirius::planner::gpu_count_for_bytes;
+using sirius::planner::scan_bytes_per_row;
 using sirius::planner::scan_estimate;
 using sirius::planner::total_scan_bytes;
 
@@ -184,6 +185,32 @@ TEST_CASE("estimate_bytes_per_row falls back where no width is known", "[admissi
   const std::vector<std::optional<uint64_t>> known{uint64_t{10}, std::nullopt};
   REQUIRE(estimate_bytes_per_row(types, k_avg_var, known) == 10 + k_avg_var + k_avg_var);
   REQUIRE(estimate_bytes_per_row(types, k_avg_var, {}) == estimate_bytes_per_row(types, k_avg_var));
+}
+
+TEST_CASE("scan_bytes_per_row counts the columns a scan reads only for its filters",
+          "[admission_estimator]")
+{
+  // TPC-H Q13's scan of orders: two keys out, and a comment column read for a NOT LIKE.
+  const std::vector<logical_type> output{logical_type::make(type_id::BIGINT),
+                                         logical_type::make(type_id::INTEGER)};
+  const std::vector<logical_type> filter_only{logical_type::make(type_id::VARCHAR)};
+  // No filter-only columns: the output columns alone.
+  REQUIRE(scan_bytes_per_row(output, {}, {}, {}, k_avg_var) == 8 + 4);
+  // A filter-only string is charged the configured average ...
+  REQUIRE(scan_bytes_per_row(output, {}, filter_only, {}, k_avg_var) == 8 + 4 + k_avg_var);
+  // ... or its known width.
+  REQUIRE(scan_bytes_per_row(output, {}, filter_only, {uint64_t{53}}, k_avg_var) == 8 + 4 + 53);
+  // A fixed-width filter column keeps its carrier width.
+  REQUIRE(
+    scan_bytes_per_row(output, {}, {logical_type::make(type_id::DATE)}, {uint64_t{1}}, k_avg_var) ==
+    8 + 4 + 4);
+}
+
+TEST_CASE("scan_bytes_per_row saturates instead of wrapping", "[admission_estimator]")
+{
+  constexpr auto k_max = std::numeric_limits<uint64_t>::max();
+  const std::vector<logical_type> varchar{logical_type::make(type_id::VARCHAR)};
+  REQUIRE(scan_bytes_per_row(varchar, {k_max - 1}, varchar, {uint64_t{2}}, k_avg_var) == k_max);
 }
 
 TEST_CASE("admission_row_count never goes below the planner estimate", "[admission_estimator]")

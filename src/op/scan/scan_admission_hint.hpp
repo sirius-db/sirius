@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "helper/logical_type.hpp"
+
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -43,6 +45,13 @@ struct scan_admission_hint {
   /// maximum string length plus the offset word. Only consulted for variable-width columns;
   /// fixed-width carriers are exact already.
   std::vector<std::optional<uint64_t>> column_widths;
+  /// Types of the columns the scan reads only to evaluate pushed-down filters. The scan decodes
+  /// them like its output columns, so they count towards its size, but they are not part of its
+  /// output: a `NOT LIKE` on a long string column can be most of a scan that outputs two keys.
+  std::vector<sirius::logical_type> filter_only_types;
+  /// Bytes per row of each filter-only column where a source could say, parallel to
+  /// `filter_only_types` and read like `column_widths`.
+  std::vector<std::optional<uint64_t>> filter_only_widths;
 };
 
 }  // namespace sirius::op::scan

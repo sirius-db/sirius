@@ -119,6 +119,23 @@ std::optional<duckdb::column_t> table_column_of_output(const op::sirius_physical
   return column.GetPrimaryIndex();
 }
 
+/// The table columns the scan reads only to evaluate pushed-down filters: the projection entries
+/// the planner appended behind the scan's own output (`projected_output_count`). Empty when the
+/// scan has no explicit projection, since it then outputs every column it reads.
+std::vector<duckdb::column_t> filter_only_table_columns(const op::sirius_physical_table_scan& scan)
+{
+  std::vector<duckdb::column_t> columns;
+  // A scan built without the planner's count of its output columns cannot tell the two apart.
+  if (scan.projected_output_count != scan.types.size()) { return columns; }
+  for (auto i = scan.projected_output_count; i < scan.projection_ids.size(); ++i) {
+    auto const idx = scan.projection_ids[i];
+    if (idx >= scan.column_ids.size() || scan.column_ids[idx].IsVirtualColumn()) { continue; }
+    auto const column = scan.column_ids[idx].GetPrimaryIndex();
+    if (column < scan.returned_types.size()) { columns.push_back(column); }
+  }
+  return columns;
+}
+
 }  // namespace
 
 namespace detail {
@@ -197,38 +214,44 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
   hint.column_widths.assign(scan.types.size(), std::nullopt);
 
   auto const leaf_widths = parquet_leaf_column_widths(scan.bind_data.get());
-  for (std::size_t i = 0; i < scan.types.size(); ++i) {
-    if (scan.types[i].is_fixed_width()) { continue; }
-    auto const column = table_column_of_output(scan, i);
-    if (!column.has_value()) { continue; }
-
-    if (*column < leaf_widths.size() && leaf_widths[*column].has_value()) {
-      hint.column_widths[i] = leaf_widths[*column];
-      continue;
+  // Bytes per row of table column `column`, read as `type`, where a source states one.
+  auto const width_of = [&](duckdb::column_t column,
+                            sirius::logical_type const& type) -> std::optional<uint64_t> {
+    if (type.is_fixed_width()) { return std::nullopt; }
+    if (column < leaf_widths.size() && leaf_widths[column].has_value()) {
+      return leaf_widths[column];
     }
-    if (scan.function.statistics == nullptr || scan.bind_data == nullptr ||
-        !scan.types[i].is_varchar()) {
-      continue;
+    if (scan.function.statistics == nullptr || scan.bind_data == nullptr || !type.is_varchar()) {
+      return std::nullopt;
     }
     try {
-      auto stats = scan.function.statistics(context, scan.bind_data.get(), *column);
+      auto stats = scan.function.statistics(context, scan.bind_data.get(), column);
       if (stats && duckdb::StringStats::HasMaxStringLength(*stats)) {
         // Upper bound: every string fits, plus cuDF's 4-byte offset per row.
-        hint.column_widths[i] =
-          static_cast<uint64_t>(duckdb::StringStats::MaxStringLength(*stats)) + 4;
+        return static_cast<uint64_t>(duckdb::StringStats::MaxStringLength(*stats)) + 4;
       }
     } catch (std::exception const& e) {
       SIRIUS_LOG_DEBUG("gpu_admission: statistics callback of {} threw for column {}: {}",
                        scan.function.GetName().GetIdentifierName(),
-                       *column,
+                       column,
                        e.what());
     }
+    return std::nullopt;
+  };
+  for (std::size_t i = 0; i < scan.types.size(); ++i) {
+    if (auto const column = table_column_of_output(scan, i)) {
+      hint.column_widths[i] = width_of(*column, scan.types[i]);
+    }
+  }
+  for (auto const column : filter_only_table_columns(scan)) {
+    hint.filter_only_types.push_back(scan.returned_types[column]);
+    hint.filter_only_widths.push_back(width_of(column, scan.returned_types[column]));
   }
   // One line per scan, so a run can show which source each estimate came from and, when the
   // table row count is missing, whether the callback or the bind data was absent.
   SIRIUS_LOG_DEBUG(
     "gpu_admission: scan of {} (cardinality callback {}, bind data {}): unfiltered rows {} ({}), "
-    "{} of {} column width(s) known",
+    "{} of {} column width(s) known, {} filter-only column(s)",
     scan.function.GetName().GetIdentifierName(),
     scan.function.cardinality != nullptr ? "present" : "absent",
     scan.bind_data != nullptr ? "present" : "absent",
@@ -239,7 +262,8 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
     std::count_if(hint.column_widths.begin(),
                   hint.column_widths.end(),
                   [](auto const& width) { return width.has_value(); }),
-    hint.column_widths.size());
+    hint.column_widths.size(),
+    hint.filter_only_types.size());
   return hint;
 }
 
