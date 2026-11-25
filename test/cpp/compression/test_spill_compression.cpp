@@ -134,6 +134,9 @@ struct scoped_disk_context {
 
 std::shared_ptr<cucascade::io::ioctx> make_spill_disk_context(cucascade::disk_io_backend backend)
 {
+  if (backend == cucascade::disk_io_backend::cufile && !sirius::test::cufile_usable()) {
+    SKIP("forced cuFile is unavailable: libcufile or its driver does not open");
+  }
   if (backend == cucascade::disk_io_backend::uring) {
     // Probe independently of the factory: only known process/kernel restrictions may skip.
     // Resource exhaustion, unexpected setup errors and every backend construction error fail.

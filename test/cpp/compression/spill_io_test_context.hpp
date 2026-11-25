@@ -20,6 +20,9 @@
 
 #include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/io/io_context.hpp>
+#ifdef CUCASCADE_HAS_CUFILE
+#include <cucascade/io/cufile/cufile_api.hpp>
+#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +40,18 @@
 #include <vector>
 
 namespace sirius::test {
+
+/// Whether a cuFile context can start here: libcufile loads and its driver opens (compatibility
+/// mode is enough).
+inline bool cufile_usable()
+{
+#ifdef CUCASCADE_HAS_CUFILE
+  namespace cufile = cucascade::io::cufile;
+  return cufile::cufile_api::get() != nullptr && cufile::cufile_api::open_driver();
+#else
+  return false;
+#endif
+}
 
 /// Two deterministic pauses: before the inner backend can touch source buffers, and
 /// after its future has drained but before the proxy resolves the caller's future.
@@ -100,8 +115,8 @@ class joined_spill_task {
 };
 
 /// Cache-free proxy over a real DISK backend: forced cuFile (with POSIX fallback)
-/// when compiled in, otherwise the automatic backend. Only write capabilities and
-/// the write completion result are changed.
+/// when it can start here, otherwise the automatic backend. Only write capabilities
+/// and the write completion result are changed.
 class spill_io_test_context final : public cucascade::io::ioctx {
  public:
   enum class completion { success, short_count, failure };
@@ -123,11 +138,9 @@ class spill_io_test_context final : public cucascade::io::ioctx {
   };
 
   spill_io_test_context()
-#ifdef CUCASCADE_HAS_CUFILE
-    : _inner(cucascade::make_disk_io_context({.backend = cucascade::disk_io_backend::cufile}))
-#else
-    : _inner(cucascade::make_disk_io_context())
-#endif
+    : _inner(cucascade::make_disk_io_context(
+        {.backend = cufile_usable() ? cucascade::disk_io_backend::cufile
+                                    : cucascade::disk_io_backend::automatic}))
   {
   }
   ~spill_io_test_context() override
