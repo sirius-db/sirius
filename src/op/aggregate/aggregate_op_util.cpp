@@ -60,7 +60,7 @@ namespace {
                              : std::format("Unsupported aggregate function: {} {}", name, detail));
 }
 
-// The width of make_carried_block(slots).inputs, without building it.
+// The width of make_carried_block_layout(slots).inputs, without building it.
 std::size_t carried_column_count(std::span<aggregate_slot const> slots) noexcept
 {
   std::size_t count    = 0;
@@ -255,7 +255,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
                                        .column_order    = column_order,
                                        .null_precedence = null_precedence});
       }
-      // The block appends one ordered FIRST's keys; make_carried_block checks the others match.
+      // One ordered FIRST's keys are appended; make_carried_block_layout checks the others match.
       if (order_key_types.empty()) {
         for (std::size_t i = 1; i < children.size(); ++i) {
           order_key_types.push_back(children[i]->return_type());
@@ -303,7 +303,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
     }
   }
   // Throws for FIRSTs under different orders, so the operator refuses them when it is built.
-  [[maybe_unused]] auto const block = make_carried_block(result.aggregate_slots);
+  [[maybe_unused]] auto const block = make_carried_block_layout(result.aggregate_slots);
   carried_types.insert(carried_types.end(), order_key_types.begin(), order_key_types.end());
   D_ASSERT(carried_types.size() == block.inputs.size());
   auto const layout = grouped_aggregate_layout{
@@ -318,9 +318,9 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   return result;
 }
 
-carried_block make_carried_block(std::span<aggregate_slot const> aggregate_slots)
+carried_block_layout make_carried_block_layout(std::span<aggregate_slot const> aggregate_slots)
 {
-  carried_block block;
+  carried_block_layout block;
   std::vector<order_key> const* order = nullptr;
   for (auto const& slot : aggregate_slots) {
     auto const* first = std::get_if<first_slot>(&slot);
@@ -332,7 +332,7 @@ carried_block make_carried_block(std::span<aggregate_slot const> aggregate_slots
       order = &first->order;
     } else if (first->order != *order) {
       throw sirius::internal_exception(
-        "make_carried_block: two FIRSTs carry different ORDER BYs in one aggregate");
+        "make_carried_block_layout: two FIRSTs carry different ORDER BYs in one aggregate");
     }
   }
   if (order != nullptr) {

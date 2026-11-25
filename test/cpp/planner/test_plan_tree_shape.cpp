@@ -2601,7 +2601,7 @@ TEST_CASE_METHOD(
       actual_inputs.push_back(first->input_idx);
     }
     CHECK(actual_inputs == first_inputs);
-    CHECK(sirius::op::make_carried_block(aggregate.aggregate_slots).inputs == first_inputs);
+    CHECK(sirius::op::make_carried_block_layout(aggregate.aggregate_slots).inputs == first_inputs);
     return &aggregate;
   };
 
@@ -2716,7 +2716,8 @@ TEST_CASE_METHOD(
     auto const* sum = std::get_if<sirius::op::plain_slot>(&aggregate.aggregate_slots[1]);
     REQUIRE(sum != nullptr);
     CHECK(sum->partial_idx == 0);
-    CHECK(sirius::op::make_carried_block(aggregate.aggregate_slots).inputs == std::vector<int>{1});
+    CHECK(sirius::op::make_carried_block_layout(aggregate.aggregate_slots).inputs ==
+          std::vector<int>{1});
     // The local and PARTITION schemas are the partial layout, not the declared one.
     CHECK(hgb->get_types() == aggregate.local_types);
     auto* partition = find_first(plan.get(), SiriusPhysicalOperatorType::PARTITION);
@@ -3012,7 +3013,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   // The local aggregate's FIRST slots, the merge above it, and the carried block they share.
   struct ordered_chain {
     sirius::op::sirius_physical_grouped_aggregate const* local;
-    sirius::op::carried_block block;
+    sirius::op::carried_block_layout block;
     std::vector<sirius::op::first_slot> firsts;
   };
   auto require_ordered_chain = [](sirius_physical_operator* plan) {
@@ -3024,7 +3025,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto* hgb = find_first(plan, SiriusPhysicalOperatorType::HASH_GROUP_BY);
     REQUIRE(hgb != nullptr);
     auto const& local = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
-    ordered_chain chain{&local, sirius::op::make_carried_block(local.aggregate_slots), {}};
+    ordered_chain chain{&local, sirius::op::make_carried_block_layout(local.aggregate_slots), {}};
     for (auto const& slot : local.aggregate_slots) {
       if (auto const* first = std::get_if<sirius::op::first_slot>(&slot)) {
         chain.firsts.push_back(*first);
@@ -3082,7 +3083,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>().partials_are_output());
     auto* hgb = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
     REQUIRE(hgb != nullptr);
-    CHECK(sirius::op::make_carried_block(
+    CHECK(sirius::op::make_carried_block_layout(
             hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>().aggregate_slots)
             .order.empty());
   }
@@ -3336,7 +3337,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>().partials_are_output());
     auto* hgb = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
     REQUIRE(hgb != nullptr);
-    CHECK(sirius::op::make_carried_block(
+    CHECK(sirius::op::make_carried_block_layout(
             hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>().aggregate_slots)
             .order.empty());
   }

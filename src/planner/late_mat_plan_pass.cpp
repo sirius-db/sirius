@@ -187,7 +187,7 @@ std::optional<group_by_shape> read_group_by(sirius_physical_operator const& node
                           &agg->cudf_aggregate_idx,
                           &agg->cudf_aggregate_struct_col_indices,
                           &agg->cudf_aggregates,
-                          op::make_carried_block(agg->aggregate_slots).inputs};
+                          op::make_carried_block_layout(agg->aggregate_slots).inputs};
   }
   if (auto const* merge = dynamic_cast<op::sirius_physical_grouped_aggregate_merge const*>(&node)) {
     if (merge->num_grouping_set_columns > 0) { return std::nullopt; }

@@ -141,7 +141,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   //! wide integer SUM, or of an aggregate whose result is HUGEINT, is INT64 or DECIMAL128 with
   //! scale 0; its column's alternate is whichever of the two is not its native carrier. Empty when
   //! no slot has two carriers or `types` is not one column per cuDF aggregate after the group
-  //! columns, followed by the carried block of `make_carried_block`.
+  //! columns, followed by the carried block that `make_carried_block_layout` describes.
   [[nodiscard]] std::vector<std::optional<cudf::data_type>> wide_integer_sum_partial_types() const;
 
   // Source interface

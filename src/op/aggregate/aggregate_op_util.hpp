@@ -234,9 +234,9 @@ using aggregate_slot =
 /**
  * @brief Column positions shared by grouped aggregation, merge, and finalization
  *
- * Partial batches contain group keys, expanded cuDF partials, then the carried block of
- * `make_carried_block`. Indices passed to `partial_column` and `carried_column` are relative to
- * their respective blocks.
+ * Partial batches contain group keys, expanded cuDF partials, then the carried block that
+ * `make_carried_block_layout` describes. Indices passed to `partial_column` and `carried_column`
+ * are relative to their respective blocks.
  */
 class grouped_aggregate_layout {
  public:
@@ -293,8 +293,8 @@ struct CudfAggregateDefinitions {
   /// One entry per original DuckDB aggregate expression, mapping to cudf_aggregates positions or,
   /// for a FIRST, to its carried column.
   std::vector<aggregate_slot> aggregate_slots;
-  /// Runtime partial schema: group keys, expanded aggregate carriers, then the carried block of
-  /// `make_carried_block`.
+  /// Runtime partial schema: group keys, expanded aggregate carriers, then the carried block that
+  /// `make_carried_block_layout` describes.
   duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;  ///< True if any aggregate is AVG
   bool has_count_distinct = false;  ///< True if any aggregate is COUNT(DISTINCT col)
@@ -325,7 +325,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
 /**
  * @brief The columns a grouped aggregate carries after its partials, and the order that picks them
  */
-struct carried_block {
+struct carried_block_layout {
   /// Child column at each carried position: each FIRST input at its `carried_idx`, then the keys of
   /// `order`
   std::vector<int> inputs;
@@ -334,16 +334,16 @@ struct carried_block {
 };
 
 /**
- * @brief The carried block of @p aggregate_slots
+ * @brief The layout of the carried block of @p aggregate_slots
  *
  * Every ordered `first_slot` must carry the same order, whose keys are appended once.
  *
  * @throw sirius::internal_exception if two `first_slot`s carry different non-empty orders
  *
  * @param aggregate_slots One entry per aggregate expression
- * @return The carried block, in carried-block order
+ * @return The carried inputs, in carried-block order, and their row order
  */
-carried_block make_carried_block(std::span<aggregate_slot const> aggregate_slots);
+carried_block_layout make_carried_block_layout(std::span<aggregate_slot const> aggregate_slots);
 
 /**
  * @brief Whether every slot in @p aggregate_slots holds a `plain_slot`
