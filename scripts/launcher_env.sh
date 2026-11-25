@@ -5,9 +5,14 @@
 # then go over RC, which an exchange over the NVLink fabric needs at full speed (4 GPU pairs on
 # two GB200 nodes, both ways: 5.9 TB/s against 5.2 with tcp on bond0). Never add bond0 to them:
 # UCX then tries to reach a peer's bond0 address from a rail NIC and hangs.
+# The gateway's ranks then also write GPU memory over NIXL to every peer the NVLink fabric does
+# not reach (host_staging never). auto reaches ranks on other hosts over lanes, which on these
+# NICs are RDMA too, but of host copies: 33 GB/s per rank against 65 when every rank sends to
+# every other (8 ranks on two GB200 nodes, fabric off).
 source "${BASH_SOURCE[0]%/*}/sirius_net.sh"
 if [[ -z ${UCX_TLS:-} && ${UCX_NET_DEVICES:-} == rails ]] && _rails=$(sirius_rail_devices); then
   export UCX_TLS=all UCX_NET_DEVICES=$_rails
+  export SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING=${SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING:-never}
 elif [[ ${UCX_NET_DEVICES:-} == rails ]]; then
   echo "UCX_NET_DEVICES=rails needs UCX_TLS unset and GPU rail NICs on this host" >&2
   return 1
