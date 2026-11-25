@@ -2887,6 +2887,7 @@ struct native_kind_tree {
 struct native_read_script {
   std::vector<std::shared_ptr<native_kind_tree>> batches;
   std::function<void()> before_next;
+  sm::preparation_stop_token stop;
   std::thread::id owner, close_owner;
   std::atomic<unsigned> reads{0}, closes{0};
   bool reads_on_owner              = true;
@@ -2942,7 +2943,8 @@ auto scripted_paimon(std::shared_ptr<native_read_script> script,
                      arrow_copy_limits limits = {3, 8192, 8192})
 {
   return std::make_shared<paimon_arrow_producer>(
-    integer_program(), limits, [script = std::move(script)](sm::preparation_stop_token) {
+    integer_program(), limits, [script = std::move(script)](sm::preparation_stop_token stop) {
+      script->stop = stop;
       return std::make_unique<paimon_batch_cursor>(
         std::make_unique<native_kind_reader>(script), script, 3);
     });
@@ -3234,11 +3236,8 @@ TEST_CASE("Paimon worker drains an accepted sibling and retains the first error"
     REQUIRE(h.ledger->permits_in_flight() == 1);
     allow_sibling = true;
     run.coordinator.wake_for_testing();
-    REQUIRE(run.until([&] {
-      auto gate = run.coordinator.publication_gate();
-      std::lock_guard lock(gate->mutex);
-      return gate->closed;
-    }));
+    REQUIRE(run.until([&] { return blocked->stop.stop_requested(); }));
+    CHECK(blocked->stop.reason() == sm::stop_reason::failure_induced);
     CHECK(run.completion.terminal_error() == first_error);
     CHECK_FALSE(run.quiescent());
     CHECK(failing->reads == 1);
@@ -3318,6 +3317,7 @@ TEST_CASE("Paimon worker holds its next claim until detached data retires on ano
   h.ledger->retire_unit({999, 0});
   free_permit.release();
   auto previous_pending = pending.load();
+  run.coordinator.wake_for_testing();
   REQUIRE(run.until([&] { return pending > previous_pending; }));
   CHECK(script->reads == 1);
   CHECK(h.gate->active);
