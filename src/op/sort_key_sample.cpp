@@ -17,9 +17,10 @@
 #include "op/sort_key_sample.hpp"
 
 #include <cudf/column/column.hpp>
-#include <cudf/column/column_factories.hpp>
 #include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/error.hpp>
 
 #include <rmm/resource_ref.hpp>
@@ -53,22 +54,12 @@ std::unique_ptr<cudf::column> row_indices(std::size_t first,
                                           ::cuda::stream_ref stream,
                                           rmm::device_async_resource_ref mr)
 {
-  std::vector<std::int32_t> indices;
-  if (end > first) { indices.reserve(1 + (end - first - 1) / step); }
-  for (auto row = first; row < end; row += step) {
-    indices.push_back(static_cast<std::int32_t>(row));
-  }
-  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                          static_cast<cudf::size_type>(indices.size()),
-                                          cudf::mask_state::UNALLOCATED,
-                                          stream,
-                                          mr);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(column->mutable_view().data<std::int32_t>(),
-                                indices.data(),
-                                indices.size() * sizeof(std::int32_t),
-                                cudaMemcpyHostToDevice,
-                                stream.get()));
-  return column;
+  auto const count = end > first ? 1 + (end - first - 1) / step : std::size_t{0};
+  cudf::numeric_scalar<cudf::size_type> const init(
+    static_cast<cudf::size_type>(first), true, stream, mr);
+  cudf::numeric_scalar<cudf::size_type> const increment(
+    static_cast<cudf::size_type>(step), true, stream, mr);
+  return cudf::sequence(static_cast<cudf::size_type>(count), init, increment, stream, mr);
 }
 
 //! Of key rows taken at stride @p from, those kept at the larger stride @p to.
