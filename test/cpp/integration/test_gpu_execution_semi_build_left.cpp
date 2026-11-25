@@ -233,9 +233,8 @@ TEST_CASE_METHOD(SemiBuildLeftFixture,
                  "[integration][gpu_execution][join][semi_build_left]")
 {
   // The TPC-H Q21 shape: a correlated (NOT) EXISTS on an equal key and a different second column.
-  auto const cte = GENERATE("true", "false");
-  INFO("delim_join_as_cte = " << cte);
-  run_ok(std::string("SET delim_join_as_cte = ") + cte + ";");
+  // Only under DuckDB's default `delim_join_as_cte`: with it off these plans keep a delim join,
+  // which Sirius leaves to DuckDB.
   sirius::test::scoped_setting const scan_batch{*con, "scan_task_batch_size", 16384};
   compare_gpu_vs_cpu(
     "SELECT count(*), sum(id) FROM small WHERE EXISTS (SELECT 1 FROM big WHERE big.k = small.k AND "
@@ -247,5 +246,4 @@ TEST_CASE_METHOD(SemiBuildLeftFixture,
     "SELECT count(*), sum(id) FROM small WHERE EXISTS (SELECT 1 FROM big WHERE big.k = small.k AND "
     "big.s <> small.s) AND NOT EXISTS (SELECT 1 FROM big WHERE big.k = small.k AND big.s <> "
     "small.s AND big.v > 50000)");
-  run_ok("RESET delim_join_as_cte;");
 }

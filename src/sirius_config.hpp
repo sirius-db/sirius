@@ -140,14 +140,11 @@ constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
 constexpr bool DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN = true;
 
 /// Restrict every table a delim subquery ties to its correlation column by an equality, before
-/// DuckDB orders the joins. Off for now: the rewrite is not tested on multiple GPUs, and a query
-/// that falls back to the CPU after the pre-optimize hook runs the rewritten plan.
-constexpr bool DEFAULT_ENABLE_SUBQUERY_KEY_CARRY = false;
+/// DuckDB orders the joins.
+constexpr bool DEFAULT_ENABLE_SUBQUERY_KEY_CARRY = true;
 
-/// Answer a correlated `EXISTS` from a scalar aggregate subquery over the same rows. Off for now,
-/// for the same reasons, and because a scan without a row estimate reports one row and so passes
-/// the rewrite's size guard.
-constexpr bool DEFAULT_ENABLE_EXISTS_FROM_AGGREGATE = false;
+/// Answer a correlated `EXISTS` from a scalar aggregate subquery over the same rows.
+constexpr bool DEFAULT_ENABLE_EXISTS_FROM_AGGREGATE = true;
 
 /// 0 = auto: a share of GPU tier capacity, mirroring max_sort_partition_bytes. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
@@ -349,7 +346,7 @@ struct operator_params {
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
-  /// Compute a decorrelated subquery's MIN/MAX/AVG per key from the outer rows its delim join
+  /// Compute a decorrelated subquery's MIN/MAX/AVG per key from the outer rows its delim CTE
   /// materializes rather than by rescanning the subquery's tables, when those rows are provably the
   /// same. See `reuse_delim_rows_for_subquery_aggregates`.
   bool enable_delim_aggregate_reuse = config::DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE;
@@ -390,6 +387,11 @@ struct operator_params {
   /// Bytes assumed per variable-width column (VARCHAR, LIST, etc.) when computing
   /// per-row byte estimates for admission. Only used when admission_bytes_per_gpu > 0.
   uint64_t avg_variable_column_bytes = 32;
+
+  /// Most uncached footers the footer-statistics pass reads for one scan, remote and local files
+  /// apart: -1 no limit, 0 cached only. Explicit analysis and pin warming are exempt.
+  std::int64_t parquet_footer_statistics_max_remote_reads = 1024;
+  std::int64_t parquet_footer_statistics_max_local_reads  = 16384;
 };
 
 struct telemetry_config {

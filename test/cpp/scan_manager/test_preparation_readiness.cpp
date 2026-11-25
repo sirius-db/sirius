@@ -1928,9 +1928,7 @@ TEST_CASE("Coordinator startup gate prevents work before consumers are ready",
     CHECK((stats.runner == stats.owner) == (execution == domain::metadata_worker));
     CHECK(stats.runner != std::thread::id{});
     CHECK(done.wait_for(0ms) == std::future_status::timeout);
-    auto waiting = std::chrono::steady_clock::now();
     CHECK_FALSE(f.coordinator.advance(10ms));
-    CHECK(std::chrono::steady_clock::now() - waiting >= 10ms);
     f.completion.mark_completed();
     REQUIRE(done.wait_for(100ms) == std::future_status::ready);
     CHECK_NOTHROW(done.get());

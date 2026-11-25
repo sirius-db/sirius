@@ -32,12 +32,13 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "planner/delim_cte_proof.hpp"
 #include "planner/sirius_plan_flat_tree.hpp"
 
 #include <algorithm>
-#include <limits>
 #include <optional>
 #include <unordered_set>
 #include <utility>
@@ -168,29 +169,42 @@ bool has_selection(flat::flat_tree const& tree)
   });
 }
 
-/// The most rows @p tree can produce, or nothing when a leaf is not a table scan. A flattened
-/// tree joins its leaves, and without a proof that a join key is unique a join can pair every row
-/// of one leaf with every row of another, so the bound is the product of the leaves' rows, not
-/// their sum.
+/// The rows DuckDB estimates for @p op when it is a table scan, or nothing when it is not one or
+/// its function gives no estimate (CSV, Arrow and most extension scans). `EstimateCardinality`
+/// reports such a scan as one row, which would pass for a tiny table.
+///
+/// Valid before DuckDB's optimizer only: its join ordering stores that one row on the scan as
+/// the scan's own estimate.
+std::optional<idx_t> scan_rows(LogicalOperator& op, duckdb::ClientContext& context)
+{
+  if (op.type != LogicalOperatorType::LOGICAL_GET || !op.children.empty()) { return std::nullopt; }
+  auto& get = op.Cast<duckdb::LogicalGet>();
+  if (get.has_estimated_cardinality) { return get.estimated_cardinality; }
+  if (!get.function.cardinality || !get.bind_data) { return std::nullopt; }
+  auto const stats = get.function.cardinality(context, get.bind_data.get());
+  if (!stats || !stats->has_estimated_cardinality) { return std::nullopt; }
+  return stats->estimated_cardinality;
+}
+
+/// The most rows @p tree can produce, or nothing when a leaf is not a table scan with a row
+/// estimate. A flattened tree joins its leaves, and without a proof that a join key is unique a
+/// join can pair every row of one leaf with every row of another, so the bound is the product of
+/// the leaves' rows, not their sum.
 std::optional<idx_t> most_rows(flat::flat_tree const& tree, duckdb::ClientContext& context)
 {
-  constexpr auto unbounded = std::numeric_limits<idx_t>::max();
-  idx_t product            = 1;
+  idx_t product = 1;
   for (auto const& leaf : tree.leaves) {
-    if (leaf.op->type != LogicalOperatorType::LOGICAL_GET || !leaf.op->children.empty()) {
-      return std::nullopt;
-    }
-    auto const rows = leaf.op->EstimateCardinality(context);
-    product         = rows != 0 && product > unbounded / rows ? unbounded : product * rows;
+    auto const rows = scan_rows(*leaf.op, context);
+    if (!rows) { return std::nullopt; }
+    product = memory::saturating_mul(product, *rows);
   }
   return product;
 }
 
+/// The rows of the largest table scan under @p op that has a row estimate, 0 when none has.
 idx_t largest_scan(LogicalOperator& op, duckdb::ClientContext& context)
 {
-  idx_t largest = op.type == LogicalOperatorType::LOGICAL_GET && op.children.empty()
-                    ? op.EstimateCardinality(context)
-                    : 0;
+  idx_t largest = scan_rows(op, context).value_or(0);
   for (auto& child : op.children) {
     largest = std::max(largest, largest_scan(*child, context));
   }

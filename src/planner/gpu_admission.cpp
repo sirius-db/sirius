@@ -16,7 +16,6 @@
 
 #include "planner/gpu_admission.hpp"
 
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_result_collector.hpp"
@@ -32,12 +31,6 @@ void for_each_gpu_scan(const op::sirius_physical_operator& node,
     if (child) { for_each_gpu_scan(*child, visit); }
   }
 
-  if (node.type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-      node.type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto& delim = node.Cast<op::sirius_physical_delim_join>();
-    if (delim.join) { for_each_gpu_scan(*delim.join, visit); }
-    if (delim.distinct_root) { for_each_gpu_scan(*delim.distinct_root, visit); }
-  }
   if (node.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
     auto& rc = node.Cast<op::sirius_physical_result_collector>();
     for_each_gpu_scan(rc.plan, visit);

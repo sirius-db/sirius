@@ -43,8 +43,8 @@ using sirius::planner::query_index;
 namespace {
 
 // Minimal concrete operator: a pass-through node used purely to carry ports/next-ports so that
-// query_index can read the pipeline DAG. Defaults to PROJECTION so get_next_ports_after_sink()
-// takes the plain (non-delim-join) path; a type can be supplied to model e.g. a HASH_JOIN consumer.
+// query_index can read the pipeline DAG. Defaults to PROJECTION; a type can be supplied to model
+// e.g. a HASH_JOIN consumer.
 struct test_operator : sirius_physical_operator {
  public:
   sirius::OrderPreservationType output_order_preservation() const override

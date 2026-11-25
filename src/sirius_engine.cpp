@@ -24,7 +24,6 @@
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_cte.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"
@@ -166,6 +165,12 @@ void sirius_engine::quiesce_plan_users()
   if (plan_users_quiescent_) return;
   if (auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
     ctx->retire_query_work(query_id_, duckdb::SiriusContext::query_retirement_mode::cancelled);
+    // The handler's error callback sees only the query's first error. A finalize that failed
+    // after it may still be a fatal device error, which must mark the runtime unavailable.
+    if (query_) {
+      pipeline::report_finalize_failures(
+        query_->get_pipelines(), ctx->get_query_lifecycle_registry(), query_id_);
+    }
   }
   finish_scan_preparation(sirius_physical_plan.get());
   plan_users_quiescent_ = true;
@@ -297,6 +302,9 @@ void sirius_engine::execute()
       sirius_ctx->throw_runtime_unavailable();
     sirius_ctx->retire_query_work(query_id_,
                                   duckdb::SiriusContext::query_retirement_mode::completed);
+    // No finish transition is running past the work barrier. One that failed after success was
+    // signalled had its report dropped, so it fails the query here.
+    if (query_) { pipeline::rethrow_finalize_failure(query_->get_pipelines()); }
     finish_scan_preparation(sirius_physical_plan.get());
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {

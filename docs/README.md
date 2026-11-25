@@ -66,7 +66,7 @@ Build from source to use the latest code on `main`, make changes to Sirius, or r
 ### Build Requirements
 
 - Git (to clone the repo)
-- Pixi (install instructions [here](https://pixi.sh/latest/installation/))
+- Pixi 0.84.2 or newer (install instructions [here](https://pixi.sh/latest/installation/))
 
 ### Quick Start
 
@@ -192,6 +192,10 @@ CALL unpin_table('lineitem');
 `tier = 'gpu'` pins columns in GPU memory for the fastest scans; `tier = 'host'` pins them in
 pinned host memory instead, for tables larger than GPU memory.
 
+A DuckDB table must be stored in a database file, not in memory, and checkpointed (`CHECKPOINT`)
+before it is pinned. Pinning one turns off WAL auto-checkpointing for the database instance;
+unpinning does not turn it back on.
+
 Deletes and committed inserts on pinned DuckDB tables are reconciled per query. `UPDATE`,
 `MERGE ... UPDATE`, and `INSERT ... ON CONFLICT DO UPDATE` are rejected while the target table is
 pinned; run `CALL unpin_table(...)` before updating it. An explicit `CHECKPOINT` while a pin is
@@ -240,6 +244,20 @@ From Python, execute the same SQL with `con.execute(...)` after loading the exte
 querying. See the [compressed pinning guide](super-sirius/compressed-pinning.md) for plan selection
 and tuning.
 
+## Footer Statistics for Large Parquet Tables
+
+During planning, Sirius reads and caches statistics from the Parquet footers of a multi-file scan
+and passes them to DuckDB's optimizer, but only for scans with at most 1,024 uncached `s3://` files
+(or 16,384 local). For a table consisting of more files than that, you can still read all the
+footers ahead of the queries explicitly by running:
+
+```sql
+SELECT files FROM sirius_analyze_parquet('s3://my-bucket/my-table/*.parquet');
+```
+
+Later scans of the same glob in that process find them cached. See the
+[scan settings](super-sirius/configuration.md#scan) to change or remove the limits.
+
 ## Configuration
 
 Sirius loads its settings from a YAML config file, searched in this order:
@@ -248,7 +266,7 @@ Sirius loads its settings from a YAML config file, searched in this order:
 2. `./sirius.yaml` (current working directory)
 3. `~/.sirius/sirius.yaml`
 
-If no config file is found, built-in defaults apply (95% GPU memory, 8 GiB pinned host memory per NUMA node). See the [Configuration reference](super-sirius/configuration.md) for all options: memory tiers, thread pools, operator parameters, and runtime `SET` variables. An example config is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
+If no config file is found, built-in defaults apply (95% of GPU memory, and 90% of each NUMA node's RAM as pinned host memory). See the [Configuration reference](super-sirius/configuration.md) for all options: memory tiers, thread pools, operator parameters, and runtime `SET` variables. An example config is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
 ## Disk Spilling
 
@@ -321,7 +339,7 @@ exporter, per-query labeling, generating telemetry (using a TPC-H helper), and v
 Sirius is under active development. Notable current limitations include:
 
 - **Data Type Coverage:** Sirius currently supports commonly used data types including `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, `VARCHAR`, `DATE`, `TIMESTAMP`, and `DECIMAL`. We are actively working on supporting additional data types—such as nested types.
-- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop/Delim), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`.
+- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`.
 
 - **DuckDB v2 regex rewrites:** Whole-input backreference replacements, including the ClickBench Q28 URL pattern, are rewritten to `regexp_extract(..., 'k')` and currently require CPU fallback instead of using the GPU regex implementation. Tracked in [#2146](https://github.com/sirius-db/sirius/issues/2146).
 
