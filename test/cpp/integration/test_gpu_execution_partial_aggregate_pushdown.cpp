@@ -17,6 +17,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 
 #include <cstddef>
@@ -299,11 +300,52 @@ TEST_CASE_METHOD(PartialAggregatePushdownFixture,
     "ON c_custkey = o_custkey WHERE o_orderdate > DATE '2100-01-01' GROUP BY o_custkey, c_name",
     true);
   // Grouped by the customers' key, the orders without a customer all fall into the one group
-  // whose key is NULL. The groups are then not the orders' keys, and the rule leaves it alone.
-  auto const before = pushdowns();
-  compare_gpu_vs_cpu(
+  // whose key is NULL. The groups are then not the orders' keys, and going by the grouping the
+  // rule leaves it alone.
+  std::string const padded =
     "SELECT c_custkey, c_name, sum(o_totalprice) AS total, min(o_totalprice) AS low "
-    "FROM orders LEFT JOIN customer ON c_custkey = o_custkey GROUP BY c_custkey, c_name");
+    "FROM orders LEFT JOIN customer ON c_custkey = o_custkey GROUP BY c_custkey, c_name";
+  {
+    sirius::test::scoped_sirius_setting by_grouping{
+      *con, "partial_aggregate_min_rows_per_key", 0.0};
+    auto const before = pushdowns();
+    compare_gpu_vs_cpu(padded);
+    CHECK(pushdowns() == before);
+  }
+  // The orders' statistics show each customer key holds about 50 of them, which is reason enough:
+  // the sums of the keys without a customer are added up in the NULL group.
+  compare_pushed_and_not(padded, true);
+}
+
+TEST_CASE_METHOD(PartialAggregatePushdownFixture,
+                 "gpu_execution aggregate below a join whose keys the statistics show repeat",
+                 "[integration][gpu_execution][partial_agg_pushdown]")
+{
+  // The strings are grouped by without the join key. Customers 5 and 7 each have two names, and
+  // several keys share an address, so the groups are not the keys. The 4000 orders hold 80 customer
+  // keys, 50 orders each, so a sum per key is worth computing first all the same.
+  std::string const by_strings =
+    "SELECT c_name, c_address, sum(o_totalprice) AS total, max(o_orderdate) AS latest "
+    "FROM customer, orders WHERE c_custkey = o_custkey GROUP BY c_name, c_address";
+  compare_pushed_and_not(by_strings, true);
+  // The same orders and customers as Parquet files. A footer holds no distinct count, but the
+  // orders' customer keys lie between 1 and 80: no more than 80 keys for the 4000 orders.
+  sirius::test::scratch_dir files{"partial_aggregate_pushdown"};
+  for (char const* table : {"orders", "customer"}) {
+    auto const file = files.file_literal(std::string{table} + ".parquet");
+    run_ok(std::string{"COPY "} + table + " TO " + file + ";");
+    run_ok(std::string{"CREATE VIEW file_"} + table + " AS SELECT * FROM read_parquet(" + file +
+           ");");
+  }
+  compare_pushed_and_not(
+    "SELECT c_name, c_address, sum(o_totalprice) AS total, max(o_orderdate) AS latest "
+    "FROM file_customer, file_orders WHERE c_custkey = o_custkey GROUP BY c_name, c_address",
+    true);
+
+  // A threshold no key reaches leaves it to the grouping.
+  sirius::test::scoped_sirius_setting unreachable{*con, "partial_aggregate_min_rows_per_key", 1e9};
+  auto const before = pushdowns();
+  compare_gpu_vs_cpu(by_strings);
   CHECK(pushdowns() == before);
 }
 
@@ -311,6 +353,8 @@ TEST_CASE_METHOD(PartialAggregatePushdownFixture,
                  "gpu_execution aggregates the partial aggregate pushdown leaves alone",
                  "[integration][gpu_execution][partial_agg_pushdown]")
 {
+  // The statistics are left out, so that the grouping alone decides.
+  sirius::test::scoped_sirius_setting by_grouping{*con, "partial_aggregate_min_rows_per_key", 0.0};
   auto const before = pushdowns();
   // COUNT and AVG do not combine into a result of their own type.
   compare_gpu_vs_cpu(

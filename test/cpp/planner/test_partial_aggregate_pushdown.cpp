@@ -165,14 +165,21 @@ struct pushdown_fixture {
           "CREATE TABLE lineitem (l_orderkey BIGINT, l_extendedprice DECIMAL(15, 2), "
           "l_discount DECIMAL(15, 2), l_returnflag VARCHAR)",
           "INSERT INTO lineitem SELECT range % 3000, (range % 1000) * 1.5, (range % 10) / 100.0, "
-          "CASE WHEN range % 2 = 0 THEN 'R' ELSE 'N' END FROM range(12000)"}) {
+          "CASE WHEN range % 2 = 0 THEN 'R' ELSE 'N' END FROM range(12000)",
+          // 100 visits per customer key, in five regions.
+          "CREATE TABLE visits (v_custkey BIGINT, v_region INTEGER, v_amount DECIMAL(15, 2))",
+          "INSERT INTO visits SELECT range % 300 + 1, range % 5, range % 100 FROM range(30000)"}) {
       auto result = con->Query(sql);
       INFO(sql);
       REQUIRE_FALSE(result->HasError());
     }
   }
 
-  std::size_t pushed(std::string const& query, pushdown_options const& options = {})
+  /// The thresholds with the statistics left out, so that a test of the other conditions does not
+  /// turn on what DuckDB estimates of these small tables.
+  static constexpr pushdown_options by_grouping{.min_rows_per_key = 0};
+
+  std::size_t pushed(std::string const& query, pushdown_options const& options = by_grouping)
   {
     return with_resolved_plan(
              *con, query, join_order::optimized, true, options, [](ClientContext&, auto&) {})
@@ -181,7 +188,7 @@ struct pushdown_fixture {
 
   /// Why the rule left the aggregates of @p query alone: one entry per aggregate over a join.
   reasons why(std::string const& query,
-              pushdown_options const& options = {},
+              pushdown_options const& options = by_grouping,
               join_order order                = join_order::optimized)
   {
     return with_resolved_plan(*con, query, order, true, options, [](ClientContext&, auto&) {})
@@ -190,17 +197,23 @@ struct pushdown_fixture {
 
   /// The shape of @p query's plan with its joins as written, with or without the rewrite. The
   /// plan must also be one Sirius can run.
-  std::string shape(std::string const& query, bool rewrite)
+  std::string shape(std::string const& query,
+                    bool rewrite,
+                    pushdown_options const& options = by_grouping)
   {
     std::string result;
-    with_resolved_plan(
-      *con, query, join_order::as_written, rewrite, {}, [&](ClientContext& context, auto& plan) {
-        result = describe(*plan);
-        ColumnBindingResolver resolver;
-        resolver.VisitOperator(*plan);
-        sirius::planner::sirius_physical_plan_generator gen(context);
-        REQUIRE(gen.create_plan(std::move(plan)));
-      });
+    with_resolved_plan(*con,
+                       query,
+                       join_order::as_written,
+                       rewrite,
+                       options,
+                       [&](ClientContext& context, auto& plan) {
+                         result = describe(*plan);
+                         ColumnBindingResolver resolver;
+                         resolver.VisitOperator(*plan);
+                         sirius::planner::sirius_physical_plan_generator gen(context);
+                         REQUIRE(gen.create_plan(std::move(plan)));
+                       });
     return result;
   }
 
@@ -537,4 +550,61 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(pushed(two_extra, {.max_extra_keys = std::numeric_limits<std::size_t>::max()}) == 1);
   CHECK(why(per_customer("sum(o_totalprice)", "", "c_custkey, c_name, o_shippriority"),
             {.max_extra_keys = 0}) == reasons{"keys:too-many-extra"});
+}
+
+TEST_CASE_METHOD(pushdown_fixture,
+                 "partial aggregate pushdown trusts statistics that show its keys repeat",
+                 "[partial_agg_pushdown][plan]")
+{
+  // Grouped by the customers' strings alone, the aggregate above does not group by the join key.
+  // The orders' statistics show that key repeats: 3000 orders over 300 customer keys, 10 each.
+  // The count behind that is DuckDB's estimate, so the thresholds here stand well clear of 10.
+  auto const by_strings = per_customer("sum(o_totalprice)", "", "c_name, c_address");
+  CHECK(pushed(by_strings, {.min_rows_per_key = 2}) == 1);
+  CHECK(pushed(by_strings, {.min_rows_per_key = 40}) == 0);
+  CHECK(why(by_strings, {.min_rows_per_key = 40}) == reasons{"keys:not-grouped"});
+  // 0 leaves the decision to the grouping.
+  CHECK(pushed(by_strings, {.min_rows_per_key = 0}) == 0);
+  CHECK(shape(by_strings, true, {.min_rows_per_key = 2}) ==
+        "AGG[2](JOIN(AGG[1](orders),customer))");
+
+  // The same under an outer join that pads the customers' key: the orders without a customer
+  // share a group above, and their keys still repeat below.
+  auto const padded =
+    "SELECT c_custkey, c_name, sum(o_totalprice) FROM orders LEFT JOIN customer "
+    "ON o_custkey = c_custkey GROUP BY c_custkey, c_name";
+  CHECK(pushed(padded, {.min_rows_per_key = 2}) == 1);
+  CHECK(pushed(padded, {.min_rows_per_key = 40}) == 0);
+
+  // A key that an equality filter leaves a single value adds no groups. The visits of one region
+  // are 6000 rows over at most 300 customer keys; counted with its five values, the region would
+  // bring that down to a few rows per group.
+  auto const one_region =
+    "SELECT c_name, c_address, v_region, sum(v_amount) FROM visits, customer "
+    "WHERE v_custkey = c_custkey AND v_region = 1 GROUP BY c_name, c_address, v_region";
+  CHECK(shape(one_region, true, {.min_rows_per_key = 6}) ==
+        "AGG[3](JOIN(AGG[2](visits),customer))");
+  CHECK(shape("SELECT c_name, c_address, v_region, sum(v_amount) FROM visits, customer "
+              "WHERE v_custkey = c_custkey AND v_region > 0 GROUP BY c_name, c_address, v_region",
+              true,
+              {.min_rows_per_key = 6}) == "AGG[3](JOIN(visits,customer))");
+
+  // A key with one row each shows nothing: every order has its own key.
+  CHECK(why("SELECT l_returnflag, sum(o_totalprice) FROM orders, lineitem "
+            "WHERE o_orderkey = l_orderkey GROUP BY l_returnflag",
+            {.min_rows_per_key = 2})
+          .size() == 1);
+  // Two keys together can form more groups than there are orders, which shows nothing either.
+  CHECK(why("SELECT c_custkey, c_name, l_returnflag, sum(o_totalprice) FROM (orders JOIN customer "
+            "ON o_custkey = c_custkey) JOIN lineitem ON o_orderkey = l_orderkey "
+            "GROUP BY c_custkey, c_name, l_returnflag",
+            {.min_rows_per_key = 2}) == reasons{"keys:not-grouped"});
+
+  // A floating-point sum is left to the grouping, however often its keys repeat: where keys share
+  // a group above, each key's sum could overflow where the group's would not.
+  auto const floats = per_customer("sum(o_weight)", "", "c_name, c_address");
+  CHECK(pushed(floats, {.min_rows_per_key = 2}) == 0);
+  CHECK(why(floats, {.min_rows_per_key = 2}) == reasons{"keys:not-grouped"});
+  CHECK(pushed(per_customer("min(o_weight), max(o_weight)", "", "c_name, c_address"),
+               {.min_rows_per_key = 2}) == 1);
 }

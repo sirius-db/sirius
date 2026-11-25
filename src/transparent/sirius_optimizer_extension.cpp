@@ -98,6 +98,10 @@ sirius::planner::partial_aggregate_pushdown_options partial_aggregate_pushdown_t
       !setting.IsNull()) {
     options.max_extra_keys = setting.GetValue<std::uint64_t>();
   }
+  if (context.TryGetCurrentSetting("partial_aggregate_min_rows_per_key", setting) &&
+      !setting.IsNull()) {
+    options.min_rows_per_key = setting.GetValue<double>();
+  }
   return options;
 }
 

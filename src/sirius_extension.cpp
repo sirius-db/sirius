@@ -3182,6 +3182,18 @@ static void SetPartialAggregateMaxExtraKeys(ClientContext& /*context*/,
   // DuckDB stores this setting in the client context.
 }
 
+static void SetPartialAggregateMinRowsPerKey(ClientContext& /*context*/,
+                                             SetScope /*scope*/,
+                                             Value& parameter)
+{
+  // DuckDB stores this setting in the client context.
+  auto const rows = DoubleValue::Get(parameter);
+  if (!(rows >= 0.0)) {
+    throw InvalidInputException("partial_aggregate_min_rows_per_key must be 0 or more, got %f",
+                                rows);
+  }
+}
+
 static void SetEnableSubqueryKeyCarry(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                      = get_operator_params(context, scope);
@@ -3830,6 +3842,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::UBIGINT,
                     Value::UBIGINT(pushdown_defaults.max_extra_keys),
                     SetPartialAggregateMaxExtraKeys);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "partial_aggregate_min_rows_per_key",
+                    "rows per group an aggregate below a join must be estimated to combine where "
+                    "the query does not group by its keys; 0 never trusts the estimate",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(pushdown_defaults.min_rows_per_key),
+                    SetPartialAggregateMinRowsPerKey);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_subquery_key_carry",

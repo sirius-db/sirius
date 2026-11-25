@@ -378,8 +378,10 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
     REQUIRE(setting_count(con, "partial_aggregate_min_kept_share") == 0);
     REQUIRE(setting_count(con, "partial_aggregate_max_extra_keys") == 0);
+    REQUIRE(setting_count(con, "partial_aggregate_min_rows_per_key") == 0);
     REQUIRE(con.Query("SET partial_aggregate_min_kept_share = 0.5")->HasError());
     REQUIRE(con.Query("SET partial_aggregate_max_extra_keys = 2")->HasError());
+    REQUIRE(con.Query("SET partial_aggregate_min_rows_per_key = 4")->HasError());
     REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
     REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
     auto native_option = con.Query("SET sirius_test_sync_native_checkpoint = true");
@@ -450,6 +452,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
     REQUIRE(setting_count(con, "partial_aggregate_min_kept_share") == 0);
     REQUIRE(setting_count(con, "partial_aggregate_max_extra_keys") == 0);
+    REQUIRE(setting_count(con, "partial_aggregate_min_rows_per_key") == 0);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
@@ -476,6 +479,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 1);
     REQUIRE(setting_count(con, "partial_aggregate_min_kept_share") == 1);
     REQUIRE(setting_count(con, "partial_aggregate_max_extra_keys") == 1);
+    REQUIRE(setting_count(con, "partial_aggregate_min_rows_per_key") == 1);
     duckdb::Value native_enabled;
     auto native_setting =
       con.context->TryGetCurrentSetting("sirius_test_sync_native_checkpoint", native_enabled);
@@ -561,6 +565,17 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET partial_aggregate_max_extra_keys");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    // 0 leaves the statistics out rather than being rejected.
+    result = con.Query("SET partial_aggregate_min_rows_per_key = 0");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET partial_aggregate_min_rows_per_key = -1");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("must be 0 or more"));
+    result = con.Query("RESET partial_aggregate_min_rows_per_key");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET concat_batch_bytes = 1048576");

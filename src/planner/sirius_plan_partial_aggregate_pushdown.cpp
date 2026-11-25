@@ -21,13 +21,17 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/optimizer/relation_statistics/relation_statistics_helper.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -39,6 +43,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -385,6 +390,114 @@ std::optional<duckdb::idx_t> estimated_rows(LogicalOperator const& op)
   return rows;
 }
 
+/// Whether a filter pushed into a scan leaves the column it tests a single value: the column
+/// equals a constant, alone or among conditions that must all hold.
+bool keeps_one_value(Expression const& condition)
+{
+  if (condition.GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_AND) {
+    auto const& all = condition.Cast<duckdb::BoundConjunctionExpression>().GetChildren();
+    return std::ranges::any_of(all, [](auto const& child) { return keeps_one_value(*child); });
+  }
+  if (!duckdb::BoundComparisonExpression::IsComparison(condition)) { return false; }
+  auto comparison     = duckdb::ExpressionType::INVALID;
+  auto const constant = duckdb::ExpressionFilter::TryGetColumnConstantComparison(
+    condition.Cast<duckdb::BoundFunctionExpression>(), comparison);
+  return constant && comparison == duckdb::ExpressionType::COMPARE_EQUAL;
+}
+
+/// The most distinct values the column @p binding of @p op's output can hold, or nullopt when
+/// nothing limits them. The limit is that of the scan column it comes from: a single value under
+/// an equality filter; otherwise, for a native table, the distinct count DuckDB derives from its
+/// statistics (the column's sketch, or an integer's range), and for a Parquet scan the integer
+/// range in its footers; and never more than the rows the scan is estimated to return. Operators
+/// between the scan and @p op drop values but add none, bar the NULL of an outer join.
+///
+/// A Parquet scan is not asked for its statistics the way a table is: the plan the rule works on
+/// is a copy, whose scan no longer holds the footer statistics DuckDB's optimizer was given and
+/// reports a single row. Its ranges are the ones the footer statistics pass kept with the scan's
+/// row count and the copy was given, so a scan that pass did not cover (one over a footer read
+/// limit, or planned with footer statistics off) has none.
+std::optional<double> most_distinct_values(duckdb::ClientContext& context,
+                                           LogicalOperator& op,
+                                           ColumnBinding const& binding)
+{
+  if (op.type == LogicalOperatorType::LOGICAL_GET) {
+    auto& get = op.Cast<duckdb::LogicalGet>();
+    if (binding.table_index != get.table_index ||
+        binding.column_index.GetIndex() >= get.GetColumnIds().size()) {
+      return std::nullopt;
+    }
+    auto const& column = get.GetColumnIndex(binding);
+    if (column.IsRowIdColumn() || column.IsVirtualColumn()) { return std::nullopt; }
+    try {
+      auto const filter = get.table_filters.TryGetFilterByColumnIndex(binding.column_index);
+      if (filter && filter->filter_type == duckdb::TableFilterType::EXPRESSION_FILTER &&
+          keeps_one_value(*filter->Cast<duckdb::ExpressionFilter>().expr)) {
+        return 1.0;
+      }
+      std::optional<double> most;
+      if (get.GetTable()) {
+        // Where the statistics give no count DuckDB falls back to the scan's rows, which shows
+        // nothing about how often a value repeats.
+        auto const scan  = duckdb::RelationStatisticsHelper::ExtractGetStats(get, context);
+        auto const found = scan.GetColumnStats(binding);
+        if (found && found->distinct_count.distinct_count > 0 &&
+            found->distinct_count.source != duckdb::DistinctCountSource::CARDINALITY) {
+          most = static_cast<double>(found->distinct_count.distinct_count);
+        }
+      } else if (auto const span =
+                   transparent::parquet_scan_value_span(get, column.GetPrimaryIndex())) {
+        most = static_cast<double>(*span);
+      }
+      if (most && get.has_estimated_cardinality) {
+        most = std::min(*most, std::max(1.0, static_cast<double>(get.estimated_cardinality)));
+      }
+      return most;
+    } catch (...) {
+      // A scan whose statistics cannot be read says nothing.
+      return std::nullopt;
+    }
+  }
+  if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+    auto const& projection = op.Cast<duckdb::LogicalProjection>();
+    if (binding.table_index != projection.table_index) { return std::nullopt; }
+    auto const index = binding.column_index.GetIndex();
+    if (index >= projection.expressions.size() || !is_column(*projection.expressions[index]) ||
+        op.children.size() != 1) {
+      return std::nullopt;
+    }
+    return most_distinct_values(
+      context, *op.children[0], binding_of(*projection.expressions[index]));
+  }
+  // Any other operator that outputs the column passes it on from a child.
+  for (auto const& child : op.children) {
+    if (outputs_of(*child).contains(binding)) {
+      return most_distinct_values(context, *child, binding);
+    }
+  }
+  return std::nullopt;
+}
+
+/// The rows of @p source that one group of @p keys is estimated to combine, at least: its row
+/// estimate over the most groups the keys can form. 1 when the statistics cannot show that keys
+/// repeat, which includes a key nothing limits.
+double least_rows_per_key(duckdb::ClientContext& context,
+                          LogicalOperator& source,
+                          std::vector<ColumnBinding> const& keys)
+{
+  auto const estimate = estimated_rows(source);
+  if (!estimate || *estimate == 0 || keys.empty()) { return 1.0; }
+  auto const rows = static_cast<double>(*estimate);
+  auto groups     = 1.0;
+  for (auto const& key : keys) {
+    auto const most = most_distinct_values(context, source, key);
+    if (!most) { return 1.0; }
+    groups *= std::max(*most, 1.0);
+    if (groups >= rows) { return 1.0; }
+  }
+  return rows / groups;
+}
+
 /// Whether @p op already has one row per group of some columns, so grouping it again by a join
 /// key reduces little.
 bool already_grouped(LogicalOperator const& op)
@@ -443,12 +556,15 @@ struct pushdown {
   duckdb::vector<unique_ptr<Expression>> upper;  ///< The aggregates combining those
   TableIndex lower_group_index;
   TableIndex lower_aggregate_index;
+  double rows_per_key = 1.0;    ///< The rows a group of the keys is estimated to combine, at least
+  bool sums_floats    = false;  ///< Whether an aggregate adds up floating-point values
 };
 
 /// Why an aggregate over a join is left alone: each reason once, in the order found.
 struct blockers {
   std::vector<std::string> reasons;
   std::optional<double> least_kept_share;  ///< Of the scans joined to the aggregated input
+  std::optional<double> rows_per_key;      ///< Of the pushed aggregate's keys, at least
 
   void add(std::string_view reason)
   {
@@ -548,6 +664,10 @@ void analyze(duckdb::ClientContext& context,
       // AVG adds up its argument too, so it reports what stands in the way of that sum.
       if (name == "avg" || (combine && std::string_view{combine} == "sum")) {
         if (auto const* blocker = sum_blocker(argument->GetReturnType())) { why.add(blocker); }
+        auto const type = argument->GetReturnType().id();
+        if (type == duckdb::LogicalTypeId::FLOAT || type == duckdb::LogicalTypeId::DOUBLE) {
+          result.sums_floats = true;
+        }
       }
       if (combine && argument_columns.size() == columns_before) { why.add("argument:constant"); }
     }
@@ -724,7 +844,17 @@ void analyze(duckdb::ClientContext& context,
              return !step.preserves && equates_with_group(step, key);
            });
   };
-  if (!std::ranges::all_of(result.keys, grouped)) { why.add("keys:not-grouped"); }
+  // Failing that, it pays when its keys repeat often enough, whatever the aggregate above groups
+  // by. The scan statistics give a floor on how often: the input's rows over the most groups its
+  // keys can form. A key the statistics do not limit shows nothing, and the floor is then 1.
+  //
+  // A floating-point sum is left to the grouping alone. Where several keys share a group above,
+  // each key's sum can overflow where the sum of them all would not (see sum_blocker).
+  result.rows_per_key = least_rows_per_key(context, source, result.keys);
+  why.rows_per_key    = result.rows_per_key;
+  auto const repeat   = !result.sums_floats && options.min_rows_per_key > 0 &&
+                      result.rows_per_key >= options.min_rows_per_key;
+  if (!repeat && !std::ranges::all_of(result.keys, grouped)) { why.add("keys:not-grouped"); }
   // A join that computes its key sees one row of each group where it saw every row. That is the
   // same only when the rows of a group cannot differ in the columns the key is computed from.
   std::vector<ColumnBinding> computed_from;
@@ -806,18 +936,18 @@ std::optional<pushdown> match(duckdb::ClientContext& context,
   if (why.reasons.empty()) { return result; }
 
   auto reasons = why.joined();
+  std::string measured;
   if (why.least_kept_share) {
-    SIRIUS_LOG_DEBUG(
-      "[sirius_plan_partial_aggregate_pushdown] Not aggregating below a join that adds group-by "
-      "payload: {} (least kept share {:.3f})",
-      reasons,
-      *why.least_kept_share);
-  } else {
-    SIRIUS_LOG_DEBUG(
-      "[sirius_plan_partial_aggregate_pushdown] Not aggregating below a join that adds group-by "
-      "payload: {}",
-      reasons);
+    measured += std::format(" (least kept share {:.3f})", *why.least_kept_share);
   }
+  if (why.rows_per_key) {
+    measured += std::format(" (at least {:.2f} rows per key)", *why.rows_per_key);
+  }
+  SIRIUS_LOG_DEBUG(
+    "[sirius_plan_partial_aggregate_pushdown] Not aggregating below a join that adds group-by "
+    "payload: {}{}",
+    reasons,
+    measured);
   declined.push_back(std::move(reasons));
   return std::nullopt;
 }
@@ -928,11 +1058,12 @@ void apply(pushdown& push)
 
   SIRIUS_LOG_INFO(
     "[sirius_plan_partial_aggregate_pushdown] Aggregating {} value(s) by {} column(s) below {} "
-    "join(s) that add group-by payload (input est {} rows)",
+    "join(s) that add group-by payload (input est {} rows, at least {:.2f} per key)",
     aggregates,
     push.keys.size(),
     push.path.size(),
-    input_rows);
+    input_rows,
+    push.rows_per_key);
 }
 
 /// Children first, so an aggregate is considered after everything below it, and the aggregates

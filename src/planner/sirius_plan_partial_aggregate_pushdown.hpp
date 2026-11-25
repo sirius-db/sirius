@@ -37,6 +37,11 @@ struct partial_aggregate_pushdown_options {
   double min_kept_share = 0.7;
   /// The columns the pushed aggregate may group by beyond those it is joined on.
   std::size_t max_extra_keys = 1;
+  /// The rows each group of the pushed aggregate must be estimated to combine, at least, for it to
+  /// be pushed where the aggregate above does not group by the same columns. The estimate is the
+  /// input's row estimate over the most groups its keys can form, from the scan statistics. 0 never
+  /// trusts the estimate, so only the grouping decides.
+  double min_rows_per_key = 8;
 };
 
 /// What `push_partial_aggregates_below_joins` did to a plan.
