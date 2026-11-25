@@ -1,5 +1,6 @@
-"""Tests of scripts/compare_answers.py and scripts/sirius_distributed_config.py. No GPU."""
+"""Tests of scripts/compare_answers.py, sirius_distributed_config.py and launcher_env.sh. No GPU."""
 
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -125,6 +126,53 @@ class DistributedConfig(unittest.TestCase):
     def test_missing_explicit_file(self):
         fallback = "sirius:\n  distributed:\n    cluster: other\n"
         done = self.read(fallback, {"SIRIUS_CONFIG_FILE": "/nonexistent/sirius.yaml"})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, "")
+
+
+class LauncherEnv(unittest.TestCase):
+    def source(self, rails, env):
+        """Sources launcher_env.sh on a host whose rail NICs are `rails` ("" is none)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy(SCRIPTS / "launcher_env.sh", tmp)
+            found = f"echo {rails}" if rails else "return 1"
+            Path(tmp, "sirius_net.sh").write_text(
+                f"sirius_rail_devices() {{ {found}; }}\n"
+            )
+            show = "$UCX_TLS $UCX_NET_DEVICES ${SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING:-unset}"
+            return subprocess.run(
+                [
+                    "bash",
+                    "-euc",
+                    f'source "$1/launcher_env.sh" && echo "{show}"',
+                    "-",
+                    tmp,
+                ],
+                env={"PATH": "/usr/bin:/bin", **env},
+                capture_output=True,
+                text=True,
+            )
+
+    def test_rails_write_over_nixl(self):
+        done = self.source("mlx5_0:1,mlx5_1:1", {"UCX_NET_DEVICES": "rails"})
+        self.assertEqual(done.stdout, "all mlx5_0:1,mlx5_1:1 never\n", done.stderr)
+
+    def test_rails_keep_a_set_host_staging(self):
+        env = {
+            "UCX_NET_DEVICES": "rails",
+            "SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING": "auto",
+        }
+        done = self.source("mlx5_0:1,mlx5_1:1", env)
+        self.assertEqual(done.stdout, "all mlx5_0:1,mlx5_1:1 auto\n", done.stderr)
+
+    def test_tcp_leaves_host_staging_to_the_gateway(self):
+        done = self.source("mlx5_0:1,mlx5_1:1", {"UCX_NET_DEVICES": "bond0"})
+        self.assertEqual(
+            done.stdout, "cuda_copy,cuda_ipc,tcp,self bond0 unset\n", done.stderr
+        )
+
+    def test_rails_without_rail_nics_fail(self):
+        done = self.source("", {"UCX_NET_DEVICES": "rails"})
         self.assertNotEqual(done.returncode, 0)
         self.assertEqual(done.stdout, "")
 

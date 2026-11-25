@@ -68,7 +68,10 @@ address in its `priority_networks`, by default the gateway's subnet from `gatewa
 `UCX_TLS` to `cuda_copy,cuda_ipc,tcp,self`: left to itself, UCX picks InfiniBand ports that GB200
 hosts cannot connect through. `UCX_NET_DEVICES=rails` takes the host's GPU rail NICs with
 `UCX_TLS=all` instead, which the exchange over the NVLink fabric needs for its notifications at
-full speed.
+full speed. `scripts/sirius_gateway.sh` then starts the gateway with
+`sirius_gateway_exchange_host_staging = 'never'`, unless `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING`
+is set: ranks on other hosts then get GPU memory written directly over RDMA, about twice as fast
+as lanes when every rank sends to every other.
 
 ## How a statement runs
 
