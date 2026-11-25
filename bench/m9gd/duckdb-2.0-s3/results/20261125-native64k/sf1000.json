@@ -1,0 +1,464 @@
+{
+  "all_timings_available": true,
+  "complete": true,
+  "measurements": [
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q01/iteration1/duckdb/q1/result.txt",
+      "answer_sha256": "490a2f5ec1d7623044d07efb038f92247bd825f9c7b1287f2913ff0e5132b5a5",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 1,
+      "rows": 4,
+      "seconds": 13.614173670997843,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q01/iteration2/duckdb/q1/result.txt",
+      "answer_sha256": "490a2f5ec1d7623044d07efb038f92247bd825f9c7b1287f2913ff0e5132b5a5",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 1,
+      "rows": 4,
+      "seconds": 1.6190172179994988,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q02/iteration1/duckdb/q2/result.txt",
+      "answer_sha256": "7ddbe965ca97530e9cf82719c0e32998ec0026383e0d7e22502cad382dd3f5ab",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 2,
+      "rows": 100,
+      "seconds": 4.197461103001842,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q02/iteration2/duckdb/q2/result.txt",
+      "answer_sha256": "7ddbe965ca97530e9cf82719c0e32998ec0026383e0d7e22502cad382dd3f5ab",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 2,
+      "rows": 100,
+      "seconds": 0.5391457570003695,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q03/iteration1/duckdb/q3/result.txt",
+      "answer_sha256": "c5a549c3b8b2ad105de64fe30c42ba8cff272a6735b2fc4bf47721208c03a17e",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 3,
+      "rows": 10,
+      "seconds": 25.426022994994128,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q03/iteration2/duckdb/q3/result.txt",
+      "answer_sha256": "c5a549c3b8b2ad105de64fe30c42ba8cff272a6735b2fc4bf47721208c03a17e",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 3,
+      "rows": 10,
+      "seconds": 2.534428992003086,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q04/iteration1/duckdb/q4/result.txt",
+      "answer_sha256": "2103c5c0cbc74a254a96146eb295d42f3ce8ca14d27ee385c1e20331e31f382b",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 4,
+      "rows": 5,
+      "seconds": 16.106642491002276,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q04/iteration2/duckdb/q4/result.txt",
+      "answer_sha256": "2103c5c0cbc74a254a96146eb295d42f3ce8ca14d27ee385c1e20331e31f382b",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 4,
+      "rows": 5,
+      "seconds": 1.3435790840012487,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q05/iteration1/duckdb/q5/result.txt",
+      "answer_sha256": "9e621e7708e8bcf00d68d263ce6be933359437d8cfb3bdbda798c327d7fd883e",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 5,
+      "rows": 5,
+      "seconds": 23.6790666060042,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q05/iteration2/duckdb/q5/result.txt",
+      "answer_sha256": "9e621e7708e8bcf00d68d263ce6be933359437d8cfb3bdbda798c327d7fd883e",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 5,
+      "rows": 5,
+      "seconds": 1.6575188040005742,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q06/iteration1/duckdb/q6/result.txt",
+      "answer_sha256": "8f0b7529321af89b524c20cbf4c7435de4a05855f5cf12793d376e1fbc34c453",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 6,
+      "rows": 1,
+      "seconds": 13.882314172005863,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q06/iteration2/duckdb/q6/result.txt",
+      "answer_sha256": "8f0b7529321af89b524c20cbf4c7435de4a05855f5cf12793d376e1fbc34c453",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 6,
+      "rows": 1,
+      "seconds": 0.49386608899658313,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q07/iteration1/duckdb/q7/result.txt",
+      "answer_sha256": "bde71b9b1159247fe807b2c903808463a717bde30e8d2578919ed2d0719b96a5",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 7,
+      "rows": 4,
+      "seconds": 26.78919112499716,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q07/iteration2/duckdb/q7/result.txt",
+      "answer_sha256": "bde71b9b1159247fe807b2c903808463a717bde30e8d2578919ed2d0719b96a5",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 7,
+      "rows": 4,
+      "seconds": 2.2640596519995597,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q08/iteration1/duckdb/q8/result.txt",
+      "answer_sha256": "a9649892e8a99437af1d2f937539c31723e96756c0e717db1df3d6a9854ac2fe",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 8,
+      "rows": 2,
+      "seconds": 21.90232284800004,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q08/iteration2/duckdb/q8/result.txt",
+      "answer_sha256": "a9649892e8a99437af1d2f937539c31723e96756c0e717db1df3d6a9854ac2fe",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 8,
+      "rows": 2,
+      "seconds": 2.506336434002151,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q09/iteration1/duckdb/q9/result.txt",
+      "answer_sha256": "ee205998c1c0ba21a5ca88e47a41f9fccd9303f32a8e49a899232d87ea04478b",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 9,
+      "rows": 175,
+      "seconds": 25.10598773699894,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q09/iteration2/duckdb/q9/result.txt",
+      "answer_sha256": "ee205998c1c0ba21a5ca88e47a41f9fccd9303f32a8e49a899232d87ea04478b",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 9,
+      "rows": 175,
+      "seconds": 7.415871420998883,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q10/iteration1/duckdb/q10/result.txt",
+      "answer_sha256": "12faf08d07ba8a20340ac81bfe1374a35662fbe5e033ffcb84ba969e02df0826",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 10,
+      "rows": 20,
+      "seconds": 22.697246235999046,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q10/iteration2/duckdb/q10/result.txt",
+      "answer_sha256": "12faf08d07ba8a20340ac81bfe1374a35662fbe5e033ffcb84ba969e02df0826",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 10,
+      "rows": 20,
+      "seconds": 2.7583180200017523,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q11/iteration1/duckdb/q11/result.txt",
+      "answer_sha256": "4837b64b09ecba29c97f738b2739b1a12eae75482a3641be6b85771e26116890",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 11,
+      "rows": 936989,
+      "seconds": 2.6000878580016433,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q11/iteration2/duckdb/q11/result.txt",
+      "answer_sha256": "3f66cf41c06f046e819f97ca1cc1ca8a6ffac4ce8b3a62f8307f569224ea518e",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 11,
+      "rows": 936989,
+      "seconds": 0.4613353189997724,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q12/iteration1/duckdb/q12/result.txt",
+      "answer_sha256": "66a3f788c0b5be76e92f3b41639809cf29829e34152567465829b2cb746c8e2c",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 12,
+      "rows": 2,
+      "seconds": 21.05107200200291,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q12/iteration2/duckdb/q12/result.txt",
+      "answer_sha256": "66a3f788c0b5be76e92f3b41639809cf29829e34152567465829b2cb746c8e2c",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 12,
+      "rows": 2,
+      "seconds": 1.0663066850029281,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q13/iteration1/duckdb/q13/result.txt",
+      "answer_sha256": "f9ab270459e38c7cc6bb7ac6316efec225bdf3b744b46e3ac1861bc719823285",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 13,
+      "rows": 30,
+      "seconds": 11.77757592999842,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q13/iteration2/duckdb/q13/result.txt",
+      "answer_sha256": "f9ab270459e38c7cc6bb7ac6316efec225bdf3b744b46e3ac1861bc719823285",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 13,
+      "rows": 30,
+      "seconds": 6.256919514999026,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q14/iteration1/duckdb/q14/result.txt",
+      "answer_sha256": "c2662b6d18a49ddec4d3baee45ffa12dd2fd756dcb1d2fe16a3291c183142f9c",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 14,
+      "rows": 1,
+      "seconds": 20.879827959004615,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q14/iteration2/duckdb/q14/result.txt",
+      "answer_sha256": "c2662b6d18a49ddec4d3baee45ffa12dd2fd756dcb1d2fe16a3291c183142f9c",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 14,
+      "rows": 1,
+      "seconds": 1.865240676997928,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q15/iteration1/duckdb/q15/result.txt",
+      "answer_sha256": "ba5f3d7b342d0526fda6ff61ebe280dc3dfeb776bf21715b0f47e098c3938682",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 15,
+      "rows": 1,
+      "seconds": 19.863020543001767,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q15/iteration2/duckdb/q15/result.txt",
+      "answer_sha256": "ba5f3d7b342d0526fda6ff61ebe280dc3dfeb776bf21715b0f47e098c3938682",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 15,
+      "rows": 1,
+      "seconds": 0.9922901610043482,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q16/iteration1/duckdb/q16/result.txt",
+      "answer_sha256": "f609e1bdd0d8d84517ad57f42953df8fac562822bf83cfb54282d9980d67cd7e",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 16,
+      "rows": 27840,
+      "seconds": 2.2992931379994843,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q16/iteration2/duckdb/q16/result.txt",
+      "answer_sha256": "f609e1bdd0d8d84517ad57f42953df8fac562822bf83cfb54282d9980d67cd7e",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 16,
+      "rows": 27840,
+      "seconds": 0.7974878900058684,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q17/iteration1/duckdb/q17/result.txt",
+      "answer_sha256": "4b3d5e4389ba56d04088a16dba0daf0d0645220fbbca41ea3ec89b564a0a067a",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 17,
+      "rows": 1,
+      "seconds": 14.842849679997016,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q17/iteration2/duckdb/q17/result.txt",
+      "answer_sha256": "4b3d5e4389ba56d04088a16dba0daf0d0645220fbbca41ea3ec89b564a0a067a",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 17,
+      "rows": 1,
+      "seconds": 1.2378770259965677,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q18/iteration1/duckdb/q18/result.txt",
+      "answer_sha256": "a343bbc61900b634b7f5c9d6bfd78a60a04012001d0091ebc37bfb013b20f239",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 18,
+      "rows": 100,
+      "seconds": 16.692001221999817,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q18/iteration2/duckdb/q18/result.txt",
+      "answer_sha256": "a343bbc61900b634b7f5c9d6bfd78a60a04012001d0091ebc37bfb013b20f239",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 18,
+      "rows": 100,
+      "seconds": 4.58817551300308,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q19/iteration1/duckdb/q19/result.txt",
+      "answer_sha256": "d21e516c0f5fb885731d6a5034580fcae7c75e5b60ff0a4e865a8fca171fea3c",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 19,
+      "rows": 1,
+      "seconds": 20.247168554000382,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q19/iteration2/duckdb/q19/result.txt",
+      "answer_sha256": "d21e516c0f5fb885731d6a5034580fcae7c75e5b60ff0a4e865a8fca171fea3c",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 19,
+      "rows": 1,
+      "seconds": 1.1152447459971881,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q20/iteration1/duckdb/q20/result.txt",
+      "answer_sha256": "d209b9e8e75ae3dcc58f1881dfffa63480e82a3475fc3be00fa8ddedbc3337cd",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 20,
+      "rows": 111384,
+      "seconds": 21.772673276995192,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q20/iteration2/duckdb/q20/result.txt",
+      "answer_sha256": "d209b9e8e75ae3dcc58f1881dfffa63480e82a3475fc3be00fa8ddedbc3337cd",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 20,
+      "rows": 111384,
+      "seconds": 1.169530302999192,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q21/iteration1/duckdb/q21/result.txt",
+      "answer_sha256": "89445246fb1812e26d308ef7b029db80352195e86f5050a51af00b28a5f02210",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 21,
+      "rows": 100,
+      "seconds": 25.3977920729958,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q21/iteration2/duckdb/q21/result.txt",
+      "answer_sha256": "89445246fb1812e26d308ef7b029db80352195e86f5050a51af00b28a5f02210",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 21,
+      "rows": 100,
+      "seconds": 5.796058430001722,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q22/iteration1/duckdb/q22/result.txt",
+      "answer_sha256": "7521a5853dcf1f8dc13ebedf892100b10fdddda9ae86753da42c8b1ace7d2104",
+      "iteration": 1,
+      "memory_limit_bytes": 318617491865,
+      "query": 22,
+      "rows": 7,
+      "seconds": 4.461993420001818,
+      "source_phase": "sf1000-initial"
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000/runner/results/q22/iteration2/duckdb/q22/result.txt",
+      "answer_sha256": "7521a5853dcf1f8dc13ebedf892100b10fdddda9ae86753da42c8b1ace7d2104",
+      "iteration": 2,
+      "memory_limit_bytes": 318617491865,
+      "query": 22,
+      "rows": 7,
+      "seconds": 1.6358543850001297,
+      "source_phase": "sf1000-initial"
+    }
+  ],
+  "native_arch_on": true,
+  "page_size": 65536,
+  "scale_factor": 1000,
+  "totals": [
+    {
+      "available_sum_s": 375.2857846400002,
+      "iteration": 1,
+      "queries": 22,
+      "sum_s": 375.2857846400002
+    },
+    {
+      "available_sum_s": 50.11446212101146,
+      "iteration": 2,
+      "queries": 22,
+      "sum_s": 50.11446212101146
+    }
+  ],
+  "uniform_memory_configuration": true
+}

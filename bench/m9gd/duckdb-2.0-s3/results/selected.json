@@ -1,12 +1,13 @@
 {
   "sf1000": {
     "iteration_sums_s": [
-      400.4399346609999,
-      66.5447536960001
+      375.2857846400002,
+      50.11446212101146
     ],
-    "native_arch_on": false,
-    "page_size": 4096,
-    "snapshot": "20261124"
+    "native_arch_on": true,
+    "page_size": 65536,
+    "snapshot": "20261125-native64k",
+    "uniform_memory_configuration": true
   },
   "sf10000": {
     "iteration_sums_s": [

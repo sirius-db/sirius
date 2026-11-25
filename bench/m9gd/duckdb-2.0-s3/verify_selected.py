@@ -2,6 +2,7 @@
 """Audit saved native-build selections; does not run queries or contact AWS."""
 
 import csv
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -23,6 +24,8 @@ def main():
         assert path.stat().st_size == expected["bytes"], name
         assert sha(path) == expected["sha256"], name
     build = read(folder / "build.json")
+    for script in read(folder / "executed-scripts.json").values():
+        assert hashlib.sha256(script["source"].encode()).hexdigest() == script["sha256"]
     assert build["page_size"] == 65536
     assert build["native_arch_on"] and build["native_mcpu_verified"]
     assert build["source_core_commit"] == "d54cbbe3df17e8e5ce68312f483b4155836112aa"
@@ -57,7 +60,7 @@ def main():
     combined = list(csv.DictReader((folder / "per-query.csv").open()))
     assert len(combined) == 23 and combined[-1]["query"] == "SUM"
     count = 0
-    for sf in (3000, 10000):
+    for sf in manifest.get("scales", [3000, 10000]):
         data = read(folder / f"sf{sf}.json")
         assert len(data["measurements"]) == 44
         assert len({(m["query"], m["iteration"]) for m in data["measurements"]}) == 44
@@ -108,10 +111,19 @@ def main():
                 total["sum_s"], actual, abs_tol=1e-9
             )
             assert float(combined[-1][f"sf{sf}_iteration{i}_s"]) == total["sum_s"]
-            assert selected[f"sf{sf}"]["iteration_sums_s"][i - 1] == total["sum_s"]
-    assert count == manifest["selected_timings"] == 88
+            if selected[f"sf{sf}"]["snapshot"] == folder.name:
+                assert selected[f"sf{sf}"]["iteration_sums_s"][i - 1] == total["sum_s"]
+            else:
+                assert sf == 1000
+                assert (
+                    selected["sf1000"]["native_comparison_sums_s"][i - 1]
+                    == total["sum_s"]
+                )
+    assert count == manifest.get(
+        "native_snapshot_timings", manifest["selected_timings"]
+    )
     print(
-        "PASS: 88 selected native timings, four sums, source phases, CPU validation, page/build/cache/memory and archive proofs"
+        f"PASS: {count} native timings, source phases, CPU validation, sums, page/build/cache/memory and archive proofs"
     )
     print(
         "SF10000 is assembled with retries and Q12 at 256 GiB; it is not a uniform-memory suite."

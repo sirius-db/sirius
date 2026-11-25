@@ -1,4 +1,28 @@
 {
+  "sf1000-initial": {
+    "bytes": 23407371,
+    "complete": true,
+    "exit_code": 0,
+    "files": 258,
+    "iteration_coverage": [
+      {
+        "available_sum_s": 375.2857846400002,
+        "iteration": 1,
+        "queries": 22,
+        "sum_s": 375.2857846400002
+      },
+      {
+        "available_sum_s": 50.11446212101146,
+        "iteration": 2,
+        "queries": 22,
+        "sum_s": 50.11446212101146
+      }
+    ],
+    "measurements": 44,
+    "path": "/home/ec2-user/m9gd24-duckdb200-native64k-sf1k-20261125/sf1000-full-results-native64.tar.gz",
+    "payload_bytes": 80838151,
+    "sha256": "69b3beb0f2d12371cd7b51a058bf475bb048d5c1212e3bdbe91a42da85355b2c"
+  },
   "sf10000-initial": {
     "bytes": 188702077,
     "complete": false,

@@ -11,7 +11,7 @@ measured scripts. These are CPU DuckDB results; Sirius is not loaded. The M9gd
 recipe is separate from the [G7e](../g7e/README.md) and
 [GB300](../gb300/README.md) GPU protocols.
 
-The November 25 SF3000/SF10000 selections use a native Release build and a
+The November 25 SF1000/SF3000/SF10000 selections use a native Release build and a
 64 KiB page kernel. SF10000 combines original measurements and retries;
 **Q12 uses a 256 GiB memory limit**, while other queries use 296.7 GiB.
 That selection is not a uniform-memory full-suite run. The earlier 4 KiB

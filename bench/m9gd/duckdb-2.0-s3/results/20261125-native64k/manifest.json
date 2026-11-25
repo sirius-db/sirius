@@ -3,32 +3,36 @@
   "engine": "DuckDB 2.0.0",
   "files": {
     "RESULTS.md": {
-      "bytes": 3929,
-      "sha256": "f17db30bcce826c4da5b6e5f6d4416835d349c2985c7b541b6ee1be8e31c80ca"
+      "bytes": 4613,
+      "sha256": "26760da909893d4f396b15176bcb45b49c7b5131a61a49f584a9da8c8eabcd42"
     },
     "build.json": {
       "bytes": 8553,
       "sha256": "cecf6ebdb67292c5efb2bc0633aa58c95f15307aaa5260b619039eee89010578"
     },
     "executed-scripts.json": {
-      "bytes": 26266,
-      "sha256": "38bdd6cd458b4bb20585cfe7577c898ce63c36ff69b952d09145ec997267d42e"
+      "bytes": 31397,
+      "sha256": "ae1a7d7b4d5c7959590127198547cd187602bb40419d0de4d611c59e26794ae9"
     },
     "failures.json": {
       "bytes": 624,
       "sha256": "567633725cc0c10046bbebc9256878af6bcacafc2c8eb177b4843549d91997a0"
     },
     "full-archives.json": {
-      "bytes": 2502,
-      "sha256": "9ed102a494d607326553ced21e2a2d2e743591da2f042638a10e783e6025ac95"
+      "bytes": 3179,
+      "sha256": "7d8468f723bc4b1a63ebb39d7038b0e5bc84e2dede2d71a5b05ecc73c43d277c"
     },
     "kernel.json": {
       "bytes": 7345,
       "sha256": "84c4873e64cf914187016b5aaafd4fb67d59d140350424f997ce79538e62ba1b"
     },
     "per-query.csv": {
-      "bytes": 2155,
-      "sha256": "9b364783c9f3187529c2522b8e6eedfb1ba5fefe77acc89c11494375410bd963"
+      "bytes": 3048,
+      "sha256": "66fda942d60a3f1cc5fb79f68d311213582c76a4cbbe0c96e0f01815455c02b9"
+    },
+    "phases/sf1000-initial.json": {
+      "bytes": 173643,
+      "sha256": "45148b7709bdf9a172737ceea93966b1f2d9751c43866e0b5edfb56b8d7a3cef"
     },
     "phases/sf10000-initial.json": {
       "bytes": 169521,
@@ -46,6 +50,10 @@
       "bytes": 173309,
       "sha256": "957972144a93c88f955885c791e75c5fe61cfef69c605a7e592331e48616082c"
     },
+    "sf1000.json": {
+      "bytes": 18687,
+      "sha256": "3b237dad7aeb05a588c94112e384b521345a248dd19348d155ca53fb0c0c2931"
+    },
     "sf10000.json": {
       "bytes": 20146,
       "sha256": "9c75648e4d26c263db7e29478c9d47b8e0f8cdff3ab96d071b80171029f51b0a"
@@ -55,5 +63,11 @@
       "sha256": "6f56e2bbbad1e9bdd90bfeebb4d2662500c0eefd1a7758175628f462b3dc4edf"
     }
   },
-  "selected_timings": 88
+  "native_snapshot_timings": 132,
+  "scales": [
+    1000,
+    3000,
+    10000
+  ],
+  "selected_timings": 132
 }
