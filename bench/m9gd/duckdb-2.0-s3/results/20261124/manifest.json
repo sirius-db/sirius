@@ -1,0 +1,162 @@
+{
+  "complete_iterations": 6,
+  "date": "2026-11-24",
+  "engine": "DuckDB 2.0.0",
+  "files": {
+    "RESULTS.md": {
+      "bytes": 6143,
+      "sha256": "774dee417406639c0d0b6d2154ab9fc68b5072a05ccb95c1aa1690fe32868bbf"
+    },
+    "full-archives.json": {
+      "bytes": 989,
+      "sha256": "2220d3dda4e9c7f05aba7f87d9f8971a507565a9f97cbc83f8f98b04ce6499d1"
+    },
+    "per-query.csv": {
+      "bytes": 2729,
+      "sha256": "e1349799340593bdcc5648a02147a3f2792f828adb7cb8ee206465c4e089f3b0"
+    },
+    "scale-summary.csv": {
+      "bytes": 172,
+      "sha256": "27e015924fe9886f3ec5469cb67af734aea0f40a8a47a6509e2e38328c627750"
+    },
+    "sf1000/answer-validation.json": {
+      "bytes": 8706,
+      "sha256": "4447ab94fdd140c3d8551bcd6b295bd4476667c085cb4e288aece264f21dd1b2"
+    },
+    "sf1000/cache-evidence.json": {
+      "bytes": 9606,
+      "sha256": "32aaa22775d154465e48457abfba48873c5b9104241c47f7f74db0bd752a5be4"
+    },
+    "sf1000/config.json": {
+      "bytes": 10254,
+      "sha256": "ed9796348bd3cd2d17bd8854a1ecbd2f65a40714e2399dbc99da8500e1d88f25"
+    },
+    "sf1000/environment.txt": {
+      "bytes": 152,
+      "sha256": "ce6882101eea4b172555665b524809129815b5040de8e630436b9bd21d15b939"
+    },
+    "sf1000/final-verification.json": {
+      "bytes": 532,
+      "sha256": "fe284fe44c75d2378df5286b43546f9550ba45d7f118f2047321e3b0394c271f"
+    },
+    "sf1000/lifecycle.json": {
+      "bytes": 62375,
+      "sha256": "5581e1b76ce99d8054fce1a28a2e2d519899deced8b3227474fdacde878ba021"
+    },
+    "sf1000/per-query.csv": {
+      "bytes": 912,
+      "sha256": "2e11ec018245965a0068967d156030eeffa2e7bb73b8f4aaa9875c5cc0655d17"
+    },
+    "sf1000/provenance.json": {
+      "bytes": 10858,
+      "sha256": "f27846cb43aa43b7b1b27a6266b12d1a5b8b3ca50308b84e090d50f6771644b9"
+    },
+    "sf1000/queries.sql": {
+      "bytes": 13149,
+      "sha256": "89914d63056744c2dac9f4e4aca690b5aab94000f02fe44433b174278e70cc6e"
+    },
+    "sf1000/sql-sha256.json": {
+      "bytes": 1697,
+      "sha256": "f34f6960481414110cfd7b12ffe62bb43013e5885bbad5a54eba068a11c8b637"
+    },
+    "sf1000/summary.json": {
+      "bytes": 14146,
+      "sha256": "972d784c1aef3adbb0575d9efc206e78b5c4f997b36980f4f90b92da2219e22f"
+    },
+    "sf10000/answer-validation.json": {
+      "bytes": 8682,
+      "sha256": "c73d53a23c715a1d1035de6cdbddf6fabc5ccb2af03ff237eaff7841cd903b65"
+    },
+    "sf10000/cache-evidence.json": {
+      "bytes": 9650,
+      "sha256": "9290f61133bbd2fc7e6a6e89dab2edd0cc616c56a7f6fdadbdfc7cc9efd128f9"
+    },
+    "sf10000/config.json": {
+      "bytes": 10311,
+      "sha256": "9ac08c1791fb5b2f963f5e54d3a44d6aaef896c910019965aa3a8ea0767690d2"
+    },
+    "sf10000/environment.txt": {
+      "bytes": 152,
+      "sha256": "ce6882101eea4b172555665b524809129815b5040de8e630436b9bd21d15b939"
+    },
+    "sf10000/final-verification.json": {
+      "bytes": 559,
+      "sha256": "cc87e925ae1ddaed06ac25ee6739dcd56680aba2e6bd07e64bd95b656741bc26"
+    },
+    "sf10000/lifecycle.json": {
+      "bytes": 62725,
+      "sha256": "dae0f84fdb36754fc4b2161cf848560aefd8f649bb3e057c3cf807dec2456cff"
+    },
+    "sf10000/per-query.csv": {
+      "bytes": 886,
+      "sha256": "6e1b7fa57a84af568b7882d575e6104bd9a7f761db200309fcb23602cfb16e97"
+    },
+    "sf10000/provenance.json": {
+      "bytes": 10795,
+      "sha256": "e68efe7bc40b336f232c0b4a2980c9441b1065deda4ec08cf6c129561a57247e"
+    },
+    "sf10000/queries.sql": {
+      "bytes": 13149,
+      "sha256": "fc621f680bbb8c7df684371ff486ef1e8f893876fbc59dd9e838783d5edf0132"
+    },
+    "sf10000/sql-sha256.json": {
+      "bytes": 1697,
+      "sha256": "4841fce594741b3939090305b0dc6c9a2310efbd41cfb4f9ba8086d7b310ee3e"
+    },
+    "sf10000/summary.json": {
+      "bytes": 14740,
+      "sha256": "b0a0803931a55aedac368e6bd52d9987b98f510fd3d1a96dadc461d069cc0251"
+    },
+    "sf3000/answer-validation.json": {
+      "bytes": 8696,
+      "sha256": "b41a0aeee29063dd142d9b1f673801b06078978085e865f81fbd331d7a9d8acd"
+    },
+    "sf3000/cache-evidence.json": {
+      "bytes": 9682,
+      "sha256": "7fdb3c5a70654de464fe26c90d1711348d787d4caa2d4f3a5b6e044c8ea9891c"
+    },
+    "sf3000/config.json": {
+      "bytes": 10288,
+      "sha256": "33cd2a808bc8bf53a9202415ed18cb9aec443162f50087a9a70bc2bdb9c7eec8"
+    },
+    "sf3000/environment.txt": {
+      "bytes": 152,
+      "sha256": "ce6882101eea4b172555665b524809129815b5040de8e630436b9bd21d15b939"
+    },
+    "sf3000/final-verification.json": {
+      "bytes": 562,
+      "sha256": "350a89dd942e6ff26ba2514595301def90a7395a828be8ec5468f37086d74b13"
+    },
+    "sf3000/lifecycle.json": {
+      "bytes": 62727,
+      "sha256": "4d0ad36e49a70cb26b1725e97efa45dd5c104456a91747746785e14fc2282980"
+    },
+    "sf3000/per-query.csv": {
+      "bytes": 900,
+      "sha256": "db427bfeaf1441501089cbd1e5eaa1f7ce234d2e2d7b5f7007b2da195554809f"
+    },
+    "sf3000/provenance.json": {
+      "bytes": 10784,
+      "sha256": "a60e0adffa3add7115e9ec6d97626954c599d11850c9e941da244b7df45146fb"
+    },
+    "sf3000/queries.sql": {
+      "bytes": 13149,
+      "sha256": "753b63a1f4d846ec97d2150bb1b5446f6a44f13644901fa6dc5225ef5015cee9"
+    },
+    "sf3000/sql-sha256.json": {
+      "bytes": 1697,
+      "sha256": "dd907246d1b5f5cca810d32a94ffcf02646158a696bfde50e02f743e790ba37f"
+    },
+    "sf3000/summary.json": {
+      "bytes": 14714,
+      "sha256": "eae9a474cddbfad5e2b5e0d09f3dd08e41282902f7519b37ce5d5eb2805077c0"
+    }
+  },
+  "fresh_processes": 66,
+  "full_archives": "See full-archives.json; archives retained locally, not committed.",
+  "instance_type": "m9gd.24xlarge",
+  "os_cache_clears": 66,
+  "region": "us-east-1",
+  "timezone": "America/Chicago",
+  "validated_measurements": 132
+}

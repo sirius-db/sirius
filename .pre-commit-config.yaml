@@ -16,7 +16,8 @@
 # .patch files are verbatim diffs: formatters (trailing-whitespace, end-of-file-fixer)
 # strip the leading context space on blank lines and corrupt `git apply`.
 # Paimon warehouse files are verbatim writer output, checked by corpus hashes.
-exclude: \.csv$|\.patch$|^experimental/.*|^src/include/third_party/.*|^test/cpp/integration/data/paimon_conformance/warehouse/
+# Measured DuckDB scripts are verbatim source snapshots, checked by SHA256.
+exclude: \.csv$|\.patch$|^experimental/.*|^src/include/third_party/.*|^test/cpp/integration/data/paimon_conformance/warehouse/|^bench/m9gd/duckdb-2.0-s3/measured/
 
 repos:
   # Standard hooks

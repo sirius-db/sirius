@@ -1,0 +1,244 @@
+{
+  "archive": {
+    "all_payload_hashes_verified": true,
+    "archive_bytes": 25965262,
+    "archive_sha256": "3d8427bcda1433d5f7b37a0b61055590ab42cac513cebebe30a3b691a673d194",
+    "files": 236
+  },
+  "bucket_region_evidence": {
+    "api_response": {
+      "LocationConstraint": null
+    },
+    "bucket": "sae-dataproc-aws-dev-sirius-scratch-us-east-1",
+    "method": "AWS GetBucketLocation via authenticated control-plane profile",
+    "normalized_region": "us-east-1",
+    "verified_at_utc": "2026-11-24T22:29:36.538192+00:00"
+  },
+  "generation_manifest": {
+    "bytes": 284000351092,
+    "files": 90,
+    "sha256": "2ebc58358c0f838f3d9b8f52d91b02b43216e82ac3ad40dd661910b8a8042745",
+    "tables": {
+      "customer": 150000000,
+      "lineitem": 5999989709,
+      "nation": 25,
+      "orders": 1500000000,
+      "part": 200000000,
+      "partsupp": 800000000,
+      "region": 5,
+      "supplier": 10000000
+    }
+  },
+  "hardware": "Architecture:                            aarch64\nCPU op-mode(s):                          64-bit\nByte Order:                              Little Endian\nCPU(s):                                  96\nOn-line CPU(s) list:                     0-95\nVendor ID:                               ARM\nModel:                                   1\nThread(s) per core:                      1\nCore(s) per socket:                      96\nSocket(s):                               1\nStepping:                                r0p1\nBogoMIPS:                                2000.00\nFlags:                                   fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 flagm2 frint svei8mm svebf16 i8mm bf16 dgh rng bti ecv afp wfxt\nL1d cache:                               6 MiB (96 instances)\nL1i cache:                               6 MiB (96 instances)\nL2 cache:                                192 MiB (96 instances)\nL3 cache:                                96 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-95\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; CSV2, BHB\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n",
+  "instance": {
+    "architecture": "arm64",
+    "availabilityZone": "us-east-1a",
+    "imageId": "ami-0272643e149bb16d0",
+    "instanceId": "i-0ac1da908cae3af37",
+    "instanceType": "m9gd.24xlarge",
+    "region": "us-east-1"
+  },
+  "memory": "MemTotal:       388937368 kB\nMemFree:        387022336 kB\nMemAvailable:   385714756 kB\nBuffers:            3120 kB\nCached:           833068 kB\nSwapCached:            0 kB\nActive:           374264 kB\nInactive:         752076 kB\nActive(anon):        480 kB\nInactive(anon):   294328 kB\nActive(file):     373784 kB\nInactive(file):   457748 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              6696 kB\nWriteback:             0 kB\nAnonPages:        291332 kB\nMapped:           128616 kB\nShmem:              1232 kB\nKReclaimable:      87832 kB\nSlab:             312776 kB\nSReclaimable:      87832 kB\nSUnreclaim:       224944 kB\nKernelStack:       23584 kB\nPageTables:         6352 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    194468684 kB\nCommitted_AS:     984920 kB\nVmallocTotal:   135288315904 kB\nVmallocUsed:       41568 kB\nVmallocChunk:          0 kB\nPercpu:            39168 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:    137216 kB\nFilePmdMapped:     10240 kB\nCmaTotal:          65536 kB\nCmaFree:           51040 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\n",
+  "parquet_footer_counts": {
+    "customer": 150000000,
+    "lineitem": 5999989709,
+    "nation": 25,
+    "orders": 1500000000,
+    "part": 200000000,
+    "partsupp": 800000000,
+    "region": 5,
+    "supplier": 10000000
+  },
+  "postflight": {
+    "datasets": {
+      "1000": {
+        "bytes": 284000351092,
+        "files": 90,
+        "inventory_matches": true,
+        "manifest_unchanged": true
+      },
+      "10000": {
+        "bytes": 2905868752031,
+        "files": 868,
+        "inventory_matches": true,
+        "manifest_unchanged": true
+      },
+      "3000": {
+        "bytes": 860695195091,
+        "files": 263,
+        "inventory_matches": true,
+        "manifest_unchanged": true
+      }
+    },
+    "measured_sources_unchanged": true,
+    "no_benchmark_workers_remaining": true,
+    "storage_mount": {
+      "filesystems": [
+        {
+          "fstype": "xfs",
+          "options": "rw,relatime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,sunit=1024,swidth=3072,noquota",
+          "source": "/dev/md127",
+          "target": "/mnt/nvme"
+        }
+      ]
+    },
+    "verified_at_utc": "2026-11-24T22:40:21.490889+00:00"
+  },
+  "scale_factor": 1000,
+  "storage": {
+    "lsblk": {
+      "blockdevices": [
+        {
+          "children": [
+            {
+              "fstype": "xfs",
+              "model": null,
+              "mountpoints": [
+                "/"
+              ],
+              "name": "nvme1n1p1",
+              "path": "/dev/nvme1n1p1",
+              "size": "64G",
+              "type": "part"
+            },
+            {
+              "fstype": "vfat",
+              "model": null,
+              "mountpoints": [
+                "/boot/efi"
+              ],
+              "name": "nvme1n1p128",
+              "path": "/dev/nvme1n1p128",
+              "size": "10M",
+              "type": "part"
+            }
+          ],
+          "fstype": null,
+          "model": "Amazon Elastic Block Store",
+          "mountpoints": [
+            null
+          ],
+          "name": "nvme1n1",
+          "path": "/dev/nvme1n1",
+          "size": "64G",
+          "type": "disk"
+        },
+        {
+          "children": [
+            {
+              "fstype": "xfs",
+              "model": null,
+              "mountpoints": [
+                "/mnt/nvme"
+              ],
+              "name": "md127",
+              "path": "/dev/md127",
+              "size": "5.2T",
+              "type": "raid0"
+            }
+          ],
+          "fstype": "linux_raid_member",
+          "model": "Amazon EC2 NVMe Instance Storage",
+          "mountpoints": [
+            null
+          ],
+          "name": "nvme2n1",
+          "path": "/dev/nvme2n1",
+          "size": "1.7T",
+          "type": "disk"
+        },
+        {
+          "children": [
+            {
+              "fstype": "xfs",
+              "model": null,
+              "mountpoints": [
+                "/mnt/nvme"
+              ],
+              "name": "md127",
+              "path": "/dev/md127",
+              "size": "5.2T",
+              "type": "raid0"
+            }
+          ],
+          "fstype": "linux_raid_member",
+          "model": "Amazon EC2 NVMe Instance Storage",
+          "mountpoints": [
+            null
+          ],
+          "name": "nvme3n1",
+          "path": "/dev/nvme3n1",
+          "size": "1.7T",
+          "type": "disk"
+        },
+        {
+          "children": [
+            {
+              "fstype": "xfs",
+              "model": null,
+              "mountpoints": [
+                "/mnt/nvme"
+              ],
+              "name": "md127",
+              "path": "/dev/md127",
+              "size": "5.2T",
+              "type": "raid0"
+            }
+          ],
+          "fstype": "linux_raid_member",
+          "model": "Amazon EC2 NVMe Instance Storage",
+          "mountpoints": [
+            null
+          ],
+          "name": "nvme0n1",
+          "path": "/dev/nvme0n1",
+          "size": "1.7T",
+          "type": "disk"
+        }
+      ]
+    },
+    "mount": {
+      "filesystems": [
+        {
+          "fstype": "xfs",
+          "options": "rw,relatime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,sunit=1024,swidth=3072,noquota",
+          "source": "/dev/md127",
+          "target": "/mnt/nvme"
+        }
+      ]
+    },
+    "physical_disks": [
+      {
+        "fstype": null,
+        "model": "Amazon EC2 NVMe Instance Storage",
+        "mountpoints": [
+          null
+        ],
+        "name": "nvme2n1",
+        "path": "/dev/nvme2n1",
+        "type": "disk"
+      },
+      {
+        "fstype": null,
+        "model": "Amazon EC2 NVMe Instance Storage",
+        "mountpoints": [
+          null
+        ],
+        "name": "nvme3n1",
+        "path": "/dev/nvme3n1",
+        "type": "disk"
+      },
+      {
+        "fstype": null,
+        "model": "Amazon EC2 NVMe Instance Storage",
+        "mountpoints": [
+          null
+        ],
+        "name": "nvme0n1",
+        "path": "/dev/nvme0n1",
+        "type": "disk"
+      }
+    ],
+    "raid": "/dev/md/duckdb:\n           Version : 1.2\n     Creation Time : Tue Nov 24 22:25:16 2026\n        Raid Level : raid0\n        Array Size : 5566009344 (5.18 TiB 5.70 TB)\n      Raid Devices : 3\n     Total Devices : 3\n       Persistence : Superblock is persistent\n\n       Update Time : Tue Nov 24 22:25:16 2026\n             State : clean \n    Active Devices : 3\n   Working Devices : 3\n    Failed Devices : 0\n     Spare Devices : 0\n\n            Layout : -unknown-\n        Chunk Size : 512K\n\nConsistency Policy : none\n\n              Name : duckdb\n              UUID : 502fb94e:425a2897:6f45ac86:34ddfb66\n            Events : 0\n\n    Number   Major   Minor   RaidDevice State\n       0     259        3        0      active sync   /dev/nvme2n1\n       1     259        4        1      active sync   /dev/nvme3n1\n       2     259        5        2      active sync   /dev/nvme0n1\n"
+  }
+}

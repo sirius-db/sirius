@@ -1,0 +1,25 @@
+{
+  "both_cache_flags_enabled": true,
+  "cache_clears": 22,
+  "complete": true,
+  "correct": 44,
+  "fresh_processes": 22,
+  "iteration_totals": [
+    {
+      "available_sum_s": 400.4399346609999,
+      "iteration": 1,
+      "queries": 22,
+      "sum_s": 400.4399346609999
+    },
+    {
+      "available_sum_s": 66.5447536960001,
+      "iteration": 2,
+      "queries": 22,
+      "sum_s": 66.5447536960001
+    }
+  ],
+  "no_warmup": true,
+  "query_pattern": "Q1 Q1 clear/restart Q2 Q2 ... Q22 Q22",
+  "threads": 96,
+  "validated": 44
+}

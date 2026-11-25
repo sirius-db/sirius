@@ -1,0 +1,408 @@
+[
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 1,
+    "seconds": 14.194553927000015
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 1,
+    "seconds": 1.5676311310000415
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 2,
+    "seconds": 4.237448933000053
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 2,
+    "seconds": 0.5432414819999849
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "correct ordered answer including legal LIMIT-boundary ties",
+      "expanded_cpu_rows": 10,
+      "rows": 10
+    },
+    "iteration": 1,
+    "query": 3,
+    "seconds": 28.05952762200002
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "correct ordered answer including legal LIMIT-boundary ties",
+      "expanded_cpu_rows": 10,
+      "rows": 10
+    },
+    "iteration": 2,
+    "query": 3,
+    "seconds": 1.8770072720000144
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 4,
+    "seconds": 16.455638643000043
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 4,
+    "seconds": 1.2809061789999987
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 5,
+    "seconds": 24.186423729000012
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 5,
+    "seconds": 2.0042061359999934
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 6,
+    "seconds": 14.935764672999994
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 6,
+    "seconds": 0.591097540000078
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 7,
+    "seconds": 27.567176307999944
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 7,
+    "seconds": 2.1154279930000257
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 8,
+    "seconds": 22.818013653000094
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 8,
+    "seconds": 2.2105616810000583
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 9,
+    "seconds": 25.515061437999975
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 9,
+    "seconds": 7.876206643000046
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 10,
+    "seconds": 24.09229406299994
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 10,
+    "seconds": 4.843854343999965
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "matches pinned harness tolerance (float abs=1e-10, other values exact)",
+      "rows": 936989
+    },
+    "iteration": 1,
+    "query": 11,
+    "seconds": 2.5204373669999995
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "matches pinned harness tolerance (float abs=1e-10, other values exact)",
+      "rows": 936989
+    },
+    "iteration": 2,
+    "query": 11,
+    "seconds": 0.5453489479999689
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 12,
+    "seconds": 21.816085801999975
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 12,
+    "seconds": 1.1348022529999753
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 13,
+    "seconds": 8.995541286000048
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 13,
+    "seconds": 7.603164578000019
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 14,
+    "seconds": 21.229498596999974
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 14,
+    "seconds": 1.637761611999963
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 15,
+    "seconds": 20.424986316999934
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 15,
+    "seconds": 1.1139744109999583
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 16,
+    "seconds": 2.550687952999965
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 16,
+    "seconds": 0.8771745850000343
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 17,
+    "seconds": 17.40248791099998
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 17,
+    "seconds": 1.229126120999922
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "correct ordered answer including legal LIMIT-boundary ties",
+      "expanded_cpu_rows": 100,
+      "rows": 100
+    },
+    "iteration": 1,
+    "query": 18,
+    "seconds": 21.851198654999962
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "correct ordered answer including legal LIMIT-boundary ties",
+      "expanded_cpu_rows": 100,
+      "rows": 100
+    },
+    "iteration": 2,
+    "query": 18,
+    "seconds": 11.194882227000107
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 19,
+    "seconds": 21.838397477000058
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 19,
+    "seconds": 1.2065946949999216
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 20,
+    "seconds": 22.769278303999954
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 20,
+    "seconds": 1.2336288230000036
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 21,
+    "seconds": 33.096078337999984
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 21,
+    "seconds": 12.704580359000033
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 1,
+    "query": 22,
+    "seconds": 3.8833536649999587
+  },
+  {
+    "answer_validation": {
+      "correct": true,
+      "detail": "byte-exact independent CPU answer"
+    },
+    "iteration": 2,
+    "query": 22,
+    "seconds": 1.153574682999988
+  }
+]

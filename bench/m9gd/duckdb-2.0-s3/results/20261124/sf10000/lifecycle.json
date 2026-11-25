@@ -1,0 +1,2466 @@
+[
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 1,
+      "wall_ns": 1795562336614055062
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 64755,
+        "query": 1,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q01",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795562338151327274
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 64755,
+        "query": 1,
+        "wall_ns": 1795562338151462277
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 64755,
+        "query": 1,
+        "rows": 4,
+        "seconds": 156.86792532500021,
+        "wall_ns": 1795562495022186292
+      },
+      {
+        "cache": {
+          "bytes": 404228041475,
+          "entries": 226207,
+          "loaded_bytes": 317491975790,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 64755,
+        "query": 1,
+        "wall_ns": 1795562495174351413
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 64755,
+        "query": 1,
+        "wall_ns": 1795562495174615671
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 64755,
+        "query": 1,
+        "rows": 4,
+        "seconds": 41.10928835699997,
+        "wall_ns": 1795562536288810676
+      },
+      {
+        "cache": {
+          "bytes": 404228041475,
+          "entries": 226207,
+          "loaded_bytes": 317476831994,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 64755,
+        "query": 1,
+        "wall_ns": 1795562536433784614
+      },
+      {
+        "event": "engine_closed",
+        "pid": 64755,
+        "query": 1,
+        "wall_ns": 1795562557802050841
+      },
+      {
+        "event": "complete",
+        "pid": 64755,
+        "query": 1,
+        "wall_ns": 1795562557802305244
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795562336614055062,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q01",
+      "exit_code": 0,
+      "pid": 64755,
+      "query": 1,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 2,
+      "wall_ns": 1795562558125373922
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 65646,
+        "query": 2,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q02",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795562559827525710
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 65646,
+        "query": 2,
+        "wall_ns": 1795562559827662740
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 65646,
+        "query": 2,
+        "rows": 100,
+        "seconds": 30.23726226200006,
+        "wall_ns": 1795562590078753134
+      },
+      {
+        "cache": {
+          "bytes": 45130202088,
+          "entries": 32690,
+          "loaded_bytes": 45130202088,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 65646,
+        "query": 2,
+        "wall_ns": 1795562590103753421
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 65646,
+        "query": 2,
+        "wall_ns": 1795562590103951246
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 65646,
+        "query": 2,
+        "rows": 100,
+        "seconds": 2.8730948550000903,
+        "wall_ns": 1795562592990281501
+      },
+      {
+        "cache": {
+          "bytes": 45130202088,
+          "entries": 32690,
+          "loaded_bytes": 45130202088,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 65646,
+        "query": 2,
+        "wall_ns": 1795562593017195085
+      },
+      {
+        "event": "engine_closed",
+        "pid": 65646,
+        "query": 2,
+        "wall_ns": 1795562595357449283
+      },
+      {
+        "event": "complete",
+        "pid": 65646,
+        "query": 2,
+        "wall_ns": 1795562595357670214
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795562558125373922,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q02",
+      "exit_code": 0,
+      "pid": 65646,
+      "query": 2,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 3,
+      "wall_ns": 1795562595529989737
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 66152,
+        "query": 3,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q03",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795562597344129759
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 66152,
+        "query": 3,
+        "wall_ns": 1795562597344259022
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 66152,
+        "query": 3,
+        "rows": 10,
+        "seconds": 354.53217518300016,
+        "wall_ns": 1795562952005470305
+      },
+      {
+        "cache": {
+          "bytes": 630672816773,
+          "entries": 371591,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 66152,
+        "query": 3,
+        "wall_ns": 1795562952305564270
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 66152,
+        "query": 3,
+        "wall_ns": 1795562952305836045
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 66152,
+        "query": 3,
+        "rows": 10,
+        "seconds": 349.0003971389997,
+        "wall_ns": 1795563301413369020
+      },
+      {
+        "cache": {
+          "bytes": 640938994309,
+          "entries": 378715,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 66152,
+        "query": 3,
+        "wall_ns": 1795563301707949419
+      },
+      {
+        "event": "engine_closed",
+        "pid": 66152,
+        "query": 3,
+        "wall_ns": 1795563304743301695
+      },
+      {
+        "event": "complete",
+        "pid": 66152,
+        "query": 3,
+        "wall_ns": 1795563304743494157
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795562595529989737,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q03",
+      "exit_code": 0,
+      "pid": 66152,
+      "query": 3,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 4,
+      "wall_ns": 1795563307035562393
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 67629,
+        "query": 4,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q04",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795563308909129844
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 67629,
+        "query": 4,
+        "wall_ns": 1795563308909284255
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 67629,
+        "query": 4,
+        "rows": 5,
+        "seconds": 165.4707299820002,
+        "wall_ns": 1795563474524419938
+      },
+      {
+        "cache": {
+          "bytes": 229855790927,
+          "entries": 204156,
+          "loaded_bytes": 229855790927,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 67629,
+        "query": 4,
+        "wall_ns": 1795563474675022133
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 67629,
+        "query": 4,
+        "wall_ns": 1795563474675263629
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 67629,
+        "query": 4,
+        "rows": 5,
+        "seconds": 15.717430562000118,
+        "wall_ns": 1795563490484694979
+      },
+      {
+        "cache": {
+          "bytes": 229855790927,
+          "entries": 204156,
+          "loaded_bytes": 229855790927,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 67629,
+        "query": 4,
+        "wall_ns": 1795563490619580724
+      },
+      {
+        "event": "engine_closed",
+        "pid": 67629,
+        "query": 4,
+        "wall_ns": 1795563510509984380
+      },
+      {
+        "event": "complete",
+        "pid": 67629,
+        "query": 4,
+        "wall_ns": 1795563510510254833
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795563307035562393,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q04",
+      "exit_code": 0,
+      "pid": 67629,
+      "query": 4,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 5,
+      "wall_ns": 1795563510883751702
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 68421,
+        "query": 5,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q05",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795563512823393464
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 68421,
+        "query": 5,
+        "wall_ns": 1795563512823523239
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 68421,
+        "query": 5,
+        "rows": 5,
+        "seconds": 255.77056406500014,
+        "wall_ns": 1795563768606595370
+      },
+      {
+        "cache": {
+          "bytes": 538470279813,
+          "entries": 331644,
+          "loaded_bytes": 293705475842,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 68421,
+        "query": 5,
+        "wall_ns": 1795563768837918988
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 68421,
+        "query": 5,
+        "wall_ns": 1795563768838194330
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 68421,
+        "query": 5,
+        "rows": 5,
+        "seconds": 116.90524165999977,
+        "wall_ns": 1795563885748290356
+      },
+      {
+        "cache": {
+          "bytes": 538470279813,
+          "entries": 331644,
+          "loaded_bytes": 293170011075,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 68421,
+        "query": 5,
+        "wall_ns": 1795563885977347754
+      },
+      {
+        "event": "engine_closed",
+        "pid": 68421,
+        "query": 5,
+        "wall_ns": 1795563906312573125
+      },
+      {
+        "event": "complete",
+        "pid": 68421,
+        "query": 5,
+        "wall_ns": 1795563906312874889
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795563510883751702,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q05",
+      "exit_code": 0,
+      "pid": 68421,
+      "query": 5,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 6,
+      "wall_ns": 1795563906656067654
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 69501,
+        "query": 6,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q06",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795563908525296611
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 69501,
+        "query": 6,
+        "wall_ns": 1795563908525746841
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 69501,
+        "query": 6,
+        "rows": 1,
+        "seconds": 143.64410578299976,
+        "wall_ns": 1795564052172333829
+      },
+      {
+        "cache": {
+          "bytes": 350084246275,
+          "entries": 226207,
+          "loaded_bytes": 317530949679,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 69501,
+        "query": 6,
+        "wall_ns": 1795564052327768185
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 69501,
+        "query": 6,
+        "wall_ns": 1795564052328003523
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 69501,
+        "query": 6,
+        "rows": 1,
+        "seconds": 16.82148199400035,
+        "wall_ns": 1795564069152216694
+      },
+      {
+        "cache": {
+          "bytes": 350084246275,
+          "entries": 226207,
+          "loaded_bytes": 317530808190,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 69501,
+        "query": 6,
+        "wall_ns": 1795564069300552401
+      },
+      {
+        "event": "engine_closed",
+        "pid": 69501,
+        "query": 6,
+        "wall_ns": 1795564090093471592
+      },
+      {
+        "event": "complete",
+        "pid": 69501,
+        "query": 6,
+        "wall_ns": 1795564090093706464
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795563906656067654,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q06",
+      "exit_code": 0,
+      "pid": 69501,
+      "query": 6,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 7,
+      "wall_ns": 1795564090423745584
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 70293,
+        "query": 7,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q07",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795564092360023507
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 70293,
+        "query": 7,
+        "wall_ns": 1795564092360157685
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 70293,
+        "query": 7,
+        "rows": 4,
+        "seconds": 283.8720122530003,
+        "wall_ns": 1795564376269931300
+      },
+      {
+        "cache": {
+          "bytes": 606774307461,
+          "entries": 376644,
+          "loaded_bytes": 259208061252,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 70293,
+        "query": 7,
+        "wall_ns": 1795564376536722161
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 70293,
+        "query": 7,
+        "wall_ns": 1795564376536974090
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 70293,
+        "query": 7,
+        "rows": 4,
+        "seconds": 155.40679273099977,
+        "wall_ns": 1795564531986348092
+      },
+      {
+        "cache": {
+          "bytes": 609881111173,
+          "entries": 378699,
+          "loaded_bytes": 258727783247,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 70293,
+        "query": 7,
+        "wall_ns": 1795564532246333389
+      },
+      {
+        "event": "engine_closed",
+        "pid": 70293,
+        "query": 7,
+        "wall_ns": 1795564550656005779
+      },
+      {
+        "event": "complete",
+        "pid": 70293,
+        "query": 7,
+        "wall_ns": 1795564550656260391
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795564090423745584,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q07",
+      "exit_code": 0,
+      "pid": 70293,
+      "query": 7,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 8,
+      "wall_ns": 1795564551002976629
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 71415,
+        "query": 8,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q08",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795564552801744712
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 71415,
+        "query": 8,
+        "wall_ns": 1795564552801878615
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 71415,
+        "query": 8,
+        "rows": 2,
+        "seconds": 268.0708540379992,
+        "wall_ns": 1795564820876605976
+      },
+      {
+        "cache": {
+          "bytes": 784632339547,
+          "entries": 448543,
+          "loaded_bytes": 275263889670,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 71415,
+        "query": 8,
+        "wall_ns": 1795564821181320230
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 71415,
+        "query": 8,
+        "wall_ns": 1795564821181582851
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 71415,
+        "query": 8,
+        "rows": 2,
+        "seconds": 163.90637983899978,
+        "wall_ns": 1795564985092770550
+      },
+      {
+        "cache": {
+          "bytes": 787941747803,
+          "entries": 448904,
+          "loaded_bytes": 275004269386,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 71415,
+        "query": 8,
+        "wall_ns": 1795564985397001652
+      },
+      {
+        "event": "engine_closed",
+        "pid": 71415,
+        "query": 8,
+        "wall_ns": 1795565005916670225
+      },
+      {
+        "event": "complete",
+        "pid": 71415,
+        "query": 8,
+        "wall_ns": 1795565005916946413
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795564551002976629,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q08",
+      "exit_code": 0,
+      "pid": 71415,
+      "query": 8,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 9,
+      "wall_ns": 1795565006252065501
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 72550,
+        "query": 9,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q09",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795565007882341932
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 72550,
+        "query": 9,
+        "wall_ns": 1795565007882471493
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 72550,
+        "query": 9,
+        "rows": 175,
+        "seconds": 796.487252766,
+        "wall_ns": 1795565860481472024
+      },
+      {
+        "cache": {
+          "bytes": 833118429545,
+          "entries": 455536,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 72550,
+        "query": 9,
+        "wall_ns": 1795565860806768786
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 72550,
+        "query": 9,
+        "wall_ns": 1795565860808658903
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 72550,
+        "query": 9,
+        "rows": 175,
+        "seconds": 813.532046966,
+        "wall_ns": 1795566731719330191
+      },
+      {
+        "cache": {
+          "bytes": 833065312617,
+          "entries": 456124,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 72550,
+        "query": 9,
+        "wall_ns": 1795566732053042114
+      },
+      {
+        "event": "engine_closed",
+        "pid": 72550,
+        "query": 9,
+        "wall_ns": 1795566739641306059
+      },
+      {
+        "event": "complete",
+        "pid": 72550,
+        "query": 9,
+        "wall_ns": 1795566739641619644
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795565006252065501,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q09",
+      "exit_code": 0,
+      "pid": 72550,
+      "query": 9,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 10,
+      "wall_ns": 1795566743785149839
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 75296,
+        "query": 10,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q10",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795566745841898196
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 75296,
+        "query": 10,
+        "wall_ns": 1795566745842030929
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 75296,
+        "query": 10,
+        "rows": 20,
+        "seconds": 347.5166688020008,
+        "wall_ns": 1795567093483775243
+      },
+      {
+        "cache": {
+          "bytes": 697999170181,
+          "entries": 401650,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 75296,
+        "query": 10,
+        "wall_ns": 1795567093792228698
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 75296,
+        "query": 10,
+        "wall_ns": 1795567093794102405
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 75296,
+        "query": 10,
+        "rows": 20,
+        "seconds": 363.6004687680006,
+        "wall_ns": 1795567457538090591
+      },
+      {
+        "cache": {
+          "bytes": 708722481797,
+          "entries": 411024,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 75296,
+        "query": 10,
+        "wall_ns": 1795567457892431999
+      },
+      {
+        "event": "engine_closed",
+        "pid": 75296,
+        "query": 10,
+        "wall_ns": 1795567460526453728
+      },
+      {
+        "event": "complete",
+        "pid": 75296,
+        "query": 10,
+        "wall_ns": 1795567460526728561
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795566743785149839,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q10",
+      "exit_code": 0,
+      "pid": 75296,
+      "query": 10,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 11,
+      "wall_ns": 1795567462060696334
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 76807,
+        "query": 11,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q11",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795567464479369585
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 76807,
+        "query": 11,
+        "wall_ns": 1795567464479504364
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 76807,
+        "query": 11,
+        "rows": 9365098,
+        "seconds": 19.08939456200096,
+        "wall_ns": 1795567491002436705
+      },
+      {
+        "cache": {
+          "bytes": 48317118994,
+          "entries": 31022,
+          "loaded_bytes": 48317118994,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 76807,
+        "query": 11,
+        "wall_ns": 1795567494327552366
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 76807,
+        "query": 11,
+        "wall_ns": 1795567494327804992
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 76807,
+        "query": 11,
+        "rows": 9365098,
+        "seconds": 4.8890228390009725,
+        "wall_ns": 1795567506746897909
+      },
+      {
+        "cache": {
+          "bytes": 48317118994,
+          "entries": 31022,
+          "loaded_bytes": 48317118994,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 76807,
+        "query": 11,
+        "wall_ns": 1795567510088681745
+      },
+      {
+        "event": "engine_closed",
+        "pid": 76807,
+        "query": 11,
+        "wall_ns": 1795567514660707524
+      },
+      {
+        "event": "complete",
+        "pid": 76807,
+        "query": 11,
+        "wall_ns": 1795567514660945017
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795567462060696334,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q11",
+      "exit_code": 0,
+      "pid": 76807,
+      "query": 11,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 12,
+      "wall_ns": 1795567518893944521
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 77342,
+        "query": 12,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q12",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795567521221801673
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 77342,
+        "query": 12,
+        "wall_ns": 1795567521221942227
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 77342,
+        "query": 12,
+        "rows": 2,
+        "seconds": 235.77368278500035,
+        "wall_ns": 1795567757036116520
+      },
+      {
+        "cache": {
+          "bytes": 320915351375,
+          "entries": 305556,
+          "loaded_bytes": 294987662714,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 77342,
+        "query": 12,
+        "wall_ns": 1795567757250963852
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 77342,
+        "query": 12,
+        "wall_ns": 1795567757251225825
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 77342,
+        "query": 12,
+        "rows": 2,
+        "seconds": 35.67274212599841,
+        "wall_ns": 1795567792969011113
+      },
+      {
+        "cache": {
+          "bytes": 320915351375,
+          "entries": 305556,
+          "loaded_bytes": 294930232698,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 77342,
+        "query": 12,
+        "wall_ns": 1795567793171918402
+      },
+      {
+        "event": "engine_closed",
+        "pid": 77342,
+        "query": 12,
+        "wall_ns": 1795567813551174312
+      },
+      {
+        "event": "complete",
+        "pid": 77342,
+        "query": 12,
+        "wall_ns": 1795567813551440152
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795567518893944521,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q12",
+      "exit_code": 0,
+      "pid": 77342,
+      "query": 12,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 13,
+      "wall_ns": 1795567813892809068
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 78294,
+        "query": 13,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q13",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795567815670735558
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 78294,
+        "query": 13,
+        "wall_ns": 1795567815670869640
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 78294,
+        "query": 13,
+        "rows": 10,
+        "seconds": 124.19853760499973,
+        "wall_ns": 1795567940253352651
+      },
+      {
+        "cache": {
+          "bytes": 405808042320,
+          "entries": 203205,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 78294,
+        "query": 13,
+        "wall_ns": 1795567940401460394
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 78294,
+        "query": 13,
+        "wall_ns": 1795567940401681948
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 78294,
+        "query": 13,
+        "rows": 10,
+        "seconds": 104.0948435420014,
+        "wall_ns": 1795568044927157332
+      },
+      {
+        "cache": {
+          "bytes": 404211212624,
+          "entries": 204470,
+          "loaded_bytes": 0,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 78294,
+        "query": 13,
+        "wall_ns": 1795568045070014567
+      },
+      {
+        "event": "engine_closed",
+        "pid": 78294,
+        "query": 13,
+        "wall_ns": 1795568048578521369
+      },
+      {
+        "event": "complete",
+        "pid": 78294,
+        "query": 13,
+        "wall_ns": 1795568048578693415
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795567813892809068,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q13",
+      "exit_code": 0,
+      "pid": 78294,
+      "query": 13,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 14,
+      "wall_ns": 1795568050573976449
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 79138,
+        "query": 14,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q14",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795568052619174369
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 79138,
+        "query": 14,
+        "wall_ns": 1795568052619323109
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 79138,
+        "query": 14,
+        "rows": 1,
+        "seconds": 278.25872993600024,
+        "wall_ns": 1795568330903262182
+      },
+      {
+        "cache": {
+          "bytes": 551473659097,
+          "entries": 343106,
+          "loaded_bytes": 165865532059,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 79138,
+        "query": 14,
+        "wall_ns": 1795568331152098912
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 79138,
+        "query": 14,
+        "wall_ns": 1795568331152337133
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 79138,
+        "query": 14,
+        "rows": 1,
+        "seconds": 197.47665390600014,
+        "wall_ns": 1795568528654699267
+      },
+      {
+        "cache": {
+          "bytes": 552110005465,
+          "entries": 343437,
+          "loaded_bytes": 165562690833,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 79138,
+        "query": 14,
+        "wall_ns": 1795568528890963386
+      },
+      {
+        "event": "engine_closed",
+        "pid": 79138,
+        "query": 14,
+        "wall_ns": 1795568541363277385
+      },
+      {
+        "event": "complete",
+        "pid": 79138,
+        "query": 14,
+        "wall_ns": 1795568541363524961
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795568050573976449,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q14",
+      "exit_code": 0,
+      "pid": 79138,
+      "query": 14,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 15,
+      "wall_ns": 1795568541804270626
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 80304,
+        "query": 15,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q15",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795568543657708813
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 80304,
+        "query": 15,
+        "wall_ns": 1795568543657843480
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 80304,
+        "query": 15,
+        "rows": 1,
+        "seconds": 236.00966651700037,
+        "wall_ns": 1795568779755861854
+      },
+      {
+        "cache": {
+          "bytes": 523142867715,
+          "entries": 284747,
+          "loaded_bytes": 185635359781,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 80304,
+        "query": 15,
+        "wall_ns": 1795568779963166208
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 80304,
+        "query": 15,
+        "wall_ns": 1795568779963434857
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 80304,
+        "query": 15,
+        "rows": 1,
+        "seconds": 139.0984834080009,
+        "wall_ns": 1795568919155329733
+      },
+      {
+        "cache": {
+          "bytes": 523142867715,
+          "entries": 284747,
+          "loaded_bytes": 185739135124,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 80304,
+        "query": 15,
+        "wall_ns": 1795568919355440771
+      },
+      {
+        "event": "engine_closed",
+        "pid": 80304,
+        "query": 15,
+        "wall_ns": 1795568933357034801
+      },
+      {
+        "event": "complete",
+        "pid": 80304,
+        "query": 15,
+        "wall_ns": 1795568933357316811
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795568541804270626,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q15",
+      "exit_code": 0,
+      "pid": 80304,
+      "query": 15,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 16,
+      "wall_ns": 1795568933726449410
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 81298,
+        "query": 16,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q16",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795568935561338907
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 81298,
+        "query": 16,
+        "wall_ns": 1795568935561472266
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 81298,
+        "query": 16,
+        "rows": 27840,
+        "seconds": 20.20584117100043,
+        "wall_ns": 1795568955820541635
+      },
+      {
+        "cache": {
+          "bytes": 20646050792,
+          "entries": 15186,
+          "loaded_bytes": 20646050792,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 81298,
+        "query": 16,
+        "wall_ns": 1795568955851246715
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 81298,
+        "query": 16,
+        "wall_ns": 1795568955851469704
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 81298,
+        "query": 16,
+        "rows": 27840,
+        "seconds": 14.15195721300006,
+        "wall_ns": 1795568970189420543
+      },
+      {
+        "cache": {
+          "bytes": 20646050792,
+          "entries": 15186,
+          "loaded_bytes": 20646050792,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 81298,
+        "query": 16,
+        "wall_ns": 1795568970217806588
+      },
+      {
+        "event": "engine_closed",
+        "pid": 81298,
+        "query": 16,
+        "wall_ns": 1795568975542438875
+      },
+      {
+        "event": "complete",
+        "pid": 81298,
+        "query": 16,
+        "wall_ns": 1795568975542705907
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795568933726449410,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q16",
+      "exit_code": 0,
+      "pid": 81298,
+      "query": 16,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 17,
+      "wall_ns": 1795568975773053752
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 81882,
+        "query": 17,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q17",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795568977502363398
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 81882,
+        "query": 17,
+        "wall_ns": 1795568977502506775
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 81882,
+        "query": 17,
+        "rows": 1,
+        "seconds": 264.22421605099953,
+        "wall_ns": 1795569241751758709
+      },
+      {
+        "cache": {
+          "bytes": 451187150041,
+          "entries": 288747,
+          "loaded_bytes": 312115199344,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 81882,
+        "query": 17,
+        "wall_ns": 1795569241965233624
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 81882,
+        "query": 17,
+        "wall_ns": 1795569241965510322
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 81882,
+        "query": 17,
+        "rows": 1,
+        "seconds": 112.97120091099896,
+        "wall_ns": 1795569354962921038
+      },
+      {
+        "cache": {
+          "bytes": 454076443865,
+          "entries": 292831,
+          "loaded_bytes": 312040893743,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 81882,
+        "query": 17,
+        "wall_ns": 1795569355158465436
+      },
+      {
+        "event": "engine_closed",
+        "pid": 81882,
+        "query": 17,
+        "wall_ns": 1795569378227128591
+      },
+      {
+        "event": "complete",
+        "pid": 81882,
+        "query": 17,
+        "wall_ns": 1795569378227397429
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795568975773053752,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q17",
+      "exit_code": 0,
+      "pid": 81882,
+      "query": 17,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 18,
+      "wall_ns": 1795569378593149675
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 82915,
+        "query": 18,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q18",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795569380253933478
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 82915,
+        "query": 18,
+        "wall_ns": 1795569380254067751
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 82915,
+        "query": 18,
+        "rows": 100,
+        "seconds": 808.7460927339998,
+        "wall_ns": 1795570189021828558
+      },
+      {
+        "cache": {
+          "bytes": 455280781957,
+          "entries": 313892,
+          "loaded_bytes": 204533705804,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 82915,
+        "query": 18,
+        "wall_ns": 1795570189255442039
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 82915,
+        "query": 18,
+        "wall_ns": 1795570189255730429
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 82915,
+        "query": 18,
+        "rows": 100,
+        "seconds": 792.4375869480009,
+        "wall_ns": 1795570981715232219
+      },
+      {
+        "cache": {
+          "bytes": 475456273029,
+          "entries": 355928,
+          "loaded_bytes": 204494344192,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 82915,
+        "query": 18,
+        "wall_ns": 1795570981984815299
+      },
+      {
+        "event": "engine_closed",
+        "pid": 82915,
+        "query": 18,
+        "wall_ns": 1795570998809721180
+      },
+      {
+        "event": "complete",
+        "pid": 82915,
+        "query": 18,
+        "wall_ns": 1795570998810003730
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795569378593149675,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q18",
+      "exit_code": 0,
+      "pid": 82915,
+      "query": 18,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 19,
+      "wall_ns": 1795570999911088606
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 85779,
+        "query": 19,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q19",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795571002039119107
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 85779,
+        "query": 19,
+        "wall_ns": 1795571002039241250
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 85779,
+        "query": 19,
+        "rows": 1,
+        "seconds": 290.8054443359997,
+        "wall_ns": 1795571292848695695
+      },
+      {
+        "cache": {
+          "bytes": 546111212761,
+          "entries": 401546,
+          "loaded_bytes": 316744404605,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 85779,
+        "query": 19,
+        "wall_ns": 1795571293127861627
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 85779,
+        "query": 19,
+        "wall_ns": 1795571293128132439
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 85779,
+        "query": 19,
+        "rows": 1,
+        "seconds": 98.2431185660007,
+        "wall_ns": 1795571391375005685
+      },
+      {
+        "cache": {
+          "bytes": 546111212761,
+          "entries": 401546,
+          "loaded_bytes": 316329295763,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 85779,
+        "query": 19,
+        "wall_ns": 1795571391643853908
+      },
+      {
+        "event": "engine_closed",
+        "pid": 85779,
+        "query": 19,
+        "wall_ns": 1795571413243926945
+      },
+      {
+        "event": "complete",
+        "pid": 85779,
+        "query": 19,
+        "wall_ns": 1795571413244167024
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795570999911088606,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q19",
+      "exit_code": 0,
+      "pid": 85779,
+      "query": 19,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 20,
+      "wall_ns": 1795571413633065259
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 86905,
+        "query": 20,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q20",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795571415764573030
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 86905,
+        "query": 20,
+        "wall_ns": 1795571415764692964
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 86905,
+        "query": 20,
+        "rows": 380400,
+        "seconds": 255.604819831,
+        "wall_ns": 1795571671591956876
+      },
+      {
+        "cache": {
+          "bytes": 650531976477,
+          "entries": 368204,
+          "loaded_bytes": 301179539075,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 86905,
+        "query": 20,
+        "wall_ns": 1795571671969420452
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 86905,
+        "query": 20,
+        "wall_ns": 1795571671969692541
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 86905,
+        "query": 20,
+        "rows": 380400,
+        "seconds": 136.1000421539993,
+        "wall_ns": 1795571808208718382
+      },
+      {
+        "cache": {
+          "bytes": 658469840157,
+          "entries": 373135,
+          "loaded_bytes": 300822539119,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 86905,
+        "query": 20,
+        "wall_ns": 1795571808595397473
+      },
+      {
+        "event": "engine_closed",
+        "pid": 86905,
+        "query": 20,
+        "wall_ns": 1795571829784039007
+      },
+      {
+        "event": "complete",
+        "pid": 86905,
+        "query": 20,
+        "wall_ns": 1795571829784275442
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795571413633065259,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q20",
+      "exit_code": 0,
+      "pid": 86905,
+      "query": 20,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 21,
+      "wall_ns": 1795571830168966588
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 88042,
+        "query": 21,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q21",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795571832142154237
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 88042,
+        "query": 21,
+        "wall_ns": 1795571832142286610
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 88042,
+        "query": 21,
+        "rows": 100,
+        "seconds": 809.5748740420004,
+        "wall_ns": 1795572641939456275
+      },
+      {
+        "cache": {
+          "bytes": 419938391887,
+          "entries": 305984,
+          "loaded_bytes": 237766675532,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 88042,
+        "query": 21,
+        "wall_ns": 1795572642179016270
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 88042,
+        "query": 21,
+        "wall_ns": 1795572642179324744
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 88042,
+        "query": 21,
+        "rows": 100,
+        "seconds": 753.2905836350001,
+        "wall_ns": 1795573395743166952
+      },
+      {
+        "cache": {
+          "bytes": 419938391887,
+          "entries": 305984,
+          "loaded_bytes": 237756350464,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 88042,
+        "query": 21,
+        "wall_ns": 1795573395976177710
+      },
+      {
+        "event": "engine_closed",
+        "pid": 88042,
+        "query": 21,
+        "wall_ns": 1795573416406426679
+      },
+      {
+        "event": "complete",
+        "pid": 88042,
+        "query": 21,
+        "wall_ns": 1795573416406604131
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795571830168966588,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q21",
+      "exit_code": 0,
+      "pid": 88042,
+      "query": 21,
+      "timed_out": false
+    }
+  },
+  {
+    "cache_clear": {
+      "command": "sync; echo 3 > /proc/sys/vm/drop_caches",
+      "query": 22,
+      "wall_ns": 1795573417257036808
+    },
+    "events": [
+      {
+        "cache": {
+          "bytes": 1589710,
+          "entries": 8,
+          "loaded_bytes": 1589710,
+          "spilled_bytes": 0
+        },
+        "event": "engine_ready",
+        "pid": 90926,
+        "query": 22,
+        "settings": {
+          "cache_local_files": "false",
+          "enable_external_file_cache": "true",
+          "enable_http_metadata_cache": "false",
+          "external_threads": "1",
+          "max_temp_directory_size": "90% of available disk space",
+          "memory_limit": "296.7 GiB",
+          "parquet_metadata_cache": "true",
+          "pin_threads": "auto",
+          "temp_directory": "/mnt/nvme/duckdb-spill/sf10k-pairs-20261124/q22",
+          "threads": "96"
+        },
+        "version": "2.0.0",
+        "wall_ns": 1795573419394965961
+      },
+      {
+        "event": "query_begin",
+        "iteration": 1,
+        "pid": 90926,
+        "query": 22,
+        "wall_ns": 1795573419395100795
+      },
+      {
+        "event": "query_end",
+        "iteration": 1,
+        "pid": 90926,
+        "query": 22,
+        "rows": 7,
+        "seconds": 26.27488393100066,
+        "wall_ns": 1795573445741067185
+      },
+      {
+        "cache": {
+          "bytes": 88818250064,
+          "entries": 46611,
+          "loaded_bytes": 88818250064,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 1,
+        "pid": 90926,
+        "query": 22,
+        "wall_ns": 1795573445779070237
+      },
+      {
+        "event": "query_begin",
+        "iteration": 2,
+        "pid": 90926,
+        "query": 22,
+        "wall_ns": 1795573445779274880
+      },
+      {
+        "event": "query_end",
+        "iteration": 2,
+        "pid": 90926,
+        "query": 22,
+        "rows": 7,
+        "seconds": 10.007167593001213,
+        "wall_ns": 1795573455887413204
+      },
+      {
+        "cache": {
+          "bytes": 88818250064,
+          "entries": 46611,
+          "loaded_bytes": 88818250064,
+          "spilled_bytes": 0
+        },
+        "event": "cache_snapshot",
+        "iteration": 2,
+        "pid": 90926,
+        "query": 22,
+        "wall_ns": 1795573455925586482
+      },
+      {
+        "event": "engine_closed",
+        "pid": 90926,
+        "query": 22,
+        "wall_ns": 1795573462852166288
+      },
+      {
+        "event": "complete",
+        "pid": 90926,
+        "query": 22,
+        "wall_ns": 1795573462852424948
+      }
+    ],
+    "process": {
+      "cache_clear_ns": 1795573417257036808,
+      "directory": "/home/ec2-user/m9gd24-duckdb200-sf3k-sf10k-pairs-20261124/sf10000/results/q22",
+      "exit_code": 0,
+      "pid": 90926,
+      "query": 22,
+      "timed_out": false
+    }
+  }
+]

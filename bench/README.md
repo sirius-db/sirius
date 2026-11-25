@@ -2,19 +2,21 @@
 
 Hardware-specific configs and selected results live together. Planning and AWS
 storage checks are shared; each hardware has one documented reproduction path.
+The M9gd directory additionally preserves the standalone DuckDB CPU baseline.
 
 ```text
 bench/
   replay.sh                  dispatches to the hardware's reproducer
   common/                    shared planning, AWS/storage checks, GB300 runner
   gb300/                     GB300 configs, results, studies and figures
+  m9gd/                      DuckDB 2.0.0 same-region S3 CPU benchmarks
   g7e/
     replay.sh                G7e guide reproducer entry point
     guide-26b5caba/           guide presets and measured worker protocol
     results/guide-ktls-20261123/  validated SF100–SF10000 timings and provenance
 ```
 
-See [G7e](g7e/README.md) and [GB300](gb300/README.md) for requirements, selected
+See [G7e](g7e/README.md), [GB300](gb300/README.md) and [M9gd](m9gd/README.md) for requirements, selected
 results and limitations. These are read-only query experiments, not official
 TPC-H benchmark submissions. No reproducer provisions or stops instances.
 
@@ -78,6 +80,13 @@ worker logs and Quent traces are retained. Timeouts and missing measurements
 remain unavailable. See [GB300](gb300/README.md) for the full protocol and studies.
 
 ## CPU-only runner checks
+
+The [M9gd CPU recipe](m9gd/duckdb-2.0-s3/README.md) has its own
+`bench/m9gd/duckdb-2.0-s3/reproduce.sh` entry point. Its November 24 results save
+both iterations of SF1000, SF3000 and SF10000, with external-file and
+Parquet-metadata caches enabled, fresh processes/cache clears between query
+pairs, and verified local NVMe spill. It does not load Sirius or use the GPU
+replay's `--profile` controls.
 
 ```bash
 pixi run python -m unittest discover -s bench/common -p 'test_*.py' -v

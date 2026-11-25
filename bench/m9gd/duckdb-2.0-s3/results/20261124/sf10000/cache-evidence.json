@@ -1,0 +1,464 @@
+[
+  {
+    "after_iteration1": {
+      "bytes": 404228041475,
+      "entries": 226207,
+      "loaded_bytes": 317491975790,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 404228041475,
+      "entries": 226207,
+      "loaded_bytes": 317476831994,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 1
+  },
+  {
+    "after_iteration1": {
+      "bytes": 45130202088,
+      "entries": 32690,
+      "loaded_bytes": 45130202088,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 45130202088,
+      "entries": 32690,
+      "loaded_bytes": 45130202088,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 2
+  },
+  {
+    "after_iteration1": {
+      "bytes": 630672816773,
+      "entries": 371591,
+      "loaded_bytes": 0,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 640938994309,
+      "entries": 378715,
+      "loaded_bytes": 0,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 3
+  },
+  {
+    "after_iteration1": {
+      "bytes": 229855790927,
+      "entries": 204156,
+      "loaded_bytes": 229855790927,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 229855790927,
+      "entries": 204156,
+      "loaded_bytes": 229855790927,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 4
+  },
+  {
+    "after_iteration1": {
+      "bytes": 538470279813,
+      "entries": 331644,
+      "loaded_bytes": 293705475842,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 538470279813,
+      "entries": 331644,
+      "loaded_bytes": 293170011075,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 5
+  },
+  {
+    "after_iteration1": {
+      "bytes": 350084246275,
+      "entries": 226207,
+      "loaded_bytes": 317530949679,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 350084246275,
+      "entries": 226207,
+      "loaded_bytes": 317530808190,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 6
+  },
+  {
+    "after_iteration1": {
+      "bytes": 606774307461,
+      "entries": 376644,
+      "loaded_bytes": 259208061252,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 609881111173,
+      "entries": 378699,
+      "loaded_bytes": 258727783247,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 7
+  },
+  {
+    "after_iteration1": {
+      "bytes": 784632339547,
+      "entries": 448543,
+      "loaded_bytes": 275263889670,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 787941747803,
+      "entries": 448904,
+      "loaded_bytes": 275004269386,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 8
+  },
+  {
+    "after_iteration1": {
+      "bytes": 833118429545,
+      "entries": 455536,
+      "loaded_bytes": 0,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 833065312617,
+      "entries": 456124,
+      "loaded_bytes": 0,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 9
+  },
+  {
+    "after_iteration1": {
+      "bytes": 697999170181,
+      "entries": 401650,
+      "loaded_bytes": 0,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 708722481797,
+      "entries": 411024,
+      "loaded_bytes": 0,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 10
+  },
+  {
+    "after_iteration1": {
+      "bytes": 48317118994,
+      "entries": 31022,
+      "loaded_bytes": 48317118994,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 48317118994,
+      "entries": 31022,
+      "loaded_bytes": 48317118994,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 11
+  },
+  {
+    "after_iteration1": {
+      "bytes": 320915351375,
+      "entries": 305556,
+      "loaded_bytes": 294987662714,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 320915351375,
+      "entries": 305556,
+      "loaded_bytes": 294930232698,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 12
+  },
+  {
+    "after_iteration1": {
+      "bytes": 405808042320,
+      "entries": 203205,
+      "loaded_bytes": 0,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 404211212624,
+      "entries": 204470,
+      "loaded_bytes": 0,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 13
+  },
+  {
+    "after_iteration1": {
+      "bytes": 551473659097,
+      "entries": 343106,
+      "loaded_bytes": 165865532059,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 552110005465,
+      "entries": 343437,
+      "loaded_bytes": 165562690833,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 14
+  },
+  {
+    "after_iteration1": {
+      "bytes": 523142867715,
+      "entries": 284747,
+      "loaded_bytes": 185635359781,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 523142867715,
+      "entries": 284747,
+      "loaded_bytes": 185739135124,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 15
+  },
+  {
+    "after_iteration1": {
+      "bytes": 20646050792,
+      "entries": 15186,
+      "loaded_bytes": 20646050792,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 20646050792,
+      "entries": 15186,
+      "loaded_bytes": 20646050792,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 16
+  },
+  {
+    "after_iteration1": {
+      "bytes": 451187150041,
+      "entries": 288747,
+      "loaded_bytes": 312115199344,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 454076443865,
+      "entries": 292831,
+      "loaded_bytes": 312040893743,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 17
+  },
+  {
+    "after_iteration1": {
+      "bytes": 455280781957,
+      "entries": 313892,
+      "loaded_bytes": 204533705804,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 475456273029,
+      "entries": 355928,
+      "loaded_bytes": 204494344192,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 18
+  },
+  {
+    "after_iteration1": {
+      "bytes": 546111212761,
+      "entries": 401546,
+      "loaded_bytes": 316744404605,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 546111212761,
+      "entries": 401546,
+      "loaded_bytes": 316329295763,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 19
+  },
+  {
+    "after_iteration1": {
+      "bytes": 650531976477,
+      "entries": 368204,
+      "loaded_bytes": 301179539075,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 658469840157,
+      "entries": 373135,
+      "loaded_bytes": 300822539119,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 20
+  },
+  {
+    "after_iteration1": {
+      "bytes": 419938391887,
+      "entries": 305984,
+      "loaded_bytes": 237766675532,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 419938391887,
+      "entries": 305984,
+      "loaded_bytes": 237756350464,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 21
+  },
+  {
+    "after_iteration1": {
+      "bytes": 88818250064,
+      "entries": 46611,
+      "loaded_bytes": 88818250064,
+      "spilled_bytes": 0
+    },
+    "after_iteration2": {
+      "bytes": 88818250064,
+      "entries": 46611,
+      "loaded_bytes": 88818250064,
+      "spilled_bytes": 0
+    },
+    "before": {
+      "bytes": 1589710,
+      "entries": 8,
+      "loaded_bytes": 1589710,
+      "spilled_bytes": 0
+    },
+    "query": 22
+  }
+]

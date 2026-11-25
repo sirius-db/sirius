@@ -1,0 +1,371 @@
+{
+  "complete": true,
+  "measurements": [
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q01/iteration1/duckdb/q1/result.txt",
+      "answer_sha256": "490a2f5ec1d7623044d07efb038f92247bd825f9c7b1287f2913ff0e5132b5a5",
+      "iteration": 1,
+      "query": 1,
+      "rows": 4,
+      "seconds": 14.194553927000015
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q01/iteration2/duckdb/q1/result.txt",
+      "answer_sha256": "490a2f5ec1d7623044d07efb038f92247bd825f9c7b1287f2913ff0e5132b5a5",
+      "iteration": 2,
+      "query": 1,
+      "rows": 4,
+      "seconds": 1.5676311310000415
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q02/iteration1/duckdb/q2/result.txt",
+      "answer_sha256": "7ddbe965ca97530e9cf82719c0e32998ec0026383e0d7e22502cad382dd3f5ab",
+      "iteration": 1,
+      "query": 2,
+      "rows": 100,
+      "seconds": 4.237448933000053
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q02/iteration2/duckdb/q2/result.txt",
+      "answer_sha256": "7ddbe965ca97530e9cf82719c0e32998ec0026383e0d7e22502cad382dd3f5ab",
+      "iteration": 2,
+      "query": 2,
+      "rows": 100,
+      "seconds": 0.5432414819999849
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q03/iteration1/duckdb/q3/result.txt",
+      "answer_sha256": "c5a549c3b8b2ad105de64fe30c42ba8cff272a6735b2fc4bf47721208c03a17e",
+      "iteration": 1,
+      "query": 3,
+      "rows": 10,
+      "seconds": 28.05952762200002
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q03/iteration2/duckdb/q3/result.txt",
+      "answer_sha256": "c5a549c3b8b2ad105de64fe30c42ba8cff272a6735b2fc4bf47721208c03a17e",
+      "iteration": 2,
+      "query": 3,
+      "rows": 10,
+      "seconds": 1.8770072720000144
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q04/iteration1/duckdb/q4/result.txt",
+      "answer_sha256": "2103c5c0cbc74a254a96146eb295d42f3ce8ca14d27ee385c1e20331e31f382b",
+      "iteration": 1,
+      "query": 4,
+      "rows": 5,
+      "seconds": 16.455638643000043
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q04/iteration2/duckdb/q4/result.txt",
+      "answer_sha256": "2103c5c0cbc74a254a96146eb295d42f3ce8ca14d27ee385c1e20331e31f382b",
+      "iteration": 2,
+      "query": 4,
+      "rows": 5,
+      "seconds": 1.2809061789999987
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q05/iteration1/duckdb/q5/result.txt",
+      "answer_sha256": "9e621e7708e8bcf00d68d263ce6be933359437d8cfb3bdbda798c327d7fd883e",
+      "iteration": 1,
+      "query": 5,
+      "rows": 5,
+      "seconds": 24.186423729000012
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q05/iteration2/duckdb/q5/result.txt",
+      "answer_sha256": "9e621e7708e8bcf00d68d263ce6be933359437d8cfb3bdbda798c327d7fd883e",
+      "iteration": 2,
+      "query": 5,
+      "rows": 5,
+      "seconds": 2.0042061359999934
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q06/iteration1/duckdb/q6/result.txt",
+      "answer_sha256": "8f0b7529321af89b524c20cbf4c7435de4a05855f5cf12793d376e1fbc34c453",
+      "iteration": 1,
+      "query": 6,
+      "rows": 1,
+      "seconds": 14.935764672999994
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q06/iteration2/duckdb/q6/result.txt",
+      "answer_sha256": "8f0b7529321af89b524c20cbf4c7435de4a05855f5cf12793d376e1fbc34c453",
+      "iteration": 2,
+      "query": 6,
+      "rows": 1,
+      "seconds": 0.591097540000078
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q07/iteration1/duckdb/q7/result.txt",
+      "answer_sha256": "bde71b9b1159247fe807b2c903808463a717bde30e8d2578919ed2d0719b96a5",
+      "iteration": 1,
+      "query": 7,
+      "rows": 4,
+      "seconds": 27.567176307999944
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q07/iteration2/duckdb/q7/result.txt",
+      "answer_sha256": "bde71b9b1159247fe807b2c903808463a717bde30e8d2578919ed2d0719b96a5",
+      "iteration": 2,
+      "query": 7,
+      "rows": 4,
+      "seconds": 2.1154279930000257
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q08/iteration1/duckdb/q8/result.txt",
+      "answer_sha256": "a9649892e8a99437af1d2f937539c31723e96756c0e717db1df3d6a9854ac2fe",
+      "iteration": 1,
+      "query": 8,
+      "rows": 2,
+      "seconds": 22.818013653000094
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q08/iteration2/duckdb/q8/result.txt",
+      "answer_sha256": "a9649892e8a99437af1d2f937539c31723e96756c0e717db1df3d6a9854ac2fe",
+      "iteration": 2,
+      "query": 8,
+      "rows": 2,
+      "seconds": 2.2105616810000583
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q09/iteration1/duckdb/q9/result.txt",
+      "answer_sha256": "ee205998c1c0ba21a5ca88e47a41f9fccd9303f32a8e49a899232d87ea04478b",
+      "iteration": 1,
+      "query": 9,
+      "rows": 175,
+      "seconds": 25.515061437999975
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q09/iteration2/duckdb/q9/result.txt",
+      "answer_sha256": "ee205998c1c0ba21a5ca88e47a41f9fccd9303f32a8e49a899232d87ea04478b",
+      "iteration": 2,
+      "query": 9,
+      "rows": 175,
+      "seconds": 7.876206643000046
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q10/iteration1/duckdb/q10/result.txt",
+      "answer_sha256": "12faf08d07ba8a20340ac81bfe1374a35662fbe5e033ffcb84ba969e02df0826",
+      "iteration": 1,
+      "query": 10,
+      "rows": 20,
+      "seconds": 24.09229406299994
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q10/iteration2/duckdb/q10/result.txt",
+      "answer_sha256": "12faf08d07ba8a20340ac81bfe1374a35662fbe5e033ffcb84ba969e02df0826",
+      "iteration": 2,
+      "query": 10,
+      "rows": 20,
+      "seconds": 4.843854343999965
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q11/iteration1/duckdb/q11/result.txt",
+      "answer_sha256": "7515aa659906ab425537c48aa7033039339214a13162598e62ed429ae1dabbc2",
+      "iteration": 1,
+      "query": 11,
+      "rows": 936989,
+      "seconds": 2.5204373669999995
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q11/iteration2/duckdb/q11/result.txt",
+      "answer_sha256": "9d10ac640fbd3d3bb76723b3fd071ea91046c64e18828ae5770923d7584bb649",
+      "iteration": 2,
+      "query": 11,
+      "rows": 936989,
+      "seconds": 0.5453489479999689
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q12/iteration1/duckdb/q12/result.txt",
+      "answer_sha256": "66a3f788c0b5be76e92f3b41639809cf29829e34152567465829b2cb746c8e2c",
+      "iteration": 1,
+      "query": 12,
+      "rows": 2,
+      "seconds": 21.816085801999975
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q12/iteration2/duckdb/q12/result.txt",
+      "answer_sha256": "66a3f788c0b5be76e92f3b41639809cf29829e34152567465829b2cb746c8e2c",
+      "iteration": 2,
+      "query": 12,
+      "rows": 2,
+      "seconds": 1.1348022529999753
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q13/iteration1/duckdb/q13/result.txt",
+      "answer_sha256": "f9ab270459e38c7cc6bb7ac6316efec225bdf3b744b46e3ac1861bc719823285",
+      "iteration": 1,
+      "query": 13,
+      "rows": 30,
+      "seconds": 8.995541286000048
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q13/iteration2/duckdb/q13/result.txt",
+      "answer_sha256": "f9ab270459e38c7cc6bb7ac6316efec225bdf3b744b46e3ac1861bc719823285",
+      "iteration": 2,
+      "query": 13,
+      "rows": 30,
+      "seconds": 7.603164578000019
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q14/iteration1/duckdb/q14/result.txt",
+      "answer_sha256": "c2662b6d18a49ddec4d3baee45ffa12dd2fd756dcb1d2fe16a3291c183142f9c",
+      "iteration": 1,
+      "query": 14,
+      "rows": 1,
+      "seconds": 21.229498596999974
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q14/iteration2/duckdb/q14/result.txt",
+      "answer_sha256": "c2662b6d18a49ddec4d3baee45ffa12dd2fd756dcb1d2fe16a3291c183142f9c",
+      "iteration": 2,
+      "query": 14,
+      "rows": 1,
+      "seconds": 1.637761611999963
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q15/iteration1/duckdb/q15/result.txt",
+      "answer_sha256": "ba5f3d7b342d0526fda6ff61ebe280dc3dfeb776bf21715b0f47e098c3938682",
+      "iteration": 1,
+      "query": 15,
+      "rows": 1,
+      "seconds": 20.424986316999934
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q15/iteration2/duckdb/q15/result.txt",
+      "answer_sha256": "ba5f3d7b342d0526fda6ff61ebe280dc3dfeb776bf21715b0f47e098c3938682",
+      "iteration": 2,
+      "query": 15,
+      "rows": 1,
+      "seconds": 1.1139744109999583
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q16/iteration1/duckdb/q16/result.txt",
+      "answer_sha256": "f609e1bdd0d8d84517ad57f42953df8fac562822bf83cfb54282d9980d67cd7e",
+      "iteration": 1,
+      "query": 16,
+      "rows": 27840,
+      "seconds": 2.550687952999965
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q16/iteration2/duckdb/q16/result.txt",
+      "answer_sha256": "f609e1bdd0d8d84517ad57f42953df8fac562822bf83cfb54282d9980d67cd7e",
+      "iteration": 2,
+      "query": 16,
+      "rows": 27840,
+      "seconds": 0.8771745850000343
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q17/iteration1/duckdb/q17/result.txt",
+      "answer_sha256": "4b3d5e4389ba56d04088a16dba0daf0d0645220fbbca41ea3ec89b564a0a067a",
+      "iteration": 1,
+      "query": 17,
+      "rows": 1,
+      "seconds": 17.40248791099998
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q17/iteration2/duckdb/q17/result.txt",
+      "answer_sha256": "4b3d5e4389ba56d04088a16dba0daf0d0645220fbbca41ea3ec89b564a0a067a",
+      "iteration": 2,
+      "query": 17,
+      "rows": 1,
+      "seconds": 1.229126120999922
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q18/iteration1/duckdb/q18/result.txt",
+      "answer_sha256": "a343bbc61900b634b7f5c9d6bfd78a60a04012001d0091ebc37bfb013b20f239",
+      "iteration": 1,
+      "query": 18,
+      "rows": 100,
+      "seconds": 21.851198654999962
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q18/iteration2/duckdb/q18/result.txt",
+      "answer_sha256": "a343bbc61900b634b7f5c9d6bfd78a60a04012001d0091ebc37bfb013b20f239",
+      "iteration": 2,
+      "query": 18,
+      "rows": 100,
+      "seconds": 11.194882227000107
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q19/iteration1/duckdb/q19/result.txt",
+      "answer_sha256": "d21e516c0f5fb885731d6a5034580fcae7c75e5b60ff0a4e865a8fca171fea3c",
+      "iteration": 1,
+      "query": 19,
+      "rows": 1,
+      "seconds": 21.838397477000058
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q19/iteration2/duckdb/q19/result.txt",
+      "answer_sha256": "d21e516c0f5fb885731d6a5034580fcae7c75e5b60ff0a4e865a8fca171fea3c",
+      "iteration": 2,
+      "query": 19,
+      "rows": 1,
+      "seconds": 1.2065946949999216
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q20/iteration1/duckdb/q20/result.txt",
+      "answer_sha256": "d209b9e8e75ae3dcc58f1881dfffa63480e82a3475fc3be00fa8ddedbc3337cd",
+      "iteration": 1,
+      "query": 20,
+      "rows": 111384,
+      "seconds": 22.769278303999954
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q20/iteration2/duckdb/q20/result.txt",
+      "answer_sha256": "d209b9e8e75ae3dcc58f1881dfffa63480e82a3475fc3be00fa8ddedbc3337cd",
+      "iteration": 2,
+      "query": 20,
+      "rows": 111384,
+      "seconds": 1.2336288230000036
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q21/iteration1/duckdb/q21/result.txt",
+      "answer_sha256": "89445246fb1812e26d308ef7b029db80352195e86f5050a51af00b28a5f02210",
+      "iteration": 1,
+      "query": 21,
+      "rows": 100,
+      "seconds": 33.096078337999984
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q21/iteration2/duckdb/q21/result.txt",
+      "answer_sha256": "89445246fb1812e26d308ef7b029db80352195e86f5050a51af00b28a5f02210",
+      "iteration": 2,
+      "query": 21,
+      "rows": 100,
+      "seconds": 12.704580359000033
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q22/iteration1/duckdb/q22/result.txt",
+      "answer_sha256": "7521a5853dcf1f8dc13ebedf892100b10fdddda9ae86753da42c8b1ace7d2104",
+      "iteration": 1,
+      "query": 22,
+      "rows": 7,
+      "seconds": 3.8833536649999587
+    },
+    {
+      "answer": "/home/ec2-user/m9gd24-duckdb200-sf1k-pairs-20261124/results/q22/iteration2/duckdb/q22/result.txt",
+      "answer_sha256": "7521a5853dcf1f8dc13ebedf892100b10fdddda9ae86753da42c8b1ace7d2104",
+      "iteration": 2,
+      "query": 22,
+      "rows": 7,
+      "seconds": 1.153574682999988
+    }
+  ],
+  "totals": [
+    {
+      "available_sum_s": 400.4399346609999,
+      "iteration": 1,
+      "queries": 22,
+      "sum_s": 400.4399346609999
+    },
+    {
+      "available_sum_s": 66.5447536960001,
+      "iteration": 2,
+      "queries": 22,
+      "sum_s": 66.5447536960001
+    }
+  ]
+}

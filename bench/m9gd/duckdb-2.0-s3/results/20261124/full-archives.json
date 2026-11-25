@@ -1,0 +1,29 @@
+{
+  "archives": [
+    {
+      "all_payload_hashes_verified": true,
+      "archive_bytes": 25965262,
+      "archive_sha256": "3d8427bcda1433d5f7b37a0b61055590ab42cac513cebebe30a3b691a673d194",
+      "filename": "m9gd24-duckdb200-sf1k-pairs-20261124-verified-full-results.tar.gz",
+      "files": 236,
+      "scale_factor": 1000
+    },
+    {
+      "all_payload_hashes_verified": true,
+      "archive_bytes": 71102540,
+      "archive_sha256": "245cd3733d17a9f0cd8844cefac11da41b5675fec110e17dac625120dce70d61",
+      "filename": "sf3000-full-results.tar.gz",
+      "files": 228,
+      "scale_factor": 3000
+    },
+    {
+      "all_payload_hashes_verified": true,
+      "archive_bytes": 213288145,
+      "archive_sha256": "59c6ffde47bcb99417f1a348fa9e2296c0ed350cf660bdfa26559c7f9c88da51",
+      "filename": "sf10000-full-results.tar.gz",
+      "files": 228,
+      "scale_factor": 10000
+    }
+  ],
+  "location": "Retained locally under ~/.aws-exp; full raw archives are not committed to Git."
+}
