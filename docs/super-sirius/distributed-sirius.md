@@ -160,12 +160,12 @@ lanes by a peer it reaches another way fails to connect, saying so. On two GB200
 across the link each way; raw TCP reaches 24.75 there. These figures are from the branch the
 lanes were ported from, with UCX `tcp` on bond0. On this code, two GB200 nodes with 4 ranks each
 and 4 lanes per rank moved 33 to 38 GB/s per rank with the lanes on the rail NICs
-(`UCX_NET_DEVICES=rails`), where UCX carries them over RDMA.
+(`SIRIUS_UCX_RAILS=1`), where UCX carries them over RDMA.
 
 On a cluster with RDMA between hosts and no fabric memory, set
 `sirius_exchange_host_staging = 'never'`: direct NIXL writes over the RDMA NICs are faster than
 lanes there, and `auto` does not yet tell such a cluster from one with TCP only. The launch
-scripts set `never` for the gateway's ranks when `UCX_NET_DEVICES=rails` puts UCX on the rail
+scripts set `never` for the gateway's ranks when `SIRIUS_UCX_RAILS=1` puts UCX on the rail
 NICs, unless `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING` is set. A lane is a UCX connection, so on
 the rails it is RDMA of the host copy, not TCP. On two GB200 nodes with 4 ranks each, the fabric
 off (`[nixl_bandwidth]`, every rank to every other), `never` moved 64.8 GB/s per rank and `auto`
@@ -203,7 +203,7 @@ The ring sizes are settings, the same on every rank: `sirius_exchange_frame_byte
 (8). A rank's ring memory is `frame × (send frames + receive frames × peers)`, outside the GPU
 memory budget: 576 MiB with 8 ranks by default. For NVLink between nodes, set 16 MiB frames, 32
 send frames and 16 receive frames per peer, which keep two 128 MiB writes to a peer in flight,
-and `UCX_NET_DEVICES=rails`: 2.25 GiB with 8 ranks, 18.3 GiB with 72 (credits on demand, #2371,
+and `SIRIUS_UCX_RAILS=1`: 2.25 GiB with 8 ranks, 18.3 GiB with 72 (credits on demand, #2371,
 would bound it). With that sizing one GPU pair moved 685 to 706 GB/s, and 626 with 8 receive
 frames per peer; with `tcp` on bond0 for the notifications, 677 and 579. With the default sizes it
 moved 312.
@@ -403,7 +403,7 @@ pixi run build-distributed
 
 | Variable | Default | Why |
 |---|---|---|
-| `UCX_TLS`, `UCX_NET_DEVICES` | `cuda_copy,cuda_ipc,tcp,self` on the interface of the rank's address | The transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout"). `UCX_NET_DEVICES=rails` takes every UCX transport on the GPU rail NICs (`sirius_rail_devices` in `scripts/sirius_net.sh`: active RDMA ports in no bond, at the highest link speed). They carry UCX's notifications over RC, which the exchange over NVLink needs at full speed: 4 GPU pairs both ways moved 5.9 TB/s, against 5.2 with tcp on bond0 |
+| `UCX_TLS`, `UCX_NET_DEVICES` | `cuda_copy,cuda_ipc,tcp,self` on the interface of the rank's address | The transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout"). `SIRIUS_UCX_RAILS=1` takes every UCX transport on the GPU rail NICs (`sirius_rail_devices` in `scripts/sirius_net.sh`: active RDMA ports in no bond, at the highest link speed). They carry UCX's notifications over RC, which the exchange over NVLink needs at full speed: 4 GPU pairs both ways moved 5.9 TB/s, against 5.2 with tcp on bond0 |
 | `DUCKDB_AGENT_MODE` | 0 | DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse that output |
 
 ## Running TPC-H Q12 on 4 GPUs
@@ -475,7 +475,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 - **Hosts:** two hosts, one GPU each, ran TPC-H Q12 at SF100 through the gateway, with UCX on
   TCP (`UCX_TLS` with `tcp`, `UCX_NET_DEVICES` set to the hosts' shared interface). The launch
   scripts set both by default (`launcher_env.sh`, [quick start](distributed-quickstart.md)):
-  `tcp` on the interface of the rank's address, or with `UCX_NET_DEVICES=rails` the GPU rail NICs
+  `tcp` on the interface of the rank's address, or with `SIRIUS_UCX_RAILS=1` the GPU rail NICs
   with every UCX transport.
   Between nodes of one NVLink domain the data goes over the
   [NVLink fabric](#nvlink-between-nodes-mnnvl), which two and four GB200 nodes with 4 GPUs each
