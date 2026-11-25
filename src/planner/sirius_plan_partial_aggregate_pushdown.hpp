@@ -56,12 +56,12 @@ struct partial_aggregate_pushdown_result {
 ///
 /// Rows of S that agree on every column used above S pair with the same rows of every join above,
 /// so combining them first changes no result, whether or not any join key is unique. Limited to
-/// SUM over an integer or a DECIMAL of up to 64 bits, MIN and MAX, whose combined result has the
-/// original type, so nothing above the aggregate changes.
+/// SUM over an integer or a DECIMAL of up to 64 bits or over a floating-point value, MIN and MAX,
+/// whose combined result has the original type, so nothing above the aggregate changes.
 ///
 /// An aggregate over a join that is left alone reports why. The reasons are short fixed names
-/// (`sum:float`, `other-side:filtered`, ...), and every independent one is listed, so a plan's
-/// report tells which limits would all have to go for the rule to apply.
+/// (`aggregate:count_star`, `other-side:filtered`, ...), and every independent one is listed, so a
+/// plan's report tells which limits would all have to go for the rule to apply.
 ///
 /// Works on the optimized, unresolved plan.
 partial_aggregate_pushdown_result push_partial_aggregates_below_joins(

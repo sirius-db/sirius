@@ -19,8 +19,10 @@
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <string>
 
 namespace {
@@ -69,16 +71,27 @@ class PartialAggregatePushdownFixture : public sirius::test::GpuExecutionFixture
   }
 
   /// The pushed and the unpushed GPU plans against the CPU. With @p pushed, the rule must fire
-  /// when enabled; it must never fire when disabled.
-  void compare_pushed_and_not(std::string const& query, bool pushed = false)
+  /// when enabled; it must never fire when disabled. The columns in @p inexact (0-based, never the
+  /// first) hold floating-point sums whose last digits depend on the order of addition, and match
+  /// within a relative tolerance.
+  void compare_pushed_and_not(std::string const& query,
+                              bool pushed                          = false,
+                              std::set<std::size_t> const& inexact = {})
   {
     INFO(query);
+    auto const compare = [&] {
+      if (inexact.empty()) {
+        compare_gpu_vs_cpu(query);
+      } else {
+        compare_gpu_vs_cpu_approx(query, inexact, 1e-9);
+      }
+    };
     auto const before = pushdowns();
-    compare_gpu_vs_cpu(query);
+    compare();
     auto const after = pushdowns();
     if (pushed) { CHECK(after > before); }
     sirius::test::scoped_sirius_setting off{*con, "enable_partial_aggregate_below_join", false};
-    compare_gpu_vs_cpu(query);
+    compare();
     CHECK(pushdowns() == after);
   }
 
@@ -218,6 +231,51 @@ TEST_CASE_METHOD(PartialAggregatePushdownFixture,
     "SELECT c_custkey, c_name, sum(o_totalprice) AS total, min(o_totalprice) AS low "
     "FROM customer, orders WHERE c_custkey = o_custkey AND o_custkey = 9 "
     "GROUP BY c_custkey, c_name");
+}
+
+TEST_CASE_METHOD(PartialAggregatePushdownFixture,
+                 "gpu_execution floating-point sums below a join",
+                 "[integration][gpu_execution][partial_agg_pushdown]")
+{
+  // Halves and quarters add up exactly in any order, so the totals match the CPU's digit for
+  // digit. Customer 9's prices are all NULL.
+  compare_pushed_and_not(
+    "SELECT c_custkey, c_name, sum(o_shippriority * 0.25::DOUBLE) AS quarters, "
+    "sum(o_shippriority * 0.5::DOUBLE) AS halves, "
+    "sum(CASE WHEN o_totalprice IS NULL THEN NULL ELSE 0.5::DOUBLE END) AS some "
+    "FROM customer, orders WHERE c_custkey = o_custkey GROUP BY c_custkey, c_name",
+    true);
+  // Tenths do not: the last digits of these totals depend on the order of addition, which the
+  // CPU, the GPU and the pushed plan each choose differently. Every value has the same sign, so
+  // nothing cancels and the totals agree to many more digits than the tolerance asks for. The name
+  // leads because it is unique, which a customer key is not.
+  compare_pushed_and_not(
+    "SELECT c_name, c_custkey, sum(o_orderkey * 0.1::DOUBLE) AS tenths, "
+    "sum(o_shippriority * 0.3::DOUBLE + 0.7::DOUBLE) AS sevenths "
+    "FROM customer, orders WHERE c_custkey = o_custkey GROUP BY c_custkey, c_name",
+    true,
+    {2, 3});
+}
+
+TEST_CASE_METHOD(PartialAggregatePushdownFixture,
+                 "gpu_execution floating-point sums that overflow below a join",
+                 "[integration][gpu_execution][partial_agg_pushdown]")
+{
+  // Two values add up to the same total in either order, so each customer's total is one the rule
+  // cannot change: customer 1's overflows, customer 2's cancels to zero and customer 3's
+  // overflows the other way. Key 99 matches no customer, so its sum overflows below the join and
+  // nowhere else.
+  run_ok("CREATE TABLE readings (r_custkey BIGINT, r_value DOUBLE);");
+  run_ok(
+    "INSERT INTO readings VALUES (1, 1e308), (1, 1e308), (2, 1e308), (2, -1e308), (3, -1e308), "
+    "(3, -1e308), (99, 1e308), (99, 1e308);");
+  run_ok("CHECKPOINT;");
+  std::string const totals =
+    "SELECT c_custkey, c_name, sum(r_value) AS total FROM customer, readings "
+    "WHERE c_custkey = r_custkey GROUP BY c_custkey, c_name";
+  compare_pushed_and_not(totals, true);
+  // A filter on the total keeps the same customer with and without the rule.
+  compare_pushed_and_not(totals + " HAVING sum(r_value) = 0", true);
 }
 
 TEST_CASE_METHOD(PartialAggregatePushdownFixture,

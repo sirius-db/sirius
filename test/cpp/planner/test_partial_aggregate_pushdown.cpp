@@ -315,6 +315,21 @@ TEST_CASE_METHOD(pushdown_fixture,
 }
 
 TEST_CASE_METHOD(pushdown_fixture,
+                 "partial aggregate pushdown covers floating-point sums",
+                 "[partial_agg_pushdown][plan]")
+{
+  // A DOUBLE sums to a DOUBLE, and so does a sum of such sums.
+  CHECK(pushed(per_customer("sum(o_weight)")) == 1);
+  CHECK(pushed(per_customer("sum(o_weight), sum(o_totalprice), min(o_weight)")) == 1);
+  CHECK(pushed(per_customer("sum(o_weight * 2 + 1)")) == 1);
+  CHECK(shape(per_customer("sum(o_weight)"), true) == "AGG[2](JOIN(AGG[1](orders),customer))");
+  // Every order without a customer falls into one group here. Summed per customer key first, two
+  // keys could each overflow where the group's sum would not, so the sum stays above the join.
+  CHECK(pushed("SELECT c_custkey, c_name, sum(o_weight) FROM orders LEFT JOIN customer "
+               "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == 0);
+}
+
+TEST_CASE_METHOD(pushdown_fixture,
                  "partial aggregate pushdown covers arguments that branch on arithmetic",
                  "[partial_agg_pushdown][plan]")
 {
@@ -345,8 +360,6 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(pushed(per_customer("avg(o_totalprice)")) == 0);
   CHECK(pushed(per_customer("sum(DISTINCT o_totalprice)")) == 0);
   CHECK(pushed(per_customer("sum(o_totalprice) FILTER (WHERE o_shippriority = 1)")) == 0);
-  // A floating-point sum depends on the order of addition.
-  CHECK(pushed(per_customer("sum(o_weight)")) == 0);
   // An argument that reads both sides, and ones that can fail on a row the join would drop.
   CHECK(pushed(per_customer("sum(o_totalprice * c_acctbal)")) == 0);
   CHECK(pushed(per_customer("max(CAST(o_clerk AS INTEGER))")) == 0);
@@ -418,11 +431,11 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(why(per_customer("count(NULLIF(o_units, 0))")) == reasons{"aggregate:count"});
   CHECK(why(per_customer("avg(o_totalprice)")) == reasons{"aggregate:avg"});
   CHECK(why(per_customer("avg(o_units)")) == reasons{"aggregate:avg"});
-  CHECK(why(per_customer("avg(o_weight)")) == reasons{"aggregate:avg; sum:float"});
+  CHECK(why(per_customer("avg(o_weight)")) == reasons{"aggregate:avg"});
   CHECK(why(per_customer("sum(DISTINCT o_totalprice)")) == reasons{"aggregate:distinct"});
   CHECK(why(per_customer("sum(o_totalprice) FILTER (WHERE o_shippriority = 1)")) ==
         reasons{"aggregate:filter"});
-  CHECK(why(per_customer("sum(o_weight)")) == reasons{"sum:float"});
+  CHECK(why(per_customer("sum(o_shippriority > 1)")) == reasons{"sum:other"});
   CHECK(why(per_customer("sum(CAST(o_units AS HUGEINT))")) == reasons{"sum:hugeint"});
   CHECK(why(per_customer("sum(o_wide)")) == reasons{"sum:decimal128"});
   // DuckDB keeps the product of two 64-bit DECIMALs in 64 bits, so its sum is one the rule pushes.
@@ -472,7 +485,7 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(why(per_customer("count(*)", "AND c_acctbal > 400")) ==
         reasons{"aggregate:count_star; other-side:filtered"});
   CHECK(why(per_customer("count(*), avg(o_weight)", "", "c_name")) ==
-        reasons{"aggregate:count_star; aggregate:avg; sum:float; keys:not-fewer-than-groups; "
+        reasons{"aggregate:count_star; aggregate:avg; keys:not-fewer-than-groups; "
                 "keys:not-grouped"});
   // A full outer join pads the orders as well as the customers.
   CHECK(why("SELECT c_custkey, c_name, sum(o_totalprice) FROM orders FULL JOIN customer "

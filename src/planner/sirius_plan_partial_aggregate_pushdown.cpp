@@ -229,8 +229,14 @@ char const* combining_aggregate(std::string const& name)
 /// refuses to add such values. A SUM over a HUGEINT or a wider DECIMAL it does refuse, when a
 /// batch's row count times its largest value could pass 128 bits. Below the join that batch holds
 /// the rows the join would have removed, so one huge value on a key that matches nothing would
-/// send to the CPU a query the GPU answers today. Floating-point sums depend on the order of
-/// addition.
+/// send to the CPU a query the GPU answers today.
+///
+/// A floating-point sum depends on the order of addition, which the GPU does not fix: the same
+/// query's sum already differs from one run to the next, in its last digits and by more where
+/// large values cancel or a running sum overflows. Adding per key first is one more order over
+/// the same values. It is no more than that only because each group of the aggregate above takes
+/// its rows from a single key, which the check on the keys below sees to: were several keys to
+/// share a group, each could overflow alone where their sum would not.
 char const* sum_blocker(LogicalType const& argument)
 {
   switch (argument.id()) {
@@ -239,10 +245,10 @@ char const* sum_blocker(LogicalType const& argument)
     case duckdb::LogicalTypeId::TINYINT:
     case duckdb::LogicalTypeId::SMALLINT:
     case duckdb::LogicalTypeId::INTEGER:
-    case duckdb::LogicalTypeId::BIGINT: return nullptr;
-    case duckdb::LogicalTypeId::HUGEINT: return "sum:hugeint";
+    case duckdb::LogicalTypeId::BIGINT:
     case duckdb::LogicalTypeId::FLOAT:
-    case duckdb::LogicalTypeId::DOUBLE: return "sum:float";
+    case duckdb::LogicalTypeId::DOUBLE: return nullptr;
+    case duckdb::LogicalTypeId::HUGEINT: return "sum:hugeint";
     default: return "sum:other";
   }
 }
