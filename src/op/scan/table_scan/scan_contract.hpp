@@ -282,6 +282,7 @@ struct physical_check_counters {
   std::optional<int64_t> statement_equality_limit_for_testing;
   std::optional<std::size_t> equality_files_per_data_file_limit_for_testing;
   std::optional<std::size_t> idle_rest_context_limit_for_testing;
+  std::optional<std::size_t> equality_key_bounds_bytes_limit_for_testing;
   std::function<void(scan_manager::scan_envelope&)> preparation_envelope_for_testing;
   void parquet_phase(std::string const& file, bool footer) const
   {

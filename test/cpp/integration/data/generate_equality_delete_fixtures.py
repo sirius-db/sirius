@@ -28,13 +28,17 @@ are listed beside the right ones, so a failure says which rule broke:
                                     int and a NULL partition value, a spec whose only field is
                                     void, and an unpartitioned spec. The first two stay inside
                                     their spec and partition; the last two reach every file.
+  iceberg_v2_eq_partition_bounds    Two data files of one partition with disjoint key bounds, a
+                                    delete stored in that partition and one stored under an
+                                    unpartitioned spec. Both deletes apply to the same data
+                                    files and each matches one of them: one group, and the data
+                                    files share a batch.
   iceberg_v2_eq_v1_data_manifest    The partitioned table as an upgraded table carries it: format
                                     version 1 wrote the data manifest, which has no `content`
                                     field and no sequence numbers. A reader that needs `content`
                                     cannot plan the partition-scoped delete. The manifest has no
                                     bounds fields either, while the delete in partition A records
-                                    bounds: a reader that asks the manifest for them by name
-                                    fails that query and the reads after it.
+                                    bounds.
   iceberg_v2_eq_float_partition     Data files in partitions -0.0, +0.0 and 1.5 of a float field,
                                     and two sibling snapshots. A delete stored in 1.5 is applied
                                     on the GPU. A delete stored in +0.0 is declined: DuckDB takes
@@ -1107,6 +1111,15 @@ KEY_RANGES = {
     6: [1, 2, 3, 4, 5, 6],  # (k, s) = (20, "zz"): s is beside both data files
     7: [1, 3, 4, 5, 6],  # k = 20 and k = 45 in two delete files, one for each data file
     8: [1, 3, 4, 5, 6],  # k = 20, in a manifest without the bounds fields
+    9: [1, 2, 3, 4, 5],  # k = NULL and 100, bounds recorded but no null count
+    10: [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    ],  # s = 20 times "z", bounds truncated to 16 as Iceberg Java does
 }
 
 
@@ -1120,10 +1133,11 @@ def build_key_ranges():
             lower[2], upper[2] = (struct.pack("<q", v) for v in k)
         if s:
             lower[3], upper[3] = (v.encode() for v in s)
+        nulls = {3: 0} if k_nulls is None else {2: k_nulls, 3: 0}
         return {
             "lower_bounds": lower,
             "upper_bounds": upper,
-            "null_value_counts": {2: k_nulls, 3: 0},
+            "null_value_counts": nulls,
         }
 
     t = Table(
@@ -1189,6 +1203,86 @@ def build_key_ranges():
     )
     t.bare_manifests.add("m-delete-8.avro")
     delete(8, [(k([20]), [2], None)])
+    delete(9, [(k([None, 100]), [2], metrics((100, 100), k_nulls=None))])
+    # truncate(16) keeps a prefix as the lower bound and rounds the upper bound's prefix up.
+    delete(
+        10,
+        [
+            (
+                [(3, "s", pa.string(), ["z" * 20])],
+                [3],
+                metrics(s=("z" * 16, "z" * 15 + "{")),
+            )
+        ],
+    )
+    t.finish()
+
+
+def build_partition_bounds():
+    """Two data files of partition A; a delete stored in A and one stored unpartitioned."""
+    import pyarrow as pa
+
+    spec = [
+        {"name": "region", "transform": "identity", "source-id": 2, "field-id": 1000}
+    ]
+    t = Table(
+        "iceberg_v2_eq_partition_bounds",
+        [[(1, "id", "long"), (2, "region", "string")]],
+        [spec, []],
+    )
+
+    def bounds(low, high):
+        return {
+            "lower_bounds": {1: struct.pack("<q", low)},
+            "upper_bounds": {1: struct.pack("<q", high)},
+            "null_value_counts": {1: 0},
+        }
+
+    def data(name, ids):
+        return t.parquet(
+            name,
+            [(1, "id", pa.int64(), ids), (2, "region", pa.string(), ["A"] * 3)],
+        )
+
+    a, b = data("data-a.parquet", [1, 2, 3]), data("data-b.parquet", [4, 5, 6])
+    t.commit(
+        "append",
+        [
+            (
+                "m-data-1.avro",
+                0,
+                0,
+                [
+                    (1, None, a, 0, {"region": "A"}, None, bounds(1, 3)),
+                    (1, None, b, 0, {"region": "A"}, None, bounds(4, 6)),
+                ],
+            )
+        ],
+    )
+    in_a = t.parquet("delete-eq-2-A.parquet", [(1, "id", pa.int64(), [2])])
+    t.commit(
+        "delete",
+        [
+            (
+                "m-delete-2.avro",
+                1,
+                0,
+                [(1, None, in_a, 2, {"region": "A"}, [1], bounds(2, 2))],
+            )
+        ],
+    )
+    everywhere = t.parquet("delete-eq-3-global.parquet", [(1, "id", pa.int64(), [5])])
+    t.commit(
+        "delete",
+        [
+            (
+                "m-delete-3.avro",
+                1,
+                1,
+                [(1, None, everywhere, 2, None, [1], bounds(5, 5))],
+            )
+        ],
+    )
     t.finish()
 
 
@@ -1212,6 +1306,10 @@ FIXTURES = {
     "iceberg_v2_eq_partitioned": (
         build_partitioned,
         [(1, "B", 30), (3, "A", 50), (3, "B", 60)],
+    ),
+    "iceberg_v2_eq_partition_bounds": (
+        build_partition_bounds,
+        [(1, "A"), (3, "A"), (4, "A"), (6, "A")],
     ),
     "iceberg_v2_eq_partition_shapes": (
         build_partition_shapes,

@@ -136,6 +136,8 @@ inline constexpr int64_t kMaxEqualityDeleteRowsPerStatement  = 64LL * 1024 * 102
 inline constexpr int64_t kMaxEqualityDeleteBytesPerStatement = 1024LL * 1024 * 1024;
 /// Not a memory bound: every batch is probed once per applicable delete group.
 inline constexpr std::size_t kMaxEqualityDeleteFilesPerDataFile = 64;
+/// Host bytes of the data files' key bounds one plan keeps; above it no bounds are compared.
+inline constexpr std::size_t kMaxEqualityKeyBoundsBytes = 256ULL * 1024 * 1024;
 
 /// Running total of the equality deletes a statement has agreed to load.
 struct equality_delete_charge {
@@ -183,14 +185,18 @@ using equality_key_types = std::function<std::optional<duckdb::LogicalType>(int3
  *
  * With @p key_types, a delete file is also left out for a data file it cannot match: one of its
  * keys has bounds recorded for both files that are disjoint, and the two files do not both hold
- * a NULL in it. That reads the bounds of the data manifests, once for the statement.
+ * a NULL in it. The delete files' bounds come with their entries; the data manifests are read
+ * for theirs, once for the statement, when a delete file records a usable range.
  *
  * @param max_files_per_data_file A data file's list stops growing one past this.
+ * @param max_key_bounds_bytes Host bytes of data-file bounds to keep; above it nothing is pruned.
  */
-iceberg_equality_plan read_equality_plan(duckdb::ClientContext&,
-                                         iceberg_delete_inventory const& inventory,
-                                         std::size_t max_files_per_data_file,
-                                         equality_key_types const& key_types = {});
+iceberg_equality_plan read_equality_plan(
+  duckdb::ClientContext&,
+  iceberg_delete_inventory const& inventory,
+  std::size_t max_files_per_data_file,
+  equality_key_types const& key_types = {},
+  std::size_t max_key_bounds_bytes    = kMaxEqualityKeyBoundsBytes);
 iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext&,
                                                  std::string const&,
                                                  iceberg_delete_inventory&&);
@@ -217,6 +223,15 @@ struct equality_replica {
   rmm::cuda_device_id device;
   std::vector<EqualityDeleteGroup> groups;
 };
+
+/// How the delete files of a plan form groups, and the groups each data file is probed against.
+struct equality_grouping {
+  /// Group -> its delete files, as indices into the plan's files: they share keys and scope.
+  std::vector<std::vector<uint32_t>> files;
+  /// Data file -> its groups. Data files with the same groups share one list object.
+  std::unordered_map<std::string, std::shared_ptr<equality_group_list const>> by_data_file;
+};
+[[nodiscard]] equality_grouping group_equality_deletes(iceberg_equality_plan const& plan);
 
 /**
  * @brief Fully materialized Iceberg delete data for one table.
@@ -245,7 +260,7 @@ struct IcebergDeleteData {
     rmm::cuda_device_id device) const;
 
   /// Every data file of the snapshot (keyed as the manifest wrote the path) -> the groups that
-  /// apply to it. Files with the same applicability share one list object. Empty when the table
+  /// apply to it. Files with the same groups share one list object. Empty when the table
   /// has no equality deletes; otherwise a scanned file missing from it must be refused.
   std::unordered_map<std::string, std::shared_ptr<equality_group_list const>>
     equality_groups_by_data_file;

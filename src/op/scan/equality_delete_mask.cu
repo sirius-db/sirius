@@ -81,10 +81,12 @@ void clear_matched_rows(rmm::device_uvector<cudf::size_type> const& build_indice
                     clear_if_matched{});
 }
 
-cudf::size_type count_kept_rows(cudf::column_view const& mask, ::cuda::stream_ref stream)
+cudf::size_type count_kept_rows(cudf::column_view const& mask,
+                                ::cuda::stream_ref stream,
+                                rmm::device_async_resource_ref mr)
 {
   return static_cast<cudf::size_type>(thrust::count(
-    rmm::exec_policy_nosync(stream), mask.data<uint8_t>(), mask.data<uint8_t>() + mask.size(), 1));
+    rmm::exec_policy(stream, mr), mask.data<uint8_t>(), mask.data<uint8_t>() + mask.size(), 1));
 }
 
 }  // namespace sirius::op::scan

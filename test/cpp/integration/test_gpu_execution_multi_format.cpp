@@ -1850,9 +1850,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
     INFO("a data manifest written by format version 1");
     // The table of "respect partitions" as an upgraded table carries it: the data manifest has
     // no `content` field and no sequence numbers. A reader that needs `content` cannot plan the
-    // partition-scoped delete and declines. It has no bounds fields either, while the delete in
-    // partition A records bounds: asking the manifest for them by name fails that query, aborts
-    // the transaction and declines.
+    // partition-scoped delete and declines. The manifest has no bounds fields either, while the
+    // delete in partition A records bounds.
     auto path = table("iceberg_v2_eq_v1_data_manifest");
     require_delete_files(path, 2);
     expect_equality_rows("SELECT id, region, v FROM " + pinned_scan(path) + " ORDER BY v;",
@@ -2017,7 +2016,13 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
           "a NULL key faces a file holding a NULL", 4, {{"1"}, {"2"}, {"3"}, {"4"}, {"5"}}, 1},
         range_case{"a delete that records no bounds", 5, without_2, 1},
         range_case{"(k, s) is beside both files in s alone", 6, all, 0},
-        range_case{"a delete manifest without the bounds fields", 8, without_2, 1}}) {
+        range_case{"a delete manifest without the bounds fields", 8, without_2, 1},
+        // Read as zero, the missing count takes the delete off data-b and keeps id 6.
+        range_case{"a NULL key whose delete file records no null count",
+                   9,
+                   {{"1"}, {"2"}, {"3"}, {"4"}, {"5"}},
+                   1},
+        range_case{"string bounds truncated to 16 characters", 10, all, 0}}) {
     INFO(c.what);
     expect_equality_rows(scan(c.sequence), c.expected, c.loads);
   }
@@ -2028,6 +2033,59 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
   auto reset    = reset_after_test(counters->equality_files_per_data_file_limit_for_testing);
   counters->equality_files_per_data_file_limit_for_testing = 1;
   expect_equality_rows(scan(7), without_2, 2);
+
+  // Bounds above the host-memory ceiling are not kept: the delete of sequence 2 is opened.
+  auto reset_bytes = reset_after_test(counters->equality_key_bounds_bytes_limit_for_testing);
+  counters->equality_key_bounds_bytes_limit_for_testing = 1;
+  expect_equality_rows(scan(2), all, 1);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - key bounds leave groups and batches as they were",
+                 "[integration][gpu_execution][iceberg]")
+{
+  using namespace sirius::op::scan;
+  auto const bigint = [](int32_t) -> std::optional<duckdb::LogicalType> {
+    return duckdb::LogicalType::BIGINT;
+  };
+  auto const named = [](iceberg_equality_plan const& plan, std::string const& name) {
+    for (auto const& [data_file, files] : plan.by_data_file)
+      if (fs::path(data_file).filename() == name) return data_file;
+    FAIL("no data file " << name);
+    return std::string();
+  };
+  {
+    // Data files a and b of partition A hold ids [1, 3] and [4, 6]. A delete of id 2 is stored
+    // in A and a delete of id 5 under an unpartitioned spec: both apply to both data files, and
+    // the bounds leave each on one list.
+    auto path = table("iceberg_v2_eq_partition_bounds");
+    expect_equality_rows(
+      "SELECT id FROM " + pinned_scan(path) + " ORDER BY id;", {{"1"}, {"3"}, {"4"}, {"6"}}, 2);
+    auto inventory = read_delete_inventory(*con->context, path, current_snapshot_id(path));
+    REQUIRE(inventory.inventory);
+    auto const plan = read_equality_plan(*con->context, *inventory.inventory, 64, bigint);
+    REQUIRE(plan.files.size() == 2);
+    auto const a = named(plan, "data-a.parquet"), b = named(plan, "data-b.parquet");
+    CHECK(plan.by_data_file.at(a).size() == 1);
+    CHECK(plan.by_data_file.at(b).size() == 1);
+    CHECK(plan.by_data_file.at(a) != plan.by_data_file.at(b));
+    // The two deletes apply to the same data files, so they are one group although they are
+    // stored under different specs, and the data files can share a batch.
+    CHECK(plan.files[0].scope == plan.files[1].scope);
+    auto const grouping = group_equality_deletes(plan);
+    CHECK(grouping.files.size() == 1);
+    CHECK(grouping.by_data_file.at(a) == grouping.by_data_file.at(b));
+  }
+  {
+    // Sequence 4 of the key-range table deletes k = NULL and 100 and records one NULL. Data
+    // file a records none, which is enough for the bounds to decide; data file b holds one.
+    auto path      = table("iceberg_v2_eq_key_ranges");
+    auto inventory = read_delete_inventory(*con->context, path, 8800000000000004);
+    REQUIRE(inventory.inventory);
+    auto const plan = read_equality_plan(*con->context, *inventory.inventory, 64, bigint);
+    CHECK(plan.by_data_file.at(named(plan, "data-a.parquet")).empty());
+    CHECK(plan.by_data_file.at(named(plan, "data-b.parquet")).size() == 1);
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,

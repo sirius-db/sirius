@@ -61,6 +61,7 @@ void clear_matched_rows(rmm::device_uvector<cudf::size_type> const& build_indice
 
 /// Number of rows the BOOL8 @p mask keeps.
 [[nodiscard]] cudf::size_type count_kept_rows(cudf::column_view const& mask,
-                                              ::cuda::stream_ref stream);
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::op::scan

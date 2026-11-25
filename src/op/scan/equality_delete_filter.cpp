@@ -96,7 +96,7 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
     }
   }
 
-  if (count_kept_rows(keep->view(), stream) == n_rows) { return tbl; }
+  if (count_kept_rows(keep->view(), stream, mr) == n_rows) { return tbl; }
   return sirius::apply_retention_mask(tbl->view(), keep->view(), stream, mr);
 }
 

@@ -109,6 +109,22 @@ std::optional<std::string> remote_scheme(std::string const& path)
 
 // Plans the live equality deletes of a snapshot into @p inventory, or says why the GPU path
 // cannot apply them: resolves each key field ID to a bound column and enforces the GPU limits.
+/// The columns of @p columns that field @p id names: the first one, and whether there is another.
+std::pair<duckdb::MultiFileColumnDefinition const*, bool> columns_of_field(
+  duckdb::vector<duckdb::MultiFileColumnDefinition> const& columns, int32_t id)
+{
+  duckdb::MultiFileColumnDefinition const* found = nullptr;
+  for (auto const& column : columns) {
+    if (column.identifier.IsNull() ||
+        column.identifier.type().id() != duckdb::LogicalTypeId::INTEGER ||
+        column.identifier.GetValue<int32_t>() != id)
+      continue;
+    if (found != nullptr) return {found, true};
+    found = &column;
+  }
+  return {found, false};
+}
+
 std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
                                                  duckdb::ClientContext& context,
                                                  duckdb::SiriusContext& sirius_ctx,
@@ -124,22 +140,20 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
   // file out for a data file. A key the checks below refuse has no type here.
   auto const key_type = [&](int32_t id) -> std::optional<duckdb::LogicalType> {
     if (bind == nullptr) return std::nullopt;
-    std::optional<duckdb::LogicalType> type;
-    for (auto const& column :
-         bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema) {
-      if (column.identifier.IsNull() ||
-          column.identifier.type().id() != duckdb::LogicalTypeId::INTEGER ||
-          column.identifier.GetValue<int32_t>() != id)
-        continue;
-      if (type || !column.children.empty() || !op::scan::equality_key_cudf_type(column.type))
-        return std::nullopt;
-      type = column.type;
-    }
-    return type;
+    auto const [column, twice] = columns_of_field(
+      bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema, id);
+    if (column == nullptr || twice || !column->children.empty() ||
+        !op::scan::equality_key_cudf_type(column->type))
+      return std::nullopt;
+    return column->type;
   };
+  auto const bounds_limit =
+    counters && counters->track_units && counters->equality_key_bounds_bytes_limit_for_testing
+      ? *counters->equality_key_bounds_bytes_limit_for_testing
+      : op::scan::kMaxEqualityKeyBoundsBytes;
   op::scan::iceberg_equality_plan plan;
   try {
-    plan = op::scan::read_equality_plan(context, inventory, files_limit, key_type);
+    plan = op::scan::read_equality_plan(context, inventory, files_limit, key_type, bounds_limit);
   } catch (op::scan::equality_plan_error const& e) {
     return iceberg_decline(scan_reason::iceberg_equality_plan_unproven, e.what());
   }
@@ -191,15 +205,8 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
       };
       // Top level only. A key the table has since dropped is not in the bound schema at all;
       // the spec still requires it, and this path cannot project it.
-      duckdb::MultiFileColumnDefinition const* found = nullptr;
-      for (auto const& column : columns) {
-        if (column.identifier.IsNull() ||
-            column.identifier.type().id() != duckdb::LogicalTypeId::INTEGER ||
-            column.identifier.GetValue<int32_t>() != id)
-          continue;
-        if (found != nullptr) return unsupported("which the bound schema lists twice");
-        found = &column;
-      }
+      auto const [found, twice] = columns_of_field(columns, id);
+      if (twice) return unsupported("which the bound schema lists twice");
       if (found == nullptr)
         return unsupported(
           "which is not a top-level column of the bound schema (dropped or "
