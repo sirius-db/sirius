@@ -154,11 +154,13 @@ write. A rank makes its mirror, if it has none yet, when it first chooses this p
 at least 2), and `sirius_exchange_recv_frames_per_peer` the frames a peer may have in flight (a
 lane carries one). Every rank must use the same `sirius_exchange_host_staging` and
 `sirius_exchange_mnnvl`; a rank offered
-lanes by a peer it reaches another way fails to connect, saying so. On gcn-17/gcn-18 over one
+lanes by a peer it reaches another way fails to connect, saying so. On two GB200 nodes over one
 200 Gb/s port (`[nixl_bandwidth]`, 16 receive frames per peer), 1+1 ranks with 16 lanes moved
 19.0 GB/s each way instead of 0.19, and 4+4 ranks with 4 lanes about 10 GB/s per rank, 23 GB/s
 across the link each way; raw TCP reaches 24.75 there. These figures are from the branch the
-lanes were ported from, with UCX `tcp` on bond0; this code has not been measured again.
+lanes were ported from, with UCX `tcp` on bond0. On this code, two GB200 nodes with 4 ranks each
+and 4 lanes per rank moved 33 to 38 GB/s per rank with the lanes on the rail NICs
+(`UCX_NET_DEVICES=rails`), where UCX carries them over RDMA.
 
 On a cluster with RDMA between hosts and no fabric memory, set
 `sirius_exchange_host_staging = 'never'`: direct NIXL writes over the RDMA NICs are faster than
@@ -190,8 +192,9 @@ NVLink fabric" (`choose_path()` in `src/exchange/path_choice.*`), on this host o
 other peer gets the path described above (TCP lanes to another host). `require` fails at connect for a peer that cannot be reached that way.
 
 UCX picks its transport per endpoint and says nothing when `cuda_ipc` cannot map a peer's memory.
-So after connecting, a rank times one write, as large as the transport's largest, to each peer on
-the fabric path, into its own credit frames there, and logs the rate. Below 150 GB/s it warns
+So after connecting, a rank times up to 8 writes, as large as the transport's largest, to each
+peer on the fabric path, into its own credit frames there, and logs the best rate: other ranks
+still connecting can stall a write. Below 150 GB/s it warns
 (`require`: fails) that UCX did not take `cuda_ipc`. `UCX_PROTO_INFO=y` prints the transport of
 each UCX protocol, for example `cuda_ipc/cuda` for a put from `cuda/GPU0` to `cuda/dev[0]`.
 
@@ -201,8 +204,9 @@ The ring sizes are settings, the same on every rank: `sirius_exchange_frame_byte
 memory budget: 576 MiB with 8 ranks by default. For NVLink between nodes, set 16 MiB frames, 32
 send frames and 16 receive frames per peer, which keep two 128 MiB writes to a peer in flight,
 and `UCX_NET_DEVICES=rails`: 2.25 GiB with 8 ranks, 18.3 GiB with 72 (credits on demand, #2371,
-would bound it). With that sizing one GPU pair moved 694 to 706 GB/s, and 626 with 8 receive
-frames per peer; with `tcp` on bond0 for the notifications, 677 and 579.
+would bound it). With that sizing one GPU pair moved 685 to 706 GB/s, and 626 with 8 receive
+frames per peer; with `tcp` on bond0 for the notifications, 677 and 579. With the default sizes it
+moved 312.
 
 `scripts/distributed_test_nixl_pairs.sh <node1>,<node2>` runs the hidden `[nixl_pairs]` test on
 two nodes of a Slurm partition, one rank per GPU paired with the same GPU on the other node: one
