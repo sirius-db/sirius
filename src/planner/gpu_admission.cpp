@@ -21,6 +21,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 
 #include <duckdb/common/multi_file/multi_file_list.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
@@ -68,7 +69,9 @@ void collect_gpu_scans(const op::sirius_physical_operator& node,
 namespace {
 
 /// The table function's own row count, before filters; nullopt when it has no cardinality
-/// callback, the callback reports nothing, or it throws.
+/// callback, the callback reports nothing, or it throws. A Parquet scan's callback reports nothing
+/// here: it reads the count off the scan's first open file, and the plan Sirius converts is a
+/// copy whose bind data has no open file (`copy_logical_plan`).
 std::optional<uint64_t> table_function_row_count(duckdb::ClientContext& context,
                                                  const op::sirius_physical_table_scan& scan)
 {
@@ -184,7 +187,13 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
                                                          const op::sirius_physical_table_scan& scan)
 {
   op::scan::scan_admission_hint hint;
-  hint.unfiltered_rows = table_function_row_count(context, scan);
+  // A Parquet scan's files were counted from their footers before DuckDB optimized the plan, when
+  // `parquet_footer_statistics` is on. That count is exact; the callback's is the first file's
+  // times the number of files, and is absent for a copied plan.
+  auto const footer_rows = transparent::parquet_scan_row_count(
+    scan.function.GetName().GetIdentifierName(), scan.bind_data.get());
+  hint.unfiltered_rows = footer_rows.has_value() ? std::optional<uint64_t>{*footer_rows}
+                                                 : table_function_row_count(context, scan);
   hint.column_widths.assign(scan.types.size(), std::nullopt);
 
   auto const leaf_widths = parquet_leaf_column_widths(scan.bind_data.get());
@@ -218,12 +227,15 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
   // One line per scan, so a run can show which source each estimate came from and, when the
   // table row count is missing, whether the callback or the bind data was absent.
   SIRIUS_LOG_DEBUG(
-    "gpu_admission: scan of {} (cardinality callback {}, bind data {}): unfiltered rows {}, {} of "
-    "{} column width(s) known",
+    "gpu_admission: scan of {} (cardinality callback {}, bind data {}): unfiltered rows {} ({}), "
+    "{} of {} column width(s) known",
     scan.function.GetName().GetIdentifierName(),
     scan.function.cardinality != nullptr ? "present" : "absent",
     scan.bind_data != nullptr ? "present" : "absent",
     hint.unfiltered_rows.has_value() ? std::to_string(*hint.unfiltered_rows) : "unknown",
+    footer_rows.has_value()            ? "from Parquet footers"
+    : hint.unfiltered_rows.has_value() ? "from the cardinality callback"
+                                       : "no source",
     std::count_if(hint.column_widths.begin(),
                   hint.column_widths.end(),
                   [](auto const& width) { return width.has_value(); }),

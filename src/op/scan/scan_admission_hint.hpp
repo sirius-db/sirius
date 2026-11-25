@@ -26,16 +26,17 @@ namespace sirius::op::scan {
  * @brief Plan-time facts about a scan that GPU admission (planner/gpu_admission.hpp) uses in
  *        place of the planner's filtered cardinality and the configured average string width.
  *
- * Filled by the plan generator from the table function's own cardinality and statistics
- * callbacks and, for Parquet, from the first file's footer. Every field is optional: admission
- * falls back to the planner estimate and `avg_variable_column_bytes` wherever a field is absent.
+ * Filled by the plan generator from the Parquet footers' row counts, the table function's own
+ * cardinality and statistics callbacks and, for Parquet, the first file's footer. Every field is
+ * optional: admission falls back to the planner estimate and `avg_variable_column_bytes` wherever
+ * a field is absent.
  */
 struct scan_admission_hint {
-  /// Rows the table function reports for the whole table or file set, before any filter. The
-  /// planner's `estimated_cardinality` applies DuckDB's filter selectivity, which under-counts
-  /// range and LIKE filters by 4-5x on TPC-H; admission only ever takes the larger of the two,
-  /// because under-estimating puts a large query on too few GPUs while over-estimating merely
-  /// keeps today's allocation.
+  /// Rows of the whole table or file set, before any filter: the Parquet footers' row counts,
+  /// or what the table function reports. The planner's `estimated_cardinality` applies DuckDB's
+  /// filter selectivity, which under-counts range and LIKE filters by 4-5x on TPC-H; admission
+  /// only ever takes the larger of the two, because under-estimating puts a large query on too
+  /// few GPUs while over-estimating merely keeps today's allocation.
   std::optional<uint64_t> unfiltered_rows;
   /// Bytes per row of each output column (plan order) where a source could say: Parquet column
   /// chunks' uncompressed size per value for columns stored verbatim, or the table statistics'

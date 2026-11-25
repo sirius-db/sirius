@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <duckdb/function/function.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
@@ -24,6 +25,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace duckdb {
@@ -81,6 +83,13 @@ struct footer_read_limits {
 /// that received it through copy_parquet_scan_row_count, is alive; entries of lists that are gone
 /// are dropped lazily.
 [[nodiscard]] std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get);
+
+/// \brief The same count for a scan that is no longer a LogicalGet: \p function_name and
+/// \p bind_data are the function name and the bind data of the LogicalGet the scan was planned
+/// from. The bind data must be that LogicalGet's own object, not a copy of it: the count is found
+/// through its file list.
+[[nodiscard]] std::optional<std::size_t> parquet_scan_row_count(
+  std::string_view function_name, duckdb::FunctionData const* bind_data);
 
 /// \brief How many values lie from the smallest to the largest that column \p column holds across
 /// all files of \p get (max - min + 1), or nullopt when the footers give it no integer range.

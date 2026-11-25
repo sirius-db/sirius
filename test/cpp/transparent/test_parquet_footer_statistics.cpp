@@ -2421,3 +2421,25 @@ TEST_CASE_METHOD(FooterAdmissionFixture,
   CHECK_FALSE(footer_fix_rows(*uncovered));
   CHECK_FALSE(span_of(*uncovered));
 }
+
+TEST_CASE_METHOD(FooterAdmissionFixture,
+                 "Footer row count is found through the bind data a physical scan keeps",
+                 "[integration][gpu_execution][parquet_footer_statistics][footer_admission_fix]"
+                 "[footer_row_count]")
+{
+  // A physical scan keeps the function name and the bind data of the LogicalGet it was planned
+  // from, not the LogicalGet, and Sirius plans from a copy of the plan.
+  auto covered    = plan();
+  auto copied     = footer_fix_copy(*con, *covered);
+  auto const* get = footer_parquet_get(*copied);
+  REQUIRE(get != nullptr);
+  auto const name = get->function.GetName().GetIdentifierName();
+  CHECK(sirius::transparent::parquet_scan_row_count(name, get->bind_data.get()) ==
+        std::optional<std::size_t>{200});
+
+  // Only a Parquet scan has a count, and only through the bind data of a covered plan.
+  CHECK_FALSE(sirius::transparent::parquet_scan_row_count("seq_scan", get->bind_data.get()));
+  CHECK_FALSE(sirius::transparent::parquet_scan_row_count(name, nullptr));
+  auto const detached = get->bind_data->Copy();
+  CHECK_FALSE(sirius::transparent::parquet_scan_row_count(name, detached.get()));
+}

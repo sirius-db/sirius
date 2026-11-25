@@ -211,11 +211,13 @@ std::vector<std::optional<uint64_t>> parquet_column_widths(
  * @brief Derive a GPU scan's admission hint from its DuckDB table function while the plan
  *        generator still holds the function and bind data.
  *
- * Rows: the table function's `cardinality` callback (`TableScanCardinality` for DuckDB tables,
- * `MultiFileCardinality` for Parquet), i.e. the row count before any filter. Widths, for
- * variable-width output columns only: decoded byte-array size statistics covering every row
- * group of a single Parquet file, plus the 4-byte offset word; otherwise the table statistics'
- * maximum string length plus the offset. Unknown widths retain the configured average.
+ * Rows, before any filter: for a Parquet scan, the sum of its files' footer row counts
+ * (`transparent::parquet_scan_row_count`, present when `parquet_footer_statistics` is on);
+ * otherwise the table function's `cardinality` callback (`TableScanCardinality` for DuckDB
+ * tables). Widths, for variable-width output columns only: decoded byte-array size statistics
+ * covering every row group of a single Parquet file, plus the 4-byte offset word; otherwise the
+ * table statistics' maximum string length plus the offset. Unknown widths retain the configured
+ * average.
  */
 op::scan::scan_admission_hint derive_scan_admission_hint(
   duckdb::ClientContext& context, const op::sirius_physical_table_scan& scan);

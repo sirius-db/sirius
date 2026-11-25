@@ -581,17 +581,27 @@ void remember_merge(std::string const& key,
   merge_references += scan.files.size();
 }
 
+bool is_parquet_scan(std::string_view function_name)
+{
+  return function_name == "read_parquet" || function_name == "parquet_scan";
+}
+
 bool is_parquet_scan(duckdb::LogicalGet const& get)
 {
-  auto const& name = get.function.GetName().GetIdentifierName();
-  return name == "read_parquet" || name == "parquet_scan";
+  return is_parquet_scan(get.function.GetName().GetIdentifierName());
+}
+
+duckdb::shared_ptr<duckdb::MultiFileList> const* file_list_of(
+  std::string_view function_name, duckdb::FunctionData const* bind_data)
+{
+  if (!is_parquet_scan(function_name)) { return nullptr; }
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
+  return bind && bind->file_list ? &bind->file_list : nullptr;
 }
 
 duckdb::shared_ptr<duckdb::MultiFileList> const* file_list_of(duckdb::LogicalGet const& get)
 {
-  if (!is_parquet_scan(get)) { return nullptr; }
-  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
-  return bind && bind->file_list ? &bind->file_list : nullptr;
+  return file_list_of(get.function.GetName().GetIdentifierName(), get.bind_data.get());
 }
 
 bool answers(row_count_entry const& entry, duckdb::MultiFileList const* list)
@@ -731,16 +741,23 @@ std::size_t add_parquet_footer_statistics(duckdb::ClientContext& context,
   return added;
 }
 
+std::optional<std::size_t> parquet_scan_row_count(std::string_view function_name,
+                                                  duckdb::FunctionData const* bind_data)
+{
+  auto const* list = file_list_of(function_name, bind_data);
+  if (!list) { return std::nullopt; }
+  std::lock_guard guard(cache_mutex);
+  auto const found = row_counts.find(list->get());
+  if (found == row_counts.end() || !answers(found->second, list->get())) { return std::nullopt; }
+  return found->second.rows;
+}
+
 std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get)
 {
-  auto const* list = file_list_of(get);
-  if (!list) { return std::nullopt; }
-  {
-    std::lock_guard guard(cache_mutex);
-    auto const found = row_counts.find(list->get());
-    if (found != row_counts.end() && answers(found->second, list->get())) {
-      return found->second.rows;
-    }
+  if (!file_list_of(get)) { return std::nullopt; }
+  if (auto const rows = parquet_scan_row_count(get.function.GetName().GetIdentifierName(),
+                                               get.bind_data.get())) {
+    return rows;
   }
   sirius::log::log_noexcept([&] {
     SIRIUS_LOG_DEBUG("No footer row count for the Parquet scan at table index {}",
