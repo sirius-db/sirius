@@ -66,7 +66,7 @@ kept in `~/.sirius/gateways/<cluster>/tls`. A registered rank listens on its nod
 address in its `priority_networks`, by default the gateway's subnet from `gateway.conf`, and
 `UCX_NET_DEVICES` defaults to that address's interface. `scripts/launcher_env.sh` defaults
 `UCX_TLS` to `cuda_copy,cuda_ipc,tcp,self`: left to itself, UCX picks InfiniBand ports that GB200
-hosts cannot connect through. `UCX_NET_DEVICES=rails` takes the host's GPU rail NICs with
+hosts cannot connect through. `SIRIUS_UCX_RAILS=1` takes the host's GPU rail NICs with
 `UCX_TLS=all` instead, which the exchange over the NVLink fabric needs for its notifications at
 full speed. `scripts/sirius_gateway.sh` then starts the gateway with
 `sirius_gateway_exchange_host_staging = 'never'`, unless `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING`

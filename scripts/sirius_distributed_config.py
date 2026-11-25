@@ -37,6 +37,7 @@ KEYS = {
     ): "SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER",
     ("ucx", "tls"): "UCX_TLS",
     ("ucx", "net_devices"): "UCX_NET_DEVICES",
+    ("ucx", "rails"): "SIRIUS_UCX_RAILS",
 }
 
 

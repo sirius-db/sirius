@@ -9,6 +9,7 @@
 # exchange_port, listen_host, dir; arguments given here win over it. It may also set:
 #   ucx_tls, ucx_net_devices  UCX_TLS, UCX_NET_DEVICES, unless exported
 #                      (defaults: scripts/launcher_env.sh)
+#   ucx_rails          SIRIUS_UCX_RAILS, unless exported: 1 puts UCX on the GPU rail NICs
 #   cpus               the rank's CPUs, unless SIRIUS_NODE_CPUS is exported. auto (default): its
 #                      GPU's share of the cores next to that GPU, or the CPUs it was started
 #                      with when those are fewer than the host's (sirius_rank_cpus.py). all:
@@ -72,6 +73,7 @@ fi
 
 [ -n "${ucx_tls:-}" ] && export UCX_TLS=${UCX_TLS:-$ucx_tls}
 [ -n "${ucx_net_devices:-}" ] && export UCX_NET_DEVICES=${UCX_NET_DEVICES:-$ucx_net_devices}
+[ -n "${ucx_rails:-}" ] && export SIRIUS_UCX_RAILS=${SIRIUS_UCX_RAILS:-$ucx_rails}
 # Before priority_networks names an interface: the GPU rail NICs win where the host has them.
 source "$here/launcher_env.sh"
 priority_networks=${priority_networks:-${networks:-}}
