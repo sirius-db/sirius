@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <string>
 
 // <linux/fs.h> defines BLOCK_SIZE as a macro and reaches this file through the result collector
 // (sirius_context.hpp -> scan manager -> liburing). DuckDB's parquet_crypto.hpp, which
@@ -214,6 +215,19 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
                        e.what());
     }
   }
+  // One line per scan, so a run can show which source each estimate came from and, when the
+  // table row count is missing, whether the callback or the bind data was absent.
+  SIRIUS_LOG_DEBUG(
+    "gpu_admission: scan of {} (cardinality callback {}, bind data {}): unfiltered rows {}, {} of "
+    "{} column width(s) known",
+    scan.function.GetName().GetIdentifierName(),
+    scan.function.cardinality != nullptr ? "present" : "absent",
+    scan.bind_data != nullptr ? "present" : "absent",
+    hint.unfiltered_rows.has_value() ? std::to_string(*hint.unfiltered_rows) : "unknown",
+    std::count_if(hint.column_widths.begin(),
+                  hint.column_widths.end(),
+                  [](auto const& width) { return width.has_value(); }),
+    hint.column_widths.size());
   return hint;
 }
 
