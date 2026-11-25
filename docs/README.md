@@ -244,6 +244,20 @@ From Python, execute the same SQL with `con.execute(...)` after loading the exte
 querying. See the [compressed pinning guide](super-sirius/compressed-pinning.md) for plan selection
 and tuning.
 
+## Footer Statistics for Large Parquet Tables
+
+During planning, Sirius reads and caches statistics from the Parquet footers of a multi-file scan
+and passes them to DuckDB's optimizer, but only for scans with at most 1,024 uncached `s3://` files
+(or 16,384 local). For a table consisting of more files than that, you can still read all the
+footers ahead of the queries explicitly by running:
+
+```sql
+SELECT files FROM sirius_analyze_parquet('s3://my-bucket/my-table/*.parquet');
+```
+
+Later scans of the same glob in that process find them cached. See the
+[scan settings](super-sirius/configuration.md#scan) to change or remove the limits.
+
 ## Configuration
 
 Sirius loads its settings from a YAML config file, searched in this order:
