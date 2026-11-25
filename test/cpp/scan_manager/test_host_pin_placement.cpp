@@ -114,6 +114,43 @@ TEST_CASE("NUMA affinity supports uneven and unknown domains independently",
   REQUIRE(affinity.next_gpu(4, known) == 2);
 }
 
+TEST_CASE("host data is routed only to the query's admitted GPUs",
+          "[host_pin_placement][numa_affinity]")
+{
+  using sirius::memory::admitted_local_gpus;
+  std::array<int, 4> const local{0, 1, 2, 3};
+  std::array<int, 3> const admitted{0, 1, 2};
+
+  // No subset: every local GPU, in the topology's order.
+  REQUIRE(admitted_local_gpus(local, {}) == std::vector<int>{0, 1, 2, 3});
+  REQUIRE(admitted_local_gpus(local, local) == std::vector<int>{0, 1, 2, 3});
+  REQUIRE(admitted_local_gpus({}, {}).empty());
+
+  // A subset keeps the local order and drops the excluded GPU.
+  REQUIRE(admitted_local_gpus(local, admitted) == std::vector<int>{0, 1, 2});
+  std::array<int, 4> const reordered{3, 2, 1, 0};
+  REQUIRE(admitted_local_gpus(reordered, admitted) == std::vector<int>{2, 1, 0});
+
+  // No admitted GPU on the data's NUMA node: every admitted GPU is a candidate.
+  std::array<int, 2> const other_node{4, 5};
+  REQUIRE(admitted_local_gpus(other_node, admitted) == std::vector<int>{0, 1, 2});
+  REQUIRE(admitted_local_gpus({}, admitted) == std::vector<int>{0, 1, 2});
+
+  // Three chunks of one scan on three admitted GPUs land on three different GPUs, wherever the
+  // walk happens to start. Walking all four GPUs would name GPU 3 for one chunk in every four.
+  sirius::memory::numa_affinity affinity;
+  for (int start = 0; start < 4; ++start) {
+    auto const gpus = admitted_local_gpus(local, admitted);
+    std::vector<int> chunks;
+    for (int i = 0; i < 3; ++i) {
+      chunks.push_back(affinity.next_gpu(0, gpus).value());
+    }
+    std::sort(chunks.begin(), chunks.end());
+    REQUIRE(chunks == std::vector<int>{0, 1, 2});
+    (void)affinity.next_gpu(0, gpus);  // shift the starting point for the next round
+  }
+}
+
 TEST_CASE("concurrent placement retains balanced host and GPU counters",
           "[host_pin_placement][numa_affinity]")
 {

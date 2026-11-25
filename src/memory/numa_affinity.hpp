@@ -16,11 +16,13 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <vector>
 
 namespace sirius::memory {
 
@@ -40,5 +42,24 @@ class numa_affinity {
   std::mutex _mutex;
   std::unordered_map<int, std::uint64_t> _cursors;
 };
+
+/// The GPUs a host-data task may be routed to when its query runs on `admitted`: the members of
+/// `local` (the GPUs on the data's NUMA node) that were admitted, in `local` order. Walking every
+/// local GPU instead sends some tasks to a GPU the query does not run on; each of those then has
+/// to be moved, and lands on a GPU that already took its own share. When no local GPU was
+/// admitted, every admitted GPU is equally far from the data, so the walk covers them all. An
+/// empty `admitted` means the query runs on every GPU and `local` is returned whole.
+[[nodiscard]] inline std::vector<int> admitted_local_gpus(std::span<int const> local,
+                                                          std::span<int const> admitted)
+{
+  if (admitted.empty()) { return {local.begin(), local.end()}; }
+  std::vector<int> gpus;
+  gpus.reserve(local.size());
+  for (int const gpu : local) {
+    if (std::find(admitted.begin(), admitted.end(), gpu) != admitted.end()) { gpus.push_back(gpu); }
+  }
+  if (gpus.empty()) { gpus.assign(admitted.begin(), admitted.end()); }
+  return gpus;
+}
 
 }  // namespace sirius::memory
