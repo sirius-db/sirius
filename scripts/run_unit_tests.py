@@ -9,9 +9,10 @@ The run has five steps:
 
   shards     Two Catch2 shards per visible GPU, run in parallel. Each shard sees
              one GPU and uses integration-shard.yaml. [multi_gpu],
-             [public_context], and hidden tests are excluded.
+             [public_context], [whole_gpu], and hidden tests are excluded.
   context    The [public_context] lifecycle tests run alone because default
-             contexts reserve most of each GPU's memory.
+             contexts reserve most of each GPU's memory, and so do the
+             [whole_gpu] tests, which take or measure a GPU's free memory.
   cuda_fault Isolated CUDA status-injection tests (Linux only). One GPU is
              visible; the [multi_gpu] ones run in a second process with all
              GPUs visible, skipped when fewer than two are.
@@ -46,8 +47,8 @@ UNITTEST_DIR = Path("test/cpp")
 SHARD_CONFIG = REPO_ROOT / "test/cpp/integration/integration-shard.yaml"
 STEPS = ("shards", "context", "cuda_fault", "multi_gpu", "late_mat")
 STEP_SPECS = {
-    "shards": "~[.]~[multi_gpu]~[public_context]",
-    "context": "[public_context]~[.]",
+    "shards": "~[.]~[multi_gpu]~[public_context]~[whole_gpu]",
+    "context": "[public_context]~[.],[whole_gpu]~[.]",
     "cuda_fault": "[cuda_status_fault]~[multi_gpu]",
     "multi_gpu": "[multi_gpu]~[.]",
     "late_mat": "[late_mat]~[late_mat_fused],[deferred_query]~[late_mat_fused],"

@@ -562,8 +562,9 @@ TEST_CASE("cuFile lanes read every column chunk of one vectored request", "[cufi
   }
 }
 
+// [whole_gpu]: it measures the GPUs' free memory, which tests running beside it would move.
 TEST_CASE("the cuFile arena is reserved ahead of the pool, on Sirius's GPU only",
-          "[cufile][scan][scan_manager]")
+          "[cufile][scan][scan_manager][whole_gpu]")
 {
   if (!cufile_usable()) { SKIP("the cuFile arena requires a CUDA device and a cuFile driver"); }
   int device_count = 0;
@@ -635,8 +636,9 @@ TEST_CASE("spills through cuFile get their arena reserved ahead of the pool",
   spill_context.shutdown();
 }
 
+// [whole_gpu]: it takes all of GPU 0's free memory, which tests running beside it would miss.
 TEST_CASE("a spill arena that cannot be reserved leaves startup and the scan arena alone",
-          "[cufile][scan][scan_manager]")
+          "[cufile][scan][scan_manager][whole_gpu]")
 {
   if (!cufile_usable()) { SKIP("the cuFile arena requires a CUDA device and a cuFile driver"); }
   rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
