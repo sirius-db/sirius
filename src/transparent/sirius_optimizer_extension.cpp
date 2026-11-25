@@ -83,6 +83,24 @@ bool plan_optimization_enabled(duckdb::ClientContext& context,
   return runtime && runtime->get_config().get_operator_params().*option;
 }
 
+/// The thresholds of the partial aggregate pushdown. They are its defaults unless the test-only
+/// settings, which exist only when test options are enabled, say otherwise.
+sirius::planner::partial_aggregate_pushdown_options partial_aggregate_pushdown_thresholds(
+  duckdb::ClientContext& context)
+{
+  sirius::planner::partial_aggregate_pushdown_options options;
+  duckdb::Value setting;
+  if (context.TryGetCurrentSetting("partial_aggregate_min_kept_share", setting) &&
+      !setting.IsNull()) {
+    options.min_kept_share = setting.GetValue<double>();
+  }
+  if (context.TryGetCurrentSetting("partial_aggregate_max_extra_keys", setting) &&
+      !setting.IsNull()) {
+    options.max_extra_keys = setting.GetValue<std::uint64_t>();
+  }
+  return options;
+}
+
 /// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving data
 /// off it. 0 when no GPU capacity is configured.
 std::uint64_t gpu_memory_budget(duckdb::ClientContext& context)
@@ -474,8 +492,10 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     if (plan_optimization_enabled(context,
                                   &sirius::operator_params::enable_partial_aggregate_below_join)) {
       try {
-        pushed_aggregates = sirius::planner::push_partial_aggregates_below_joins(
-          context, input.optimizer.binder, copy);
+        pushed_aggregates =
+          sirius::planner::push_partial_aggregates_below_joins(
+            context, input.optimizer.binder, copy, partial_aggregate_pushdown_thresholds(context))
+            .pushed;
       } catch (std::exception& e) {
         SIRIUS_LOG_WARN(
           "Transparent execution: partial aggregate pushdown failed, planning without it: {}",

@@ -376,6 +376,10 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
     REQUIRE(setting_count(con, "cross_join_task_bytes") == 0);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
+    REQUIRE(setting_count(con, "partial_aggregate_min_kept_share") == 0);
+    REQUIRE(setting_count(con, "partial_aggregate_max_extra_keys") == 0);
+    REQUIRE(con.Query("SET partial_aggregate_min_kept_share = 0.5")->HasError());
+    REQUIRE(con.Query("SET partial_aggregate_max_extra_keys = 2")->HasError());
     REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
     REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
     auto native_option = con.Query("SET sirius_test_sync_native_checkpoint = true");
@@ -444,6 +448,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
     REQUIRE(setting_count(con, "cross_join_task_bytes") == 0);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
+    REQUIRE(setting_count(con, "partial_aggregate_min_kept_share") == 0);
+    REQUIRE(setting_count(con, "partial_aggregate_max_extra_keys") == 0);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
@@ -468,6 +474,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
     REQUIRE(setting_count(con, "cross_join_task_bytes") == 1);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 1);
+    REQUIRE(setting_count(con, "partial_aggregate_min_kept_share") == 1);
+    REQUIRE(setting_count(con, "partial_aggregate_max_extra_keys") == 1);
     duckdb::Value native_enabled;
     auto native_setting =
       con.context->TryGetCurrentSetting("sirius_test_sync_native_checkpoint", native_enabled);
@@ -536,6 +544,23 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result->HasError());
     REQUIRE_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("must be in (0.0, 1.0]"));
     result = con.Query("RESET dense_count_join_memory_fraction");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    // 0 turns the gate off rather than being rejected.
+    result = con.Query("SET partial_aggregate_min_kept_share = 0");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET partial_aggregate_min_kept_share = 1.5");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("must be in [0.0, 1.0]"));
+    result = con.Query("RESET partial_aggregate_min_kept_share");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET partial_aggregate_max_extra_keys = 2");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET partial_aggregate_max_extra_keys");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET concat_batch_bytes = 1048576");

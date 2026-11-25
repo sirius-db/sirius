@@ -110,6 +110,81 @@ TEST_CASE_METHOD(PartialAggregatePushdownFixture,
 }
 
 TEST_CASE_METHOD(PartialAggregatePushdownFixture,
+                 "gpu_execution sums of integers below a join",
+                 "[integration][gpu_execution][partial_agg_pushdown]")
+{
+  // An INTEGER and a BIGINT sum to a HUGEINT, and so does the sum of the per-key sums. Customer
+  // 9's prices are all NULL, so the third sum has nothing to add for that customer.
+  compare_pushed_and_not(
+    "SELECT c_custkey, c_name, sum(o_shippriority) AS units, sum(o_orderkey) AS keys, "
+    "sum(CASE WHEN o_totalprice IS NULL THEN NULL ELSE o_shippriority END) AS some_units, "
+    "min(o_shippriority) AS low FROM customer, orders WHERE c_custkey = o_custkey "
+    "GROUP BY c_custkey, c_name",
+    true);
+  // No rows to add up.
+  compare_pushed_and_not(
+    "SELECT c_custkey, c_name, sum(o_shippriority) AS units FROM customer, orders "
+    "WHERE c_custkey = o_custkey AND o_orderdate > DATE '2100-01-01' GROUP BY c_custkey, c_name",
+    true);
+}
+
+TEST_CASE_METHOD(PartialAggregatePushdownFixture,
+                 "gpu_execution integer sums past the BIGINT range below a join",
+                 "[integration][gpu_execution][partial_agg_pushdown]")
+{
+  // Forty rows of 9e18 per key leave the BIGINT range. Keys 61 to 80 match no customer: their
+  // sums are computed below the join and then dropped by it, and must not fail on the way.
+  // Customer 3's sum is past the range in the result itself.
+  run_ok("CREATE TABLE payments (p_custkey BIGINT, p_amount BIGINT);");
+  run_ok(
+    "INSERT INTO payments SELECT range % 80 + 1, CASE WHEN range % 80 + 1 > 60 OR "
+    "range % 80 + 1 = 3 THEN 9000000000000000000 ELSE range % 1000 END FROM range(3200);");
+  run_ok("CHECKPOINT;");
+  compare_pushed_and_not(
+    "SELECT c_custkey, c_name, sum(p_amount) AS paid, max(p_amount) AS most "
+    "FROM customer, payments WHERE c_custkey = p_custkey GROUP BY c_custkey, c_name",
+    true);
+}
+
+TEST_CASE_METHOD(PartialAggregatePushdownFixture,
+                 "gpu_execution sums of 128-bit values stay above the join",
+                 "[integration][gpu_execution][partial_agg_pushdown]")
+{
+  // The GPU refuses a 128-bit sum when a batch's row count times its largest value could
+  // overflow. Key 99 matches no customer, and the square of its 9e18 nearly fills a HUGEINT:
+  // summed below the join, that row would send the query to the CPU. The rule leaves the sum
+  // above the join, where the GPU never sees the row.
+  run_ok("CREATE TABLE ledger (g_custkey BIGINT, g_amount BIGINT);");
+  run_ok(
+    "INSERT INTO ledger VALUES (1, 3), (1, 4), (2, 5), (99, 9000000000000000000), "
+    "(99, 9000000000000000000);");
+  run_ok("CHECKPOINT;");
+  auto const before = pushdowns();
+  compare_gpu_vs_cpu(
+    "SELECT c_custkey, c_name, sum(g_amount::HUGEINT * g_amount::HUGEINT) AS squares, "
+    "max(g_amount) AS most FROM customer, ledger WHERE c_custkey = g_custkey "
+    "GROUP BY c_custkey, c_name");
+  CHECK(pushdowns() == before);
+}
+
+TEST_CASE_METHOD(PartialAggregatePushdownFixture,
+                 "gpu_execution aggregates of arguments that branch on arithmetic below a join",
+                 "[integration][gpu_execution][partial_agg_pushdown]")
+{
+  // TPC-DS q50's shape: rows counted per range of a difference, as sums of a CASE. The join key
+  // is left out of the arguments: DuckDB would read the customers' copy of it instead.
+  compare_pushed_and_not(
+    "SELECT c_custkey, c_name, "
+    "sum(CASE WHEN o_orderkey - o_shippriority <= 30 THEN 1 ELSE 0 END) AS near, "
+    "sum(CASE WHEN o_orderkey - o_shippriority > 30 AND o_orderkey - o_shippriority <= 600 "
+    "THEN 1 ELSE 0 END) AS further, "
+    "sum(CASE WHEN o_shippriority * 2 > 2 OR o_totalprice < 0 THEN o_totalprice ELSE 0 END) "
+    "AS priced, max(CASE WHEN o_shippriority + 1 > 2 THEN o_orderkey * 2 ELSE o_orderkey END) "
+    "AS highest FROM customer, orders WHERE c_custkey = o_custkey GROUP BY c_custkey, c_name",
+    true);
+}
+
+TEST_CASE_METHOD(PartialAggregatePushdownFixture,
                  "gpu_execution aggregate below joins in the shape of TPC-H q10",
                  "[integration][gpu_execution][partial_agg_pushdown]")
 {
@@ -158,6 +233,20 @@ TEST_CASE_METHOD(PartialAggregatePushdownFixture,
     "SELECT c_custkey, c_nationkey, sum(o_totalprice) AS total FROM customer, orders "
     "WHERE c_custkey = o_custkey GROUP BY c_custkey, c_nationkey");
   CHECK(pushdowns() == before);
+}
+
+TEST_CASE_METHOD(PartialAggregatePushdownFixture,
+                 "gpu_execution aggregate below a join that discards most of its groups",
+                 "[integration][gpu_execution][partial_agg_pushdown]")
+{
+  // With the kept-share threshold at 0 the rule no longer minds that the customers are filtered:
+  // every customer key is summed, and the join then drops the sums of the customers filtered out.
+  sirius::test::scoped_sirius_setting any_other_side{*con, "partial_aggregate_min_kept_share", 0.0};
+  compare_pushed_and_not(
+    "SELECT c_custkey, c_name, sum(o_totalprice) AS total, max(o_orderdate) AS latest "
+    "FROM customer, orders WHERE c_custkey = o_custkey AND c_acctbal < 20 "
+    "GROUP BY c_custkey, c_name",
+    true);
 }
 
 TEST_CASE_METHOD(PartialAggregatePushdownFixture,

@@ -224,17 +224,19 @@ DuckDB's own `PARTIAL_AGGREGATE_PUSHDOWN` optimizer stays disabled (`unsupported
 **Measured** (TPC-H SF500 Parquet, one RTX PRO 6000, warm): q10's `customer` join outputs 21.0 M rows (3.8 GB) instead of 57.4 M (10.4 GB). The query runs in 0.30 s instead of 0.39 s with its columns pinned on the GPU, and in 1.52 s instead of 1.64 s unpinned. TPC-DS q11 at SF100 goes from 0.29 s to 0.18 s pinned, and the TPC-Havoc Q18 variants that filter a per-order total with `HAVING` from about 14.7 s to 10.3 s unpinned.
 
 **When it applies:**
-- Aggregates are `SUM` (or `sum_no_overflow`) over a DECIMAL stored in at most 64 bits, `MIN` or `MAX`, without DISTINCT, FILTER or ORDER BY. A sum of such sums is the same DECIMAL(38) total. COUNT and AVG would need a cast above the aggregate, integer sums combine through a 128-bit sum that is range-checked on every merge, and floating-point sums depend on the order of addition.
-- Arguments read only `S`, are not volatile, and use only columns, constants, `+`, `-`, `*` and sub-expressions that cannot throw, because they now run on rows a join above might have removed. Arithmetic can still overflow on such a row, as it can with DuckDB's own pushdown.
+- Aggregates are `SUM` (or `sum_no_overflow`) over an integer of up to 64 bits (TINYINT to BIGINT) or a DECIMAL of up to 18 digits, `MIN` or `MAX`, without DISTINCT, FILTER or ORDER BY. DuckDB sums such an integer into a HUGEINT and such a DECIMAL into a DECIMAL(38), and a sum of such sums is the same total in the same type. A `SUM` over a HUGEINT or a wider DECIMAL is left alone (`sum:hugeint`, `sum:decimal128`): the GPU refuses such a sum when a batch's row count times its largest value could pass 128 bits, and below the join the batch holds rows the join would have removed, so one huge value on a key that matches nothing would send the query to the CPU. COUNT and AVG would need a cast above the aggregate, and floating-point sums depend on the order of addition.
+- Arguments read only `S`, are not volatile, and can throw only through `+`, `-` and `*`, which may sit under `CASE`, `AND`, `OR` and functions that cannot fail themselves, such as comparisons. They now run on rows a join above might have removed. Arithmetic can still overflow on such a row, as it can with DuckDB's own pushdown.
 - Only INNER comparison joins lie between the aggregate and `S`. Projections directly under the aggregate are inlined.
 - The new group keys are fixed-width, fewer than the aggregate's own, and at most one more than the join's keys.
 - Every other side on the way up consists of scans estimated to keep at least 70% of their unfiltered rows, joined to each other. A join against a filtered side discards rows, and aggregating them first would be wasted. This leaves alone q10 when `lineitem` is joined last, and TPC-H q18, whose other side is restricted by its `IN` subquery.
 - A join that computes its key from a column of `S` (`1 / x`, a cast) does so only from integer, DECIMAL, BOOLEAN, DATE, TIME, TIMESTAMP or UUID columns. Values of other types can group together and still differ: `0.0` and `-0.0` are one group, but `1 / x` sends them to opposite infinities. A bare column of any fixed-width type is fine.
 - `S` is not already grouped.
 
+**When it does not apply:** an aggregate over a join that is left alone logs why at debug level, as `Not aggregating below a join that adds group-by payload: <reasons>`. The reasons are fixed names such as `sum:float`, `aggregate:count_star`, `keys:too-many-extra` or `other-side:filtered`, and every independent one is listed, so the line tells which of the conditions above would all have to be lifted for that aggregate. The smallest share of its rows a joined scan is estimated to keep is appended when it is known.
+
 **Code path:** `src/planner/sirius_plan_partial_aggregate_pushdown.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp`, which plans without it if it throws.
 
-**Config:** `enable_partial_aggregate_below_join` (default `true`, see [Configuration](configuration.md)).
+**Config:** `enable_partial_aggregate_below_join` (default `true`, see [Configuration](configuration.md)). The 70% share and the one extra key are the test-only settings `partial_aggregate_min_kept_share` and `partial_aggregate_max_extra_keys`.
 
 ### Subquery Keys Carried Across an Equality
 

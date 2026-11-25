@@ -31,9 +31,12 @@
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/planner.hpp>
 
+#include <cstddef>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace duckdb;
 
@@ -77,15 +80,23 @@ void estimate_scans(ClientContext& context, LogicalOperator& op)
   }
 }
 
+using pushdown_options = sirius::planner::partial_aggregate_pushdown_options;
+using pushdown_result  = sirius::planner::partial_aggregate_pushdown_result;
+using reasons          = std::vector<std::string>;
+
 /// Parse and optimize @p query, copy the plan as transparent execution does, apply the rewrite
-/// when @p rewrite is set, copy the result again as plan validation does, then resolve it and hand
-/// it to @p consume inside a transaction. Returns the number of aggregates pushed.
+/// with @p options when @p rewrite is set, copy the result again as plan validation does, then
+/// resolve it and hand it to @p consume inside a transaction. Returns what the rewrite did.
 template <class Consume>
-std::size_t with_resolved_plan(
-  Connection& con, std::string const& query, join_order order, bool rewrite, Consume&& consume)
+pushdown_result with_resolved_plan(Connection& con,
+                                   std::string const& query,
+                                   join_order order,
+                                   bool rewrite,
+                                   pushdown_options const& options,
+                                   Consume&& consume)
 {
-  std::size_t pushed = 0;
-  auto& context      = *con.context;
+  pushdown_result pushed;
+  auto& context = *con.context;
 
   auto original_disabled = DBConfig::GetConfig(context).options.disabled_optimizers;
   auto& disabled         = DBConfig::GetConfig(context).options.disabled_optimizers;
@@ -110,8 +121,9 @@ std::size_t with_resolved_plan(
     estimate_scans(context, *optimized);
     auto plan = sirius::transparent::copy_logical_plan(*optimized, context);
     if (rewrite) {
-      pushed = sirius::planner::push_partial_aggregates_below_joins(context, *planner.binder, plan);
-      plan   = sirius::transparent::copy_logical_plan(*plan, context);
+      pushed = sirius::planner::push_partial_aggregates_below_joins(
+        context, *planner.binder, plan, options);
+      plan = sirius::transparent::copy_logical_plan(*plan, context);
     }
     plan->ResolveOperatorTypes();
     ColumnBindingResolver verifier(true);
@@ -160,9 +172,20 @@ struct pushdown_fixture {
     }
   }
 
-  std::size_t pushed(std::string const& query, join_order order = join_order::optimized)
+  std::size_t pushed(std::string const& query, pushdown_options const& options = {})
   {
-    return with_resolved_plan(*con, query, order, true, [](ClientContext&, auto&) {});
+    return with_resolved_plan(
+             *con, query, join_order::optimized, true, options, [](ClientContext&, auto&) {})
+      .pushed;
+  }
+
+  /// Why the rule left the aggregates of @p query alone: one entry per aggregate over a join.
+  reasons why(std::string const& query,
+              pushdown_options const& options = {},
+              join_order order                = join_order::optimized)
+  {
+    return with_resolved_plan(*con, query, order, true, options, [](ClientContext&, auto&) {})
+      .declined;
   }
 
   /// The shape of @p query's plan with its joins as written, with or without the rewrite. The
@@ -171,7 +194,7 @@ struct pushdown_fixture {
   {
     std::string result;
     with_resolved_plan(
-      *con, query, join_order::as_written, rewrite, [&](ClientContext& context, auto& plan) {
+      *con, query, join_order::as_written, rewrite, {}, [&](ClientContext& context, auto& plan) {
         result = describe(*plan);
         ColumnBindingResolver resolver;
         resolver.VisitOperator(*plan);
@@ -268,6 +291,52 @@ TEST_CASE_METHOD(pushdown_fixture,
 }
 
 TEST_CASE_METHOD(pushdown_fixture,
+                 "partial aggregate pushdown covers sums of integers of up to 64 bits",
+                 "[partial_agg_pushdown][plan]")
+{
+  // An INTEGER and a BIGINT sum to a HUGEINT, and the sum of those sums is the same HUGEINT.
+  CHECK(pushed(per_customer("sum(o_units)")) == 1);
+  CHECK(pushed(per_customer("sum(o_orderkey)")) == 1);
+  CHECK(pushed(per_customer("sum(CAST(o_units AS BIGINT)), sum(o_totalprice), min(o_units)")) == 1);
+  // The plan is one Sirius can run.
+  auto const joined =
+    "SELECT c_custkey, c_name, sum(o_units), sum(o_orderkey) "
+    "FROM orders JOIN customer ON o_custkey = c_custkey GROUP BY c_custkey, c_name";
+  CHECK(shape(joined, false) == "AGG[2](JOIN(orders,customer))");
+  CHECK(shape(joined, true) == "AGG[2](JOIN(AGG[1](orders),customer))");
+  // A sum of 128-bit values stays above the join. The GPU refuses one when a batch's row count
+  // times its largest value could overflow, and below the join the batch holds rows the join
+  // would have removed.
+  CHECK(pushed(per_customer("sum(CAST(o_units AS HUGEINT))")) == 0);
+  CHECK(pushed(per_customer("sum(o_wide)")) == 0);
+  CHECK(pushed(per_customer("sum(o_units), sum(o_wide)")) == 0);
+  // MIN and MAX of such values add nothing up.
+  CHECK(pushed(per_customer("min(o_wide), max(CAST(o_units AS HUGEINT))")) == 1);
+}
+
+TEST_CASE_METHOD(pushdown_fixture,
+                 "partial aggregate pushdown covers arguments that branch on arithmetic",
+                 "[partial_agg_pushdown][plan]")
+{
+  // What can throw is the arithmetic alone, under CASE, a comparison, AND and OR.
+  CHECK(pushed(per_customer(
+          "sum(CASE WHEN o_units * o_shippriority > 4 THEN o_totalprice ELSE 0 END)")) == 1);
+  CHECK(pushed(per_customer("sum(CASE WHEN o_units - o_shippriority <= 3 THEN 1 ELSE 0 END)")) ==
+        1);
+  CHECK(pushed(per_customer("max(CASE WHEN o_units + 1 > 2 AND o_shippriority * 2 < 4 "
+                            "OR o_units - 1 = 0 THEN o_units * 2 ELSE o_units END)")) == 1);
+  auto const branching =
+    "SELECT c_custkey, c_name, sum(CASE WHEN o_units - o_shippriority <= 3 THEN 1 ELSE 0 END) "
+    "FROM orders JOIN customer ON o_custkey = c_custkey GROUP BY c_custkey, c_name";
+  CHECK(shape(branching, true) == "AGG[2](JOIN(AGG[1](orders),customer))");
+  // A division or a cast that can fail still stands in the way, wherever it sits.
+  CHECK(pushed(per_customer(
+          "sum(CASE WHEN o_units / o_shippriority > 1 THEN o_totalprice ELSE 0 END)")) == 0);
+  CHECK(pushed(per_customer(
+          "sum(CASE WHEN CAST(o_clerk AS INTEGER) > 1 THEN o_totalprice ELSE 0 END)")) == 0);
+}
+
+TEST_CASE_METHOD(pushdown_fixture,
                  "partial aggregate pushdown declines aggregates it cannot combine exactly",
                  "[partial_agg_pushdown][plan]")
 {
@@ -276,10 +345,8 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(pushed(per_customer("avg(o_totalprice)")) == 0);
   CHECK(pushed(per_customer("sum(DISTINCT o_totalprice)")) == 0);
   CHECK(pushed(per_customer("sum(o_totalprice) FILTER (WHERE o_shippriority = 1)")) == 0);
-  // Sums that are not a narrow DECIMAL's: floating point, integer and 128-bit decimal.
+  // A floating-point sum depends on the order of addition.
   CHECK(pushed(per_customer("sum(o_weight)")) == 0);
-  CHECK(pushed(per_customer("sum(o_units)")) == 0);
-  CHECK(pushed(per_customer("sum(o_wide)")) == 0);
   // An argument that reads both sides, and ones that can fail on a row the join would drop.
   CHECK(pushed(per_customer("sum(o_totalprice * c_acctbal)")) == 0);
   CHECK(pushed(per_customer("max(CAST(o_clerk AS INTEGER))")) == 0);
@@ -319,4 +386,94 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(pushed("SELECT c_custkey, c_name, sum(o_totalprice) FROM customer LEFT JOIN orders "
                "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == 0);
   CHECK(pushed("SELECT sum(o_totalprice) FROM orders, customer WHERE o_custkey = c_custkey") == 0);
+}
+
+TEST_CASE_METHOD(pushdown_fixture,
+                 "partial aggregate pushdown reports why it leaves an aggregate alone",
+                 "[partial_agg_pushdown][plan]")
+{
+  // An aggregate it pushes, and one that is not over a join, report nothing.
+  CHECK(why(per_customer("sum(o_totalprice)")).empty());
+  CHECK(why("SELECT o_clerk, sum(o_totalprice) FROM orders GROUP BY o_clerk").empty());
+
+  // Aggregates it cannot combine.
+  CHECK(why(per_customer("count(*)")) == reasons{"aggregate:count_star"});
+  // DuckDB counts rows instead when the counted column holds no NULL.
+  CHECK(why(per_customer("count(o_totalprice), sum(o_totalprice)")) ==
+        reasons{"aggregate:count_star"});
+  CHECK(why(per_customer("count(NULLIF(o_units, 0))")) == reasons{"aggregate:count"});
+  CHECK(why(per_customer("avg(o_totalprice)")) == reasons{"aggregate:avg"});
+  CHECK(why(per_customer("avg(o_units)")) == reasons{"aggregate:avg"});
+  CHECK(why(per_customer("avg(o_weight)")) == reasons{"aggregate:avg; sum:float"});
+  CHECK(why(per_customer("sum(DISTINCT o_totalprice)")) == reasons{"aggregate:distinct"});
+  CHECK(why(per_customer("sum(o_totalprice) FILTER (WHERE o_shippriority = 1)")) ==
+        reasons{"aggregate:filter"});
+  CHECK(why(per_customer("sum(o_weight)")) == reasons{"sum:float"});
+  CHECK(why(per_customer("sum(CAST(o_units AS HUGEINT))")) == reasons{"sum:hugeint"});
+  CHECK(why(per_customer("sum(o_wide)")) == reasons{"sum:decimal128"});
+  // DuckDB keeps the product of two 64-bit DECIMALs in 64 bits, so its sum is one the rule pushes.
+  CHECK(why(per_customer("sum(o_totalprice * o_totalprice)")).empty());
+
+  // Arguments: one that reads both sides, and ones that can fail other than through arithmetic.
+  CHECK(why(per_customer("sum(o_totalprice * c_acctbal)")) == reasons{"arguments:both-sides"});
+  CHECK(
+    why(per_customer("sum(CASE WHEN o_units / o_shippriority > 1 THEN o_totalprice ELSE 0 END)")) ==
+    reasons{"argument:fallible"});
+  CHECK(why(per_customer("max(CAST(o_clerk AS INTEGER))")) == reasons{"argument:fallible"});
+  CHECK(why(per_customer("min(o_units / o_shippriority)")) == reasons{"argument:fallible"});
+
+  // Joins and keys.
+  CHECK(why(per_customer("sum(o_totalprice)", "", "c_custkey, c_nationkey")) ==
+        reasons{"path:no-payload"});
+  CHECK(why(per_customer("sum(o_totalprice)", "AND c_acctbal > 400")) ==
+        reasons{"other-side:filtered"});
+  // A filter DuckDB keeps above the scan is not trusted to keep rows, whatever it is estimated
+  // to keep.
+  CHECK(
+    why(per_customer("sum(o_totalprice)", "AND c_clerk IN ('Clerk#1', 'Clerk#2', 'Clerk#3')")) ==
+    reasons{"other-side:opaque; other-side:filtered"});
+  CHECK(why(per_customer("sum(o_totalprice)", "", "c_name")) ==
+        reasons{"keys:not-fewer-than-groups"});
+  CHECK(why("SELECT c_custkey, c_address, sum(o_totalprice) FROM orders, customer "
+            "WHERE o_clerk = c_clerk GROUP BY c_custkey, c_address") ==
+        reasons{"keys:variable-width"});
+  CHECK(
+    why(per_customer("sum(o_totalprice)", "", "c_custkey, c_name, o_shippriority, o_orderdate")) ==
+    reasons{"keys:too-many-extra"});
+  CHECK(why("SELECT c_custkey, c_name, sum(o_totalprice) FROM orders, customer "
+            "WHERE 1.0 / o_weight = c_weight GROUP BY c_custkey, c_name") ==
+        reasons{"key:computed-inexact"});
+  CHECK(why("SELECT c_custkey, c_name, sum(o_totalprice) FROM customer LEFT JOIN orders "
+            "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == reasons{"join:outer-padded"});
+  CHECK(why("SELECT sum(o_totalprice) FROM orders, customer WHERE o_custkey = c_custkey") ==
+        reasons{"shape:ungrouped"});
+
+  // Every independent reason is reported, so that it shows which limits would all have to go.
+  CHECK(why(per_customer("count(*)", "AND c_acctbal > 400")) ==
+        reasons{"aggregate:count_star; other-side:filtered"});
+  CHECK(why(per_customer("count(*), avg(o_weight)", "", "c_name")) ==
+        reasons{"aggregate:count_star; aggregate:avg; sum:float; keys:not-fewer-than-groups"});
+  // The orders are the side every row of which the outer join keeps: only the join is in the way.
+  CHECK(why("SELECT c_custkey, c_name, sum(o_totalprice) FROM orders LEFT JOIN customer "
+            "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") ==
+        reasons{"join:outer-preserved"});
+}
+
+TEST_CASE_METHOD(pushdown_fixture,
+                 "partial aggregate pushdown follows its thresholds",
+                 "[partial_agg_pushdown][plan]")
+{
+  auto const filtered = per_customer("sum(o_totalprice)", "AND c_acctbal > 400");
+  CHECK(pushed(filtered) == 0);
+  CHECK(pushed(filtered, {.min_kept_share = 0.0}) == 1);
+  CHECK(pushed(per_customer("sum(o_totalprice)"), {.min_kept_share = 1.0}) == 1);
+
+  auto const two_extra =
+    per_customer("sum(o_totalprice)", "", "c_custkey, c_name, o_shippriority, o_orderdate");
+  CHECK(pushed(two_extra) == 0);
+  CHECK(pushed(two_extra, {.max_extra_keys = 2}) == 1);
+  // The largest value the setting can hold is no limit, not a sum that wraps around to none.
+  CHECK(pushed(two_extra, {.max_extra_keys = std::numeric_limits<std::size_t>::max()}) == 1);
+  CHECK(why(per_customer("sum(o_totalprice)", "", "c_custkey, c_name, o_shippriority"),
+            {.max_extra_keys = 0}) == reasons{"keys:too-many-extra"});
 }

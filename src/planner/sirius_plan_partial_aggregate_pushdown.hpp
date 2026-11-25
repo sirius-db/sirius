@@ -19,6 +19,8 @@
 #include "duckdb/common/unique_ptr.hpp"
 
 #include <cstddef>
+#include <string>
+#include <vector>
 
 namespace duckdb {
 class Binder;
@@ -27,6 +29,23 @@ class LogicalOperator;
 }  // namespace duckdb
 
 namespace sirius::planner {
+
+/// The thresholds `push_partial_aggregates_below_joins` judges a push by.
+struct partial_aggregate_pushdown_options {
+  /// The share of its unfiltered rows a scan must be estimated to keep for a join against it to
+  /// count as keeping the rows of its other side. 0 accepts any other side.
+  double min_kept_share = 0.7;
+  /// The columns the pushed aggregate may group by beyond those it is joined on.
+  std::size_t max_extra_keys = 1;
+};
+
+/// What `push_partial_aggregates_below_joins` did to a plan.
+struct partial_aggregate_pushdown_result {
+  std::size_t pushed = 0;  ///< The aggregates pushed
+  /// One entry per aggregate over a join that was left alone: every reason found, separated by
+  /// "; ". The same text is logged at debug level.
+  std::vector<std::string> declined;
+};
 
 /// Aggregate before a join that only adds group-by payload. For `AGGREGATE <- JOIN ... <- S`,
 /// where every aggregate argument comes from the subtree S and an inner join above S brings in
@@ -37,12 +56,18 @@ namespace sirius::planner {
 ///
 /// Rows of S that agree on every column used above S pair with the same rows of every join above,
 /// so combining them first changes no result, whether or not any join key is unique. Limited to
-/// SUM over a DECIMAL stored in at most 64 bits, MIN and MAX, whose combined result has the
+/// SUM over an integer or a DECIMAL of up to 64 bits, MIN and MAX, whose combined result has the
 /// original type, so nothing above the aggregate changes.
 ///
-/// Works on the optimized, unresolved plan. Returns the number of aggregates pushed.
-std::size_t push_partial_aggregates_below_joins(duckdb::ClientContext& context,
-                                                duckdb::Binder& binder,
-                                                duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
+/// An aggregate over a join that is left alone reports why. The reasons are short fixed names
+/// (`sum:float`, `other-side:filtered`, ...), and every independent one is listed, so a plan's
+/// report tells which limits would all have to go for the rule to apply.
+///
+/// Works on the optimized, unresolved plan.
+partial_aggregate_pushdown_result push_partial_aggregates_below_joins(
+  duckdb::ClientContext& context,
+  duckdb::Binder& binder,
+  duckdb::unique_ptr<duckdb::LogicalOperator>& plan,
+  partial_aggregate_pushdown_options const& options = {});
 
 }  // namespace sirius::planner

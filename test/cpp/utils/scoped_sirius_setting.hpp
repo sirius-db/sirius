@@ -44,6 +44,13 @@ class scoped_sirius_setting final {
   {
   }
 
+  template <std::same_as<double> Double>
+  scoped_sirius_setting(duckdb::Connection& connection, std::string name, Double value)
+    : scoped_sirius_setting(
+        connection, std::move(name), setting_value{duckdb::Value::DOUBLE(value)})
+  {
+  }
+
   //! @p value is unquoted; the guard quotes it.
   scoped_sirius_setting(duckdb::Connection& connection, std::string name, std::string_view value)
     : scoped_sirius_setting(

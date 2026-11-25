@@ -16,6 +16,7 @@
 
 #include "planner/sirius_plan_partial_aggregate_pushdown.hpp"
 
+#include "duckdb/common/enums/function_errors.hpp"
 #include "duckdb/common/enums/tuple_data_layout_enums.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -57,13 +58,6 @@ using duckdb::LogicalType;
 using duckdb::ProjectionIndex;
 using duckdb::TableIndex;
 using duckdb::unique_ptr;
-
-/// The share of its unfiltered rows a scan must be estimated to keep for a join against it to
-/// count as keeping the rows of its other side.
-constexpr double k_min_kept_share = 0.7;
-
-/// The columns the pushed aggregate may group by beyond those it is joined on.
-constexpr std::size_t k_max_extra_keys = 1;
 
 unique_ptr<Expression> column(LogicalType const& type, ColumnBinding binding)
 {
@@ -173,11 +167,13 @@ unique_ptr<Expression> inline_columns(Expression const& expression, inlined_colu
 }
 
 /// The projections directly under an aggregate, folded away: `columns` gives each of their
-/// columns as an expression over the first operator below them, which `input` holds. `input` is
-/// null when a projection is volatile, since inlining it would evaluate it once per reader.
+/// columns as an expression over the first operator below them, which `input` holds. A volatile
+/// projection cannot be folded, since inlining it would evaluate it once per reader: `is_volatile`
+/// is then set and `columns` is incomplete.
 struct aggregate_input {
   unique_ptr<LogicalOperator>* input = nullptr;
   inlined_columns columns;
+  bool is_volatile = false;
 };
 
 aggregate_input fold_projections(duckdb::LogicalAggregate& aggregate)
@@ -190,15 +186,18 @@ aggregate_input fold_projections(duckdb::LogicalAggregate& aggregate)
     slot = &(*slot)->children[0];
   }
   aggregate_input result;
+  result.input = slot;
   for (auto projection = projections.rbegin(); projection != projections.rend(); ++projection) {
     auto const& expressions = (*projection)->expressions;
     for (std::size_t i = 0; i < expressions.size(); ++i) {
-      if (expressions[i]->IsVolatile()) { return {}; }
+      if (expressions[i]->IsVolatile()) {
+        result.is_volatile = true;
+        return result;
+      }
       result.columns[ColumnBinding((*projection)->table_index, ProjectionIndex(i))] =
         inline_columns(*expressions[i], result.columns);
     }
   }
-  result.input = slot;
   return result;
 }
 
@@ -224,67 +223,160 @@ char const* combining_aggregate(std::string const& name)
   return nullptr;
 }
 
-/// A SUM whose results add up to a result of the same type without an overflow the original could
-/// not have: DuckDB sums a DECIMAL stored in at most 64 bits into a DECIMAL(38), and the sum of
-/// such sums is the same DECIMAL(38) total. Integer sums combine through a 128-bit sum that the
-/// GPU range-checks on every merge, and floating-point sums depend on the order of addition.
-bool sum_combines_exactly(LogicalType const& argument)
+/// Why the results of a SUM over @p argument are not added up, or null when they are. DuckDB sums
+/// an integer of up to 64 bits into a HUGEINT and a DECIMAL of up to 18 digits into a
+/// DECIMAL(38), and the sum of such sums is the same total in the same type. The GPU never
+/// refuses to add such values. A SUM over a HUGEINT or a wider DECIMAL it does refuse, when a
+/// batch's row count times its largest value could pass 128 bits. Below the join that batch holds
+/// the rows the join would have removed, so one huge value on a key that matches nothing would
+/// send to the CPU a query the GPU answers today. Floating-point sums depend on the order of
+/// addition.
+char const* sum_blocker(LogicalType const& argument)
 {
-  if (argument.id() != duckdb::LogicalTypeId::DECIMAL) { return false; }
-  switch (argument.InternalType()) {
-    case duckdb::PhysicalType::INT16:
-    case duckdb::PhysicalType::INT32:
-    case duckdb::PhysicalType::INT64: return true;
-    default: return false;
+  switch (argument.id()) {
+    case duckdb::LogicalTypeId::DECIMAL:
+      return argument.InternalType() == duckdb::PhysicalType::INT128 ? "sum:decimal128" : nullptr;
+    case duckdb::LogicalTypeId::TINYINT:
+    case duckdb::LogicalTypeId::SMALLINT:
+    case duckdb::LogicalTypeId::INTEGER:
+    case duckdb::LogicalTypeId::BIGINT: return nullptr;
+    case duckdb::LogicalTypeId::HUGEINT: return "sum:hugeint";
+    case duckdb::LogicalTypeId::FLOAT:
+    case duckdb::LogicalTypeId::DOUBLE: return "sum:float";
+    default: return "sum:other";
   }
 }
 
+bool is_arithmetic(duckdb::BoundFunctionExpression const& function)
+{
+  auto const& name = function.Function().GetName().GetIdentifierName();
+  return name == "+" || name == "-" || name == "*" || name == "add" || name == "subtract" ||
+         name == "multiply";
+}
+
 /// Whether @p expression is safe to evaluate on rows a join above would have removed: it cannot
-/// throw, or it only adds, subtracts and multiplies such values. Arithmetic can still overflow on
-/// a row the unrewritten plan never evaluates it on; DuckDB's own partial aggregate pushdown
-/// accepts the same.
-bool arithmetic_or_infallible(Expression const& expression)
+/// throw, or what can throw in it is only `+`, `-` and `*`, under CASE, AND, OR and functions that
+/// cannot fail themselves, such as comparisons. Arithmetic can still overflow on a row the
+/// unrewritten plan never evaluates it on; DuckDB's own partial aggregate pushdown accepts the
+/// same.
+bool fails_only_through_arithmetic(Expression const& expression)
 {
   if (!expression.CanThrow()) { return true; }
-  if (expression.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) { return false; }
-  auto const& function = expression.Cast<duckdb::BoundFunctionExpression>();
-  auto const& name     = function.Function().GetName().GetIdentifierName();
-  if (name != "+" && name != "-" && name != "*" && name != "add" && name != "subtract" &&
-      name != "multiply") {
-    return false;
+  switch (expression.GetExpressionClass()) {
+    case ExpressionClass::BOUND_FUNCTION: {
+      auto const& function = expression.Cast<duckdb::BoundFunctionExpression>();
+      if (!is_arithmetic(function) &&
+          function.Function().GetErrorMode() == duckdb::FunctionErrors::CAN_THROW_RUNTIME_ERROR) {
+        return false;
+      }
+      // A lambda's body is not among the children that are checked below.
+      if (std::ranges::any_of(function.GetChildren(), [](auto const& child) {
+            return child->GetExpressionClass() == ExpressionClass::BOUND_LAMBDA;
+          })) {
+        return false;
+      }
+      break;
+    }
+    case ExpressionClass::BOUND_CASE:
+    case ExpressionClass::BOUND_CONJUNCTION: break;
+    default: return false;
   }
-  return std::ranges::all_of(function.GetChildren(),
-                             [](auto const& child) { return arithmetic_or_infallible(*child); });
+  bool safe = true;
+  duckdb::ExpressionIterator::EnumerateChildren(expression, [&](Expression const& child) {
+    safe = safe && fails_only_through_arithmetic(child);
+  });
+  return safe;
 }
 
 // ---------------------------------------------------------------------------------------------
 // Whether the push pays off
 // ---------------------------------------------------------------------------------------------
 
-/// Whether a join against @p op is expected to keep nearly every row of its other side: @p op is
-/// made of scans that keep most of their rows, joined to each other. A join against a filtered
-/// side discards rows, and aggregating them first would be wasted. Scan estimates are compared
-/// with the unfiltered row count; a filter the join itself implies is added after DuckDB
-/// estimates the scan, so it does not count.
-bool keeps_rows(duckdb::ClientContext& context, LogicalOperator const& op)
+/// What the sides joined to the aggregated input are expected to do to its rows.
+struct other_sides {
+  /// Each is made of scans with a row estimate, joined to each other. A join against anything
+  /// else, a filter above a scan included, is not trusted to keep rows.
+  bool known = true;
+  /// Every scan is estimated to keep at least the asked share of its unfiltered rows, counting a
+  /// filter directly above it.
+  bool keep_rows = true;
+  /// The smallest such share.
+  std::optional<double> least_share;
+};
+
+/// Add to @p sides what a join against @p op is expected to do to the rows of its other side. A
+/// join against a filtered side discards rows, and aggregating them first would be wasted. Scan
+/// estimates are compared with the unfiltered row count; a filter the join itself implies is
+/// added after DuckDB estimates the scan, so it does not count. @p kept_above is the row estimate
+/// of a filter directly above @p op, when there is one.
+void judge_other_side(duckdb::ClientContext& context,
+                      LogicalOperator const& op,
+                      double min_kept_share,
+                      std::optional<double> kept_above,
+                      other_sides& sides)
 {
   switch (op.type) {
     case LogicalOperatorType::LOGICAL_GET: {
       auto const& get = op.Cast<duckdb::LogicalGet>();
-      if (!get.children.empty() || !get.has_estimated_cardinality) { return false; }
-      auto rows = transparent::parquet_scan_row_count(get);
-      if (!rows) { rows = duckdb_base_table_cardinality{context}(get); }
-      return rows && static_cast<double>(get.estimated_cardinality) >=
-                       k_min_kept_share * static_cast<double>(*rows);
+      std::optional<std::size_t> rows;
+      if (get.children.empty() && get.has_estimated_cardinality) {
+        rows = transparent::parquet_scan_row_count(get);
+        if (!rows) { rows = duckdb_base_table_cardinality{context}(get); }
+      }
+      if (!rows) {
+        sides.known = false;
+        return;
+      }
+      auto const scanned = static_cast<double>(get.estimated_cardinality);
+      auto const total   = static_cast<double>(*rows);
+      auto const kept    = kept_above ? std::min(scanned, *kept_above) : scanned;
+      if (kept < min_kept_share * total) { sides.keep_rows = false; }
+      auto const share = total > 0 ? kept / total : 1.0;
+      if (!sides.least_share || share < *sides.least_share) { sides.least_share = share; }
+      return;
     }
     case LogicalOperatorType::LOGICAL_PROJECTION:
-      return op.children.size() == 1 && keeps_rows(context, *op.children[0]);
+      if (op.children.size() != 1) {
+        sides.known = false;
+        return;
+      }
+      judge_other_side(context, *op.children[0], min_kept_share, kept_above, sides);
+      return;
+    case LogicalOperatorType::LOGICAL_FILTER:
+      // Not trusted, but what it is estimated to keep of the scan below it is still reported.
+      sides.known = false;
+      if (op.children.size() == 1) {
+        if (op.has_estimated_cardinality) {
+          auto const kept = static_cast<double>(op.estimated_cardinality);
+          kept_above      = kept_above ? std::min(kept, *kept_above) : kept;
+        }
+        judge_other_side(context, *op.children[0], min_kept_share, kept_above, sides);
+      }
+      return;
     case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-      return op.Cast<duckdb::LogicalComparisonJoin>().join_type == duckdb::JoinType::INNER &&
-             std::ranges::all_of(op.children,
-                                 [&](auto const& child) { return keeps_rows(context, *child); });
-    default: return false;
+      if (op.Cast<duckdb::LogicalComparisonJoin>().join_type != duckdb::JoinType::INNER) {
+        sides.known = false;
+        return;
+      }
+      for (auto const& child : op.children) {
+        judge_other_side(context, *child, min_kept_share, std::nullopt, sides);
+      }
+      return;
+    default: sides.known = false;
   }
+}
+
+/// @p op's row estimate, or the largest of its children's when it has none. Only reads:
+/// `LogicalOperator::EstimateCardinality` would store the estimate it computes.
+std::optional<duckdb::idx_t> estimated_rows(LogicalOperator const& op)
+{
+  if (op.has_estimated_cardinality) { return op.estimated_cardinality; }
+  std::optional<duckdb::idx_t> rows;
+  for (auto const& child : op.children) {
+    auto const below = estimated_rows(*child);
+    if (below && (!rows || *below > *rows)) { rows = below; }
+  }
+  return rows;
 }
 
 /// Whether @p op already has one row per group of some columns, so grouping it again by a join
@@ -310,6 +402,9 @@ struct path_step {
   duckdb::LogicalComparisonJoin* join;
   std::size_t side;                      ///< The child the arguments come from
   std::vector<ColumnBinding> forwarded;  ///< That child's columns the join outputs
+  /// An outer join that keeps every row of that child. The rule does not pass one yet; the walk
+  /// goes on through it only to report what else stands in the way.
+  bool preserves = false;
 };
 
 /// @p side's columns that @p join outputs, or nullopt when its projection map is out of range.
@@ -334,120 +429,236 @@ struct pushdown {
   std::vector<ColumnBinding> keys;  ///< The columns the pushed aggregate groups by
   std::vector<LogicalType> key_types;
   duckdb::vector<unique_ptr<Expression>> groups;  ///< The groups, over the joins' columns
-  duckdb::vector<unique_ptr<Expression>> lower;   ///< The aggregates, over the pushed input
-  duckdb::vector<unique_ptr<Expression>> upper;   ///< The aggregates combining those
+  /// Each aggregate's argument over the joins' columns (null when it has none), and the aggregate
+  /// that combines its results (null when none does).
+  duckdb::vector<unique_ptr<Expression>> arguments;
+  std::vector<char const*> combines;
+  duckdb::vector<unique_ptr<Expression>> lower;  ///< The aggregates, over the pushed input
+  duckdb::vector<unique_ptr<Expression>> upper;  ///< The aggregates combining those
   TableIndex lower_group_index;
   TableIndex lower_aggregate_index;
 };
 
-std::nullopt_t decline(char const* reason)
-{
-  SIRIUS_LOG_DEBUG(
-    "[sirius_plan_partial_aggregate_pushdown] Not aggregating below a join that adds group-by "
-    "payload: {}",
-    reason);
-  return std::nullopt;
-}
+/// Why an aggregate over a join is left alone: each reason once, in the order found.
+struct blockers {
+  std::vector<std::string> reasons;
+  std::optional<double> least_kept_share;  ///< Of the scans joined to the aggregated input
 
-/// Whether @p aggregate can be computed in two steps around a join that only adds payload, and
-/// how. Changes nothing.
-std::optional<pushdown> match(duckdb::ClientContext& context,
-                              duckdb::Binder& binder,
-                              duckdb::LogicalAggregate& aggregate)
-{
-  if (aggregate.children.size() != 1 || aggregate.groups.empty() || aggregate.expressions.empty() ||
-      !aggregate.grouping_functions.empty() || !groups_once(aggregate)) {
-    return std::nullopt;
-  }
-  auto folded = fold_projections(aggregate);
-  if (!folded.input || (*folded.input)->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-    return std::nullopt;
+  void add(std::string_view reason)
+  {
+    if (std::ranges::find(reasons, reason) == reasons.end()) { reasons.emplace_back(reason); }
   }
 
-  pushdown result;
-  result.aggregate = &aggregate;
-  result.input     = folded.input;
+  [[nodiscard]] std::string joined() const
+  {
+    std::string all;
+    for (auto const& reason : reasons) {
+      if (!all.empty()) { all += "; "; }
+      all += reason;
+    }
+    return all;
+  }
+};
+
+/// Work out how @p aggregate, whose input below its projections is the join in @p folded, can be
+/// computed in two steps around a join that only adds payload, and add to @p why every reason it
+/// cannot be. Changes nothing.
+///
+/// The reasons are meant to be complete, so that they tell which limits would all have to go for
+/// the rule to apply. An aggregate the rule cannot combine still says which side it reads, and
+/// the walk goes on through an outer join that keeps that side. Only where nothing further can be
+/// worked out does the first reason stand alone.
+void analyze(duckdb::ClientContext& context,
+             duckdb::LogicalAggregate& aggregate,
+             aggregate_input const& folded,
+             partial_aggregate_pushdown_options const& options,
+             pushdown& result,
+             blockers& why)
+{
+  if (aggregate.groups.empty()) {
+    why.add("shape:ungrouped");
+    return;
+  }
+  if (aggregate.expressions.empty()) {
+    why.add("shape:no-aggregates");
+    return;
+  }
+  if (!aggregate.grouping_functions.empty() || !groups_once(aggregate)) {
+    why.add("shape:grouping-sets");
+    return;
+  }
+  if (folded.is_volatile) {
+    why.add("shape:volatile-projection");
+    return;
+  }
+
+  result.aggregate    = &aggregate;
+  result.input        = folded.input;
+  bool groups_payload = false;
   for (auto const& group : aggregate.groups) {
     auto value = inline_columns(*group, folded.columns);
-    if (!is_column(*value)) { return std::nullopt; }
+    if (!is_column(*value)) {
+      why.add("shape:group-expression");
+      return;
+    }
+    groups_payload =
+      groups_payload || !duckdb::TypeIsConstantSize(value->GetReturnType().InternalType());
     result.groups.push_back(std::move(value));
+  }
+  if (!groups_payload) {
+    why.add("path:no-payload");
+    return;
   }
 
   // Each aggregate's argument over the joins' columns, and what combines its results.
-  duckdb::vector<unique_ptr<Expression>> arguments;
-  std::vector<char const*> combines;
   std::vector<ColumnBinding> argument_columns;
   for (auto const& expression : aggregate.expressions) {
     if (expression->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
-      return std::nullopt;
+      why.add("shape:not-an-aggregate");
+      return;
     }
     auto const& original = expression->Cast<duckdb::BoundAggregateExpression>();
-    auto const* combine  = combining_aggregate(original.Function().GetName().GetIdentifierName());
-    if (!combine || original.IsDistinct() || original.GetFilter() || original.GetOrderBys() ||
-        original.GetChildren().size() != 1) {
-      return std::nullopt;
-    }
-    auto argument = inline_columns(*original.GetChildren()[0], folded.columns);
-    if (argument->IsVolatile() || !arithmetic_or_infallible(*argument)) { return std::nullopt; }
-    if (std::string_view{combine} == "sum" && !sum_combines_exactly(argument->GetReturnType())) {
-      return std::nullopt;
-    }
+    auto const& name     = original.Function().GetName().GetIdentifierName();
+    auto const* combine  = combining_aggregate(name);
+    auto const unary     = original.GetChildren().size() == 1;
+    if (!combine || !unary) { why.add("aggregate:" + name); }
+    if (original.IsDistinct()) { why.add("aggregate:distinct"); }
+    if (original.GetFilter()) { why.add("aggregate:filter"); }
+    if (original.GetOrderBys()) { why.add("aggregate:order-by"); }
+
     auto const columns_before = argument_columns.size();
-    append_columns_read(*argument, argument_columns);
-    if (argument_columns.size() == columns_before) { return std::nullopt; }
-    arguments.push_back(std::move(argument));
-    combines.push_back(combine);
+    unique_ptr<Expression> argument;
+    for (auto const& child : original.GetChildren()) {
+      auto value = inline_columns(*child, folded.columns);
+      if (value->IsVolatile()) {
+        why.add("argument:volatile");
+      } else if (!fails_only_through_arithmetic(*value)) {
+        why.add("argument:fallible");
+      }
+      append_columns_read(*value, argument_columns);
+      if (unary) { argument = std::move(value); }
+    }
+    if (unary) {
+      // AVG adds up its argument too, so it reports what stands in the way of that sum.
+      if (name == "avg" || (combine && std::string_view{combine} == "sum")) {
+        if (auto const* blocker = sum_blocker(argument->GetReturnType())) { why.add(blocker); }
+      }
+      if (combine && argument_columns.size() == columns_before) { why.add("argument:constant"); }
+    }
+    if (original.GetFilter()) {
+      append_columns_read(*inline_columns(*original.GetFilter(), folded.columns), argument_columns);
+    }
+    result.arguments.push_back(std::move(argument));
+    result.combines.push_back(combine);
   }
 
-  // Down through inner joins, on the side that holds every argument.
-  auto* node = folded.input->get();
+  // Down through joins, on the side that holds every argument. The rule passes inner joins: the
+  // first `passable` steps. The walk goes on through an outer join that keeps every row of that
+  // side, to report what else stands in the way.
+  auto* node               = folded.input->get();
+  std::size_t passable     = 0;
+  bool passing             = true;
+  char const* stopped_here = nullptr;
   while (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
     auto& join = node->Cast<duckdb::LogicalComparisonJoin>();
-    if (join.join_type != duckdb::JoinType::INNER || join.children.size() != 2 ||
-        join.conditions.empty()) {
+    if (join.children.size() != 2 || join.conditions.empty()) {
+      stopped_here = "join:no-condition";
       break;
     }
     std::optional<std::size_t> side;
-    for (std::size_t child = 0; child < 2 && !side; ++child) {
-      auto const outputs = outputs_of(*join.children[child]);
-      if (std::ranges::all_of(argument_columns,
-                              [&](auto const& read) { return outputs.contains(read); })) {
-        side = child;
+    if (argument_columns.empty()) {
+      // No aggregate reads a column (COUNT(*)): the side with more rows is the one to aggregate.
+      auto const left  = estimated_rows(*join.children[0]);
+      auto const right = estimated_rows(*join.children[1]);
+      if (!left || !right || *left == *right) {
+        stopped_here = "side:unknown";
+        break;
+      }
+      side = *left > *right ? 0 : 1;
+    } else {
+      for (std::size_t child = 0; child < 2 && !side; ++child) {
+        auto const outputs = outputs_of(*join.children[child]);
+        if (std::ranges::all_of(argument_columns,
+                                [&](auto const& read) { return outputs.contains(read); })) {
+          side = child;
+        }
+      }
+      if (!side) {
+        stopped_here = "arguments:both-sides";
+        break;
       }
     }
-    if (!side) { break; }
+    bool preserves = false;
+    switch (join.join_type) {
+      case duckdb::JoinType::INNER: break;
+      case duckdb::JoinType::LEFT:
+        preserves    = *side == 0;
+        stopped_here = preserves ? nullptr : "join:outer-padded";
+        break;
+      case duckdb::JoinType::RIGHT:
+        preserves    = *side == 1;
+        stopped_here = preserves ? nullptr : "join:outer-padded";
+        break;
+      case duckdb::JoinType::OUTER: stopped_here = "join:full"; break;
+      case duckdb::JoinType::SEMI:
+      case duckdb::JoinType::ANTI:
+      case duckdb::JoinType::RIGHT_SEMI:
+      case duckdb::JoinType::RIGHT_ANTI: stopped_here = "join:semi-anti"; break;
+      case duckdb::JoinType::MARK: stopped_here = "join:mark"; break;
+      case duckdb::JoinType::SINGLE: stopped_here = "join:single"; break;
+      default: stopped_here = "join:other"; break;
+    }
+    if (stopped_here) { break; }
     auto forwarded = forwarded_columns(join, *side);
-    if (!forwarded) { return std::nullopt; }
-    result.path.push_back({&join, *side, std::move(*forwarded)});
+    if (!forwarded) {
+      why.add("plan:projection-map");
+      return;
+    }
+    passing = passing && !preserves;
+    if (passing) { ++passable; }
+    result.path.push_back({&join, *side, std::move(*forwarded), preserves});
     node = join.children[*side].get();
   }
 
   // The lowest join whose other side supplies a variable-width group column. Below it each input
-  // row stands alone; from it upwards each carries that payload.
-  std::optional<std::size_t> payload;
-  for (std::size_t i = result.path.size(); i-- > 0 && !payload;) {
-    auto const& step  = result.path[i];
-    auto const others = outputs_of(*step.join->children[1 - step.side]);
-    if (std::ranges::any_of(result.groups, [&](auto const& group) {
-          return !duckdb::TypeIsConstantSize(group->GetReturnType().InternalType()) &&
-                 others.contains(binding_of(*group));
-        })) {
-      payload = i;
+  // row stands alone; from it upwards each carries that payload. It is looked for among the joins
+  // the rule passes first, so that the walk's going further never moves a push.
+  auto const lowest_payload = [&](std::size_t begin, std::size_t end) {
+    std::optional<std::size_t> payload;
+    for (std::size_t i = end; i-- > begin && !payload;) {
+      auto const& step  = result.path[i];
+      auto const others = outputs_of(*step.join->children[1 - step.side]);
+      if (std::ranges::any_of(result.groups, [&](auto const& group) {
+            return !duckdb::TypeIsConstantSize(group->GetReturnType().InternalType()) &&
+                   others.contains(binding_of(*group));
+          })) {
+        payload = i;
+      }
     }
+    return payload;
+  };
+  auto payload = lowest_payload(0, passable);
+  if (!payload) { payload = lowest_payload(passable, result.path.size()); }
+  if (!payload) {
+    why.add(stopped_here ? stopped_here : "path:no-payload");
+    return;
   }
-  if (!payload) { return std::nullopt; }
   result.path.erase(result.path.begin() + static_cast<std::ptrdiff_t>(*payload) + 1,
                     result.path.end());
+  if (std::ranges::any_of(result.path, &path_step::preserves)) { why.add("join:outer-preserved"); }
   auto const& under = result.path.back();
   auto& source      = *under.join->children[under.side];
 
-  if (already_grouped(source)) { return decline("its input is already grouped"); }
+  if (already_grouped(source)) { why.add("source:grouped"); }
 
   // The pushed aggregate groups by every column of its input that is read above it: by the joins
   // on the way up and by the aggregate's groups. The join it goes under comes first, so its keys
   // lead.
   auto const source_columns = source.GetColumnBindings();
-  if (source_columns.size() != source.types.size()) { return std::nullopt; }
+  if (source_columns.size() != source.types.size()) {
+    why.add("plan:unresolved-source");
+    return;
+  }
   auto const add_keys = [&](std::vector<ColumnBinding> const& read) {
     for (auto const& binding : read) {
       auto const found = std::ranges::find(source_columns, binding);
@@ -472,16 +683,16 @@ std::optional<pushdown> match(duckdb::ClientContext& context,
   }
   add_keys(read);
 
-  if (result.keys.empty()) { return decline("the join reads no column of its input"); }
+  // It would group by nothing, by a variable-width column, by as many columns as the aggregate
+  // above it, or by too many columns beyond the join's.
+  if (result.keys.empty()) { why.add("keys:none"); }
   if (!std::ranges::all_of(result.key_types, [](auto const& type) {
         return duckdb::TypeIsConstantSize(type.InternalType());
       })) {
-    return decline("it would group by a variable-width column");
+    why.add("keys:variable-width");
   }
-  if (result.keys.size() >= aggregate.groups.size() ||
-      result.keys.size() > join_keys + k_max_extra_keys) {
-    return decline("it would group by too many columns");
-  }
+  if (result.keys.size() >= aggregate.groups.size()) { why.add("keys:not-fewer-than-groups"); }
+  if (result.keys.size() - join_keys > options.max_extra_keys) { why.add("keys:too-many-extra"); }
   // A join that computes its key sees one row of each group where it saw every row. That is the
   // same only when the rows of a group cannot differ in the columns the key is computed from.
   std::vector<ColumnBinding> computed_from;
@@ -491,36 +702,92 @@ std::optional<pushdown> match(duckdb::ClientContext& context,
   for (std::size_t k = 0; k < result.keys.size(); ++k) {
     if (!equal_means_identical(result.key_types[k]) &&
         std::ranges::find(computed_from, result.keys[k]) != computed_from.end()) {
-      return decline("a join computes its key from a column whose equal values can differ");
+      why.add("key:computed-inexact");
     }
   }
-  for (auto const& step : result.path) {
-    if (!keeps_rows(context, *step.join->children[1 - step.side])) {
-      return decline("a join above its input may discard the rows it would aggregate");
+  // A join above its input may discard the rows it would aggregate. One that keeps every row of
+  // the aggregated side cannot.
+  if (options.min_kept_share > 0) {
+    other_sides sides;
+    for (auto const& step : result.path) {
+      if (!step.preserves) {
+        judge_other_side(context,
+                         *step.join->children[1 - step.side],
+                         options.min_kept_share,
+                         std::nullopt,
+                         sides);
+      }
     }
+    if (!sides.known) { why.add("other-side:opaque"); }
+    if (!sides.keep_rows) { why.add("other-side:filtered"); }
+    why.least_kept_share = sides.least_share;
   }
+}
 
+/// Bind the aggregates @p result pushes and the ones that combine them. Adds a reason to @p why
+/// when combining would change a result's type.
+void bind(duckdb::ClientContext& context, duckdb::Binder& binder, pushdown& result, blockers& why)
+{
+  auto const& aggregate        = *result.aggregate;
   result.lower_group_index     = binder.GenerateTableIndex();
   result.lower_aggregate_index = binder.GenerateTableIndex();
   for (std::size_t i = 0; i < aggregate.expressions.size(); ++i) {
     auto const& original = aggregate.expressions[i]->Cast<duckdb::BoundAggregateExpression>();
     auto lower           = original.Copy();
     lower->Cast<duckdb::BoundAggregateExpression>().GetChildrenMutable()[0] =
-      std::move(arguments[i]);
+      std::move(result.arguments[i]);
     auto const type = lower->GetReturnType();
     auto upper      = bind_builtin_aggregate(
       context,
-      combines[i],
+      result.combines[i],
       type,
       column(type, ColumnBinding(result.lower_aggregate_index, ProjectionIndex(i))));
     if (upper->GetReturnType() != original.GetReturnType()) {
-      return decline("combining its results would change their type");
+      why.add("combine:type");
+      return;
     }
     upper->SetAlias(original.GetAlias());
     result.lower.push_back(std::move(lower));
     result.upper.push_back(std::move(upper));
   }
-  return result;
+}
+
+/// How to compute @p aggregate in two steps around a join that only adds payload, or nullopt
+/// when it is left alone. An aggregate over a join that is left alone adds its reasons to
+/// @p declined; any other aggregate is not the rule's concern and adds nothing. Changes nothing.
+std::optional<pushdown> match(duckdb::ClientContext& context,
+                              duckdb::Binder& binder,
+                              duckdb::LogicalAggregate& aggregate,
+                              partial_aggregate_pushdown_options const& options,
+                              std::vector<std::string>& declined)
+{
+  if (aggregate.children.size() != 1) { return std::nullopt; }
+  auto const folded = fold_projections(aggregate);
+  if ((*folded.input)->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+    return std::nullopt;
+  }
+
+  pushdown result;
+  blockers why;
+  analyze(context, aggregate, folded, options, result, why);
+  if (why.reasons.empty()) { bind(context, binder, result, why); }
+  if (why.reasons.empty()) { return result; }
+
+  auto reasons = why.joined();
+  if (why.least_kept_share) {
+    SIRIUS_LOG_DEBUG(
+      "[sirius_plan_partial_aggregate_pushdown] Not aggregating below a join that adds group-by "
+      "payload: {} (least kept share {:.3f})",
+      reasons,
+      *why.least_kept_share);
+  } else {
+    SIRIUS_LOG_DEBUG(
+      "[sirius_plan_partial_aggregate_pushdown] Not aggregating below a join that adds group-by "
+      "payload: {}",
+      reasons);
+  }
+  declined.push_back(std::move(reasons));
+  return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -641,29 +908,32 @@ void apply(pushdown& push)
 void visit(duckdb::ClientContext& context,
            duckdb::Binder& binder,
            LogicalOperator& op,
-           std::size_t& pushed)
+           partial_aggregate_pushdown_options const& options,
+           partial_aggregate_pushdown_result& result)
 {
   for (auto& child : op.children) {
-    visit(context, binder, *child, pushed);
+    visit(context, binder, *child, options, result);
   }
   if (op.type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) { return; }
-  auto push = match(context, binder, op.Cast<duckdb::LogicalAggregate>());
+  auto push = match(context, binder, op.Cast<duckdb::LogicalAggregate>(), options, result.declined);
   if (!push) { return; }
   // ---- Nothing below declines. ----
   apply(*push);
-  ++pushed;
+  ++result.pushed;
 }
 
 }  // namespace
 
-std::size_t push_partial_aggregates_below_joins(duckdb::ClientContext& context,
-                                                duckdb::Binder& binder,
-                                                duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
+partial_aggregate_pushdown_result push_partial_aggregates_below_joins(
+  duckdb::ClientContext& context,
+  duckdb::Binder& binder,
+  duckdb::unique_ptr<duckdb::LogicalOperator>& plan,
+  partial_aggregate_pushdown_options const& options)
 {
   plan->ResolveOperatorTypes();
-  std::size_t pushed = 0;
-  visit(context, binder, *plan, pushed);
-  return pushed;
+  partial_aggregate_pushdown_result result;
+  visit(context, binder, *plan, options, result);
+  return result;
 }
 
 }  // namespace sirius::planner
