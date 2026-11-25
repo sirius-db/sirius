@@ -322,8 +322,8 @@ void attach_delete_set(parquet_file_scan_info& file,
   file.visibility_class = set->equality_groups;
   if (set->equality_groups) {
     // Probing holds the join indices and the compaction's gather map (4 B/row each), a BOOL8
-    // mask and the compacted copy beside the batch. Groups run one after another, and virtual
-    // scans already budget a filter copy.
+    // mask and the compacted copy beside the batch. Groups probe one after another into the
+    // same mask and the batch is compacted once, and virtual scans already budget a filter copy.
     for (auto& group : file.row_groups) {
       auto const copy =
         plan.has_user_virtual_columns() ? std::size_t{0} : group.decode_working_bytes;
@@ -839,13 +839,13 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
         throw sirius::internal_exception("[iceberg_gpu_ingestible] '" + _table_path +
                                          "': decoded table has no owned state to filter");
       auto const rows_before = table->num_rows();
-      for (auto const group : *equality_groups) {
-        equality_delete_filter filter(_equality_data,
-                                      rmm::cuda_device_id{mem_space.get_device_id()},
-                                      group,
-                                      _equality_key_positions.at(group));
-        table = filter.apply(std::move(table), {}, stream, mr_ref);
-      }
+      std::vector<equality_delete_filter::probe> probes;
+      probes.reserve(equality_groups->size());
+      for (auto const group : *equality_groups)
+        probes.push_back({group, _equality_key_positions.at(group)});
+      table = equality_delete_filter(
+                _equality_data, rmm::cuda_device_id{mem_space.get_device_id()}, std::move(probes))
+                .apply(std::move(table), {}, stream, mr_ref);
       // Rows no longer line up with file positions or with any lineage the decoder returned.
       if (table->num_rows() != rows_before) {
         base.row_positions.reset();

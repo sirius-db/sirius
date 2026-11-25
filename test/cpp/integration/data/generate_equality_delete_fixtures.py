@@ -69,6 +69,14 @@ are listed beside the right ones, so a failure says which rule broke:
                                     delete applies to data with a strictly lower sequence
                                     number, so this one applies to nothing: no reader opens it,
                                     and its format must not decline the scan.
+  iceberg_v2_eq_key_ranges          Two data files whose manifest records the key's bounds and
+                                    null count, and one sibling snapshot per delete: a key range
+                                    beside both files, one that meets a file at its endpoint, a
+                                    NULL key facing a file with NULLs, a delete without bounds, a
+                                    composite key disjoint in one column, two deletes that each
+                                    meet one file, and a delete manifest whose schema has no
+                                    bounds fields. Skipping a delete whose range still meets a
+                                    file, or whose NULL key does, returns deleted rows.
 
 Hand-forged, like the other delete fixtures: pyiceberg does not write delete files, and the only
 independent writer of equality deletes is Flink. Avro schemas are copied from an existing
@@ -148,6 +156,9 @@ class Table:
         self.file_formats = (
             {}
         )  # file_format of an entry by path, where it is not PARQUET
+        self.bare_manifests = (
+            set()
+        )  # manifests whose schema leaves the bounds fields out
         if self.root.exists():
             shutil.rmtree(self.root)
         (self.root / "data").mkdir(parents=True)
@@ -176,8 +187,13 @@ class Table:
         )
 
     def _manifest(self, name, content, spec_id, entries):
-        """entries: [(status, explicit_sequence_or_None, file, content, partition, equality_ids)]."""
+        """entries: [(status, explicit_sequence_or_None, file, content, partition, equality_ids)],
+        optionally followed by the file's column metrics: a dict with any of `lower_bounds`,
+        `upper_bounds` ({field_id: serialized value}) and `null_value_counts` ({field_id: n}).
+        """
         import fastavro
+
+        entries = [e if len(e) == 7 else (*e, None) for e in entries]
 
         spec = self.specs[spec_id]
         schema = copy.deepcopy(self.entry_schema)
@@ -204,7 +220,19 @@ class Table:
         meta["partition-spec-id"] = str(spec_id)
         meta["schema"] = json.dumps(self._schema_json(len(self.schemas) - 1))
         rows = []
-        for status, explicit_seq, (path, count, size), kind, partition, ids in entries:
+        for (
+            status,
+            explicit_seq,
+            (path, count, size),
+            kind,
+            partition,
+            ids,
+            metrics,
+        ) in entries:
+            metrics = {
+                name: [{"key": k, "value": v} for k, v in sorted(values.items())]
+                for name, values in (metrics or {}).items()
+            }
             rows.append(
                 {
                     "status": status,
@@ -220,10 +248,10 @@ class Table:
                         "file_size_in_bytes": size,
                         "column_sizes": None,
                         "value_counts": None,
-                        "null_value_counts": None,
+                        "null_value_counts": metrics.get("null_value_counts"),
                         "nan_value_counts": None,
-                        "lower_bounds": None,
-                        "upper_bounds": None,
+                        "lower_bounds": metrics.get("lower_bounds"),
+                        "upper_bounds": metrics.get("upper_bounds"),
                         "key_metadata": None,
                         "split_offsets": [4],
                         "equality_ids": ids,
@@ -234,6 +262,16 @@ class Table:
         v1 = name in self.v1_manifests
         if v1:
             _as_v1_manifest(schema, meta, rows)
+        if name in self.bare_manifests:
+            bounds = ("lower_bounds", "upper_bounds", "null_value_counts")
+            for field in schema["fields"]:
+                if field["name"] == "data_file":
+                    field["type"]["fields"] = [
+                        f for f in field["type"]["fields"] if f["name"] not in bounds
+                    ]
+            for row in rows:
+                for bound in bounds:
+                    del row["data_file"][bound]
         out = self.root / "metadata" / name
         with open(out, "wb") as fh:
             fastavro.writer(fh, schema, rows, codec="null", metadata=meta)
@@ -241,7 +279,7 @@ class Table:
         existing = sum(1 for r in rows if r["status"] == 0)
 
         def summary(field):
-            values = [p[field["name"]] for *_, p, _ in entries if p]
+            values = [e[4][field["name"]] for e in entries if e[4]]
             present = sorted(v for v in values if v is not None)
 
             def bound(v):
@@ -280,7 +318,7 @@ class Table:
             ),
             deleted_rows_count=0,
             partitions=(
-                [summary(f) for f in spec] if any(p for *_, p, _ in entries) else []
+                [summary(f) for f in spec] if any(e[4] for e in entries) else []
             ),
         )
         return row
@@ -1041,6 +1079,100 @@ PARTITION_SHAPES = [
 # name -> (builder, expectation). The expectation is the rows a correct reader returns for the
 # current snapshot, a {snapshot sequence: rows} map for a table of sibling snapshots, or None
 # for a table DuckDB cannot read from this machine.
+# Sequence number of each iceberg_v2_eq_key_ranges snapshot -> the ids it leaves.
+KEY_RANGES = {
+    2: [1, 2, 3, 4, 5, 6],  # k in [100, 110]: beside both data files
+    3: [1, 2, 4, 5, 6],  # k in [30, 35]: meets data-a at its upper bound
+    4: [1, 2, 3, 4, 5],  # k = NULL and 100: data-b holds a NULL
+    5: [1, 3, 4, 5, 6],  # k = 20, no bounds recorded
+    6: [1, 2, 3, 4, 5, 6],  # (k, s) = (20, "zz"): s is beside both data files
+    7: [1, 3, 4, 5, 6],  # k = 20 and k = 45 in two delete files, one for each data file
+    8: [1, 3, 4, 5, 6],  # k = 20, in a manifest without the bounds fields
+}
+
+
+def build_key_ranges():
+    import pyarrow as pa
+
+    def metrics(k=None, s=None, k_nulls=0):
+        """Bounds as a manifest serializes them: long little-endian, string UTF-8."""
+        lower, upper = {}, {}
+        if k:
+            lower[2], upper[2] = (struct.pack("<q", v) for v in k)
+        if s:
+            lower[3], upper[3] = (v.encode() for v in s)
+        return {
+            "lower_bounds": lower,
+            "upper_bounds": upper,
+            "null_value_counts": {2: k_nulls, 3: 0},
+        }
+
+    t = Table(
+        "iceberg_v2_eq_key_ranges",
+        [[(1, "id", "long"), (2, "k", "long"), (3, "s", "string")]],
+    )
+    columns = lambda ids, ks, ss: [  # noqa: E731
+        (1, "id", pa.int64(), ids),
+        (2, "k", pa.int64(), ks),
+        (3, "s", pa.string(), ss),
+    ]
+    a = t.parquet("data-a.parquet", columns([1, 2, 3], [10, 20, 30], ["a", "b", "c"]))
+    b = t.parquet("data-b.parquet", columns([4, 5, 6], [40, 50, None], ["d", "e", "f"]))
+    t.commit(
+        "append",
+        [
+            (
+                "m-data-1.avro",
+                0,
+                0,
+                [
+                    (1, None, a, 0, None, None, metrics((10, 30), ("a", "c"))),
+                    (
+                        1,
+                        None,
+                        b,
+                        0,
+                        None,
+                        None,
+                        metrics((40, 50), ("d", "f"), k_nulls=1),
+                    ),
+                ],
+            )
+        ],
+    )
+
+    def delete(seq, files):
+        """files: [(key columns, equality ids, metrics or None)], one delete file each."""
+        entries = []
+        for n, (keys, ids, file_metrics) in enumerate(files):
+            file = t.parquet(f"delete-eq-{seq}-{n}.parquet", keys)
+            entries.append((1, None, file, 2, None, ids, file_metrics))
+        t.commit("delete", [(f"m-delete-{seq}.avro", 1, 0, entries)], sibling=True)
+
+    k = lambda values: [(2, "k", pa.int64(), values)]  # noqa: E731
+    delete(2, [(k([100, 110]), [2], metrics((100, 110)))])
+    delete(3, [(k([30, 35]), [2], metrics((30, 35)))])
+    delete(4, [(k([None, 100]), [2], metrics((100, 100), k_nulls=1))])
+    delete(5, [(k([20]), [2], None)])
+    delete(
+        6,
+        [
+            (
+                k([20]) + [(3, "s", pa.string(), ["zz"])],
+                [2, 3],
+                metrics((20, 20), ("zz", "zz")),
+            )
+        ],
+    )
+    delete(
+        7,
+        [(k([20]), [2], metrics((20, 20))), (k([45]), [2], metrics((45, 45)))],
+    )
+    t.bare_manifests.add("m-delete-8.avro")
+    delete(8, [(k([20]), [2], None)])
+    t.finish()
+
+
 FIXTURES = {
     "iceberg_v2_eq_wide_delete_file": (
         build_wide_delete_file,
@@ -1129,6 +1261,10 @@ FIXTURES = {
             applies=False,
         ),
         [("apple", 1), ("banana", 2), ("cherry", 3)],
+    ),
+    "iceberg_v2_eq_key_ranges": (
+        build_key_ranges,
+        {seq: [(i,) for i in ids] for seq, ids in KEY_RANGES.items()},
     ),
 }
 

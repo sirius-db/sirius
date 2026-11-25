@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/device_uvector.hpp>
@@ -51,5 +52,15 @@ std::unique_ptr<cudf::column> make_anti_join_mask(
   cudf::size_type n_rows,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
+
+/// Clears @p mask[i] where @p build_indices[i] names a match, in place: a row any probe deleted
+/// stays deleted. @p mask is a BOOL8 column no longer than @p build_indices.
+void clear_matched_rows(rmm::device_uvector<cudf::size_type> const& build_indices,
+                        cudf::mutable_column_view mask,
+                        ::cuda::stream_ref stream);
+
+/// Number of rows the BOOL8 @p mask keeps.
+[[nodiscard]] cudf::size_type count_kept_rows(cudf::column_view const& mask,
+                                              ::cuda::stream_ref stream);
 
 }  // namespace sirius::op::scan

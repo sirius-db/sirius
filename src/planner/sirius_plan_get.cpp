@@ -119,9 +119,27 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
     counters && counters->track_units && counters->equality_files_per_data_file_limit_for_testing
       ? *counters->equality_files_per_data_file_limit_for_testing
       : op::scan::kMaxEqualityDeleteFilesPerDataFile;
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
+  // The bound type of a key this path compares, so that its recorded bounds can rule a delete
+  // file out for a data file. A key the checks below refuse has no type here.
+  auto const key_type = [&](int32_t id) -> std::optional<duckdb::LogicalType> {
+    if (bind == nullptr) return std::nullopt;
+    std::optional<duckdb::LogicalType> type;
+    for (auto const& column :
+         bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema) {
+      if (column.identifier.IsNull() ||
+          column.identifier.type().id() != duckdb::LogicalTypeId::INTEGER ||
+          column.identifier.GetValue<int32_t>() != id)
+        continue;
+      if (type || !column.children.empty() || !op::scan::equality_key_cudf_type(column.type))
+        return std::nullopt;
+      type = column.type;
+    }
+    return type;
+  };
   op::scan::iceberg_equality_plan plan;
   try {
-    plan = op::scan::read_equality_plan(context, inventory, files_limit);
+    plan = op::scan::read_equality_plan(context, inventory, files_limit, key_type);
   } catch (op::scan::equality_plan_error const& e) {
     return iceberg_decline(scan_reason::iceberg_equality_plan_unproven, e.what());
   }
@@ -156,7 +174,6 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
     }
   }
 
-  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
   if (bind == nullptr) {
     return iceberg_decline(scan_reason::iceberg_equality_key_unsupported,
                            "the binding does not expose the table schema, so equality-delete "

@@ -1987,6 +1987,48 @@ TEST_CASE_METHOD(
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - key bounds take equality deletes off a data file",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The manifest records key k of the two data files as [10, 30] without NULLs and [40, 50]
+  // with one. Each sibling snapshot adds deletes; `loads` is how many delete files are opened.
+  auto path = table("iceberg_v2_eq_key_ranges");
+  auto scan = [&](int64_t sequence) {
+    return "SELECT id FROM iceberg_scan('" + path +
+           "', snapshot_from_id = " + std::to_string(8800000000000000 + sequence) +
+           ") ORDER BY id;";
+  };
+  using rows = std::vector<std::vector<std::string>>;
+  struct range_case {
+    char const* what;
+    int64_t sequence;
+    rows expected;
+    uint64_t loads;
+  };
+  rows const all{{"1"}, {"2"}, {"3"}, {"4"}, {"5"}, {"6"}};
+  rows const without_2{{"1"}, {"3"}, {"4"}, {"5"}, {"6"}};
+  for (auto const& c :
+       {range_case{"k in [100, 110] is beside both files", 2, all, 0},
+        range_case{
+          "k in [30, 35] meets a file at its bound", 3, {{"1"}, {"2"}, {"4"}, {"5"}, {"6"}}, 1},
+        range_case{
+          "a NULL key faces a file holding a NULL", 4, {{"1"}, {"2"}, {"3"}, {"4"}, {"5"}}, 1},
+        range_case{"a delete that records no bounds", 5, without_2, 1},
+        range_case{"(k, s) is beside both files in s alone", 6, all, 0},
+        range_case{"a delete manifest without the bounds fields", 8, without_2, 1}}) {
+    INFO(c.what);
+    expect_equality_rows(scan(c.sequence), c.expected, c.loads);
+  }
+
+  // Sequence 7 deletes k = 20 and k = 45 in two files, one within each data file's bounds.
+  // Counted without the bounds, each data file is subject to two deletes.
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto reset    = reset_after_test(counters->equality_files_per_data_file_limit_for_testing);
+  counters->equality_files_per_data_file_limit_for_testing = 1;
+  expect_equality_rows(scan(7), without_2, 2);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
                  "gpu_execution iceberg - equality keys outside the supported types decline",
                  "[integration][gpu_execution][iceberg]")
 {

@@ -159,6 +159,19 @@ struct equality_plan_error : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+/// The bound type of the key with a field ID, or nullopt for a key whose bounds are not compared.
+using equality_key_types = std::function<std::optional<duckdb::LogicalType>(int32_t)>;
+
+/// Whether the [lower, upper] bounds two manifests record for a key of @p type prove that no
+/// value is in both files. False for a type whose bounds are not compared, a bound that is empty
+/// or not how a manifest serializes @p type, and string bounds beyond ASCII, whose order differs
+/// between writers.
+[[nodiscard]] bool equality_key_ranges_disjoint(duckdb::LogicalType const& type,
+                                                std::string_view a_lower,
+                                                std::string_view a_upper,
+                                                std::string_view b_lower,
+                                                std::string_view b_upper);
+
 /**
  * @brief Decide which equality-delete files apply to which data file of @p inventory.
  *
@@ -168,16 +181,21 @@ struct equality_plan_error : std::runtime_error {
  * partition. A manifest whose live entries are not the inventory's throws
  * @ref equality_plan_error. `keys` is left empty; the plan gate resolves them.
  *
+ * With @p key_types, a delete file is also left out for a data file it cannot match: one of its
+ * keys has bounds recorded for both files that are disjoint, and the two files do not both hold
+ * a NULL in it. That reads the bounds of the data manifests, once for the statement.
+ *
  * @param max_files_per_data_file A data file's list stops growing one past this.
  */
 iceberg_equality_plan read_equality_plan(duckdb::ClientContext&,
                                          iceberg_delete_inventory const& inventory,
-                                         std::size_t max_files_per_data_file);
+                                         std::size_t max_files_per_data_file,
+                                         equality_key_types const& key_types = {});
 iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext&,
                                                  std::string const&,
                                                  iceberg_delete_inventory&&);
 
-/// Equality-delete files that share their key columns and apply to exactly the same data files.
+/// Equality-delete files that share their key columns and their scope.
 struct EqualityDeleteGroup {
   /// GPU-resident deduplicated keys: one column per key, in @ref key_field_ids order, in the
   /// bound key types.

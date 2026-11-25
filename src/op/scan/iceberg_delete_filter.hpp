@@ -78,13 +78,23 @@ class positional_delete_filter : public iceberg_delete_filter {
   iceberg_delete_sets _delete_sets;
 };
 
-/// Applies one equality-delete group: probes its prebuilt hash join with the batch's key columns
-/// and applies an anti-join mask. The caller decides which groups apply; the layout is ignored.
+/// Applies equality-delete groups: probes each group's prebuilt hash join with the batch's key
+/// columns, then compacts the batch once -- or not at all when no row matched. The caller decides
+/// which groups apply; the layout is ignored.
 class equality_delete_filter : public iceberg_delete_filter {
  public:
-  /// @param device The device the batch is on. The group's tables built there are probed.
-  /// @param data_key_indices Batch column indices of the group's key columns, in the group's
-  ///                         key order.
+  /// One group to probe, and the batch column indices of its key columns in the group's key
+  /// order.
+  struct probe {
+    size_t group_index;
+    std::vector<cudf::size_type> data_key_indices;
+  };
+
+  /// @param device The device the batch is on. The groups' tables built there are probed.
+  equality_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data,
+                         rmm::cuda_device_id device,
+                         std::vector<probe> probes);
+  /// A single group.
   equality_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data,
                          rmm::cuda_device_id device,
                          size_t group_index,
@@ -98,8 +108,7 @@ class equality_delete_filter : public iceberg_delete_filter {
  private:
   std::shared_ptr<const IcebergDeleteData> _delete_data;
   rmm::cuda_device_id _device;
-  size_t _group_index;
-  std::vector<cudf::size_type> _data_key_indices;
+  std::vector<probe> _probes;
 };
 
 }  // namespace sirius::op::scan

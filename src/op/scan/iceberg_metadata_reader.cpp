@@ -380,11 +380,111 @@ bool spec_partitions(std::string const& spec_json)
   return false;
 }
 
+/// What a manifest records about one key column of one file.
+struct key_bounds {
+  std::string lower, upper;  // Serialized bounds; empty when not recorded.
+  bool no_nulls = false;     // The null count is recorded as zero.
+};
+
+/// The bounds the live entries of @p manifests record for @p ids: file path -> one entry per ID.
+/// Empty when the manifests cannot be read this way. Bounds are optional and so is pruning by
+/// them, so that is not an error.
+std::unordered_map<std::string, std::vector<key_bounds>> read_key_bounds(
+  iceberg_metadata_connection& connection,
+  std::set<std::string_view> const& manifests,
+  std::vector<int32_t> const& ids)
+{
+  std::string sql = "SELECT data_file.file_path";
+  for (auto const id : ids)
+    for (auto const* column : {"lower_bounds", "upper_bounds", "null_value_counts"})
+      sql +=
+        std::string(", map_extract_value(data_file.") + column + ", " + std::to_string(id) + ")";
+  sql += " FROM read_avro([";
+  for (auto const manifest : manifests)
+    sql += (sql.back() == '[' ? "'" : ", '") + escape_sql_string(std::string(manifest)) + "'";
+  sql += "]) WHERE status <> 2";
+
+  std::unordered_map<std::string, std::vector<key_bounds>> bounds;
+  auto const bytes = [](duckdb::Value const& value) {
+    return value.IsNull() || value.type().id() != duckdb::LogicalTypeId::BLOB
+             ? std::string()
+             : duckdb::StringValue::Get(value);
+  };
+  try {
+    auto result = connection.Query(sql);
+    if (!result || result->HasError()) return {};
+    while (true) {
+      auto chunk = result->Fetch();
+      if (!chunk || chunk->size() == 0) break;
+      for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+        std::vector<key_bounds> keys;
+        keys.reserve(ids.size());
+        for (duckdb::idx_t column = 1; column < chunk->ColumnCount(); column += 3) {
+          auto const nulls = chunk->GetValue(column + 2, row);
+          keys.push_back({bytes(chunk->GetValue(column, row)),
+                          bytes(chunk->GetValue(column + 1, row)),
+                          !nulls.IsNull() && nulls.GetValue<int64_t>() == 0});
+        }
+        bounds.insert_or_assign(chunk->GetValue(0, row).ToString(), std::move(keys));
+      }
+    }
+    if (result->HasError()) return {};
+  } catch (std::exception const&) {
+    return {};
+  }
+  return bounds;
+}
+
+/// A bound of an integral key as a manifest serializes it: little-endian, in the width of the
+/// type that wrote it. Nullopt for any other length.
+std::optional<int64_t> integral_bound(duckdb::LogicalTypeId type, std::string_view bytes)
+{
+  uint64_t raw = 0;
+  for (auto i = bytes.size(); i-- > 0;)
+    raw = raw << 8 | static_cast<uint8_t>(bytes[i]);
+  switch (type) {
+    case duckdb::LogicalTypeId::BOOLEAN:
+      return bytes.size() == 1 ? std::optional<int64_t>(raw != 0) : std::nullopt;
+    case duckdb::LogicalTypeId::BIGINT:
+      // A file written before the key was promoted from int records 4-byte bounds.
+      if (bytes.size() == 8) return static_cast<int64_t>(raw);
+      [[fallthrough]];
+    case duckdb::LogicalTypeId::INTEGER:
+    case duckdb::LogicalTypeId::DATE:
+      return bytes.size() == 4 ? std::optional<int64_t>(static_cast<int32_t>(raw)) : std::nullopt;
+    case duckdb::LogicalTypeId::TIMESTAMP:
+    case duckdb::LogicalTypeId::TIMESTAMP_NS:
+      return bytes.size() == 8 ? std::optional<int64_t>(static_cast<int64_t>(raw)) : std::nullopt;
+    default: return std::nullopt;
+  }
+}
+
 }  // namespace
+
+bool equality_key_ranges_disjoint(duckdb::LogicalType const& type,
+                                  std::string_view a_lower,
+                                  std::string_view a_upper,
+                                  std::string_view b_lower,
+                                  std::string_view b_upper)
+{
+  if (a_lower.empty() || a_upper.empty() || b_lower.empty() || b_upper.empty()) return false;
+  if (type.id() == duckdb::LogicalTypeId::VARCHAR) {
+    for (auto const bound : {a_lower, a_upper, b_lower, b_upper})
+      if (!std::all_of(bound.begin(), bound.end(), [](unsigned char c) { return c < 0x80; }))
+        return false;
+    return a_upper < b_lower || b_upper < a_lower;
+  }
+  auto const a_low  = integral_bound(type.id(), a_lower);
+  auto const a_high = integral_bound(type.id(), a_upper);
+  auto const b_low  = integral_bound(type.id(), b_lower);
+  auto const b_high = integral_bound(type.id(), b_upper);
+  return a_low && a_high && b_low && b_high && (*a_high < *b_low || *b_high < *a_low);
+}
 
 iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
                                          iceberg_delete_inventory const& inventory,
-                                         std::size_t max_files_per_data_file)
+                                         std::size_t max_files_per_data_file,
+                                         equality_key_types const& key_types)
 {
   auto const fail = [](std::string const& what) {
     return equality_plan_error("[iceberg] equality deletes: " + what);
@@ -536,16 +636,66 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
   }
   require_all_read(deletes);
 
-  // Data manifests are read only when a delete is partition-scoped.
+  std::set<std::string_view> data_manifests;
+  for (auto const& [path, entry] : data)
+    data_manifests.insert(entry.manifest);
+
+  // Bounds of the keys whose type the caller compares, in `ranged_ids` order. The data
+  // manifests are read for them only when a delete file records a usable range.
+  std::vector<int32_t> ranged_ids;
+  std::vector<duckdb::LogicalType> ranged_types;
+  std::unordered_map<std::string, std::vector<key_bounds>> data_bounds;
+  std::vector<std::vector<key_bounds> const*> delete_bounds(files.size(), nullptr);
+  std::unordered_map<std::string, std::vector<key_bounds>> bounds_by_delete;
+  if (key_types) {
+    std::set<int32_t> ids;
+    for (auto const& file : files)
+      ids.insert(file.equality_ids.begin(), file.equality_ids.end());
+    for (auto const id : ids) {
+      if (auto type = key_types(id)) {
+        ranged_ids.push_back(id);
+        ranged_types.push_back(std::move(*type));
+      }
+    }
+    if (!ranged_ids.empty())
+      bounds_by_delete = read_key_bounds(metadata_conn, delete_manifests, ranged_ids);
+    bool usable = false;
+    for (std::size_t file = 0; file < files.size(); ++file) {
+      auto const found = bounds_by_delete.find(files[file].file_path);
+      if (found == bounds_by_delete.end()) continue;
+      delete_bounds[file] = &found->second;
+      for (auto const& key : found->second)
+        usable |= !key.lower.empty() && !key.upper.empty();
+    }
+    if (usable) data_bounds = read_key_bounds(metadata_conn, data_manifests, ranged_ids);
+  }
+  // Whether the bounds prove that delete file @p file matches no row of a data file. One key is
+  // enough. A NULL key matches a NULL value and bounds leave NULLs out, so a key decides only
+  // when one of the two files holds no NULL in it.
+  auto const ruled_out = [&](uint32_t file, std::vector<key_bounds> const* data_keys) {
+    auto const* delete_keys = delete_bounds[file];
+    if (delete_keys == nullptr || data_keys == nullptr) return false;
+    for (auto const id : files[file].equality_ids) {
+      auto const ranged = std::lower_bound(ranged_ids.begin(), ranged_ids.end(), id);
+      if (ranged == ranged_ids.end() || *ranged != id) continue;
+      auto const k         = static_cast<std::size_t>(ranged - ranged_ids.begin());
+      auto const& deleted  = (*delete_keys)[k];
+      auto const& existing = (*data_keys)[k];
+      if ((deleted.no_nulls || existing.no_nulls) &&
+          equality_key_ranges_disjoint(
+            ranged_types[k], deleted.lower, deleted.upper, existing.lower, existing.upper))
+        return true;
+    }
+    return false;
+  };
+
+  // Data manifests are read for their partitions only when a delete is partition-scoped.
   struct placement {
     int32_t spec_id;
     duckdb::Value tuple;
   };
   std::unordered_map<std::string_view, placement> placed;
   if (!by_partition.empty()) {
-    std::set<std::string_view> data_manifests;
-    for (auto const& [path, entry] : data)
-      data_manifests.insert(entry.manifest);
     for (auto const manifest : data_manifests) {
       auto result = read_manifest(manifest, "", 0);
       while (true) {
@@ -572,16 +722,24 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
 
   iceberg_equality_plan plan;
   std::vector<bool> applies(files.size(), false);
+  // The data sequence numbers each list of deletes is ordered against.
+  std::unordered_map<std::vector<scoped_delete> const*, std::vector<int64_t>> sequences;
   for (auto const& [path, entry] : data) {
     std::vector<uint32_t> applicable;
+    std::vector<key_bounds> const* data_keys = nullptr;
+    if (!data_bounds.empty()) {
+      if (auto const found = data_bounds.find(std::string(path)); found != data_bounds.end())
+        data_keys = &found->second;
+    }
     // Strictly newer deletes only: an upsert must not delete the row it writes.
     auto const add = [&](std::vector<scoped_delete> const& scope) {
+      sequences[&scope].push_back(entry.sequence);
       auto first = std::upper_bound(
         scope.begin(), scope.end(), entry.sequence, [](int64_t sequence, scoped_delete const& d) {
           return sequence < d.sequence;
         });
       for (; first != scope.end() && applicable.size() <= max_files_per_data_file; ++first)
-        applicable.push_back(first->file);
+        if (!ruled_out(first->file, data_keys)) applicable.push_back(first->file);
     };
     add(everywhere);
     if (auto const place = placed.find(path); place != placed.end()) {
@@ -596,6 +754,22 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
     for (auto file : applicable)
       applies[file] = true;
     plan.by_data_file.emplace(std::string(path), std::move(applicable));
+  }
+
+  // Deletes of one list that follow the same number of its data files apply to the same data
+  // files, whatever the bounds ruled out: they share a scope.
+  uint32_t scopes = 0;
+  for (auto& [deletes, data_sequences] : sequences) {
+    std::sort(data_sequences.begin(), data_sequences.end());
+    std::ptrdiff_t preceding = -1;
+    for (auto const& scoped : *deletes) {
+      auto const below =
+        std::lower_bound(data_sequences.begin(), data_sequences.end(), scoped.sequence) -
+        data_sequences.begin();
+      if (below != preceding) ++scopes;
+      preceding                = below;
+      files[scoped.file].scope = scopes;
+    }
   }
 
   // A delete file that applies to nothing is neither charged nor opened.
@@ -1055,8 +1229,9 @@ EqualityDeleteGroup index_equality_group(std::vector<int32_t> key_field_ids,
 /// Builds the delete groups the scan probes, once on each device of @p resources, and records
 /// which of them each data file needs. The first device reads and decodes the delete files; the
 /// others index a copy of its keys.
-/// A group is the delete files that share their keys and apply to exactly the same data files,
-/// so memory grows with the delete rows, not with the number of distinct applicability sets.
+/// A group is the delete files that share their keys and their scope, so memory grows with the
+/// delete rows, not with the number of distinct applicability sets, and key bounds only take
+/// groups off a data file's list.
 void materialize_equality_deletes(duckdb::ClientContext& context,
                                   iceberg_equality_plan const& plan,
                                   std::shared_ptr<cucascade::io::ioctx> const& ioctx,
@@ -1068,23 +1243,14 @@ void materialize_equality_deletes(duckdb::ClientContext& context,
   for (auto const& [data_file, files] : plan.by_data_file)
     class_of_list.emplace(files, static_cast<uint32_t>(class_of_list.size()));
 
-  // Each delete file's signature: the classes that use it. Unused files are never opened.
-  std::vector<std::vector<uint32_t>> signature(plan.files.size());
-  for (auto const& [files, id] : class_of_list)
-    for (auto file : files)
-      signature.at(file).push_back(id);
-  for (auto& classes_using : signature)
-    std::sort(classes_using.begin(), classes_using.end());
-
-  std::map<std::pair<std::vector<int32_t>, std::vector<uint32_t>>, uint32_t> group_of;
+  std::map<std::pair<std::vector<int32_t>, uint32_t>, uint32_t> group_of;
   std::vector<std::vector<uint32_t>> group_files;
   std::vector<uint32_t> group_of_file(plan.files.size(), 0);
   for (uint32_t file = 0; file < plan.files.size(); ++file) {
-    if (signature[file].empty()) continue;
     // Canonical key order, so two files listing the same ids in a different order still merge.
     auto ids = plan.files[file].equality_ids;
     std::sort(ids.begin(), ids.end());
-    auto const [slot, fresh] = group_of.emplace(std::pair{std::move(ids), signature[file]},
+    auto const [slot, fresh] = group_of.emplace(std::pair{std::move(ids), plan.files[file].scope},
                                                 static_cast<uint32_t>(group_files.size()));
     if (fresh) group_files.emplace_back();
     group_files[slot->second].push_back(file);

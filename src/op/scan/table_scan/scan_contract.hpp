@@ -479,13 +479,17 @@ struct iceberg_equality_delete_file {
   std::vector<int32_t> equality_ids;
   int64_t record_count       = 0;
   int64_t file_size_in_bytes = 0;
+  // Files with the same scope apply, by data sequence number and partition, to the same data
+  // files. Key bounds do not enter it, so files that share keys and scope share a delete group.
+  uint32_t scope = 0;
 };
 
 // Which equality-delete files apply to which data file, by data sequence number and partition.
 struct iceberg_equality_plan {
   std::vector<iceberg_equality_delete_file> files;
   // Every data file of the snapshot, keyed as the manifest wrote its path, to the sorted indices
-  // of the `files` that apply. A scanned file absent from this map must be refused.
+  // of the `files` that apply and whose recorded key bounds do not rule out a match. A scanned
+  // file absent from this map must be refused.
   std::unordered_map<std::string, std::vector<uint32_t>> by_data_file;
   struct key {
     std::size_t primary_index;  // Index into the bound schema (P-space).
