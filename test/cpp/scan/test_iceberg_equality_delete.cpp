@@ -233,7 +233,7 @@ TEST_CASE("iceberg equality delete - filter removes exactly the matching rows", 
   batch_cols.push_back(int32_column({1, 2, 3, 4, 5}));
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {0}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), {{0, {0}}}};
   std::vector<batch_row_run> runs{{"data-0.parquet", 0, 0, 5}};
 
   auto out = filter.apply(std::move(batch), batch_layout{runs}, test_stream(), test_mr());
@@ -307,7 +307,7 @@ TEST_CASE("iceberg equality delete - a NULL key deletes the NULL rows", "[iceber
   batch_cols.push_back(int32_column({1, 0, 3}, {false, true, false}));
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {0}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), {{0, {0}}}};
   std::vector<batch_row_run> runs{{"data-0.parquet", 0, 0, 3}};
 
   auto out = filter.apply(std::move(batch), batch_layout{runs}, test_stream(), test_mr());
@@ -331,7 +331,7 @@ TEST_CASE("iceberg equality delete - missing key column throws", "[iceberg][scan
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
   equality_delete_filter filter{
-    data, rmm::get_current_cuda_device(), 0, {3}};  // index past the end of the batch
+    data, rmm::get_current_cuda_device(), {{0, {3}}}};  // index past the end of the batch
   std::vector<batch_row_run> runs{{"data-0.parquet", 0, 0, 2}};
 
   REQUIRE_THROWS_AS(filter.apply(std::move(batch), batch_layout{runs}, test_stream(), test_mr()),
@@ -359,7 +359,7 @@ TEST_CASE("iceberg equality delete - a composite key matches on every key column
   batch_cols.push_back(int32_column({1, 1, 2}));     // first key
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {2, 0}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), {{0, {2, 0}}}};
   auto out = filter.apply(std::move(batch), {}, test_stream(), test_mr());
   REQUIRE(out->num_rows() == 2);
   REQUIRE(to_host(out->get_column(1).view()) == std::vector<int32_t>{7, 9});
@@ -383,7 +383,7 @@ TEST_CASE("iceberg equality delete - a composite key with a NULL member matches 
   batch_cols.push_back(int32_column({0, 5, 0}, {true, false, true}));
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {0, 1}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), {{0, {0, 1}}}};
   auto out = filter.apply(std::move(batch), {}, test_stream(), test_mr());
   REQUIRE(out->num_rows() == 2);
   REQUIRE(out->get_column(0).view().null_count() == 1);
@@ -407,17 +407,17 @@ TEST_CASE("iceberg equality delete - key count and key type mismatches throw", "
   };
 
   // Two batch columns offered for a one-key group.
-  equality_delete_filter too_many{data, rmm::get_current_cuda_device(), 0, {0, 1}};
+  equality_delete_filter too_many{data, rmm::get_current_cuda_device(), {{0, {0, 1}}}};
   REQUIRE_THROWS_AS(too_many.apply(make_batch(), {}, test_stream(), test_mr()),
                     std::invalid_argument);
   // An INT64 batch column against INT32 delete keys: the join would compare raw bytes.
-  equality_delete_filter wrong_type{data, rmm::get_current_cuda_device(), 0, {1}};
+  equality_delete_filter wrong_type{data, rmm::get_current_cuda_device(), {{0, {1}}}};
   REQUIRE_THROWS_AS(wrong_type.apply(make_batch(), {}, test_stream(), test_mr()),
                     std::invalid_argument);
   // A batch on a device no tables were built on. Another device's tables need not be
   // addressable from it, and passing the batch through would return the deleted row.
   rmm::cuda_device_id const other{rmm::get_current_cuda_device().value() + 1};
-  equality_delete_filter other_device{data, other, 0, {0}};
+  equality_delete_filter other_device{data, other, {{0, {0}}}};
   REQUIRE_THROWS_WITH(
     other_device.apply(make_batch(), {}, test_stream(), test_mr()),
     Catch::Matchers::ContainsSubstring("no equality-delete tables were built on GPU"));
@@ -739,7 +739,7 @@ TEST_CASE("iceberg equality delete - a second device probes keys held in its own
   rmm::cuda_set_device_raii guard{second};
   std::vector<std::unique_ptr<cudf::column>> batch_cols;
   batch_cols.push_back(int32_column({1, 2}));
-  equality_delete_filter filter{data, second, 0, {0}};
+  equality_delete_filter filter{data, second, {{0, {0}}}};
   auto out = filter.apply(
     std::make_unique<cudf::table>(std::move(batch_cols)), {}, resources[1].stream, resources[1].mr);
   resources[1].stream.sync();

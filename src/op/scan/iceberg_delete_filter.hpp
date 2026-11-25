@@ -94,11 +94,6 @@ class equality_delete_filter : public iceberg_delete_filter {
   equality_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data,
                          rmm::cuda_device_id device,
                          std::vector<probe> probes);
-  /// A single group.
-  equality_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data,
-                         rmm::cuda_device_id device,
-                         size_t group_index,
-                         std::vector<cudf::size_type> data_key_indices);
 
   std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
                                      batch_layout layout,

@@ -81,9 +81,11 @@ are listed beside the right ones, so a failure says which rule broke:
                                     beside both files, one that meets a file at its endpoint, a
                                     NULL key facing a file with NULLs, a delete without bounds, a
                                     composite key disjoint in one column, two deletes that each
-                                    meet one file, and a delete manifest whose schema has no
-                                    bounds fields. Skipping a delete whose range still meets a
-                                    file, or whose NULL key does, returns deleted rows.
+                                    meet one file, a delete manifest whose schema has no bounds
+                                    fields, a NULL key whose delete records no null count, and
+                                    string bounds truncated to 16 characters. Skipping a delete
+                                    whose range still meets a file, or whose NULL key does,
+                                    returns deleted rows.
 
 Hand-forged, like the other delete fixtures: pyiceberg does not write delete files, and the only
 independent writer of equality deletes is Flink. Avro schemas are copied from an existing
@@ -1099,9 +1101,6 @@ PARTITION_SHAPES = [
     (5, None, 1, 3),
 ]
 
-# name -> (builder, expectation). The expectation is the rows a correct reader returns for the
-# current snapshot, a {snapshot sequence: rows} map for a table of sibling snapshots, or None
-# for a table DuckDB cannot read from this machine.
 # Sequence number of each iceberg_v2_eq_key_ranges snapshot -> the ids it leaves.
 KEY_RANGES = {
     2: [1, 2, 3, 4, 5, 6],  # k in [100, 110]: beside both data files
@@ -1286,6 +1285,9 @@ def build_partition_bounds():
     t.finish()
 
 
+# name -> (builder, expectation). The expectation is the rows a correct reader returns for the
+# current snapshot, a {snapshot sequence: rows} map for a table of sibling snapshots, or None
+# for a table DuckDB cannot read from this machine.
 FIXTURES = {
     "iceberg_v2_eq_wide_delete_file": (
         build_wide_delete_file,

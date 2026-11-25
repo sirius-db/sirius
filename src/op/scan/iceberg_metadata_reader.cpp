@@ -452,6 +452,7 @@ bool read_key_bounds(iceberg_metadata_connection& connection,
         if (!sink(chunk->GetValue(0, row).ToString(), std::move(keys))) return false;
       }
     }
+    if (stream.HasError()) return false;
   } catch (std::exception const&) {
     return false;
   }

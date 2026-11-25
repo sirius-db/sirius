@@ -107,8 +107,6 @@ std::optional<std::string> remote_scheme(std::string const& path)
   }
 }
 
-// Plans the live equality deletes of a snapshot into @p inventory, or says why the GPU path
-// cannot apply them: resolves each key field ID to a bound column and enforces the GPU limits.
 /// The columns of @p columns that field @p id names: the first one, and whether there is another.
 std::pair<duckdb::MultiFileColumnDefinition const*, bool> columns_of_field(
   duckdb::vector<duckdb::MultiFileColumnDefinition> const& columns, int32_t id)
@@ -125,6 +123,8 @@ std::pair<duckdb::MultiFileColumnDefinition const*, bool> columns_of_field(
   return {found, false};
 }
 
+// Plans the live equality deletes of a snapshot into @p inventory, or says why the GPU path
+// cannot apply them: resolves each key field ID to a bound column and enforces the GPU limits.
 std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
                                                  duckdb::ClientContext& context,
                                                  duckdb::SiriusContext& sirius_ctx,
