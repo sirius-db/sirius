@@ -47,8 +47,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -381,6 +383,26 @@ std::vector<std::int64_t> sequence(std::int64_t first, std::int64_t step, int co
 }
 
 }  // namespace
+
+TEST_CASE("a merged Bloom's size keeps every rank's copy within one GPU's Bloom budget",
+          "[exchange][collectives]")
+{
+  using sirius::planner::merged_bloom_keys;
+  constexpr std::size_t GiB  = std::size_t{1} << 30;
+  constexpr std::size_t rows = std::size_t{3} << 30;
+  // 2 bytes per key. One key on 16 ranks: a GPU holds 17 Blooms while it merges.
+  CHECK(merged_bloom_keys(rows, 17 * GiB, 16, 1) == GiB / 2);
+  // 34 Blooms in the same budget: with 33 ranks, or with 2 keys on 16.
+  CHECK(merged_bloom_keys(rows, 17 * GiB, 33, 1) == GiB / 4);
+  CHECK(merged_bloom_keys(rows, 17 * GiB, 16, 2) == GiB / 4);
+  // A budget with room to spare leaves the size the build asks for, up to 2^30 keys.
+  CHECK(merged_bloom_keys(1'000'000, 17 * GiB, 16, 1) == 1'000'000);
+  CHECK(merged_bloom_keys(rows, 64 * GiB, 8, 1) == GiB);
+  // Never under 2^16 keys, whatever the build or the budget.
+  CHECK(merged_bloom_keys(100, 17 * GiB, 16, 1) == std::size_t{1} << 16);
+  CHECK(merged_bloom_keys(rows, 1024, 16, 1) == std::size_t{1} << 16);
+  CHECK(merged_bloom_keys(rows, std::numeric_limits<std::uint64_t>::max(), 16, 1) == GiB);
+}
 
 TEST_CASE("ranks merge the Blooms they accumulate from multi-partition builds",
           "[exchange][collectives][dynamic_filter]")
