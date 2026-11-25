@@ -277,8 +277,8 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(pushed(per_customer("sum(o_totalprice), min(o_totalprice), max(o_clerk)")) == 1);
   // The join key is also aggregated, and a filter on the aggregated side does not matter.
   CHECK(pushed(per_customer("min(o_custkey), sum(o_totalprice)", "AND o_shippriority = 1")) == 1);
-  // The strings alone are grouped by: the join key still leaves fewer columns to group by.
-  CHECK(pushed(per_customer("sum(o_totalprice)", "", "c_name, c_address")) == 1);
+  // The join key is grouped by on the aggregated side instead of the customers'.
+  CHECK(pushed(per_customer("sum(o_totalprice)", "", "o_custkey, c_name")) == 1);
   // A group column of the aggregated side travels with the join key.
   CHECK(pushed(per_customer("sum(o_totalprice)", "", "c_custkey, c_name, o_shippriority")) == 1);
   // A two-column join key.
@@ -363,8 +363,22 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(pushed(per_customer("sum(o_totalprice)", "AND c_acctbal > 400")) == 0);
   // It would group by as many columns as the aggregate above it, or by a string.
   CHECK(pushed(per_customer("sum(o_totalprice)", "", "c_name")) == 0);
-  CHECK(pushed("SELECT c_custkey, c_address, sum(o_totalprice) FROM orders, customer "
-               "WHERE o_clerk = c_clerk GROUP BY c_custkey, c_address") == 0);
+  CHECK(pushed("SELECT c_clerk, c_address, sum(o_totalprice) FROM orders, customer "
+               "WHERE o_clerk = c_clerk GROUP BY c_clerk, c_address") == 0);
+  // The strings alone are grouped by, not the join key: the aggregate above may group far more
+  // coarsely than a group per key.
+  CHECK(pushed(per_customer("sum(o_totalprice)", "", "c_name, c_address")) == 0);
+  // A column a join further up reads is a key too. Below the customers' join the orders would be
+  // grouped by their own key, one group per order, which pays only when the aggregate above keeps
+  // the orders apart as well.
+  auto const through_lineitem = [](std::string const& groups) {
+    return "SELECT " + groups +
+           ", sum(o_totalprice) FROM (orders JOIN customer "
+           "ON o_custkey = c_custkey) JOIN lineitem ON o_orderkey = l_orderkey GROUP BY " +
+           groups;
+  };
+  CHECK(pushed(through_lineitem("c_custkey, c_name, l_orderkey, l_returnflag")) == 1);
+  CHECK(pushed(through_lineitem("c_custkey, c_name, l_returnflag")) == 0);
   // Too many columns of the aggregated side are grouped by.
   CHECK(pushed(per_customer(
           "sum(o_totalprice)", "", "c_custkey, c_name, o_shippriority, o_orderdate")) == 0);
@@ -374,14 +388,14 @@ TEST_CASE_METHOD(pushdown_fixture,
                "WHERE o_custkey = c_custkey GROUP BY c_custkey, c_name") == 0);
   // A join key computed from a DOUBLE: 0.0 and -0.0 group together, but the key can tell them
   // apart. The bare column and a key computed from an integer are fine.
-  auto const joined_on = [](std::string const& condition) {
-    return "SELECT c_custkey, c_name, sum(o_totalprice) FROM orders, customer WHERE " + condition +
-           " GROUP BY c_custkey, c_name";
+  auto const joined_on = [](std::string const& condition, std::string const& key) {
+    return "SELECT " + key + ", c_name, sum(o_totalprice) FROM orders, customer WHERE " +
+           condition + " GROUP BY " + key + ", c_name";
   };
-  CHECK(pushed(joined_on("o_weight = c_weight")) == 1);
-  CHECK(pushed(joined_on("o_custkey + 1 = c_custkey")) == 1);
-  CHECK(pushed(joined_on("1.0 / o_weight = c_weight")) == 0);
-  CHECK(pushed(joined_on("CAST(o_weight AS VARCHAR) = c_clerk")) == 0);
+  CHECK(pushed(joined_on("o_weight = c_weight", "c_weight")) == 1);
+  CHECK(pushed(joined_on("o_custkey + 1 = c_custkey", "o_custkey")) == 1);
+  CHECK(pushed(joined_on("1.0 / o_weight = c_weight", "o_weight")) == 0);
+  CHECK(pushed(joined_on("CAST(o_weight AS VARCHAR) = c_clerk", "o_weight")) == 0);
   // An outer join pads the aggregated side, and an ungrouped aggregate has nothing to carry.
   CHECK(pushed("SELECT c_custkey, c_name, sum(o_totalprice) FROM customer LEFT JOIN orders "
                "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == 0);
@@ -433,15 +447,21 @@ TEST_CASE_METHOD(pushdown_fixture,
     why(per_customer("sum(o_totalprice)", "AND c_clerk IN ('Clerk#1', 'Clerk#2', 'Clerk#3')")) ==
     reasons{"other-side:opaque; other-side:filtered"});
   CHECK(why(per_customer("sum(o_totalprice)", "", "c_name")) ==
-        reasons{"keys:not-fewer-than-groups"});
-  CHECK(why("SELECT c_custkey, c_address, sum(o_totalprice) FROM orders, customer "
-            "WHERE o_clerk = c_clerk GROUP BY c_custkey, c_address") ==
+        reasons{"keys:not-fewer-than-groups; keys:not-grouped"});
+  CHECK(why(per_customer("sum(o_totalprice)", "", "c_name, c_address")) ==
+        reasons{"keys:not-grouped"});
+  // The join to lineitem reads the order key, which no group stands for.
+  CHECK(why("SELECT c_custkey, c_name, l_returnflag, sum(o_totalprice) FROM (orders JOIN customer "
+            "ON o_custkey = c_custkey) JOIN lineitem ON o_orderkey = l_orderkey "
+            "GROUP BY c_custkey, c_name, l_returnflag") == reasons{"keys:not-grouped"});
+  CHECK(why("SELECT c_clerk, c_address, sum(o_totalprice) FROM orders, customer "
+            "WHERE o_clerk = c_clerk GROUP BY c_clerk, c_address") ==
         reasons{"keys:variable-width"});
   CHECK(
     why(per_customer("sum(o_totalprice)", "", "c_custkey, c_name, o_shippriority, o_orderdate")) ==
     reasons{"keys:too-many-extra"});
-  CHECK(why("SELECT c_custkey, c_name, sum(o_totalprice) FROM orders, customer "
-            "WHERE 1.0 / o_weight = c_weight GROUP BY c_custkey, c_name") ==
+  CHECK(why("SELECT o_weight, c_name, sum(o_totalprice) FROM orders, customer "
+            "WHERE 1.0 / o_weight = c_weight GROUP BY o_weight, c_name") ==
         reasons{"key:computed-inexact"});
   CHECK(why("SELECT c_custkey, c_name, sum(o_totalprice) FROM customer LEFT JOIN orders "
             "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == reasons{"join:outer-padded"});
@@ -452,11 +472,17 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(why(per_customer("count(*)", "AND c_acctbal > 400")) ==
         reasons{"aggregate:count_star; other-side:filtered"});
   CHECK(why(per_customer("count(*), avg(o_weight)", "", "c_name")) ==
-        reasons{"aggregate:count_star; aggregate:avg; sum:float; keys:not-fewer-than-groups"});
+        reasons{"aggregate:count_star; aggregate:avg; sum:float; keys:not-fewer-than-groups; "
+                "keys:not-grouped"});
   // The orders are the side every row of which the outer join keeps: only the join is in the way.
+  CHECK(why("SELECT o_custkey, c_name, sum(o_totalprice) FROM orders LEFT JOIN customer "
+            "ON o_custkey = c_custkey GROUP BY o_custkey, c_name") ==
+        reasons{"join:outer-preserved"});
+  // Grouped by the customers' key, every order without a customer falls into the one group
+  // whose key is NULL, so the groups are not the orders' keys.
   CHECK(why("SELECT c_custkey, c_name, sum(o_totalprice) FROM orders LEFT JOIN customer "
             "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") ==
-        reasons{"join:outer-preserved"});
+        reasons{"join:outer-preserved; keys:not-grouped"});
 }
 
 TEST_CASE_METHOD(pushdown_fixture,

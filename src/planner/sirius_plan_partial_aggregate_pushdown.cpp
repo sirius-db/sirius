@@ -693,6 +693,39 @@ void analyze(duckdb::ClientContext& context,
   }
   if (result.keys.size() >= aggregate.groups.size()) { why.add("keys:not-fewer-than-groups"); }
   if (result.keys.size() - join_keys > options.max_extra_keys) { why.add("keys:too-many-extra"); }
+  // It pays when the aggregate above groups as finely as it does: by each of its keys, or by the
+  // column a join on the way up equates with the key. That aggregate then builds a group per key
+  // anyway, over wide columns, and this one spares it rows. An aggregate above that groups more
+  // coarsely is cheap as it is, and a group per key below it only pays when keys repeat often,
+  // which the plan cannot tell.
+  //
+  // Every key counts, not only those of the join it goes under: a join further up that reads an
+  // order key would have it group by every order. And an outer join's equality does not count:
+  // it pads the other side's column with NULL wherever a key finds no match, so grouping by that
+  // column folds all of those keys into one group.
+  auto const is_group = [&](ColumnBinding const& column) {
+    return std::ranges::any_of(result.groups,
+                               [&](auto const& group) { return binding_of(*group) == column; });
+  };
+  auto const equates_with_group = [&](path_step const& step, ColumnBinding const& key) {
+    return std::ranges::any_of(step.join->conditions, [&](auto const& condition) {
+      if (!condition.IsComparison() ||
+          (condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL &&
+           condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) ||
+          !is_column(condition.GetLHS()) || !is_column(condition.GetRHS())) {
+        return false;
+      }
+      auto const left  = binding_of(condition.GetLHS());
+      auto const right = binding_of(condition.GetRHS());
+      return (left == key && is_group(right)) || (right == key && is_group(left));
+    });
+  };
+  auto const grouped = [&](ColumnBinding const& key) {
+    return is_group(key) || std::ranges::any_of(result.path, [&](path_step const& step) {
+             return !step.preserves && equates_with_group(step, key);
+           });
+  };
+  if (!std::ranges::all_of(result.keys, grouped)) { why.add("keys:not-grouped"); }
   // A join that computes its key sees one row of each group where it saw every row. That is the
   // same only when the rows of a group cannot differ in the columns the key is computed from.
   std::vector<ColumnBinding> computed_from;

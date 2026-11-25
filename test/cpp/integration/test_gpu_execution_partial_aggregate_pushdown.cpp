@@ -103,9 +103,14 @@ TEST_CASE_METHOD(PartialAggregatePushdownFixture,
     true);
   // The filter is on the aggregated side, which the join keeps.
   compare_pushed_and_not(
-    "SELECT c_name, c_address, min(o_totalprice) AS low, max(o_totalprice) AS high "
+    "SELECT c_custkey, c_address, min(o_totalprice) AS low, max(o_totalprice) AS high "
     "FROM customer, orders WHERE c_custkey = o_custkey AND o_shippriority = 1 "
-    "GROUP BY c_name, c_address",
+    "GROUP BY c_custkey, c_address",
+    true);
+  // The join key is grouped by on the orders' side.
+  compare_pushed_and_not(
+    "SELECT o_custkey, c_name, sum(o_totalprice) AS total FROM customer, orders "
+    "WHERE c_custkey = o_custkey GROUP BY o_custkey, c_name",
     true);
 }
 
@@ -232,6 +237,17 @@ TEST_CASE_METHOD(PartialAggregatePushdownFixture,
   compare_gpu_vs_cpu(
     "SELECT c_custkey, c_nationkey, sum(o_totalprice) AS total FROM customer, orders "
     "WHERE c_custkey = o_custkey GROUP BY c_custkey, c_nationkey");
+  // The strings are grouped by without the join key. Customers 5 and 7 each have two names, and
+  // several keys share an address, so the groups are not the keys.
+  compare_gpu_vs_cpu(
+    "SELECT c_name, c_address, sum(o_totalprice) AS total FROM customer, orders "
+    "WHERE c_custkey = o_custkey GROUP BY c_name, c_address");
+  // The join to lineitem reads the order key, which nothing above groups by. Summed below the
+  // customers' join, the orders would be grouped one by one.
+  compare_gpu_vs_cpu(
+    "SELECT c_custkey, c_name, l_returnflag, sum(o_totalprice) AS total "
+    "FROM customer, orders, lineitem WHERE c_custkey = o_custkey AND o_orderkey = l_orderkey "
+    "GROUP BY c_custkey, c_name, l_returnflag");
   CHECK(pushdowns() == before);
 }
 
