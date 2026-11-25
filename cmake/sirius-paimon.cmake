@@ -18,8 +18,11 @@ if(NOT EXISTS "${SIRIUS_PAIMON_ARROW_INCLUDE_DIR}/arrow/c/abi.h")
   )
 endif()
 
-target_sources(sirius_objects PRIVATE src/op/scan/paimon/paimon_batch_cursor.cpp
-                                      src/op/scan/paimon/paimon_native_read.cpp)
+target_sources(
+  sirius_objects
+  PRIVATE src/op/scan/paimon/paimon_batch_cursor.cpp
+          src/op/scan/paimon/paimon_native_read.cpp
+          src/op/scan/paimon/paimon_arrow_producer.cpp)
 target_include_directories(sirius_objects SYSTEM
                            PRIVATE "${SIRIUS_PAIMON_ARROW_INCLUDE_DIR}")
 target_link_libraries(sirius_objects PRIVATE Paimon::paimon_shared)

@@ -16,6 +16,13 @@
 
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
+#ifdef SIRIUS_ENABLE_PAIMON_SDK
+#include "op/scan/paimon/paimon_arrow_producer.hpp"
+#include "scan/paimon_native_test_fixture.hpp"
+
+#include <paimon/fs/file_system_factory.h>
+#include <paimon/reader/batch_reader.h>
+#endif
 #include "data/data_batch_utils.hpp"
 #include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
@@ -2834,3 +2841,224 @@ TEST_CASE("Arrow children share preparation identities with retained slots",
   a->finish_preparation();
   b->finish_preparation();
 }
+
+#ifdef SIRIUS_ENABLE_PAIMON_SDK
+namespace {
+struct native_kind_tree {
+  integer_tree values;
+  ArrowSchema kind_schema{}, dictionary_schema{};
+  ArrowArray kind{}, dictionary{};
+  ArrowSchema* schemas[2]{&kind_schema, &values.field};
+  ArrowArray* arrays[2]{&kind, &values.column};
+  int8_t kinds[3]{0, 0, 0}, deleted = 3;
+  void const* kind_buffers[2]{nullptr, kinds};
+  void const* dictionary_buffers[2]{nullptr, &deleted};
+  unsigned reads = 0, releases = 0;
+  explicit native_kind_tree(int fault)
+  {
+    values.schema.n_children = values.array.n_children = 2;
+    values.schema.children                             = schemas;
+    values.array.children                              = arrays;
+    kind_schema.name                                   = "_VALUE_KIND";
+    kind_schema.format                                 = "c";
+    kind_schema.release = [](ArrowSchema* p) { p->release = nullptr; };
+    kind.length         = 3;
+    kind.n_buffers      = 2;
+    kind.buffers        = kind_buffers;
+    kind.release        = [](ArrowArray* p) { p->release = nullptr; };
+    dictionary_schema   = kind_schema;
+    dictionary          = kind;
+    dictionary.length   = 1;
+    dictionary.buffers  = dictionary_buffers;
+    if (fault == 0) {
+      kind_schema.dictionary = &dictionary_schema;
+      kind.dictionary        = &dictionary;
+    }
+    if (fault == 1) {
+      kind_schema.n_children = kind.n_children = 1;
+      kind_schema.children                     = &schemas[1];
+      kind.children                            = &arrays[1];
+    }
+    if (fault == 2) kind.release = nullptr;
+    if (fault == 3) kind_schema.release = nullptr;
+  }
+};
+class native_kind_reader final : public ::paimon::BatchReader {
+ public:
+  explicit native_kind_reader(std::shared_ptr<native_kind_tree> value) : value_(std::move(value)) {}
+  ::paimon::Result<ReadBatch> NextBatch() override
+  {
+    if (value_->reads++) return MakeEofBatch();
+    auto array           = std::make_unique<ArrowArray>(value_->values.array);
+    auto schema          = std::make_unique<ArrowSchema>(value_->values.schema);
+    array->private_data  = new std::shared_ptr<native_kind_tree>(value_);
+    schema->private_data = new std::shared_ptr<native_kind_tree>(value_);
+    array->release       = [](ArrowArray* p) {
+      auto owner = static_cast<std::shared_ptr<native_kind_tree>*>(p->private_data);
+      ++(*owner)->releases;
+      delete owner;
+      p->release = nullptr;
+    };
+    schema->release = [](ArrowSchema* p) {
+      auto owner = static_cast<std::shared_ptr<native_kind_tree>*>(p->private_data);
+      ++(*owner)->releases;
+      delete owner;
+      p->release = nullptr;
+    };
+    return ReadBatch{std::move(array), std::move(schema)};
+  }
+  void Close() override {}
+  std::shared_ptr<::paimon::Metrics> GetReaderMetrics() const override { return {}; }
+
+ private:
+  std::shared_ptr<native_kind_tree> value_;
+};
+}  // namespace
+TEST_CASE("Paimon producer refuses an Arrow source profile before opening a cursor",
+          "[paimon_kind_profile]")
+{
+  bool opened = false;
+  auto open   = [&](sm::preparation_stop_token) {
+    opened = true;
+    return std::unique_ptr<paimon_batch_cursor>{};
+  };
+  CHECK_THROWS_AS(
+    paimon_arrow_producer(qualified_integer_program(), arrow_copy_limits{3, 8192, 8192}, open),
+    std::invalid_argument);
+  CHECK_FALSE(opened);
+}
+
+#if defined(__GLIBCXX__) && _GLIBCXX_USE_CXX11_ABI
+TEST_CASE("Paimon snapshot budget refusal aborts Arrow preparation before publication",
+          "[arrow_driver][paimon_snapshot_admission]")
+{
+  auto owners   = std::make_shared<sirius::test::paimon::native_fixture>();
+  auto metadata = sirius::test::paimon::fixture_metadata();
+  auto fs       = ::paimon::FileSystemFactory::Get("local", metadata.path, {});
+  REQUIRE(fs.ok());
+  unsigned requests = 0;
+  paimon_snapshot_input_budget budget{std::move(fs).value(), [&](uint64_t bytes) {
+                                        CHECK(bytes > 0);
+                                        ++requests;
+                                        return std::shared_ptr<void>{};
+                                      }};
+  auto open = [&](sm::preparation_stop_token stop) {
+    return open_paimon_read(metadata, {0}, owners->pool, owners, 1, stop, &budget);
+  };
+  materialization_program program{701, 4, {cudf::data_type{cudf::type_id::INT64}}, 0, false};
+  program.input_types = program.output_types;
+  auto producer =
+    std::make_shared<paimon_arrow_producer>(program, arrow_copy_limits{1, 8192, 8192}, open);
+  harness h(producer, program);
+  try {
+    (void)h.next();
+    FAIL("snapshot budget refusal completed Arrow preparation");
+  } catch (sm::preparation_resource_error const& error) {
+    CHECK(error.bound_exceeded);
+  }
+  CHECK(requests == 1);
+  CHECK(h.backing.seen->allocations == 0);
+  CHECK(h.ledger->tracked_units() == 0);
+  CHECK(owners->pool->CurrentUsage() == 0);
+}
+#endif
+
+TEST_CASE("Paimon row-kind must be a live plain leaf before any copy", "[paimon_kind_profile]")
+{
+  auto fault = GENERATE(0, 1, 2, 3);
+  auto input = std::make_shared<native_kind_tree>(fault);
+  auto open  = [input](sm::preparation_stop_token) {
+    return std::make_unique<paimon_batch_cursor>(
+      std::make_unique<native_kind_reader>(input), input, 3);
+  };
+  auto producer = std::make_shared<paimon_arrow_producer>(
+    integer_program(), arrow_copy_limits{3, 8192, 8192}, open);
+  harness h(producer);
+  CHECK_THROWS(h.next());
+  CHECK(input->releases == 2);
+  CHECK(h.backing.seen->allocations == 0);
+  CHECK_THROWS(h.next());
+  CHECK(input->reads == 1);
+  producer->close();
+  CHECK(h.ledger->tracked_units() == 0);
+}
+
+TEST_CASE("Paimon native lane detaches roots before GPU import and cancellation drain",
+          "[arrow_driver][paimon_native_gpu]")
+{
+  bool stopped     = GENERATE(false, true);
+  auto owners      = std::make_shared<sirius::test::paimon::native_fixture>();
+  auto metadata    = sirius::test::paimon::fixture_metadata();
+  auto native_pool = owners->pool;
+  materialization_program program{701, 4, {cudf::data_type{cudf::type_id::INT64}}, 0, false};
+  program.input_types = program.output_types;
+  auto open           = [metadata, owners](sm::preparation_stop_token stop) {
+    return open_paimon_read(metadata, {0}, owners->pool, owners, 1, stop);
+  };
+  auto producer = std::make_shared<paimon_arrow_producer>(
+    program, arrow_copy_limits{1, 8192, 8192}, std::move(open));
+  harness h(producer, program);
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+  sirius::exec::static_thread_pool pool(2);
+  sirius::exec::scoped_dispatcher dispatcher(pool);
+  sirius::pipeline::completion_handler completion;
+  sm::native_reader_executor readers(1, 1);
+  sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1}, &readers);
+  auto lane = h.driver->make_preparation_source({});
+  REQUIRE(lane.execution == sm::preparation_execution_domain::native_reader);
+  auto connector = std::make_shared<sm::split_connector>();
+  sm::preparation_coordinator::source source;
+  source.execution   = lane.execution;
+  source.try_claim   = std::move(lane.try_claim);
+  source.close       = std::move(lane.close);
+  source.bind_wakeup = std::move(lane.bind_wakeup);
+  source.coalescer   = std::move(lane.coalescer);
+  source.destination = connector;
+  source.construct   = [](auto input) {
+    auto bytes = input->preparation_bytes();
+    return sirius::test::preparation::make_publication(std::move(input), bytes);
+  };
+  std::vector<int64_t> actual;
+  coordinator.after_publication_for_testing([&](auto, auto const& input, auto) {
+    auto result = h.driver->materialize_metadata_to_table(*input, *space, stream);
+    auto n      = result.table.num_rows();
+    auto begin  = actual.size();
+    actual.resize(begin + n);
+    REQUIRE(cudaMemcpyAsync(actual.data() + begin,
+                            result.table.view().column(0).template data<int64_t>(),
+                            n * sizeof(int64_t),
+                            cudaMemcpyDeviceToHost,
+                            stream.value()) == cudaSuccess);
+    stream.synchronize();
+  });
+  if (stopped)
+    coordinator.before_publication_for_testing(
+      [&] { coordinator.request_stop(sm::stop_reason::user_cancel); });
+  coordinator.add_source(std::move(source));
+  h.driver->preflight_for_query();
+  coordinator.arm();
+  coordinator.start();
+  auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (coordinator.snapshot().phase != sm::preparation_coordinator::lifecycle::quiescent &&
+         std::chrono::steady_clock::now() < deadline) {
+    coordinator.advance(1ms);
+    if (connector->has_more_splits()) (void)connector->get_next_split();
+  }
+  auto finished = coordinator.snapshot().phase == sm::preparation_coordinator::lifecycle::quiescent;
+  if (!finished) coordinator.request_stop(sm::stop_reason::failure_induced);
+  coordinator.drain();
+  REQUIRE(finished);
+  if (!stopped && completion.terminal_error()) std::rethrow_exception(completion.terminal_error());
+  std::sort(actual.begin(), actual.end());
+  if (stopped)
+    REQUIRE(actual.empty());
+  else
+    REQUIRE(actual == std::vector<int64_t>{1, 1, 2});
+  REQUIRE(h.profiles->counters->arrow_batches_imported == (stopped ? 0 : 3));
+  REQUIRE(native_pool->CurrentUsage() == 0);
+  REQUIRE(h.backing.seen->allocated_bytes == 0);
+  REQUIRE(h.ledger->tracked_units() == 0);
+}
+#endif
