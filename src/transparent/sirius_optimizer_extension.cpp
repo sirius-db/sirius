@@ -207,6 +207,7 @@ void preserve_parquet_bindings(duckdb::LogicalOperator const& from,
       // Serialization rebinds the wildcard and loses Hive pruning. Copy the verified
       // bind data instead; DuckDB gives the copy its own materialized file list.
       copied.bind_data = original.bind_data->Copy();
+      copy_parquet_scan_row_count(original, copied);
     }
   }
   for (std::size_t i = 0; i < from.children.size(); ++i) {
@@ -267,6 +268,8 @@ void prepare_for_sirius(duckdb::OptimizerExtensionInput& input, duckdb::LogicalO
   if (parquet_footer_statistics_enabled(context)) {
     auto const scans = add_parquet_footer_statistics(context, plan);
     if (scans > 0) { SIRIUS_LOG_DEBUG("Gave {} Parquet scans their footer statistics", scans); }
+  } else {
+    forget_parquet_scan_row_counts(plan);
   }
   bool const gpu_execution = gpu_execution_enabled(context);
   // Only a statement that can reach the GPU is rewritten; anything else must get the plan DuckDB

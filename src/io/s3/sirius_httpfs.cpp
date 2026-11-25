@@ -57,10 +57,12 @@ class sirius_httpfs_file_handle : public duckdb::FileHandle {
   sirius_httpfs_file_handle(duckdb::FileSystem& fs,
                             std::string path,
                             duckdb::FileOpenFlags flags,
-                            std::shared_ptr<cucascade::io::datasource> datasource)
+                            std::shared_ptr<cucascade::io::datasource> datasource,
+                            bool external_file_cache)
     : duckdb::FileHandle(fs, std::move(path), flags),
       datasource_(std::move(datasource)),
-      version_tag_(datasource_->get_io_object().validation_tag())
+      version_tag_(datasource_->get_io_object().validation_tag()),
+      external_file_cache_(external_file_cache)
   {
   }
 
@@ -68,6 +70,8 @@ class sirius_httpfs_file_handle : public duckdb::FileHandle {
 
   std::shared_ptr<cucascade::io::datasource> datasource_;
   std::string version_tag_;
+  /// scan_manager.httpfs_external_file_cache of the engine that opened the handle.
+  bool external_file_cache_;
   duckdb::idx_t cursor_{0};
 };
 
@@ -264,7 +268,12 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + path + "'");
   }
-  return duckdb::make_uniq<sirius_httpfs_file_handle>(*this, path, flags, std::move(datasource));
+  return duckdb::make_uniq<sirius_httpfs_file_handle>(
+    *this,
+    path,
+    flags,
+    std::move(datasource),
+    sirius_ctx->get_config().get_scan_manager_config().httpfs_external_file_cache);
 }
 
 duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
@@ -296,7 +305,11 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + file.path + "'");
   }
   return duckdb::make_uniq<sirius_httpfs_file_handle>(
-    *this, file.path, flags, std::move(datasource));
+    *this,
+    file.path,
+    flags,
+    std::move(datasource),
+    sirius_ctx->get_config().get_scan_manager_config().httpfs_external_file_cache);
 }
 
 void sirius_httpfs::Read(duckdb::FileHandle& handle,
@@ -348,6 +361,12 @@ duckdb::timestamp_t sirius_httpfs::GetLastModifiedTime(duckdb::FileHandle& /*han
 std::string sirius_httpfs::GetVersionTag(duckdb::FileHandle& handle)
 {
   return as_httpfs_handle(handle).version_tag_;
+}
+
+duckdb::optional<duckdb::timestamp_t> sirius_httpfs::GetCacheValidUntil(duckdb::FileHandle& handle)
+{
+  if (as_httpfs_handle(handle).external_file_cache_) { return duckdb::nullopt; }
+  return duckdb::timestamp_t::ninfinity();
 }
 
 duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path,
