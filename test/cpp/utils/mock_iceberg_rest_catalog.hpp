@@ -24,6 +24,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -39,9 +40,12 @@ class mock_iceberg_rest_catalog {
   struct table {
     std::string metadata_location;
     std::string metadata_json;
+    /// The `config` vended with this table, when it is not the catalog's.
+    std::optional<std::map<std::string, std::string>> vended = std::nullopt;
   };
 
-  /// @p vended is returned as the `config` of every loadTable response.
+  /// @p vended is returned as the `config` of every loadTable response whose table has none
+  /// of its own.
   explicit mock_iceberg_rest_catalog(std::map<std::string, std::string> vended)
     : _vended(std::move(vended))
   {
@@ -98,8 +102,32 @@ class mock_iceberg_rest_catalog {
     return out + "\"";
   }
 
-  std::pair<int, std::string> respond(std::string const& path)
+  /// @p encoded with its percent escapes resolved: a client sends a name that is not URL-safe,
+  /// such as one with a space, in that form.
+  static std::string percent_decoded(std::string const& encoded)
   {
+    auto const hex = [](char c) {
+      return c >= '0' && c <= '9'   ? c - '0'
+             : c >= 'a' && c <= 'f' ? c - 'a' + 10
+             : c >= 'A' && c <= 'F' ? c - 'A' + 10
+                                    : -1;
+    };
+    std::string out;
+    for (std::size_t i = 0; i < encoded.size(); ++i) {
+      if (encoded[i] == '%' && i + 2 < encoded.size() && hex(encoded[i + 1]) >= 0 &&
+          hex(encoded[i + 2]) >= 0) {
+        out.push_back(static_cast<char>(hex(encoded[i + 1]) * 16 + hex(encoded[i + 2])));
+        i += 2;
+      } else {
+        out.push_back(encoded[i]);
+      }
+    }
+    return out;
+  }
+
+  std::pair<int, std::string> respond(std::string const& encoded_path)
+  {
+    auto const path = percent_decoded(encoded_path);
     if (path == "/v1/config") return {200, R"({"defaults":{},"overrides":{}})"};
     std::lock_guard lock(_mutex);
     auto const found = _tables.find(path);
@@ -108,7 +136,7 @@ class mock_iceberg_rest_catalog {
     }
     ++_load_table_requests;
     std::string config;
-    for (auto const& [key, value] : _vended) {
+    for (auto const& [key, value] : found->second.vended ? *found->second.vended : _vended) {
       config += (config.empty() ? "" : ",") + json_string(key) + ":" + json_string(value);
     }
     auto body = "{\"metadata-location\":" + json_string(found->second.metadata_location) +

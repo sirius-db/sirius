@@ -228,18 +228,41 @@ std::string_view credential_statement_kind(std::string const& statement)
   } catch (...) {
     return "unclassified statement";
   }
-  bool create = false;
+  // EXPLAIN is logged with the statement it wraps, and EXPLAIN ANALYZE also runs it, so the
+  // wrapped statement decides: `EXPLAIN [ANALYZE | ANALYSE] [(options)] <statement>`.
+  enum class position { statement, after_explain, explain_options, after_create };
+  auto at           = position::statement;
+  std::size_t depth = 0;
   for (auto const& token : tokens) {
     if (token.type == duckdb::SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT) { continue; }
     auto end = token.start;
     while (end < statement.size() && is_identifier_char(statement[end])) {
       ++end;
     }
-    auto const word = std::string_view(statement).substr(token.start, end - token.start);
-    if (!create) {
+    auto const word   = std::string_view(statement).substr(token.start, end - token.start);
+    auto const symbol = token.start < statement.size() ? statement[token.start] : '\0';
+    if (at == position::explain_options) {
+      if (symbol == '(') { ++depth; }
+      if (symbol == ')' && --depth == 0) { at = position::statement; }
+      continue;
+    }
+    if (at == position::after_explain) {
+      if (iequals(word, "ANALYZE") || iequals(word, "ANALYSE")) { continue; }
+      if (symbol == '(') {
+        depth = 1;
+        at    = position::explain_options;
+        continue;
+      }
+      at = position::statement;
+    }
+    if (at == position::statement) {
+      if (iequals(word, "EXPLAIN")) {
+        at = position::after_explain;
+        continue;
+      }
       if (iequals(word, "ATTACH")) { return "ATTACH"; }
       if (!iequals(word, "CREATE")) { return {}; }
-      create = true;
+      at = position::after_create;
     } else if (iequals(word, "SECRET")) {
       return "CREATE SECRET";
     } else if (!iequals(word, "OR") && !iequals(word, "REPLACE") && !iequals(word, "PERSISTENT") &&

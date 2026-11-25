@@ -459,11 +459,15 @@ TEST_CASE("iceberg equality delete - a delete file must match its manifest and k
   rmm::mr::statistics_resource_adaptor handed{upstream};
   auto const path  = directory.file("delete.parquet");
   auto const bytes = static_cast<int64_t>(std::filesystem::file_size(path));
-  auto load = [&](int32_t field_id, duckdb::LogicalTypeId bound, int64_t rows, int64_t size) {
+  auto load_from   = [&](std::string const& file,
+                       int32_t field_id,
+                       duckdb::LogicalTypeId bound,
+                       int64_t rows,
+                       int64_t size) {
     iceberg_delete_discovery discovery;
     discovery.equality_delete_entries.emplace_back();
     auto& plan = discovery.equality_plan.emplace();
-    plan.files.push_back({path, {field_id}, rows, size});
+    plan.files.push_back({file, {field_id}, rows, size});
     plan.by_data_file.emplace("data.parquet", std::vector<uint32_t>{0});
     plan.keys.emplace(field_id, iceberg_equality_plan::key{0, bound});
     return load_delete_payload(
@@ -472,6 +476,9 @@ TEST_CASE("iceberg equality delete - a delete file must match its manifest and k
       sirius::test::make_test_local_ioctx(),
       discovery,
       equality_build_resources{test_stream(), rmm::device_async_resource_ref{handed}});
+  };
+  auto load = [&](int32_t field_id, duckdb::LogicalTypeId bound, int64_t rows, int64_t size) {
+    return load_from(path, field_id, bound, rows, size);
   };
   CHECK_THROWS_WITH(load(1, duckdb::LogicalTypeId::INTEGER, 1, bytes - 1),
                     Catch::Matchers::ContainsSubstring("size differs from its manifest entry"));
@@ -495,6 +502,11 @@ TEST_CASE("iceberg equality delete - a delete file must match its manifest and k
   CHECK_THROWS_WITH(
     load_delete_payload(*con.context, "table", sirius::test::make_test_local_ioctx(), unbuilt),
     Catch::Matchers::ContainsSubstring("no stream and allocator"));
+  // So is a delete file under s3:// with no context to read it through. Going on as if it
+  // deleted nothing would return the rows it removes.
+  CHECK_THROWS_WITH(
+    load_from("s3://bucket/delete.parquet", 1, duckdb::LogicalTypeId::INTEGER, 1, bytes),
+    Catch::Matchers::ContainsSubstring("no S3 backend is available to read equality-delete file"));
   // INT32 stored for a BIGINT key is the one accepted difference.
   auto const data = load(1, duckdb::LogicalTypeId::BIGINT, 1, bytes);
   REQUIRE(data->equality_delete_groups.size() == 1);

@@ -71,7 +71,9 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -127,18 +129,6 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
       "GPU only");
   }
 
-  // The spec also allows Avro and ORC delete files. The format is in the inventory, so no
-  // manifest or delete file is opened to find out.
-  for (auto const& entry : inventory.entries) {
-    if (entry.content == "EQUALITY_DELETES" &&
-        !duckdb::StringUtil::CIEquals(entry.file_format, "parquet")) {
-      return iceberg_decline(scan_reason::iceberg_equality_file_format,
-                             "equality delete '" + entry.file_path + "' is stored as " +
-                               entry.file_format +
-                               "; the GPU scan path reads Parquet equality deletes only");
-    }
-  }
-
   auto const files_limit =
     counters && counters->track_units && counters->equality_files_per_data_file_limit_for_testing
       ? *counters->equality_files_per_data_file_limit_for_testing
@@ -148,6 +138,24 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
     plan = op::scan::read_equality_plan(context, inventory, files_limit);
   } catch (op::scan::equality_plan_error const& e) {
     return iceberg_decline(scan_reason::iceberg_equality_plan_unproven, e.what());
+  }
+  // The plan keeps the delete files that apply to a data file, and only those are opened. A
+  // live delete that applies to none is never read, so its format does not matter, like its URI.
+  //
+  // The spec also allows Avro and ORC delete files. The format is in the inventory, so no
+  // delete file is opened to find out.
+  std::unordered_set<std::string_view> applicable;
+  for (auto const& file : plan.files) {
+    applicable.insert(file.file_path);
+  }
+  for (auto const& entry : inventory.entries) {
+    if (entry.content == "EQUALITY_DELETES" && applicable.contains(entry.file_path) &&
+        !duckdb::StringUtil::CIEquals(entry.file_format, "parquet")) {
+      return iceberg_decline(scan_reason::iceberg_equality_file_format,
+                             "equality delete '" + entry.file_path + "' is stored as " +
+                               entry.file_format +
+                               "; the GPU scan path reads Parquet equality deletes only");
+    }
   }
   // A remote delete file is read through the REST backend. Whether one serves it is decided
   // from the URI and the registered backends, without building a context or opening anything.
@@ -409,25 +417,30 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
     // The catalog resolves the name again on the connection that reads the inventory, and the
     // first lookup pins the table for that transaction. The table bound there under the same
     // name is therefore the one the inventory is read from: its UUID must be the bound one.
+    //
+    // This lookup names no snapshot, so it binds the table's current one, and only its UUID is
+    // compared. The statement may read a retained snapshot of a table that has no current
+    // snapshot: the inner binding then publishes a UUID and no snapshot ID. Which snapshot is
+    // read stays the inventory's choice, made from the snapshot ID the statement bound.
     std::function<std::string(duckdb::ClientContext&)> other_table;
     if (catalog_name && bound) {
       other_table = [&](duckdb::ClientContext& inner) -> std::string {
         duckdb::EntryLookupInfo lookup(duckdb::CatalogType::TABLE_ENTRY, *catalog_name);
         auto entry = duckdb::Catalog::GetEntry(inner, lookup, duckdb::OnEntryNotFound::RETURN_NULL);
-        std::optional<op::scan::iceberg_snapshot_binding> resolved;
+        std::optional<std::string> resolved;
         if (entry && entry->type == duckdb::CatalogType::TABLE_ENTRY) {
           duckdb::unique_ptr<duckdb::FunctionData> bind;
           auto const function =
             entry->Cast<duckdb::TableCatalogEntry>().GetScanFunction(inner, bind, lookup);
           if (lookup_connector(function, bind.get(), inner)) {
-            resolved = op::scan::capture_iceberg_snapshot(
+            resolved = op::scan::capture_iceberg_table_uuid(
               duckdb::BoundTableFunction(function), bind.get(), inner);
           }
         }
-        if (resolved && resolved->table_uuid == bound->table_uuid) { return {}; }
+        if (resolved && *resolved == bound->table_uuid) { return {}; }
         return "Table UUID mismatch: " + table_path + " was bound as table " + bound->table_uuid +
                " and now resolves to " +
-               (resolved ? "table " + resolved->table_uuid : "a table whose identity is unknown");
+               (resolved ? "table " + *resolved : "a table whose identity is unknown");
       };
     }
     auto result = op::scan::read_delete_inventory(
@@ -459,6 +472,13 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
         scan_reason::evidence_missing,
         "the iceberg delete probe returned no rows, so the table's delete files could not be "
         "inspected",
+        scan_verdict::incomplete);
+    }
+    if (e.other_table) {
+      // The metadata was readable. It belongs to another table than the one the scan bound.
+      return iceberg_decline(
+        scan_reason::evidence_missing,
+        std::string(e.what()) + ", so its delete files would be read from another table",
         scan_verdict::incomplete);
     }
     return iceberg_decline(scan_reason::evidence_missing,

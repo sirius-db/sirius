@@ -157,8 +157,13 @@ op::scan::certification_result supported_iceberg(op::scan::bound_table_scan cons
 // A path scan carries no function_info, like the registered function. A catalog table's scan
 // carries the extension's scan info: accept that type only, and only on a binding the extension
 // reports as a catalog table. Lookup calls this after the callbacks matched the reference
-// definition, so get_bind_info is the extension's. DuckDB's types cannot read the info's
-// content, and the GPU path does not use it: it reads the binding.
+// definition, so get_bind_info is the extension's.
+//
+// This is the whole guarantee (see connector::verify_binding): the info's type and the kind of
+// binding it sits on. Two catalog tables carry info of the same type, and nothing here tells
+// one from the other. That is sound because the GPU path takes nothing from the info: the
+// table, its UUID, snapshot, schema and files all come from the bind data, through
+// get_table_entry, get_bind_info and the delete inventory, none of which is handed the info.
 bool verify_iceberg_binding(duckdb::BaseTableFunction const& function,
                             duckdb::FunctionData const* bind,
                             duckdb::ClientContext& context)

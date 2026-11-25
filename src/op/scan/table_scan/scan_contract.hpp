@@ -265,8 +265,13 @@ struct physical_check_counters {
   // Actual cuDF prepend requests, independently for row and source index.
   std::function<void(bool, bool)> parquet_positions_for_testing;
   std::function<void()> after_certify_for_testing;
+  // Once every scan of the statement is lowered. Lowering is where a scan resolves and records
+  // the S3 configuration of its data files, and where Iceberg delete files are read; no scan
+  // has opened a data file yet.
+  std::function<void()> after_lowering_for_testing;
   std::function<void(std::string const&, bool)> iceberg_dv_phase_for_testing;
-  // After a bind or a glob installed the S3 configuration for its path, before it reads.
+  // After a bind, a glob or a file open installed the S3 configuration for its path, before
+  // it reads.
   std::function<void(std::string const&)> s3_config_installed_for_testing;
   // Before an equality-delete file is opened.
   std::function<void(std::string const&)> iceberg_equality_open_for_testing;

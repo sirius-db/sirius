@@ -32,7 +32,9 @@ namespace sirius::op::scan {
  * was expired before the metadata query, Iceberg reports the missing ID.
  * The path must keep identifying the same table during the query. When the loaded
  * extension accepts expected_table_uuid, the query passes the bound table UUID and
- * iceberg_metadata() rejects another table. Otherwise replacement by another table
+ * iceberg_metadata() rejects another table. Otherwise a catalog table is checked here, by
+ * resolving its name on this connection and comparing the table UUID with the bound one
+ * (see read_delete_inventory); for a table addressed by path, replacement by another table
  * with the same snapshot ID is not detected.
  *
  * ## What it deliberately does NOT do

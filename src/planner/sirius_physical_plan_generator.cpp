@@ -580,9 +580,13 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   auto discovery =
     sirius::op::scan::discover_from_manifests(context, info->table_path, std::move(inventory));
   // Deletion vectors and equality-delete files are opened by path after this. Install the
-  // credential this statement resolves for them now, as for the data files.
-  for (auto const& dv : discovery.deletion_vector_entries) {
-    plan_s3_config(*info, dv.file_path, context, *sirius_ctx);
+  // credential this statement resolves for them now, as for the data files. A caller that
+  // takes the discovery prunes the vectors to the files it scans first and installs theirs
+  // itself: a vector it never opens must not need a credential Sirius can resolve.
+  if (!supplied_discovery) {
+    for (auto const& dv : discovery.deletion_vector_entries) {
+      plan_s3_config(*info, dv.file_path, context, *sirius_ctx);
+    }
   }
   if (discovery.equality_plan) {
     for (auto const& file : discovery.equality_plan->files) {
@@ -682,6 +686,8 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
     });
     uint64_t total = 0;
     for (auto const& dv : descriptors) {
+      // Only the vectors that survived the pruning are opened, so only they get a credential.
+      plan_s3_config(*c.info, dv.file_path, context, *sirius_ctx);
       inspect_remote_puffin(c.scan->contract_id, dv);
       if (dv.record_count < 0 ||
           static_cast<uint64_t>(dv.record_count) > std::numeric_limits<uint64_t>::max() - total) {
@@ -2357,6 +2363,9 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   prepare_scan_statement(*plan, op_params, context);
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
+  if (sirius_ctx && sirius_ctx->physical_counters()->track_units &&
+      sirius_ctx->physical_counters()->after_lowering_for_testing)
+    sirius_ctx->physical_counters()->after_lowering_for_testing();
   if (op_params.distributed()) {
     // The scans above took this rank's share; without the exchanges each rank's answer is partial.
     if (!sirius_ctx) {

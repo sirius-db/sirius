@@ -2429,7 +2429,7 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri,
 }
 
 std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_path(
-  std::string_view path, s3_config_snapshot const* planned)
+  std::string_view path, s3_config_snapshot const* planned, retired_io_ctxs* retired)
 {
   // Normalize here so every caller (incl. the scan resolver, which forwards raw
   // ingestible paths) routes `file://` the same way create_datasource does.
@@ -2441,7 +2441,7 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_path(
   }
   auto type = _ioctx_registry.lookup_path(file_path);
   if (!type) { return nullptr; }
-  return ioctx_for_type(*type, file_path, planned);
+  return ioctx_for_type(*type, file_path, planned, retired);
 }
 
 std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_scan(
@@ -2449,11 +2449,15 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_scan(
 {
   auto const config = info.s3_configs.find(std::string(path));
   if (config == info.s3_configs.end()) { return ioctx_for_path(path); }
+  // Building the context may drop idle ones of other configurations. Declared before the
+  // lock, so they are destroyed after it is released: a context joins its reactors when
+  // destroyed, and every scan of this query that needs a planned context waits on this lock.
+  retired_io_ctxs retired;
   // One lookup per config and query: a context this query had to build for itself is built
   // once and lives as long as its scans.
   std::lock_guard lk{planned.mtx};
   auto& io_ctx = planned.by_config[config->second.id];
-  if (!io_ctx) { io_ctx = ioctx_for_path(path, &config->second); }
+  if (!io_ctx) { io_ctx = ioctx_for_path(path, &config->second, &retired); }
   return io_ctx;
 }
 
@@ -2468,7 +2472,10 @@ std::optional<cucascade::io::io_context_type> sirius_scan_manager::planning_io_b
 }
 
 std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
-  cucascade::io::io_context_type type, std::string_view path, s3_config_snapshot const* planned)
+  cucascade::io::io_context_type type,
+  std::string_view path,
+  s3_config_snapshot const* planned,
+  retired_io_ctxs* retired_by_caller)
 {
   auto const canonical_path = path.empty() ? std::string{} : normalize_path(std::string(path));
   bool const uses_object_store_config = type == cucascade::io::io_context_type::restful;
@@ -2490,6 +2497,13 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
       return it->second;
     }
   }
+  // Idle REST contexts dropped by this call when it builds one. Declared before the build
+  // and map locks, so it is destroyed after both on a return and on an exception alike: a
+  // context joins its reactors and tears its cache down when it is destroyed. A caller that
+  // holds a lock of its own across this call passes its list instead, and destroys them
+  // after that lock too.
+  retired_io_ctxs retired_here;
+  auto& retired = retired_by_caller != nullptr ? *retired_by_caller : retired_here;
   // Build outside the map mutex: make_ioctx/start spawn reactor threads and
   // initialize_cache allocates, so holding _routed_io_ctxs_mtx across them would
   // park every concurrent lookup behind one long critical section. The build
@@ -2504,7 +2518,7 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
     auto const latest_id = latest ? latest->id : 0;
     if (latest_id != config_id) {
       build_lk.unlock();
-      return ioctx_for_type(type, canonical_path);
+      return ioctx_for_type(type, canonical_path, nullptr, &retired);
     }
   }
   {
@@ -2550,42 +2564,59 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   init_cache_for(*io_ctx);
   if (!cached) { return std::move(io_ctx); }
   std::shared_ptr<cucascade::io::ioctx> kept;
-  std::vector<std::shared_ptr<cucascade::io::ioctx>> retired;
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
     kept = _routed_io_ctxs.emplace(cache_key, std::move(io_ctx)).first->second;
     _routed_io_ctx_last_use[cache_key] = ++_routed_io_ctx_clock;
     // The contexts grow in number only here.
-    if (type == cucascade::io::io_context_type::restful) { retired = evict_idle_rest_contexts(); }
+    if (type == cucascade::io::io_context_type::restful) { detach_idle_rest_contexts(retired); }
   }
   build_lk.unlock();
   return kept;
 }
 
-std::vector<std::shared_ptr<cucascade::io::ioctx>> sirius_scan_manager::evict_idle_rest_contexts()
+void sirius_scan_manager::detach_idle_rest_contexts(retired_io_ctxs& retired) noexcept
 {
   auto const limit = _physical_counters && _physical_counters->track_units &&
                          _physical_counters->idle_rest_context_limit_for_testing
                        ? *_physical_counters->idle_rest_context_limit_for_testing
                        : kMaxIdleRestContexts;
-  std::vector<std::pair<std::uint64_t, routed_ioctx_key>> idle;
-  for (auto const& [key, io_ctx] : _routed_io_ctxs) {
-    if (key.type == cucascade::io::io_context_type::restful && io_ctx.use_count() == 1) {
-      idle.emplace_back(_routed_io_ctx_last_use[key], key);
+  if (_routed_io_ctxs.size() <= limit) { return; }
+  try {
+    std::vector<std::pair<std::uint64_t, routed_ioctx_key>> idle;
+    for (auto const& [key, io_ctx] : _routed_io_ctxs) {
+      if (key.type != cucascade::io::io_context_type::restful || io_ctx.use_count() != 1) {
+        continue;
+      }
+      auto const used = _routed_io_ctx_last_use.find(key);
+      idle.emplace_back(used == _routed_io_ctx_last_use.end() ? 0 : used->second, key);
     }
+    if (idle.size() <= limit) { return; }
+    std::ranges::sort(idle, {}, [](auto const& entry) { return entry.first; });
+    idle.resize(idle.size() - limit);
+    // The last allocation. Once it succeeds every context to move has a place in the caller's
+    // list, so moving them there cannot fail half way and leave one to be destroyed under a
+    // lock.
+    retired.reserve(retired.size() + idle.size());
+    for (auto const& [last_use, key] : idle) {
+      auto const it = _routed_io_ctxs.find(key);
+      retired.push_back(std::move(it->second));
+      _routed_io_ctxs.erase(it);
+      _routed_io_ctx_last_use.erase(key);
+    }
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] dropped {} idle REST context(s)", idle.size());
+  } catch (...) {
+    // Out of memory. If it was while listing the idle contexts, none has left the map: the
+    // reserve is the last step before the first one moves, and they stay cached until the
+    // next call. If it was the log line, they are all in the caller's list already.
   }
-  std::vector<std::shared_ptr<cucascade::io::ioctx>> retired;
-  if (idle.size() <= limit) { return retired; }
-  std::ranges::sort(idle, {}, [](auto const& entry) { return entry.first; });
-  idle.resize(idle.size() - limit);
-  for (auto const& [last_use, key] : idle) {
-    auto const it = _routed_io_ctxs.find(key);
-    retired.push_back(std::move(it->second));
-    _routed_io_ctxs.erase(it);
-    _routed_io_ctx_last_use.erase(key);
-  }
-  SIRIUS_LOG_DEBUG("[sirius_scan_manager] dropped {} idle REST context(s)", retired.size());
-  return retired;
+}
+
+void sirius_scan_manager::release_idle_rest_contexts() noexcept
+{
+  retired_io_ctxs retired;
+  std::lock_guard lk{_routed_io_ctxs_mtx};
+  detach_idle_rest_contexts(retired);
 }
 
 std::size_t sirius_scan_manager::rest_context_count() const
@@ -2789,6 +2820,11 @@ void sirius_scan_manager::reset(sirius::query_id_t query_id)
 {
   drain_query(query_id);
   release_checkpoint_keys(query_id);
+  // The scans of a query hold their REST contexts together, so none of them was idle while
+  // the others were built. With the query's state gone they are: give the excess back now,
+  // rather than when the next context is built. After the keys, because tearing a context
+  // down joins its reactors.
+  release_idle_rest_contexts();
 }
 
 void sirius_scan_manager::drain_query(sirius::query_id_t query_id)

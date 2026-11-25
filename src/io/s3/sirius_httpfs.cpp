@@ -260,6 +260,10 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
   auto s3_config = resolve_duckdb_s3_secret(
     *client, path, sirius_ctx->get_config().get_scan_manager_config().object_store);
   auto const planned = sirius_ctx->get_scan_manager().install_s3_config(path, std::move(s3_config));
+  if (auto const counters = sirius_ctx->physical_counters();
+      counters->track_units && counters->s3_config_installed_for_testing) {
+    counters->s3_config_installed_for_testing(path);
+  }
   // Resolve through the scan_manager's datasource factory (the routed seam):
   // the returned datasource performs the HEAD and carries the backend;
   // HEAD failures (missing key / auth / network) propagate as exceptions for
@@ -298,6 +302,10 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
     *client, file.path, sirius_ctx->get_config().get_scan_manager_config().object_store);
   auto const planned =
     sirius_ctx->get_scan_manager().install_s3_config(file.path, std::move(s3_config));
+  if (auto const counters = sirius_ctx->physical_counters();
+      counters->track_units && counters->s3_config_installed_for_testing) {
+    counters->s3_config_installed_for_testing(file.path);
+  }
   // A parquet_footer_probe open: one suffix-range GET resolves the size (== the
   // LIST size that rode the glob expansion) and stashes the footer, so the
   // binder's footer reads are served locally (no HEAD, no separate footer GETs).

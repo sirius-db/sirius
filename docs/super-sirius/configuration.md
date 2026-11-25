@@ -979,7 +979,8 @@ requires startup configuration.
 - **`noop`**: discards all logs.
 
 Each statement's SQL text is logged at `info` when it begins. `CREATE SECRET` and `ATTACH` are the
-exception: their literals are credentials, so the log names the statement kind and withholds the text.
+exception, also when `EXPLAIN` wraps them: their literals are credentials, so the log names the
+statement kind and withholds the text.
 The statement is classified with DuckDB's tokenizer.
 
 Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA

@@ -1137,22 +1137,32 @@ class sirius_scan_manager {
   /// memory_prefetcher.hpp). No-op otherwise.
   void maybe_start_memory_prefetcher(query_scan_manager_state& state);
 
+  /// REST contexts taken out of the cache. A context joins its reactors when it is destroyed,
+  /// so a list of them is destroyed only after every lock its owner held is released.
+  using retired_io_ctxs = std::vector<std::shared_ptr<cucascade::io::ioctx>>;
+
   /// Resolve the ioctx that should serve @p path (normalized internally, so callers
   /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
   /// building it once per backend on first use.  Routes by path through the registry
   /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
   /// is uring.  Returns nullptr when no backend supports the path.
   /// @throws std::invalid_argument for a raw `http://` / `https://` URL (use `s3://`).
+  /// Building a REST context may drop idle ones. They go to @p retired when it is set, for a
+  /// caller that holds a lock of its own across the call and must destroy them after
+  /// releasing it; otherwise they are destroyed before returning, outside the routing locks.
   std::shared_ptr<cucascade::io::ioctx> ioctx_for_path(std::string_view path,
-                                                       s3_config_snapshot const* planned = nullptr);
+                                                       s3_config_snapshot const* planned = nullptr,
+                                                       retired_io_ctxs* retired          = nullptr);
 
   /// Resolve the ioctx of @p type, building and caching it on first use (the
   /// by-path routing above resolves to a type and then lands here).  Returns
   /// nullptr when the registry cannot build that backend.  A REST context is built
   /// for @p planned when set, else for the S3 configuration @p path maps to now.
+  /// @p retired as in @ref ioctx_for_path.
   std::shared_ptr<cucascade::io::ioctx> ioctx_for_type(cucascade::io::io_context_type type,
                                                        std::string_view path             = {},
-                                                       s3_config_snapshot const* planned = nullptr);
+                                                       s3_config_snapshot const* planned = nullptr,
+                                                       retired_io_ctxs* retired          = nullptr);
 
   /// The contexts one query's scans opened for the S3 configurations its statement planned with.
   struct planned_s3_io_ctxs {
@@ -1263,11 +1273,19 @@ class sirius_scan_manager {
   /// new credentials on every load would add one per load. Each holds reactor threads and
   /// connections; a dropped one is rebuilt, on cold connections, when a path of its is opened.
   static constexpr std::size_t kMaxIdleRestContexts = 32;
-  /// Removes the least recently used REST contexts that only `_routed_io_ctxs` holds, down to
-  /// `kMaxIdleRestContexts` of them. A read holds its context through its datasource, so none
-  /// in use is removed. Call with `_routed_io_ctxs_mtx` held and destroy the result after
-  /// releasing it: a context joins its reactors when it is destroyed.
-  [[nodiscard]] std::vector<std::shared_ptr<cucascade::io::ioctx>> evict_idle_rest_contexts();
+  /// Moves the least recently used REST contexts that only `_routed_io_ctxs` holds into
+  /// @p retired, until `kMaxIdleRestContexts` of them remain. A read holds its context through
+  /// its datasource, so none in use is moved.
+  ///
+  /// Call with `_routed_io_ctxs_mtx` held. @p retired must be declared before every lock the
+  /// caller holds, so that it is destroyed after them: a context joins its reactors when it
+  /// is destroyed. Room for every context to move is reserved before the first one leaves the
+  /// map, so the move cannot fail half way; if that reservation fails, none is moved.
+  void detach_idle_rest_contexts(retired_io_ctxs& retired) noexcept;
+  /// Drops the idle REST contexts beyond the bound, and destroys them on the calling thread
+  /// once the map is unlocked. Called when a query's scans are released (@ref reset); a build
+  /// detaches them under the locks it already holds.
+  void release_idle_rest_contexts() noexcept;
   /// Backends that failed to build, keyed like `_routed_io_ctxs`; the value is
   /// `ioctx_failure::by_configuration`.  A failure the configuration explains is
   /// final for that key: a config snapshot is immutable, so a retry could only

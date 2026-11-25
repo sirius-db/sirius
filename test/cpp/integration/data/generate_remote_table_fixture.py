@@ -4,9 +4,11 @@
 
 Usage: generate_remote_table_fixture.py <source table dir> <out dir> <remote root>
 Writes the table under <out dir> with every path rewritten to <remote root>, plus
-metadata/empty.metadata.json: the same table before its first snapshot. A table with
-deletes also gets metadata/replaced.metadata.json: another table for the same name, whose
-snapshot of the same ID lists the data manifests only.
+metadata/empty.metadata.json: the same table before its first snapshot, and
+metadata/detached.metadata.json: the same table with its snapshots retained and none of them
+current, so they are readable by version only. A table with deletes also gets
+metadata/replaced.metadata.json: another table for the same name, whose snapshot of the same
+ID lists the data manifests only.
 """
 import copy
 import json
@@ -81,6 +83,10 @@ for snapshot in meta.get("snapshots", []):
         if other["snapshot-id"] == snapshot["snapshot-id"]:
             other["manifest-list"] = remote + "/metadata/snap-replaced.avro"
     (out / "metadata/replaced.metadata.json").write_text(json.dumps(replaced))
+detached = copy.deepcopy(meta)
+for key in ("current-snapshot-id", "refs"):
+    detached.pop(key, None)
+(out / "metadata/detached.metadata.json").write_text(json.dumps(detached))
 for key in ("current-snapshot-id", "snapshots", "snapshot-log", "refs"):
     meta.pop(key, None)
 (out / "metadata/empty.metadata.json").write_text(json.dumps(meta))

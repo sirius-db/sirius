@@ -785,6 +785,34 @@ def _build_catalog_views_sql(schema):
     )
 
 
+def _run_catalog_setup(con):
+    """Run the statements of CATALOG_SETUP_PATH on @p con, in order.
+
+    The file holds credentials, and a DuckDB error quotes the statement it
+    failed on. A failure is therefore reported by position and error class
+    only, with the DuckDB error dropped rather than chained.
+    """
+    with open(CATALOG_SETUP_PATH) as f:
+        text = f.read()
+    withheld = "the DuckDB error is withheld because it quotes the file, which holds credentials"
+    try:
+        # DuckDB splits the file: a ';' inside a quoted value or a comment
+        # ends no statement.
+        statements = con.extract_statements(text)
+    except duckdb.Error as error:
+        raise RuntimeError(
+            f"{CATALOG_SETUP_PATH} does not parse ({type(error).__name__}); {withheld}"
+        ) from None
+    for index, statement in enumerate(statements, start=1):
+        try:
+            con.execute(statement).fetchall()
+        except duckdb.Error as error:
+            raise RuntimeError(
+                f"{CATALOG_SETUP_PATH}: statement {index} of {len(statements)} failed "
+                f"({type(error).__name__}); {withheld}"
+            ) from None
+
+
 def open_connection(
     source, gpu_execution=False, data_source="parquet", s3_input=None, workload=None
 ):
@@ -813,7 +841,10 @@ def open_connection(
         log(f"Opening DuckDB database file {source} (read-only)")
         con = duckdb.connect(source, read_only=True, config=config)
     else:
-        log(f"Opening DuckDB connection over parquet dir {source}")
+        if data_source == "iceberg":
+            log(f"Opening DuckDB connection for the Iceberg catalog schema {source}")
+        else:
+            log(f"Opening DuckDB connection over parquet dir {source}")
         con = duckdb.connect(
             workload.database(gpu_execution) if workload else ":memory:", config=config
         )
@@ -840,11 +871,7 @@ def _configure_connection(con, source, gpu_execution, data_source, s3_input, wor
         # run it before Sirius is loaded.
         for extension in ("httpfs", "avro", "iceberg"):
             con.execute(f"LOAD {extension}")
-        with open(CATALOG_SETUP_PATH) as f:
-            # DuckDB splits the file: a ';' inside a quoted value or a comment
-            # ends no statement.
-            for statement in con.extract_statements(f.read()):
-                con.execute(statement).fetchall()
+        _run_catalog_setup(con)
 
     # Load Sirius before registering S3 views. GPU execution stays on while the
     # views bind: sirius_httpfs serves S3 only under gpu_execution=true.

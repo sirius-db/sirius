@@ -23,6 +23,7 @@
  * generic duckdb_scan path) is currently disabled.
  */
 
+#include "io/s3/duckdb_secret_config.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
@@ -2146,6 +2147,34 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
     CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
     CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
   }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - an Avro equality delete that applies to no data "
+                 "file does not decline",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The Avro delete is live and was committed before the only data file, so it applies to
+  // nothing. Nothing exists where the manifest puts it: the rows come back only if no reader
+  // opens it, and the scan stays on the GPU only if its format is not held against it.
+  auto path = table("iceberg_v2_eq_avro_delete_older");
+  require_delete_files(path, 1);
+  auto inventory =
+    sirius::op::scan::read_delete_inventory(*con->context, path, current_snapshot_id(path));
+  REQUIRE(inventory.inventory);
+  CHECK(inventory.equality_count == 1);
+  CHECK(std::ranges::any_of(inventory.inventory->entries, [](auto const& entry) {
+    return entry.content == "EQUALITY_DELETES" &&
+           duckdb::StringUtil::CIEquals(entry.file_format, "avro");
+  }));
+  CHECK(
+    sirius::op::scan::read_equality_plan(*con->context, *inventory.inventory, 64).files.empty());
+
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  // No delete payload is loaded: the plan retained no file to load.
+  expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                       {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}},
+                       0);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
@@ -5404,6 +5433,30 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   REQUIRE(result);
   INFO((result->HasError() ? result->GetError() : ""));
   REQUIRE_FALSE(result->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "A Puffin for an unselected data file needs no S3 credential",
+                 "[integration][scan_preparation][iceberg][planning]")
+{
+  // The vector for an unselected data file sits under s3://, and the only secret that covers
+  // it is one Sirius cannot use. The scan never opens that file, so resolving a credential
+  // for it must not be what fails the statement.
+  auto table = inventory_fixture("dv_unused_s3_uri");
+  REQUIRE_FALSE(
+    con
+      ->Query("CREATE OR REPLACE SECRET unused_puffin (TYPE SIRIUS_S3, SCOPE "
+              "'s3://sirius-unused-puffin/', KEY_ID 'k', SECRET 's', URL_STYLE 'vhost')")
+      ->HasError());
+  absl::Cleanup drop_secret = [&] { con->Query("DROP SECRET IF EXISTS unused_puffin"); };
+  // The secret is the unusable one: resolving that path by itself is refused.
+  CHECK_THROWS_WITH(sirius::io::s3::resolve_duckdb_s3_secret(
+                      *con->context, "s3://sirius-unused-puffin/unused-sidecar.puffin", {}),
+                    Catch::Matchers::ContainsSubstring("url_style='path'"));
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(table) + " ORDER BY count",
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,

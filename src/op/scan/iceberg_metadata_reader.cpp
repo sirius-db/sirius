@@ -261,10 +261,11 @@ inventory_result read_delete_inventory(
   if (injection == "missing") throw inventory_query_error("", true);
   if (injection == "fail") throw inventory_query_error("injected inventory query failure", false);
   if (other_table && !extension_checks_uuid) {
-    // Returned, not thrown: a foreign exception would abort this connection's transaction.
+    // Returned, not thrown: an exception from the callback would invalidate this connection's
+    // transaction, which the inventory query below runs in.
     std::string reason;
     conn.read_catalog([&](duckdb::ClientContext& inner) { reason = other_table(inner); });
-    if (!reason.empty()) throw inventory_query_error(reason, false);
+    if (!reason.empty()) throw inventory_query_error(reason, false, /*another_table=*/true);
   }
   // One query supplies the equality count and the inventory the equality plan is checked against.
   if (counters) ++counters->iceberg_manifest_walks;

@@ -604,8 +604,9 @@ class SiriusContext : public ClientContextState {
     unique_ptr<QueryResult> Query(const string& sql);
     unique_ptr<QueryResult> Submit(const string& sql);
     /// Runs @p read with this connection's context, in its transaction: a catalog lookup made
-    /// there sees what the connection's queries see. An exception from @p read that is not a
-    /// DuckDB one aborts the transaction.
+    /// there sees what the connection's queries see. An exception from @p read, whatever its
+    /// type, invalidates that transaction, so a caller that goes on to query should have
+    /// @p read report failure by other means.
     void read_catalog(const std::function<void(ClientContext&)>& read);
 
    private:

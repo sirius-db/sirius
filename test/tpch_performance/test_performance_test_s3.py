@@ -9,6 +9,7 @@
 import csv
 import os
 import tempfile
+import traceback
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -209,6 +210,43 @@ class PerformanceTestS3Tests(unittest.TestCase):
                 for sql in events[sirius + 1 :]
             )
         )
+
+    def test_failing_catalog_setup_does_not_quote_the_file(self):
+        # A real connection, so the errors are the ones DuckDB raises: a parser
+        # error and a binder error each quote the line they stopped on,
+        # credential and all.
+        token = "synthetic-token-7f3a"
+        cases = {
+            "does not parse": f"CREATE SECRETT c (TYPE ICEBERG, TOKEN '{token}');\n",
+            "statement 2 of 2 failed": (
+                f"SELECT 1;\nSELECT '{token}' || no_such_column;\n"
+            ),
+        }
+        for expected, text in cases.items():
+            with self.subTest(expected), tempfile.NamedTemporaryFile(
+                "w", suffix=".sql"
+            ) as setup:
+                setup.write(text)
+                setup.flush()
+                con = benchmark.duckdb.connect()
+                with patch.object(benchmark, "CATALOG_SETUP_PATH", setup.name):
+                    with self.assertRaises(RuntimeError) as raised:
+                        benchmark._run_catalog_setup(con)
+                # What a caller prints: the message and the whole traceback chain.
+                printed = "".join(
+                    traceback.format_exception(
+                        type(raised.exception),
+                        raised.exception,
+                        raised.exception.__traceback__,
+                    )
+                )
+                self.assertIn(expected, printed)
+                self.assertNotIn(token, printed)
+                # The control: DuckDB's own error for this file does quote it.
+                with self.assertRaises(benchmark.duckdb.Error) as quoted:
+                    for statement in con.extract_statements(text):
+                        con.execute(statement)
+                self.assertIn(token, str(quoted.exception))
 
     def test_s3_profiler_child_writes_timings_but_no_secret_sql(self):
         source = Mock()

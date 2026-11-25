@@ -97,11 +97,13 @@ struct inventory_result {
   uint64_t equality_count = 0;
 };
 struct inventory_query_error : std::runtime_error {
-  inventory_query_error(std::string const& message, bool missing)
-    : std::runtime_error(message), missing_result(missing)
+  inventory_query_error(std::string const& message, bool missing, bool another_table = false)
+    : std::runtime_error(message), missing_result(missing), other_table(another_table)
   {
   }
   bool missing_result;
+  /// The lookup resolved a table that is not the one the scan bound; what() says which.
+  bool other_table;
 };
 // Inspect only Avro manifest schemas (LIMIT 0), once per data manifest. Empty
 // partition records prove missing columns cannot be supplied by partition metadata.
