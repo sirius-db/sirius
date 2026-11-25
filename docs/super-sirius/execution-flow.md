@@ -97,7 +97,7 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 - **HASH_JOIN** → inserts `PARTITION + CONCAT` on both probe and build sides
 - **HASH_GROUP_BY** → inserts `PARTITION + MERGE_GROUP_BY`
 - **UNGROUPED_AGGREGATE** → inserts `PARTITION + MERGE_AGGREGATE`
-- **ORDER_BY** → creates 4-phase sort: `ORDER → SORT_SAMPLE → SORT_PARTITION → MERGE_SORT`
+- **ORDER_BY** → creates the sort chain: `ORDER_BY → SORT_KEY_SAMPLE → SORT_SAMPLE → SORT_PARTITION → MERGE_SORT`
 - **TOP_N** → adds `MERGE_TOP_N`
 
 ### 4c. Data Repository Wiring

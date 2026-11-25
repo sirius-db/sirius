@@ -71,7 +71,7 @@ publication separates them for LIMIT's one-batch claims.
 | Operator | `output_order_preservation()` |
 |---|---|
 | MERGE_SORT, MERGE_TOP_N | `FIXED_ORDER` |
-| ORDER_BY (local sort), TOP_N (local top-N), SORT_SAMPLE, SORT_PARTITION | `NO_ORDER` |
+| ORDER_BY (local sort), TOP_N (local top-N), SORT_KEY_SAMPLE, SORT_SAMPLE, SORT_PARTITION | `NO_ORDER` |
 | PARTITION, CONCAT, UNION | `NO_ORDER` |
 | WINDOW, REPLICATE | `NO_ORDER` |
 | HASH_JOIN, NESTED_LOOP_JOIN, DENSE_COUNT_JOIN | `NO_ORDER` |
@@ -476,6 +476,18 @@ Local sort of each data batch.
 
 - **GPU execution:** `gpu_order_impl::local_order_by()` using `cudf::order_by()`
 - **Key members:** `orders` (sort keys with ASC/DESC and null ordering), `projections` (output columns), `is_index_sort`
+- **Pipeline role:** under a SORT_KEY_SAMPLE, which is where the planner puts it, it is neither a sink nor a source and runs inside that operator's pipeline. On its own it ends its pipeline.
+
+### `sirius_physical_sort_key_sample` — `SORT_KEY_SAMPLE`
+**File:** `src/op/sirius_physical_sort_key_sample.hpp`
+
+Runs after ORDER_BY and ends its pipeline. It keeps evenly spaced sort-key rows of every sorted
+batch in the `sort_key_sample` store (`src/op/sort_key_sample.hpp`) that the plan's SORT_SAMPLE
+reads, and passes the batches on unchanged.
+
+- The store keeps the rows in host memory: one stride for all batches, a power of two that doubles until at most about 1M rows are kept.
+- A batch is named by its original ID, so a retried task replaces its earlier rows, also when the retry runs on another GPU and gets clones of its input.
+- It keeps nothing once SORT_SAMPLE has chosen the boundaries and closed the store.
 
 ### `sirius_physical_top_n` — `TOP_N`
 **File:** `src/op/sirius_physical_top_n.hpp`
@@ -626,11 +638,8 @@ neither half of.
 **File:** `src/op/sirius_physical_sort_sample.hpp`
 
 Computes P-1 partition boundary rows for range partitioning from key rows of every sorted batch.
-ORDER_BY hands each batch it sorts to `add_sorted_batch()` before the batch reaches the input
-port. `sort_key_sample` (`src/op/sort_key_sample.hpp`) keeps evenly spaced key rows of each batch
-in host memory: one stride for all batches, a power of two that doubles until at most about 1M
-rows are kept. A retried ORDER_BY task hands its batch over again under the same id, which
-replaces its earlier rows.
+The SORT_KEY_SAMPLE that ends the producing pipeline adds the key rows of each batch to the
+store this operator shares with it (`key_sample()`) before the batch reaches the input port.
 
 `sort_sample_bytes` is the input to see before the boundaries are chosen. The default, 0, waits
 for all of it. Input that ends before a nonzero value is reached is used whole. A distributed
@@ -736,7 +745,8 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | REPLICATE | Relational | `gpu_replicate_impl::plan_slices()` + `materialize()`; one `cudf::gather` per output batch |
 | ORDER_BY | Sort | `gpu_order_impl::local_order_by()` |
 | TOP_N | Sort | Order + limit |
-| SORT_SAMPLE | Sort | Sample + boundary computation |
+| SORT_KEY_SAMPLE | Sort | Key rows of each sorted batch, kept in host memory |
+| SORT_SAMPLE | Sort | Boundary computation from the kept key rows |
 | SORT_PARTITION | Sort | Range partition by boundaries |
 | MERGE_SORT | Sort | `gpu_merge_impl::merge_order_by()` |
 | UNGROUPED_AGGREGATE | Agg | `gpu_aggregate_impl::local_ungrouped_aggregate()` |

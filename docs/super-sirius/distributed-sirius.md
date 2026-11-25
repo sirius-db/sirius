@@ -43,7 +43,7 @@ flowchart BT
     OP --> J
     LB -. "Bloom, ORed across ranks" .-> OS
     J --> GX["EXCHANGE hash(l_shipmode)"]
-    GX --> M["PARTITION → MERGE_GROUP_BY → ORDER_BY"]
+    GX --> M["PARTITION → MERGE_GROUP_BY → ORDER_BY → SORT_KEY_SAMPLE"]
     M --> SS["SORT_SAMPLE<br/>(samples gathered: same boundaries everywhere)"]
     SS --> RX["EXCHANGE range"]
     RX --> SP["SORT_PARTITION → MERGE_SORT"]
@@ -202,7 +202,7 @@ single-process plan already partitions:
 | the same, with `COUNT(DISTINCT)` | `hash` on the group keys, below `HASH_GROUP_BY`: partial distinct sets are LIST columns, which the wire does not carry |
 | `MERGE_AGGREGATE → UNGROUPED_AGGREGATE` | `gather` to rank 0, between them |
 | `MERGE_TOP_N → TOP_N` | `gather` to rank 0, between them; a row outside its rank's top N is outside the overall top N |
-| `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY` | `range` between `SORT_PARTITION` and a distributed `SORT_SAMPLE` |
+| `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → SORT_KEY_SAMPLE → ORDER_BY` | `range` between `SORT_PARTITION` and a distributed `SORT_SAMPLE` |
 | the result | `gather` to rank 0, ordered after a distributed sort |
 
 `GPU_SCAN`, `FILTER`, `PROJECTION` and `DYNAMIC_FILTER` keep their input's placement. A `CTE`
