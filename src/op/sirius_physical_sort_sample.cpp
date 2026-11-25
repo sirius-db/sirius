@@ -247,23 +247,6 @@ bool sirius_physical_sort_sample::boundary_input_ready(port const& input) const
   return _key_sample->seen().bytes >= _sort_sample_bytes;
 }
 
-void sirius_physical_sort_sample::add_sorted_batch(std::uint64_t id,
-                                                   cucascade::data_batch& sorted,
-                                                   ::cuda::stream_ref stream)
-{
-  if (boundary_state() == BoundaryState::DONE) { return; }
-  auto const batch = sorted.to_read_only();
-  auto* space      = batch.get_memory_space();
-  if (!space || !batch.get_data()) { return; }
-  auto const table = get_cudf_table_view(batch);
-  std::vector<cudf::column_view> key_columns;
-  for (int idx : sort_key_order().columns) {
-    key_columns.push_back(table.column(idx));
-  }
-  _key_sample->add(
-    id, cudf::table_view(key_columns), batch.get_data()->get_size_in_bytes(), *space, stream);
-}
-
 sirius_physical_sort_sample::range_sizing sirius_physical_sort_sample::size_ranges(
   sample_summary const& summary,
   cucascade::memory::memory_space& space,

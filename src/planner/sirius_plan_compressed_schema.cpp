@@ -471,8 +471,8 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
   }
 
   // Pipeline wrapper operators (PARTITION, CONCAT, MERGE_*, SORT_PARTITION, SORT_SAMPLE,
-  // GPU_SCAN) are inserted by insert_gpu_pipeline_operators after these passes run; their
-  // carrier contracts are established at wrap time from the finished sidecars.
+  // SORT_KEY_SAMPLE, GPU_SCAN) are inserted by insert_gpu_pipeline_operators after these passes
+  // run; their carrier contracts are established at wrap time from the finished sidecars.
   D_ASSERT(slot->type != sirius::op::SiriusPhysicalOperatorType::PARTITION &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::CONCAT &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_SORT &&
@@ -481,6 +481,7 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
            slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_AGGREGATE &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::SORT_PARTITION &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::SORT_SAMPLE &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::SORT_KEY_SAMPLE &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::GPU_SCAN);
 
   // Joins, aggregates, ordering, and all other operators retain their existing native-type

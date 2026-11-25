@@ -69,6 +69,7 @@
 #include "op/sirius_physical_passthrough_sink.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_result_collector.hpp"
+#include "op/sirius_physical_sort_key_sample.hpp"
 #include "op/sirius_physical_sort_partition.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "op/sirius_physical_table_scan.hpp"
@@ -1654,13 +1655,14 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
   });
 }
 
-//! Replace an ORDER_BY slot with `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY →
-//! original_input`. Destructive: ORDER_BY's
+//! Replace an ORDER_BY slot with `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → SORT_KEY_SAMPLE →
+//! ORDER_BY → original_input`. Destructive: ORDER_BY's
 //! `projections`/`types` are overwritten with the identity over the input's types so every
 //! column stays visible to SORT_SAMPLE / SORT_PARTITION; a non-identity original projection is
-//! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
-//! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape, matching legacy). ORDER_BY
-//! hands each sorted batch's key rows to SORT_SAMPLE, which picks the range boundaries from them.
+//! restored on MERGE_SORT via `set_final_projections`. SORT_KEY_SAMPLE is a sink and ORDER_BY
+//! under it is not, so both run in one pipeline; SORT_SAMPLE is a non-sink, so it lands in
+//! `operators[]` of the SORT_PARTITION pipeline (3 pipelines). SORT_KEY_SAMPLE keeps key rows of
+//! each sorted batch in a store that SORT_SAMPLE picks the range boundaries from.
 void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                    const sirius::operator_params& op_params)
 {
@@ -1688,8 +1690,10 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
       op_params.max_sort_partition_bytes,
       op_params.max_sort_partition_memory_fraction);
     auto* sample_ptr = sample.get();
-    order_ptr->set_sort_sample(sample_ptr);
-    sample->children.push_back(std::move(order_op));
+    auto key_sample  = duckdb::make_uniq<sirius::op::sirius_physical_sort_key_sample>(
+      order_ptr, sample_ptr->key_sample());
+    key_sample->children.push_back(std::move(order_op));
+    sample->children.push_back(std::move(key_sample));
 
     auto partition = duckdb::make_uniq<sirius::op::sirius_physical_sort_partition>(order_ptr);
     partition->set_sample_op(sample_ptr);

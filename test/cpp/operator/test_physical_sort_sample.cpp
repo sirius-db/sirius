@@ -17,6 +17,7 @@
 #include "helper/cuda_launch_error.hpp"
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
+#include "sort_range_test_utils.hpp"
 #include "utils/scan_resource_test_utils.hpp"
 #include "utils/test_physical_operator.hpp"
 
@@ -93,7 +94,7 @@ void feed(sirius_physical_sort_sample& sample_op,
           cucascade::shared_data_repository& repo,
           std::shared_ptr<cucascade::data_batch> batch)
 {
-  sample_op.add_sorted_batch(batch->get_batch_id(), *batch, cudf::get_default_stream());
+  sirius::test::sort_range::keep_key_rows(sample_op, {batch});
   repo.add_data_batch(std::move(batch), 0);
 }
 
@@ -219,15 +220,16 @@ TEST_CASE("sirius_physical_sort_sample counts a batch handed over twice once",
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
   attach_port(sample_op, *repo);
 
-  // A retried ORDER_BY task hands its batch over again under the same id.
-  sample_op.add_sorted_batch(7, *batch, stream);
-  sample_op.add_sorted_batch(7, *batch, stream);
+  // A retried task hands its batch over again.
+  sirius::test::sort_range::keep_key_rows(sample_op, {batch}, stream);
+  sirius::test::sort_range::keep_key_rows(sample_op, {batch}, stream);
   CHECK(sample_op.sampled_input().batches == 1);
   CHECK(sample_op.sampled_input().rows == rows);
   CHECK(sample_op.sampled_input().bytes == batch_bytes);
 
   // Key rows alone do not start the boundary task: a batch has to wait in the port.
-  sample_op.add_sorted_batch(8, *batch, stream);
+  auto second = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
+  sirius::test::sort_range::keep_key_rows(sample_op, {second}, stream);
   CHECK(sample_op.sampled_input().batches == 2);
   CHECK(sample_op.get_next_task_input_data() == nullptr);
 
@@ -492,8 +494,7 @@ TEST_CASE("sirius_physical_sort_sample merges pre-sorted batches for partition b
     sirius::config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
 
   auto const stream = cudf::get_default_stream();
-  sample_op.add_sorted_batch(batch_high->get_batch_id(), *batch_high, stream);
-  sample_op.add_sorted_batch(batch_low->get_batch_id(), *batch_low, stream);
+  sirius::test::sort_range::keep_key_rows(sample_op, {batch_high, batch_low}, stream);
   auto output = sample_op.execute(pipelineable_operator_data({batch_high, batch_low}), stream);
   REQUIRE(output != nullptr);
   REQUIRE(sample_op.boundaries_computed());

@@ -34,6 +34,7 @@
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "operator/partitioned_join_test_utils.hpp"
+#include "operator/sort_range_test_utils.hpp"
 #include "planner/distributed_plan.hpp"
 #include "sirius/exception.hpp"
 
@@ -231,13 +232,12 @@ sirius::op::sample_all_gather_boundaries const& gathering(sirius_physical_sort_s
     *sample.cross_rank_boundaries());
 }
 
-/// As a rank's ORDER_BY does: hands each sorted batch of @p input over to @p sample.
+/// As a rank's SORT_KEY_SAMPLE does: keeps the key rows of each sorted batch of @p input for
+/// @p sample.
 void hand_over(sirius_physical_sort_sample& sample,
                std::vector<std::shared_ptr<cucascade::data_batch>> const& input)
 {
-  for (auto const& batch : input) {
-    sample.add_sorted_batch(batch->get_batch_id(), *batch, utils::default_stream());
-  }
+  sirius::test::sort_range::keep_key_rows(sample, input, utils::default_stream());
 }
 
 using sirius::op::dynamic_filter_publish_plan;

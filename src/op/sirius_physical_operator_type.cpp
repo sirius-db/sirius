@@ -110,6 +110,7 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::MERGE_AGGREGATE: return "MERGE_AGGREGATE";
     case SiriusPhysicalOperatorType::SORT_PARTITION: return "SORT_PARTITION";
     case SiriusPhysicalOperatorType::SORT_SAMPLE: return "SORT_SAMPLE";
+    case SiriusPhysicalOperatorType::SORT_KEY_SAMPLE: return "SORT_KEY_SAMPLE";
     case SiriusPhysicalOperatorType::GPU_VALUES: return "GPU_VALUES";
     case SiriusPhysicalOperatorType::GPU_SCAN: return "GPU_SCAN";
     case SiriusPhysicalOperatorType::DYNAMIC_FILTER: return "DYNAMIC_FILTER";

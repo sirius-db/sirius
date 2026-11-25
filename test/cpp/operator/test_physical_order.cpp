@@ -20,7 +20,6 @@
 #include <catch.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_order.hpp>
-#include <op/sirius_physical_sort_sample.hpp>
 
 using namespace sirius::op;
 using sirius::op::operator_data;
@@ -465,47 +464,4 @@ TEST_CASE("sirius_physical_order returns empty for all-null inputs", "[physical_
   std::vector<std::shared_ptr<data_batch>> inputs{nullptr, nullptr};
   auto out = op.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().empty());
-}
-
-TEST_CASE("sirius_physical_order hands each sorted batch to its sort sample once",
-          "[physical_order]")
-{
-  auto* space = get_default_gpu_space();
-  REQUIRE(space);
-
-  auto first  = make_1col_batch(*space, {5, 1, 9, 3});
-  auto second = make_1col_batch(*space, {7, 2, 8});
-
-  duckdb::vector<duckdb::LogicalType> types;
-  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
-
-  duckdb::vector<duckdb::BoundOrderByNode> orders;
-  orders.push_back(make_order(
-    0, duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), duckdb::OrderType::ASCENDING));
-
-  duckdb::vector<duckdb::idx_t> projections{0};
-
-  sirius_physical_order op(
-    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
-  sirius_physical_sort_sample sample(&op);
-  op.set_sort_sample(&sample);
-
-  pipelineable_operator_data input({first, second});
-  (void)op.execute(input, cudf::get_default_stream());
-  CHECK(sample.sampled_input().batches == 2);
-  CHECK(sample.sampled_input().rows == 7);
-
-  // A retried task sorts the same input again: its batches still count once.
-  (void)op.execute(input, cudf::get_default_stream());
-  CHECK(sample.sampled_input().batches == 2);
-  CHECK(sample.sampled_input().rows == 7);
-
-  // A retry on another GPU gets clones of its input, which have new batch IDs.
-  auto const cloned = input.with_batches_preserving_rows(
-    {make_1col_batch(*space, {5, 1, 9, 3}), make_1col_batch(*space, {7, 2, 8})});
-  REQUIRE(cloned->original_batch_ids() ==
-          std::vector<std::uint64_t>{first->get_batch_id(), second->get_batch_id()});
-  (void)op.execute(*cloned, cudf::get_default_stream());
-  CHECK(sample.sampled_input().batches == 2);
-  CHECK(sample.sampled_input().rows == 7);
 }

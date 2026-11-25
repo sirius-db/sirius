@@ -274,6 +274,7 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::MERGE_AGGREGATE:
     case SiriusPhysicalOperatorType::SORT_PARTITION:
     case SiriusPhysicalOperatorType::SORT_SAMPLE:
+    case SiriusPhysicalOperatorType::SORT_KEY_SAMPLE:
     case SiriusPhysicalOperatorType::GPU_VALUES:
     case SiriusPhysicalOperatorType::GPU_SCAN:
     case SiriusPhysicalOperatorType::STREAMING_SOURCE:

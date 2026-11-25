@@ -250,8 +250,12 @@ std::string_view sirius_physical_operator::input_port_for(
 MemoryBarrierType sirius_physical_operator::input_barrier_for(
   sirius_physical_operator const& producer) const
 {
-  return producer.type == SiriusPhysicalOperatorType::ORDER_BY ? MemoryBarrierType::PIPELINE
-                                                               : MemoryBarrierType::FULL;
+  // Sorted batches are read as they arrive: from ORDER_BY, or from the SORT_KEY_SAMPLE that ends
+  // its pipeline.
+  return producer.type == SiriusPhysicalOperatorType::ORDER_BY ||
+             producer.type == SiriusPhysicalOperatorType::SORT_KEY_SAMPLE
+           ? MemoryBarrierType::PIPELINE
+           : MemoryBarrierType::FULL;
 }
 
 //===--------------------------------------------------------------------===//

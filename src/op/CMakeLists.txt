@@ -97,6 +97,7 @@ target_sources(
           sirius_physical_replicate.cpp
           sirius_physical_parquet_sink.cpp
           sirius_physical_result_collector.cpp
+          sirius_physical_sort_key_sample.cpp
           sirius_physical_sort_partition.cpp
           sirius_physical_sort_sample.cpp
           sort_key_sample.cpp

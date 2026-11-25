@@ -19,9 +19,12 @@
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
 
+#include <cudf/utilities/default_stream.hpp>
+
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_merge_sort.hpp>
+#include <op/sirius_physical_sort_key_sample.hpp>
 #include <op/sirius_physical_sort_partition.hpp>
 #include <op/sirius_physical_sort_sample.hpp>
 #include <pipeline/sirius_pipeline.hpp>
@@ -112,10 +115,23 @@ inline std::vector<key_row> read_keys(cucascade::data_batch& batch,
   return rows;
 }
 
-//! Runs @p batches through SORT_SAMPLE, SORT_PARTITION and MERGE_SORT as the pipelines do: each
-//! batch is handed over and pushed in turn, and every task that is ready runs before the next
-//! batch arrives. The input ends, if @p upstream_finished, only after the last batch.
-//! @p max_sample_key_rows of 0 keeps the operator's cap.
+//! Keeps the key rows of @p batches for @p sample, as the SORT_KEY_SAMPLE that ends the producing
+//! pipeline does before the batches reach SORT_SAMPLE's input port.
+inline void keep_key_rows(op::sirius_physical_sort_sample& sample,
+                          std::vector<std::shared_ptr<cucascade::data_batch>> const& batches,
+                          ::cuda::stream_ref stream = cudf::get_default_stream())
+{
+  op::sirius_physical_sort_key_sample key_sample(sample.types,
+                                                 op::copy_orders(sample.orders),
+                                                 sample.estimated_cardinality,
+                                                 sample.key_sample());
+  (void)key_sample.execute(op::pipelineable_operator_data(batches), stream);
+}
+
+//! Runs @p batches through SORT_KEY_SAMPLE, SORT_SAMPLE, SORT_PARTITION and MERGE_SORT as the
+//! pipelines do: each batch gives its key rows and is pushed in turn, and every task that is ready
+//! runs before the next batch arrives. The input ends, if @p upstream_finished, only after the
+//! last batch. @p max_sample_key_rows of 0 keeps the operator's cap.
 inline layout run_layout(std::vector<std::shared_ptr<cucascade::data_batch>> const& batches,
                          duckdb::vector<duckdb::BoundOrderByNode> const& orders,
                          std::uint64_t sort_sample_bytes,
@@ -134,6 +150,8 @@ inline layout run_layout(std::vector<std::shared_ptr<cucascade::data_batch>> con
   op::sirius_physical_sort_sample sample(
     types, op::copy_orders(orders), estimated_cardinality, sort_sample_bytes, max_partition_bytes);
   if (max_sample_key_rows != 0) { sample.set_max_sample_key_rows(max_sample_key_rows); }
+  op::sirius_physical_sort_key_sample key_sample(
+    types, op::copy_orders(orders), estimated_cardinality, sample.key_sample());
   op::sirius_physical_sort_partition partition(
     types, op::copy_orders(orders), {}, estimated_cardinality);
   partition.set_sample_op(&sample);
@@ -159,7 +177,8 @@ inline layout run_layout(std::vector<std::shared_ptr<cucascade::data_batch>> con
     }
   };
   for (auto const& batch : batches) {
-    sample.add_sorted_batch(batch->get_batch_id(), *batch, stream);
+    std::vector<std::shared_ptr<cucascade::data_batch>> const one{batch};
+    (void)key_sample.execute(op::pipelineable_operator_data(one), stream);
     input_repo.add_data_batch(batch, 0);
     run_ready_tasks();
   }

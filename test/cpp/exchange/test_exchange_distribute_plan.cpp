@@ -474,7 +474,9 @@ TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
   CHECK(distributed->orders.size() == planned.orders.size());
   CHECK(distributed->types == planned.types);
   CHECK(distributed->estimated_cardinality == planned.estimated_cardinality);
-  CHECK(distributed->children.size() == 1);
+  REQUIRE(distributed->children.size() == 1);
+  // The key rows are still taken where the rank sorts, before the exchange.
+  CHECK(distributed->children[0]->type == T::SORT_KEY_SAMPLE);
 }
 
 TEST_CASE("distribute_plan refuses what it cannot place", "[exchange][planner]")

@@ -34,8 +34,6 @@ inline duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
   return result;
 }
 
-class sirius_physical_sort_sample;
-
 class sirius_physical_order : public sirius_physical_operator {
  public:
   [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
@@ -57,22 +55,19 @@ class sirius_physical_order : public sirius_physical_operator {
   duckdb::vector<std::size_t> projections;
   bool is_index_sort;
 
-  bool is_source() const override { return true; }
-  bool is_sink() const override { return true; }
+  //! Under a SORT_KEY_SAMPLE it runs inside that operator's pipeline; otherwise it ends its own.
+  bool is_source() const override { return !feeds_sort_key_sample(); }
+  bool is_sink() const override { return !feeds_sort_key_sample(); }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
-  //! Hand every sorted batch to @p sample, which picks range boundaries from their key rows. Set
-  //! while planning.
-  void set_sort_sample(sirius_physical_sort_sample* sample) noexcept { _sort_sample = sample; }
-  [[nodiscard]] sirius_physical_sort_sample* get_sort_sample() const noexcept
-  {
-    return _sort_sample;
-  }
-
  private:
-  sirius_physical_sort_sample* _sort_sample = nullptr;
+  [[nodiscard]] bool feeds_sort_key_sample() const noexcept
+  {
+    auto const* parent = get_parent_op();
+    return parent != nullptr && parent->type == SiriusPhysicalOperatorType::SORT_KEY_SAMPLE;
+  }
 };
 
 }  // namespace op
