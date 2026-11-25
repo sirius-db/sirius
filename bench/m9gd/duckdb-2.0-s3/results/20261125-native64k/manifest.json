@@ -3,32 +3,36 @@
   "engine": "DuckDB 2.0.0",
   "files": {
     "RESULTS.md": {
-      "bytes": 4613,
-      "sha256": "26760da909893d4f396b15176bcb45b49c7b5131a61a49f584a9da8c8eabcd42"
+      "bytes": 6567,
+      "sha256": "82cfe0722343578d324519632fc5b37cdba8975c21aa3c36c35d3a023971f7d8"
     },
     "build.json": {
       "bytes": 8553,
       "sha256": "cecf6ebdb67292c5efb2bc0633aa58c95f15307aaa5260b619039eee89010578"
     },
     "executed-scripts.json": {
-      "bytes": 31397,
-      "sha256": "ae1a7d7b4d5c7959590127198547cd187602bb40419d0de4d611c59e26794ae9"
+      "bytes": 42519,
+      "sha256": "61ca951560da7a84e7d070de0df8a7c95585ccb27ef851c34d5879cb5bda7f6e"
     },
     "failures.json": {
       "bytes": 624,
       "sha256": "567633725cc0c10046bbebc9256878af6bcacafc2c8eb177b4843549d91997a0"
     },
     "full-archives.json": {
-      "bytes": 3179,
-      "sha256": "7d8468f723bc4b1a63ebb39d7038b0e5bc84e2dede2d71a5b05ecc73c43d277c"
+      "bytes": 4541,
+      "sha256": "bb6474eddd78510409812e5b6bf47f8f9f97882651f114b2b196f221fe591be4"
     },
     "kernel.json": {
       "bytes": 7345,
       "sha256": "84c4873e64cf914187016b5aaafd4fb67d59d140350424f997ce79538e62ba1b"
     },
     "per-query.csv": {
-      "bytes": 3048,
-      "sha256": "66fda942d60a3f1cc5fb79f68d311213582c76a4cbbe0c96e0f01815455c02b9"
+      "bytes": 4871,
+      "sha256": "cbae309f1e513a1c1a3e93bf95176763e922c695d86da39d0023b601c27bbab9"
+    },
+    "phases/sf100-initial.json": {
+      "bytes": 213847,
+      "sha256": "3fde2fa0a305c12b9c233d096b992ea3d593cfc72b6cf3b23abb95c877124eab"
     },
     "phases/sf1000-initial.json": {
       "bytes": 173643,
@@ -46,9 +50,17 @@
       "bytes": 19159,
       "sha256": "2c7f0cecb84065edf2ac8d28add81014d78b022483c9a4a0aaf5f5df57290614"
     },
+    "phases/sf300-initial.json": {
+      "bytes": 219852,
+      "sha256": "fdc3fdcea2e8b2765c367c7845ad74d2e58b433e4f2bb90472a5ef34807567f2"
+    },
     "phases/sf3000-initial.json": {
       "bytes": 173309,
       "sha256": "957972144a93c88f955885c791e75c5fe61cfef69c605a7e592331e48616082c"
+    },
+    "sf100.json": {
+      "bytes": 18925,
+      "sha256": "384bcf01cf4dca1348baea5958287f4f1d1fc8c9dd4aeab346bb092e02f79485"
     },
     "sf1000.json": {
       "bytes": 18687,
@@ -58,16 +70,30 @@
       "bytes": 20146,
       "sha256": "9c75648e4d26c263db7e29478c9d47b8e0f8cdff3ab96d071b80171029f51b0a"
     },
+    "sf300.json": {
+      "bytes": 18922,
+      "sha256": "72562690f14eb0fcd33446b859ee48ffaffe0c2935854abb4c457f8433475cc1"
+    },
     "sf3000.json": {
       "bytes": 18444,
       "sha256": "6f56e2bbbad1e9bdd90bfeebb4d2662500c0eefd1a7758175628f462b3dc4edf"
+    },
+    "small-scale-inputs.json": {
+      "bytes": 49879,
+      "sha256": "c91a6bdccabf9abbead295e8502ea51de7e04fdf6cf354f078c68e8554499058"
+    },
+    "small-scale-reference-provenance.json": {
+      "bytes": 457,
+      "sha256": "9adeb02577787c0f473faa843945a84196d8f769462a00f8672c1ce30f93097b"
     }
   },
-  "native_snapshot_timings": 132,
+  "native_snapshot_timings": 220,
   "scales": [
+    100,
+    300,
     1000,
     3000,
     10000
   ],
-  "selected_timings": 132
+  "selected_timings": 220
 }

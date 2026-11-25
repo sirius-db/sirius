@@ -1,0 +1,13 @@
+{
+  "archive": {
+    "bytes": 203193424,
+    "files": 9909,
+    "path": "/home/ec2-user/g7e8-london-guide-matrix-20261123-full-results.tar.gz",
+    "payload_bytes": 737222411,
+    "sha256": "1e3824f2099b85afea577e11e983898198893037a7a2fed5eaddc1f5d391c6f7"
+  },
+  "expanded_limit_tie_sets": 4,
+  "independent_cpu_answers": 44,
+  "matching_sql_sha256": "c9ae5a51870ced2e1f7aec82eb58517536fa66615c94ba1d3e3953d6b41d0e8b",
+  "verified_selected_payloads": 93
+}

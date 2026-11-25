@@ -1,4 +1,28 @@
 {
+  "sf100-initial": {
+    "bytes": 3226647,
+    "complete": true,
+    "exit_code": 0,
+    "files": 260,
+    "iteration_coverage": [
+      {
+        "available_sum_s": 33.992618462012615,
+        "iteration": 1,
+        "queries": 22,
+        "sum_s": 33.992618462012615
+      },
+      {
+        "available_sum_s": 8.17741294701409,
+        "iteration": 2,
+        "queries": 22,
+        "sum_s": 8.17741294701409
+      }
+    ],
+    "measurements": 44,
+    "path": "/home/ec2-user/m9gd24-duckdb200-native64k-sf100-sf300-20261125/sf100-full-results-native64.tar.gz",
+    "payload_bytes": 12472413,
+    "sha256": "0408e1391df9e7129f48c6d2ca68a0de71021ede010b62c3bdfa37056d37de58"
+  },
   "sf1000-initial": {
     "bytes": 23407371,
     "complete": true,
@@ -90,6 +114,30 @@
         "sum_s": null
       }
     ]
+  },
+  "sf300-initial": {
+    "bytes": 8392696,
+    "complete": true,
+    "exit_code": 0,
+    "files": 260,
+    "iteration_coverage": [
+      {
+        "available_sum_s": 67.28068945300038,
+        "iteration": 1,
+        "queries": 22,
+        "sum_s": 67.28068945300038
+      },
+      {
+        "available_sum_s": 16.11063567201927,
+        "iteration": 2,
+        "queries": 22,
+        "sum_s": 16.11063567201927
+      }
+    ],
+    "measurements": 44,
+    "path": "/home/ec2-user/m9gd24-duckdb200-native64k-sf100-sf300-20261125/sf300-full-results-native64.tar.gz",
+    "payload_bytes": 28933125,
+    "sha256": "c90993300e89cafdf8696a69897ac9ef76c1948b603a6baa1f916eac06a6c3e3"
   },
   "sf3000-initial": {
     "bytes": 63321162,

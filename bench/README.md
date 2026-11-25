@@ -88,6 +88,11 @@ Parquet-metadata caches enabled, fresh processes/cache clears between query
 pairs, and verified local NVMe spill. It does not load Sirius or use the GPU
 replay's `--profile` controls.
 
+The [selected November 25 CPU results](m9gd/duckdb-2.0-s3/results/SELECTED.md)
+extend from SF100 through SF10000 using a native build and a 64 KiB page kernel.
+SF10000 combines retries and uses 256 GiB only for Q12, with 296.7 GiB for
+other queries; that selection is not a uniform-memory full-suite run.
+
 ```bash
 pixi run python -m unittest discover -s bench/common -p 'test_*.py' -v
 pixi run python -m unittest discover -s bench/g7e/guide-26b5caba -p 'test_*.py' -v

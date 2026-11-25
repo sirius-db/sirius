@@ -1,4 +1,14 @@
 {
+  "sf100": {
+    "iteration_sums_s": [
+      33.992618462012615,
+      8.17741294701409
+    ],
+    "native_arch_on": true,
+    "page_size": 65536,
+    "snapshot": "20261125-native64k",
+    "uniform_memory_configuration": true
+  },
   "sf1000": {
     "iteration_sums_s": [
       375.2857846400002,
@@ -18,6 +28,16 @@
     "page_size": 65536,
     "snapshot": "20261125-native64k",
     "uniform_memory_configuration": false
+  },
+  "sf300": {
+    "iteration_sums_s": [
+      67.28068945300038,
+      16.11063567201927
+    ],
+    "native_arch_on": true,
+    "page_size": 65536,
+    "snapshot": "20261125-native64k",
+    "uniform_memory_configuration": true
   },
   "sf3000": {
     "iteration_sums_s": [

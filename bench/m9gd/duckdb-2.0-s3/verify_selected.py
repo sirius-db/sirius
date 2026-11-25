@@ -65,10 +65,14 @@ def main():
         assert len(data["measurements"]) == 44
         assert len({(m["query"], m["iteration"]) for m in data["measurements"]}) == 44
         assert data["uniform_memory_configuration"] == (sf != 10000)
-        sql_sha = sha(measured_sources(sf)["queries.py"])
+        template_scale = 1000 if sf in (100, 300) else sf
+        sql_sha = sha(measured_sources(template_scale)["queries.py"])
         for measured in data["measurements"]:
             q, i = measured["query"], measured["iteration"]
             phase = phases[measured["source_phase"]]
+            if sf in (100, 300):
+                assert phase["replay_plan"]["adapter"]["actual_scale_factor"] == sf
+                assert phase["replay_plan"]["adapter"]["template_scale_factor"] == 1000
             assert phase["replay_plan"]["sources"]["queries.py"] == sql_sha
             match = next(
                 m

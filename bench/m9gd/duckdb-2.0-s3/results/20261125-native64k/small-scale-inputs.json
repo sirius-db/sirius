@@ -1,0 +1,320 @@
+{
+  "100": {
+    "generation_manifest": "{\"table\": \"customer\", \"part\": 1, \"parts\": 1, \"rows\": 15000000, \"bytes\": 1076302309, \"row_groups\": 16, \"schema\": \"c_custkey: int32 not null\\nc_name: string not null\\nc_address: string not null\\nc_nationkey: int32 not null\\nc_phone: string not null\\nc_acctbal: decimal128(15, 2) not null\\nc_mktsegment: string not null\\nc_comment: string not null\", \"generation_s\": 6.20067043399996, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/customer/part.0.parquet\", \"upload_s\": 4.215032301000008, \"upload_attempts\": 1, \"etag\": \"\\\"6d87c1f3d028890966b8746371713f45-129\\\"\"}\n{\"table\": \"lineitem\", \"part\": 1, \"parts\": 6, \"rows\": 99988837, \"bytes\": 2864588086, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 8.168094967000002, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/lineitem/part.0.parquet\", \"upload_s\": 6.455780672000003, \"upload_attempts\": 1, \"etag\": \"\\\"793db8ab8142359626f84eb6f38d94f3-342\\\"\"}\n{\"table\": \"lineitem\", \"part\": 3, \"parts\": 6, \"rows\": 100005393, \"bytes\": 2865268729, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 8.222462248999989, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/lineitem/part.2.parquet\", \"upload_s\": 6.478589749000037, \"upload_attempts\": 1, \"etag\": \"\\\"7386763b1feae10437f8f6022926ddfb-342\\\"\"}\n{\"table\": \"lineitem\", \"part\": 2, \"parts\": 6, \"rows\": 100011089, \"bytes\": 2864161741, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 8.30319470500001, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/lineitem/part.1.parquet\", \"upload_s\": 6.401324880000004, \"upload_attempts\": 1, \"etag\": \"\\\"dd18f9d4b5e03ba414da6823f8bf3383-342\\\"\"}\n{\"table\": \"nation\", \"part\": 1, \"parts\": 1, \"rows\": 25, \"bytes\": 2250, \"row_groups\": 1, \"schema\": \"n_nationkey: int32 not null\\nn_name: string not null\\nn_regionkey: int32 not null\\nn_comment: string not null\", \"generation_s\": 1.1053377420000743, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/nation/part.0.parquet\", \"upload_s\": 2.692068532999997, \"upload_attempts\": 1, \"etag\": \"\\\"f4ff698eeae15f22b9f159e57ba2a819\\\"\"}\n{\"table\": \"lineitem\", \"part\": 4, \"parts\": 6, \"rows\": 100013561, \"bytes\": 2864315036, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 3.7104803349999997, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/lineitem/part.3.parquet\", \"upload_s\": 6.6272417889999815, \"upload_attempts\": 1, \"etag\": \"\\\"a396a1ff5c9ee26736bc6d55464dbf2b-342\\\"\"}\n{\"table\": \"lineitem\", \"part\": 5, \"parts\": 6, \"rows\": 100007339, \"bytes\": 2865084199, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 5.539777275999995, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/lineitem/part.4.parquet\", \"upload_s\": 6.341575955999929, \"upload_attempts\": 1, \"etag\": \"\\\"2f118404e8f58a1e31771afc1decacde-342\\\"\"}\n{\"table\": \"lineitem\", \"part\": 6, \"parts\": 6, \"rows\": 100011683, \"bytes\": 2864185047, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 5.595757902000059, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/lineitem/part.5.parquet\", \"upload_s\": 6.691238032000001, \"upload_attempts\": 1, \"etag\": \"\\\"e258efdac5eedb0a220336f9f30be7a1-342\\\"\"}\n{\"table\": \"orders\", \"part\": 1, \"parts\": 2, \"rows\": 74999973, \"bytes\": 2525756275, \"row_groups\": 57, \"schema\": \"o_orderkey: int64 not null\\no_custkey: int32 not null\\no_orderstatus: string not null\\no_totalprice: decimal128(15, 2) not null\\no_orderdate: date32[day] not null\\no_orderpriority: string not null\\no_clerk: string not null\\no_shippriority: int32 not null\\no_comment: string not null\", \"generation_s\": 4.436014825000029, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/orders/part.0.parquet\", \"upload_s\": 5.827212645000031, \"upload_attempts\": 1, \"etag\": \"\\\"ebf8e4687c666ac784151538042d6fe0-302\\\"\"}\n{\"table\": \"orders\", \"part\": 2, \"parts\": 2, \"rows\": 75000027, \"bytes\": 2525626871, \"row_groups\": 57, \"schema\": \"o_orderkey: int64 not null\\no_custkey: int32 not null\\no_orderstatus: string not null\\no_totalprice: decimal128(15, 2) not null\\no_orderdate: date32[day] not null\\no_orderpriority: string not null\\no_clerk: string not null\\no_shippriority: int32 not null\\no_comment: string not null\", \"generation_s\": 4.064093572000047, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/orders/part.1.parquet\", \"upload_s\": 5.904958655000087, \"upload_attempts\": 1, \"etag\": \"\\\"a637a0fc4282b2cd73d1d6ad7234fd35-302\\\"\"}\n{\"table\": \"region\", \"part\": 1, \"parts\": 1, \"rows\": 5, \"bytes\": 1103, \"row_groups\": 1, \"schema\": \"r_regionkey: int32 not null\\nr_name: string not null\\nr_comment: string not null\", \"generation_s\": 1.1570721530000583, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/region/part.0.parquet\", \"upload_s\": 1.216615571000034, \"upload_attempts\": 1, \"etag\": \"\\\"c2da0b04dd4792d1bd9c40fd005c5688\\\"\"}\n{\"table\": \"part\", \"part\": 1, \"parts\": 1, \"rows\": 20000000, \"bytes\": 508470833, \"row_groups\": 21, \"schema\": \"p_partkey: int32 not null\\np_name: string not null\\np_mfgr: string not null\\np_brand: string not null\\np_type: string not null\\np_size: int32 not null\\np_container: string not null\\np_retailprice: decimal128(15, 2) not null\\np_comment: string not null\", \"generation_s\": 3.2030485069999486, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/part/part.0.parquet\", \"upload_s\": 2.208476128999905, \"upload_attempts\": 1, \"etag\": \"\\\"6eadd75318a4cab52bfe4c87097c9647-61\\\"\"}\n{\"table\": \"supplier\", \"part\": 1, \"parts\": 1, \"rows\": 1000000, \"bytes\": 68669903, \"row_groups\": 2, \"schema\": \"s_suppkey: int32 not null\\ns_name: string not null\\ns_address: string not null\\ns_nationkey: int32 not null\\ns_phone: string not null\\ns_acctbal: decimal128(15, 2) not null\\ns_comment: string not null\", \"generation_s\": 1.2751445979999971, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/supplier/part.0.parquet\", \"upload_s\": 1.439617247000001, \"upload_attempts\": 1, \"etag\": \"\\\"0bac090bf48670118b752048ee50aec2-9\\\"\"}\n{\"table\": \"partsupp\", \"part\": 1, \"parts\": 1, \"rows\": 80000000, \"bytes\": 3787197945, \"row_groups\": 77, \"schema\": \"ps_partkey: int32 not null\\nps_suppkey: int32 not null\\nps_availqty: int32 not null\\nps_supplycost: decimal128(15, 2) not null\\nps_comment: string not null\", \"generation_s\": 4.461170111000001, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf100_plus2201_20261020/partsupp/part.0.parquet\", \"upload_s\": 7.711001167999939, \"upload_attempts\": 1, \"etag\": \"\\\"9560c75e4dc2c55c19880b1ae5d4dd01-452\\\"\"}\n",
+    "generator_commits": [
+      "cdcf74def0072f94bf1886667e8d2ac51feb8721"
+    ],
+    "spec": {
+      "files": {
+        "datasets/tpch_sf100_plus2201_20261020/customer/part.0.parquet": {
+          "bytes": 1076302309,
+          "etag": "6d87c1f3d028890966b8746371713f45-129",
+          "rows": 15000000,
+          "table": "customer"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/lineitem/part.0.parquet": {
+          "bytes": 2864588086,
+          "etag": "793db8ab8142359626f84eb6f38d94f3-342",
+          "rows": 99988837,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/lineitem/part.1.parquet": {
+          "bytes": 2864161741,
+          "etag": "dd18f9d4b5e03ba414da6823f8bf3383-342",
+          "rows": 100011089,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/lineitem/part.2.parquet": {
+          "bytes": 2865268729,
+          "etag": "7386763b1feae10437f8f6022926ddfb-342",
+          "rows": 100005393,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/lineitem/part.3.parquet": {
+          "bytes": 2864315036,
+          "etag": "a396a1ff5c9ee26736bc6d55464dbf2b-342",
+          "rows": 100013561,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/lineitem/part.4.parquet": {
+          "bytes": 2865084199,
+          "etag": "2f118404e8f58a1e31771afc1decacde-342",
+          "rows": 100007339,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/lineitem/part.5.parquet": {
+          "bytes": 2864185047,
+          "etag": "e258efdac5eedb0a220336f9f30be7a1-342",
+          "rows": 100011683,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/nation/part.0.parquet": {
+          "bytes": 2250,
+          "etag": "f4ff698eeae15f22b9f159e57ba2a819",
+          "rows": 25,
+          "table": "nation"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/orders/part.0.parquet": {
+          "bytes": 2525756275,
+          "etag": "ebf8e4687c666ac784151538042d6fe0-302",
+          "rows": 74999973,
+          "table": "orders"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/orders/part.1.parquet": {
+          "bytes": 2525626871,
+          "etag": "a637a0fc4282b2cd73d1d6ad7234fd35-302",
+          "rows": 75000027,
+          "table": "orders"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/part/part.0.parquet": {
+          "bytes": 508470833,
+          "etag": "6eadd75318a4cab52bfe4c87097c9647-61",
+          "rows": 20000000,
+          "table": "part"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/partsupp/part.0.parquet": {
+          "bytes": 3787197945,
+          "etag": "9560c75e4dc2c55c19880b1ae5d4dd01-452",
+          "rows": 80000000,
+          "table": "partsupp"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/region/part.0.parquet": {
+          "bytes": 1103,
+          "etag": "c2da0b04dd4792d1bd9c40fd005c5688",
+          "rows": 5,
+          "table": "region"
+        },
+        "datasets/tpch_sf100_plus2201_20261020/supplier/part.0.parquet": {
+          "bytes": 68669903,
+          "etag": "0bac090bf48670118b752048ee50aec2-9",
+          "rows": 1000000,
+          "table": "supplier"
+        }
+      },
+      "metadata_key": "datasets/tpch_sf100_plus2201_20261020/generation-manifest.jsonl",
+      "metadata_sha256": "923d1bb17a61ea3ca50d28549207d76cb1148b3865234ea546b0130f13640df5",
+      "prefix": "datasets/tpch_sf100_plus2201_20261020",
+      "scale_factor": 100,
+      "tables": {
+        "customer": 15000000,
+        "lineitem": 600037902,
+        "nation": 25,
+        "orders": 150000000,
+        "part": 20000000,
+        "partsupp": 80000000,
+        "region": 5,
+        "supplier": 1000000
+      }
+    }
+  },
+  "300": {
+    "generation_manifest": "{\"table\": \"lineitem\", \"part\": 3, \"parts\": 18, \"rows\": 100005393, \"bytes\": 2909311031, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.142037479999999, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.2.parquet\", \"upload_s\": 5.9817580760000055, \"upload_attempts\": 1, \"etag\": \"\\\"4f2a3b0a545340b191626f86403152d7-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 2, \"parts\": 18, \"rows\": 100011089, \"bytes\": 2908205924, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.16674305100014, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.1.parquet\", \"upload_s\": 6.0910451280001325, \"upload_attempts\": 1, \"etag\": \"\\\"49a4ed358a15438f2070b2d48e28d5f0-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 1, \"parts\": 18, \"rows\": 99988837, \"bytes\": 2908618219, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.1230446200002, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.0.parquet\", \"upload_s\": 6.503339954000239, \"upload_attempts\": 1, \"etag\": \"\\\"e3bcb9c76f9015e31abe5db039b4f4b2-347\\\"\"}\n{\"table\": \"customer\", \"part\": 1, \"parts\": 1, \"rows\": 45000000, \"bytes\": 3228109831, \"row_groups\": 46, \"schema\": \"c_custkey: int32 not null\\nc_name: string not null\\nc_address: string not null\\nc_nationkey: int32 not null\\nc_phone: string not null\\nc_acctbal: decimal128(15, 2) not null\\nc_mktsegment: string not null\\nc_comment: string not null\", \"generation_s\": 9.480944181000268, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/customer/part.0.parquet\", \"upload_s\": 6.382557224000266, \"upload_attempts\": 1, \"etag\": \"\\\"9ee29606018e0574c9074aa308ecde42-385\\\"\"}\n{\"table\": \"lineitem\", \"part\": 5, \"parts\": 18, \"rows\": 100007339, \"bytes\": 2909115725, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.623171091000131, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.4.parquet\", \"upload_s\": 5.698584191999998, \"upload_attempts\": 1, \"etag\": \"\\\"1c3284a996d11c6415f2fc48c9a56d93-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 6, \"parts\": 18, \"rows\": 100010619, \"bytes\": 2908174782, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.473286310000276, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.5.parquet\", \"upload_s\": 5.6589565649996985, \"upload_attempts\": 1, \"etag\": \"\\\"835cc21429cc38aab038829ede09274d-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 4, \"parts\": 18, \"rows\": 100013561, \"bytes\": 2908359968, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.611483280000357, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.3.parquet\", \"upload_s\": 6.123305060999883, \"upload_attempts\": 1, \"etag\": \"\\\"6e1d4fa3780e931bcf71d286b3bd7bb7-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 7, \"parts\": 18, \"rows\": 100002324, \"bytes\": 2908288123, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.378195747000063, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.6.parquet\", \"upload_s\": 5.80453747599995, \"upload_attempts\": 1, \"etag\": \"\\\"33b70809be55d8df21ca451ce8989f42-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 10, \"parts\": 18, \"rows\": 99986586, \"bytes\": 2908898646, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.673180237999986, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.9.parquet\", \"upload_s\": 5.829687762000049, \"upload_attempts\": 1, \"etag\": \"\\\"74c934cc159ad7cedbda04d334e7576c-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 8, \"parts\": 18, \"rows\": 100001814, \"bytes\": 2907751870, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.540064818999781, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.7.parquet\", \"upload_s\": 6.328355981000186, \"upload_attempts\": 1, \"etag\": \"\\\"f73ae63c22cf6c45320bb598a84c590c-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 9, \"parts\": 18, \"rows\": 99992698, \"bytes\": 2908102807, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.609131927999897, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.8.parquet\", \"upload_s\": 6.0721279239996875, \"upload_attempts\": 1, \"etag\": \"\\\"9f4b4551d7487bdad58b0eb8e34c5a03-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 11, \"parts\": 18, \"rows\": 100000541, \"bytes\": 2909113964, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.428357154999958, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.10.parquet\", \"upload_s\": 6.32847205600001, \"upload_attempts\": 1, \"etag\": \"\\\"d95d59ff3beb0b76f86e7a15eedbf845-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 14, \"parts\": 18, \"rows\": 99991797, \"bytes\": 2908821080, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.43652845600036, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.13.parquet\", \"upload_s\": 5.671420922999914, \"upload_attempts\": 1, \"etag\": \"\\\"59a17ea88f473de856a9d5ae700db67e-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 12, \"parts\": 18, \"rows\": 99995646, \"bytes\": 2908948393, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.360673270000007, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.11.parquet\", \"upload_s\": 5.9911887620000925, \"upload_attempts\": 1, \"etag\": \"\\\"2cfd3a52f4c37cf37371b6c58f5ef4be-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 13, \"parts\": 18, \"rows\": 100012600, \"bytes\": 2908305846, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.723080866000146, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.12.parquet\", \"upload_s\": 5.630740175000028, \"upload_attempts\": 1, \"etag\": \"\\\"b781a6bbe2e2858155bc3af358ffdad8-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 15, \"parts\": 18, \"rows\": 99977434, \"bytes\": 2908800438, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 9.535827784000048, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.14.parquet\", \"upload_s\": 5.535694550999779, \"upload_attempts\": 1, \"etag\": \"\\\"9d560340759c1b20f0e98cfa514f6742-347\\\"\"}\n{\"table\": \"nation\", \"part\": 1, \"parts\": 1, \"rows\": 25, \"bytes\": 2250, \"row_groups\": 1, \"schema\": \"n_nationkey: int32 not null\\nn_name: string not null\\nn_regionkey: int32 not null\\nn_comment: string not null\", \"generation_s\": 1.2955579019999277, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/nation/part.0.parquet\", \"upload_s\": 3.6320458310001413, \"upload_attempts\": 1, \"etag\": \"\\\"f4ff698eeae15f22b9f159e57ba2a819\\\"\"}\n{\"table\": \"lineitem\", \"part\": 17, \"parts\": 18, \"rows\": 99993210, \"bytes\": 2909223592, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 7.957011334000072, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.16.parquet\", \"upload_s\": 6.184895604999838, \"upload_attempts\": 1, \"etag\": \"\\\"0a927c6d82cb9776db03fddfd708133a-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 16, \"parts\": 18, \"rows\": 100013300, \"bytes\": 2908491899, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 8.002104707999933, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.15.parquet\", \"upload_s\": 6.55182286299987, \"upload_attempts\": 1, \"etag\": \"\\\"d44e910494502440a2eb8c4193c1abf1-347\\\"\"}\n{\"table\": \"lineitem\", \"part\": 18, \"parts\": 18, \"rows\": 99984303, \"bytes\": 2907846997, \"row_groups\": 94, \"schema\": \"l_orderkey: int64 not null\\nl_partkey: int32 not null\\nl_suppkey: int32 not null\\nl_linenumber: int32 not null\\nl_quantity: decimal128(15, 2) not null\\nl_extendedprice: decimal128(15, 2) not null\\nl_discount: decimal128(15, 2) not null\\nl_tax: decimal128(15, 2) not null\\nl_returnflag: string not null\\nl_linestatus: string not null\\nl_shipdate: date32[day] not null\\nl_commitdate: date32[day] not null\\nl_receiptdate: date32[day] not null\\nl_shipinstruct: string not null\\nl_shipmode: string not null\\nl_comment: string not null\", \"generation_s\": 8.288442695999947, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/lineitem/part.17.parquet\", \"upload_s\": 6.229806580000059, \"upload_attempts\": 1, \"etag\": \"\\\"33fde1a53fdd2c0830773f063bca68f0-347\\\"\"}\n{\"table\": \"orders\", \"part\": 1, \"parts\": 5, \"rows\": 89999943, \"bytes\": 3091563957, \"row_groups\": 69, \"schema\": \"o_orderkey: int64 not null\\no_custkey: int32 not null\\no_orderstatus: string not null\\no_totalprice: decimal128(15, 2) not null\\no_orderdate: date32[day] not null\\no_orderpriority: string not null\\no_clerk: string not null\\no_shippriority: int32 not null\\no_comment: string not null\", \"generation_s\": 5.1059003459999985, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/orders/part.0.parquet\", \"upload_s\": 6.943660679999994, \"upload_attempts\": 1, \"etag\": \"\\\"3f733fcd602a4138bfacf3b259982345-369\\\"\"}\n{\"table\": \"orders\", \"part\": 3, \"parts\": 5, \"rows\": 89999943, \"bytes\": 3091327143, \"row_groups\": 69, \"schema\": \"o_orderkey: int64 not null\\no_custkey: int32 not null\\no_orderstatus: string not null\\no_totalprice: decimal128(15, 2) not null\\no_orderdate: date32[day] not null\\no_orderpriority: string not null\\no_clerk: string not null\\no_shippriority: int32 not null\\no_comment: string not null\", \"generation_s\": 8.627711550000186, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/orders/part.2.parquet\", \"upload_s\": 6.108804164000048, \"upload_attempts\": 1, \"etag\": \"\\\"58e15eb39001cad5f529e1463e7a9e40-369\\\"\"}\n{\"table\": \"orders\", \"part\": 2, \"parts\": 5, \"rows\": 89999943, \"bytes\": 3091489793, \"row_groups\": 69, \"schema\": \"o_orderkey: int64 not null\\no_custkey: int32 not null\\no_orderstatus: string not null\\no_totalprice: decimal128(15, 2) not null\\no_orderdate: date32[day] not null\\no_orderpriority: string not null\\no_clerk: string not null\\no_shippriority: int32 not null\\no_comment: string not null\", \"generation_s\": 8.345650994000152, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/orders/part.1.parquet\", \"upload_s\": 6.965278157000284, \"upload_attempts\": 1, \"etag\": \"\\\"13fc4abd7f13aa0fed4ad2c78f549632-369\\\"\"}\n{\"table\": \"orders\", \"part\": 4, \"parts\": 5, \"rows\": 89999943, \"bytes\": 3091606697, \"row_groups\": 69, \"schema\": \"o_orderkey: int64 not null\\no_custkey: int32 not null\\no_orderstatus: string not null\\no_totalprice: decimal128(15, 2) not null\\no_orderdate: date32[day] not null\\no_orderpriority: string not null\\no_clerk: string not null\\no_shippriority: int32 not null\\no_comment: string not null\", \"generation_s\": 8.988332303999869, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/orders/part.3.parquet\", \"upload_s\": 6.2935664359997645, \"upload_attempts\": 1, \"etag\": \"\\\"7d70dbf5730f57fbf19b6a1c3e8280f5-369\\\"\"}\n{\"table\": \"orders\", \"part\": 5, \"parts\": 5, \"rows\": 90000228, \"bytes\": 3091579737, \"row_groups\": 69, \"schema\": \"o_orderkey: int64 not null\\no_custkey: int32 not null\\no_orderstatus: string not null\\no_totalprice: decimal128(15, 2) not null\\no_orderdate: date32[day] not null\\no_orderpriority: string not null\\no_clerk: string not null\\no_shippriority: int32 not null\\no_comment: string not null\", \"generation_s\": 7.254728068000077, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/orders/part.4.parquet\", \"upload_s\": 6.286208121000072, \"upload_attempts\": 1, \"etag\": \"\\\"7883de4b5d9d9a47afe4ff1b37c7f1dd-369\\\"\"}\n{\"table\": \"part\", \"part\": 1, \"parts\": 1, \"rows\": 60000000, \"bytes\": 1523531420, \"row_groups\": 61, \"schema\": \"p_partkey: int32 not null\\np_name: string not null\\np_mfgr: string not null\\np_brand: string not null\\np_type: string not null\\np_size: int32 not null\\np_container: string not null\\np_retailprice: decimal128(15, 2) not null\\np_comment: string not null\", \"generation_s\": 9.287514391999593, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/part/part.0.parquet\", \"upload_s\": 3.830132912999943, \"upload_attempts\": 1, \"etag\": \"\\\"4dda7375b937855f3d53c801728f55dc-182\\\"\"}\n{\"table\": \"region\", \"part\": 1, \"parts\": 1, \"rows\": 5, \"bytes\": 1103, \"row_groups\": 1, \"schema\": \"r_regionkey: int32 not null\\nr_name: string not null\\nr_comment: string not null\", \"generation_s\": 0.9202926329999173, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/region/part.0.parquet\", \"upload_s\": 1.1458738740002445, \"upload_attempts\": 1, \"etag\": \"\\\"c2da0b04dd4792d1bd9c40fd005c5688\\\"\"}\n{\"table\": \"partsupp\", \"part\": 1, \"parts\": 3, \"rows\": 79999920, \"bytes\": 3787928438, \"row_groups\": 77, \"schema\": \"ps_partkey: int32 not null\\nps_suppkey: int32 not null\\nps_availqty: int32 not null\\nps_supplycost: decimal128(15, 2) not null\\nps_comment: string not null\", \"generation_s\": 9.22392717899993, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/partsupp/part.0.parquet\", \"upload_s\": 6.8668084659998385, \"upload_attempts\": 1, \"etag\": \"\\\"516fdcb21bc339e283b8d70782a1395c-452\\\"\"}\n{\"table\": \"partsupp\", \"part\": 2, \"parts\": 3, \"rows\": 79999920, \"bytes\": 3788981203, \"row_groups\": 77, \"schema\": \"ps_partkey: int32 not null\\nps_suppkey: int32 not null\\nps_availqty: int32 not null\\nps_supplycost: decimal128(15, 2) not null\\nps_comment: string not null\", \"generation_s\": 8.774777495000308, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/partsupp/part.1.parquet\", \"upload_s\": 7.0426654099996995, \"upload_attempts\": 1, \"etag\": \"\\\"50a95fbea1ac66c1d83744e4b9903ff8-452\\\"\"}\n{\"table\": \"partsupp\", \"part\": 3, \"parts\": 3, \"rows\": 80000160, \"bytes\": 3787913681, \"row_groups\": 77, \"schema\": \"ps_partkey: int32 not null\\nps_suppkey: int32 not null\\nps_availqty: int32 not null\\nps_supplycost: decimal128(15, 2) not null\\nps_comment: string not null\", \"generation_s\": 8.20635484100012, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/partsupp/part.2.parquet\", \"upload_s\": 7.176558845999807, \"upload_attempts\": 1, \"etag\": \"\\\"0b7bf2d2b6fd467a1300ccd86052bb92-452\\\"\"}\n{\"table\": \"supplier\", \"part\": 1, \"parts\": 1, \"rows\": 3000000, \"bytes\": 206152717, \"row_groups\": 4, \"schema\": \"s_suppkey: int32 not null\\ns_name: string not null\\ns_address: string not null\\ns_nationkey: int32 not null\\ns_phone: string not null\\ns_acctbal: decimal128(15, 2) not null\\ns_comment: string not null\", \"generation_s\": 1.5350427329999548, \"reused_staging\": false, \"generator_commit\": \"cdcf74def0072f94bf1886667e8d2ac51feb8721\", \"key\": \"datasets/tpch_sf300_plus2201_20261020/supplier/part.0.parquet\", \"upload_s\": 1.6231699750001098, \"upload_attempts\": 1, \"etag\": \"\\\"97a29b5dd01592727d1272d28a3baa1c-25\\\"\"}\n",
+    "generator_commits": [
+      "cdcf74def0072f94bf1886667e8d2ac51feb8721"
+    ],
+    "spec": {
+      "files": {
+        "datasets/tpch_sf300_plus2201_20261020/customer/part.0.parquet": {
+          "bytes": 3228109831,
+          "etag": "9ee29606018e0574c9074aa308ecde42-385",
+          "rows": 45000000,
+          "table": "customer"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.0.parquet": {
+          "bytes": 2908618219,
+          "etag": "e3bcb9c76f9015e31abe5db039b4f4b2-347",
+          "rows": 99988837,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.1.parquet": {
+          "bytes": 2908205924,
+          "etag": "49a4ed358a15438f2070b2d48e28d5f0-347",
+          "rows": 100011089,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.10.parquet": {
+          "bytes": 2909113964,
+          "etag": "d95d59ff3beb0b76f86e7a15eedbf845-347",
+          "rows": 100000541,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.11.parquet": {
+          "bytes": 2908948393,
+          "etag": "2cfd3a52f4c37cf37371b6c58f5ef4be-347",
+          "rows": 99995646,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.12.parquet": {
+          "bytes": 2908305846,
+          "etag": "b781a6bbe2e2858155bc3af358ffdad8-347",
+          "rows": 100012600,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.13.parquet": {
+          "bytes": 2908821080,
+          "etag": "59a17ea88f473de856a9d5ae700db67e-347",
+          "rows": 99991797,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.14.parquet": {
+          "bytes": 2908800438,
+          "etag": "9d560340759c1b20f0e98cfa514f6742-347",
+          "rows": 99977434,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.15.parquet": {
+          "bytes": 2908491899,
+          "etag": "d44e910494502440a2eb8c4193c1abf1-347",
+          "rows": 100013300,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.16.parquet": {
+          "bytes": 2909223592,
+          "etag": "0a927c6d82cb9776db03fddfd708133a-347",
+          "rows": 99993210,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.17.parquet": {
+          "bytes": 2907846997,
+          "etag": "33fde1a53fdd2c0830773f063bca68f0-347",
+          "rows": 99984303,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.2.parquet": {
+          "bytes": 2909311031,
+          "etag": "4f2a3b0a545340b191626f86403152d7-347",
+          "rows": 100005393,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.3.parquet": {
+          "bytes": 2908359968,
+          "etag": "6e1d4fa3780e931bcf71d286b3bd7bb7-347",
+          "rows": 100013561,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.4.parquet": {
+          "bytes": 2909115725,
+          "etag": "1c3284a996d11c6415f2fc48c9a56d93-347",
+          "rows": 100007339,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.5.parquet": {
+          "bytes": 2908174782,
+          "etag": "835cc21429cc38aab038829ede09274d-347",
+          "rows": 100010619,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.6.parquet": {
+          "bytes": 2908288123,
+          "etag": "33b70809be55d8df21ca451ce8989f42-347",
+          "rows": 100002324,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.7.parquet": {
+          "bytes": 2907751870,
+          "etag": "f73ae63c22cf6c45320bb598a84c590c-347",
+          "rows": 100001814,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.8.parquet": {
+          "bytes": 2908102807,
+          "etag": "9f4b4551d7487bdad58b0eb8e34c5a03-347",
+          "rows": 99992698,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/lineitem/part.9.parquet": {
+          "bytes": 2908898646,
+          "etag": "74c934cc159ad7cedbda04d334e7576c-347",
+          "rows": 99986586,
+          "table": "lineitem"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/nation/part.0.parquet": {
+          "bytes": 2250,
+          "etag": "f4ff698eeae15f22b9f159e57ba2a819",
+          "rows": 25,
+          "table": "nation"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/orders/part.0.parquet": {
+          "bytes": 3091563957,
+          "etag": "3f733fcd602a4138bfacf3b259982345-369",
+          "rows": 89999943,
+          "table": "orders"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/orders/part.1.parquet": {
+          "bytes": 3091489793,
+          "etag": "13fc4abd7f13aa0fed4ad2c78f549632-369",
+          "rows": 89999943,
+          "table": "orders"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/orders/part.2.parquet": {
+          "bytes": 3091327143,
+          "etag": "58e15eb39001cad5f529e1463e7a9e40-369",
+          "rows": 89999943,
+          "table": "orders"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/orders/part.3.parquet": {
+          "bytes": 3091606697,
+          "etag": "7d70dbf5730f57fbf19b6a1c3e8280f5-369",
+          "rows": 89999943,
+          "table": "orders"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/orders/part.4.parquet": {
+          "bytes": 3091579737,
+          "etag": "7883de4b5d9d9a47afe4ff1b37c7f1dd-369",
+          "rows": 90000228,
+          "table": "orders"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/part/part.0.parquet": {
+          "bytes": 1523531420,
+          "etag": "4dda7375b937855f3d53c801728f55dc-182",
+          "rows": 60000000,
+          "table": "part"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/partsupp/part.0.parquet": {
+          "bytes": 3787928438,
+          "etag": "516fdcb21bc339e283b8d70782a1395c-452",
+          "rows": 79999920,
+          "table": "partsupp"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/partsupp/part.1.parquet": {
+          "bytes": 3788981203,
+          "etag": "50a95fbea1ac66c1d83744e4b9903ff8-452",
+          "rows": 79999920,
+          "table": "partsupp"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/partsupp/part.2.parquet": {
+          "bytes": 3787913681,
+          "etag": "0b7bf2d2b6fd467a1300ccd86052bb92-452",
+          "rows": 80000160,
+          "table": "partsupp"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/region/part.0.parquet": {
+          "bytes": 1103,
+          "etag": "c2da0b04dd4792d1bd9c40fd005c5688",
+          "rows": 5,
+          "table": "region"
+        },
+        "datasets/tpch_sf300_plus2201_20261020/supplier/part.0.parquet": {
+          "bytes": 206152717,
+          "etag": "97a29b5dd01592727d1272d28a3baa1c-25",
+          "rows": 3000000,
+          "table": "supplier"
+        }
+      },
+      "metadata_key": "datasets/tpch_sf300_plus2201_20261020/generation-manifest.jsonl",
+      "metadata_sha256": "4c69251a2503e9782f02cde7fcb6bdb0f205c50b4be40a10883addcacc75742b",
+      "prefix": "datasets/tpch_sf300_plus2201_20261020",
+      "scale_factor": 300,
+      "tables": {
+        "customer": 45000000,
+        "lineitem": 1799989091,
+        "nation": 25,
+        "orders": 450000000,
+        "part": 60000000,
+        "partsupp": 240000000,
+        "region": 5,
+        "supplier": 3000000
+      }
+    }
+  }
+}
