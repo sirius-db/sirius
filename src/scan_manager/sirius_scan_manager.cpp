@@ -2914,6 +2914,8 @@ void sirius_scan_manager::reset_caches()
       _pinned_parquet_sources.size(),
       names);
     _pinned_parquet_sources.clear();
+    // Those datasources may have been the last readers of their REST contexts.
+    release_idle_rest_contexts();
   }
 
   // Rebuild one context's cache.  shutdown_cache drains the evictor and every
@@ -3909,6 +3911,8 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
   // Replace rather than accumulate: a re-pin under the same name should leave
   // one set of handles, not two covering the same chunks.
   _pinned_parquet_sources[name] = std::move(retained);
+  // The handles replaced may have been the last readers of their REST contexts.
+  release_idle_rest_contexts();
   return total_bytes;
 }
 

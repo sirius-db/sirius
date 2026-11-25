@@ -1920,6 +1920,20 @@ TEST_CASE(
   CHECK(manager.rest_context_count() == 2);
   manager.remove_pinned_entry("reader_region");
   CHECK(manager.rest_context_count() == 1);
+  // Resetting the caches drops the datasources of every pin.
+  REQUIRE(manager.pin_parquet_ranges("reader_nation", {nation}, std::nullopt) > 0);
+  REQUIRE(manager.pin_parquet_ranges("reader_region", {region}, std::nullopt) > 0);
+  CHECK(manager.rest_context_count() == 2);
+  sirius_ctx->reset_caches();
+  CHECK(manager.rest_context_count() == 1);
+  // Pinning a name again drops the datasources it held. With no idle context allowed, the
+  // context that only they held goes.
+  REQUIRE(manager.pin_parquet_ranges("reader_nation", {nation}, std::nullopt) > 0);
+  REQUIRE(manager.pin_parquet_ranges("reader_region", {region}, std::nullopt) > 0);
+  CHECK(manager.rest_context_count() == 2);
+  counters->idle_rest_context_limit_for_testing = 0;
+  REQUIRE(manager.pin_parquet_ranges("reader_nation", {region}, std::nullopt) > 0);
+  CHECK(manager.rest_context_count() == 1);
 }
 
 TEST_CASE("transparent S3 read_parquet expands globbed parquet files",

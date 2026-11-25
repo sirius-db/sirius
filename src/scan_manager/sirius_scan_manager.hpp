@@ -1309,8 +1309,8 @@ class sirius_scan_manager {
   void detach_idle_rest_contexts(retired_io_ctxs& retired) noexcept;
   /// Drops the idle REST contexts beyond the bound, and destroys them on the calling thread
   /// once the map is unlocked. Called when a query's scans are released (@ref reset), when a
-  /// Parquet pin is removed and when a file handle is closed; a build detaches them under the
-  /// locks it already holds.
+  /// Parquet pin's datasources are dropped and when a file handle is closed; a build detaches
+  /// them under the locks it already holds.
   void release_idle_rest_contexts() noexcept;
   std::shared_ptr<idle_rest_context_sweeper> _idle_rest_sweeper =
     std::make_shared<idle_rest_context_sweeper>(*this);
