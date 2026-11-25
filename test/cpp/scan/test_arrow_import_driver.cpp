@@ -2882,6 +2882,7 @@ struct native_kind_tree {
     }
     if (fault == 2) kind.release = nullptr;
     if (fault == 3) kind_schema.release = nullptr;
+    if (fault == 4) kinds[0] = deleted;
   }
 };
 struct native_read_script {
@@ -3029,6 +3030,17 @@ void check_native_ledger(harness const& h)
   CHECK(h.ledger->permits_in_flight() == 0);
   CHECK(h.backing.seen->allocated_bytes == 0);
 }
+
+void check_native_bound(std::exception_ptr error, std::string_view message)
+{
+  REQUIRE(error);
+  try {
+    std::rethrow_exception(error);
+  } catch (sm::preparation_resource_error const& refusal) {
+    CHECK(refusal.bound_exceeded);
+    CHECK(refusal.what() == message);
+  }
+}
 }  // namespace
 TEST_CASE("Paimon producer refuses an Arrow source profile before opening a cursor",
           "[paimon_kind_profile]")
@@ -3081,13 +3093,15 @@ TEST_CASE("Paimon snapshot budget refusal aborts Arrow preparation before public
 
 TEST_CASE("Paimon row-kind must be a live plain leaf before any copy", "[paimon_kind_profile]")
 {
-  auto fault      = GENERATE(0, 1, 2, 3);
+  auto fault      = GENERATE(0, 1, 2, 3, 4);
   auto input      = std::make_shared<native_kind_tree>(fault);
   auto script     = std::make_shared<native_read_script>();
   script->batches = {input};
   auto producer   = scripted_paimon(script);
   harness h(producer, integer_program(), false);
-  CHECK_THROWS(h.next());
+  auto message = fault == 4 ? "Paimon batch contains non-insert row kinds"
+                            : "Paimon batch has no valid row-kind column";
+  CHECK_THROWS_WITH(h.next(), message);
   CHECK(input->releases == 2);
   CHECK(h.backing.seen->allocations == 0);
   CHECK_THROWS(h.next());
@@ -3105,7 +3119,8 @@ TEST_CASE("Paimon producer checks its own row budget before inspecting row kinds
   script->batches = {input};
   // The cursor allows three rows, while this producer admits only one.
   harness h(scripted_paimon(script, {1, 8192, 8192}), integer_program(), false);
-  CHECK_THROWS_WITH(h.next(), "Paimon batch exceeds its declared row bound");
+  check_native_bound(capture_rejection([&] { (void)h.next(); }),
+                     "Paimon batch exceeds its declared row bound");
   CHECK(script->reads == 1);
   CHECK(input->releases == 2);
   CHECK(h.backing.seen->allocations == 0);
@@ -3186,10 +3201,8 @@ TEST_CASE("Paimon worker waits for capacity and rejects oversized copies",
     run.coordinator.after_publication_for_testing([&](auto, auto const&, auto) { ++publications; });
     run.start();
     REQUIRE(run.until([&] { return run.quiescent(); }));
-    auto error = run.completion.terminal_error();
-    REQUIRE(error);
-    CHECK_THROWS_WITH(std::rethrow_exception(error),
-                      "Arrow offered input exceeds copy or normalization bounds");
+    check_native_bound(run.completion.terminal_error(),
+                       "Arrow offered input exceeds copy or normalization bounds");
     CHECK(publications == 0);
     CHECK(h.backing.seen->allocations == 0);
     check_native_retirement(*script, 1, 2);

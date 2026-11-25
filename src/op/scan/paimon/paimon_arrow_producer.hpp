@@ -19,7 +19,8 @@
 #include "op/scan/paimon/paimon_batch_cursor.hpp"
 namespace sirius::op::scan {
 // The factory owns separately admitted native planning and read resources. It opens
-// on the native lane. The producer charges detached Arrow data and staging.
+// on the native lane and must return fields in the bound stable-ID order with plain
+// Arrow layouts and no extension semantics. The producer charges detached data and staging.
 // Bind with arrow_import_binding::emit_empty_source = false for native EOF.
 class paimon_arrow_producer final : public arrow_batch_producer {
  public:

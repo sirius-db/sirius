@@ -202,7 +202,7 @@ void detail::validate_arrow_copy_input(ArrowSchema const& schema,
                                        arrow_metadata_lengths const& metadata_lengths)
 {
   if (array.length > bounds.max_rows)
-    throw std::invalid_argument("Arrow offered input exceeds its declared bounds");
+    throw sm::preparation_resource_error("Arrow offered input exceeds its declared bounds", true);
   auto types = validate_arrow_host_flat(schema, array, metadata_lengths);
   if (types.size() != program.input_types->size())
     throw transparent::arrow_schema_drift_error("Arrow offered input exceeds its declared bounds");
@@ -210,7 +210,8 @@ void detail::validate_arrow_copy_input(ArrowSchema const& schema,
     throw transparent::arrow_schema_drift_error("Arrow offered schema drift");
   if (copy_size(schema, array, types) > aligned(bounds.max_copy_bytes) ||
       arrow_import_staging_bytes(array, types) > bounds.staging_bytes)
-    throw std::invalid_argument("Arrow offered input exceeds copy or normalization bounds");
+    throw sm::preparation_resource_error("Arrow offered input exceeds copy or normalization bounds",
+                                         true);
   for (size_t i = 0; i < types.size(); ++i) {
     if (types[i].id() != cudf::type_id::DECIMAL128) continue;
     int precision = 0;
@@ -314,12 +315,17 @@ struct arrow_push_queue::impl {
     if (!value.schema || !value.array || !value.owner || !value.retained_bytes ||
         value.retained_bytes > bounds.max_offered_bytes)
       throw std::invalid_argument("Arrow offered input exceeds its declared bounds");
-    detail::validate_arrow_copy_input(
-      *value.schema,
-      *value.array,
-      program,
-      {bounds.max_rows, bounds.max_copy_bytes, bounds.staging_bytes},
-      value.metadata_lengths);
+    try {
+      detail::validate_arrow_copy_input(
+        *value.schema,
+        *value.array,
+        program,
+        {bounds.max_rows, bounds.max_copy_bytes, bounds.staging_bytes},
+        value.metadata_lengths);
+    } catch (sm::preparation_resource_error const& error) {
+      // Keep the offered-input contract of Arrow push sources.
+      throw std::invalid_argument(error.what());
+    }
   }
 };
 arrow_push_queue::arrow_push_queue(materialization_program p,
