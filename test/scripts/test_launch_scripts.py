@@ -1,4 +1,5 @@
-"""Tests of scripts/compare_answers.py, sirius_distributed_config.py and launcher_env.sh. No GPU."""
+"""Tests of scripts/compare_answers.py, sirius_distributed_config.py, launcher_env.sh and
+sirius_net.sh. No GPU."""
 
 import shutil
 import subprocess
@@ -175,6 +176,61 @@ class LauncherEnv(unittest.TestCase):
         done = self.source("", {"UCX_NET_DEVICES": "rails"})
         self.assertNotEqual(done.returncode, 0)
         self.assertEqual(done.stdout, "")
+
+
+class RailDevices(unittest.TestCase):
+    def rails(self, ports):
+        """sirius_rail_devices on a host with these (device, port, interface, state, speed, bonded)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for dev, port, net, state, speed, bonded in ports:
+                ib = Path(tmp, "class/infiniband", dev)
+                (ib / "ports" / str(port)).mkdir(parents=True)
+                (ib / "ports" / str(port) / "state").write_text(f"{state}\n")
+                (ib / "device/net" / net).mkdir(parents=True)
+                (ib / "device/net" / net / "dev_port").write_text(f"{port - 1}\n")
+                Path(tmp, "class/net", net).mkdir(parents=True)
+                Path(tmp, "class/net", net, "speed").write_text(f"{speed}\n")
+                if bonded:
+                    Path(tmp, "class/net", net, "master").touch()
+            return subprocess.run(
+                [
+                    "bash",
+                    "-euc",
+                    'source "$1" && sirius_rail_devices "$2"',
+                    "-",
+                    SCRIPTS / "sirius_net.sh",
+                    tmp,
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+    def test_one_port_per_device(self):
+        done = self.rails(
+            [
+                ("mlx5_0", 1, "rail0", "4: ACTIVE", 400000, False),
+                ("mlx5_1", 1, "rail1", "4: ACTIVE", 400000, False),
+                ("mlx5_2", 1, "eth0", "4: ACTIVE", 200000, False),
+                ("mlx5_3", 1, "eth1", "4: ACTIVE", 400000, True),
+                ("mlx5_4", 1, "rail4", "1: DOWN", 400000, False),
+            ]
+        )
+        self.assertEqual(done.stdout, "mlx5_0:1,mlx5_1:1\n", done.stderr)
+
+    def test_a_port_other_than_1(self):
+        done = self.rails(
+            [
+                ("mlx4_0", 1, "ib0", "1: DOWN", 400000, False),
+                ("mlx4_0", 2, "ib1", "4: ACTIVE", 400000, False),
+                ("mlx4_1", 1, "ib2", "4: ACTIVE", 400000, False),
+                ("mlx4_1", 2, "ib3", "4: ACTIVE", 400000, True),
+            ]
+        )
+        self.assertEqual(done.stdout, "mlx4_0:2,mlx4_1:1\n", done.stderr)
+
+    def test_fewer_than_two_rails_is_none(self):
+        done = self.rails([("mlx5_0", 1, "rail0", "4: ACTIVE", 400000, False)])
+        self.assertEqual((done.returncode, done.stdout), (1, ""))
 
 
 if __name__ == "__main__":
