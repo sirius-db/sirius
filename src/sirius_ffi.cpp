@@ -224,9 +224,9 @@ void publish_snapshot(sirius::object_store_scope::registry& registry,
 // A plan that reads from an object store is refused here, before DuckDB's consumer can bind the
 // read: without a snapshot there is nothing to serve it with; outside the snapshot's namespace
 // the read is out of scope; and until the native object-store route lands, a configured context
-// refuses too rather than letting the read reach a legacy path/default route. The offending item
-// is named in redacted form; no secret lookup and no network access happen. Each message starts
-// with a stable reason token.
+// refuses too rather than letting the read reach a legacy path/default route. An offending S3
+// item is shown as `s3://<redacted>`, any other item in redacted form; no secret lookup and no
+// network access happen. Each message starts with a stable reason token.
 void refuse_remote_reads(const std::vector<std::string>& remote_paths,
                          const sirius::object_store_scope::scope_set& set)
 {

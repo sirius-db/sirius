@@ -1,6 +1,7 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include "c_api/error_internal.hpp"
 #include "c_api/plan_internal.hpp"
+#include "io/s3/scope_policy.hpp"
 
 #include <absl/strings/ascii.h>
 #include <absl/strings/escaping.h>
@@ -116,7 +117,12 @@ std::string describe(const sirius_plan_node& root)
         {
           out += "ParquetScan(path=" + quoted(file.path) + ")\n";
         }
-        void operator()(s3_object const&) const { out += "ParquetScan(uri=\"s3://<redacted>\")\n"; }
+        void operator()(s3_object const&) const
+        {
+          out += "ParquetScan(uri=\"";
+          out += sirius::io::s3::redacted_s3_location;
+          out += "\")\n";
+        }
       } show{result};
       std::visit(show, scan->source());
       node = nullptr;
@@ -142,19 +148,18 @@ parquet_scan parquet_scan::parse_scan_source(char const* location, std::size_t l
 {
   auto name = bytes(location, location_size);
   if (!has_uri_scheme(name)) { return parquet_scan{local_file{std::move(name)}}; }
+  using sirius::io::s3::bucket_defect;
   constexpr std::string_view prefix = "s3://";
-  constexpr std::string_view bucket_bytes =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
-  std::string_view const uri = name;
+  std::string_view const uri        = name;
   require(absl::StartsWithIgnoreCase(uri, prefix),
           "Expected a local file path or an s3://bucket/key URI");
   require(uri.find_first_of("?#", prefix.size()) == std::string_view::npos,
           "S3 URI must not contain '?' or '#'");
   auto const bucket_end = uri.find('/', prefix.size());
-  auto const bucket     = uri.substr(prefix.size(), bucket_end - prefix.size());
-  require(!bucket.empty() && bucket != "." && bucket != "..",
-          "S3 bucket must not be empty, '.' or '..'");
-  require(bucket.find_first_not_of(bucket_bytes) == std::string_view::npos,
+  auto const defect =
+    sirius::io::s3::check_bucket(uri.substr(prefix.size(), bucket_end - prefix.size()));
+  require(defect != bucket_defect::empty_or_dot, "S3 bucket must not be empty, '.' or '..'");
+  require(defect != bucket_defect::byte,
           "S3 bucket must use only ASCII letters, digits, '.', '_' or '-'");
   require(bucket_end != std::string_view::npos && bucket_end + 1 < uri.size(),
           "S3 URI has no object key");
