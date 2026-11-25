@@ -54,8 +54,10 @@ struct bulk_read_contexts {
 
 inline bulk_read_contexts& bulk_read_registry() noexcept
 {
-  static bulk_read_contexts registry;
-  return registry;
+  // Never destroyed: a registration can be withdrawn during static destruction, by a database a
+  // static object owns, after a registry built on the first registration would be gone.
+  static auto* const registry = new bulk_read_contexts;
+  return *registry;
 }
 
 }  // namespace detail
