@@ -25,8 +25,8 @@ mod ffi {
     }
 
     /// Named fields for building an [`ObjectStoreConfig`] snapshot; see the C++ struct for
-    /// the meaning of each field. `Debug` is implemented by hand and redacts the three
-    /// credential fields.
+    /// the meaning of each field. `Debug` redacts all seven text values; transport and
+    /// signing mode remain visible.
     #[derive(Clone, Default)]
     struct ObjectStoreConfigArgs {
         endpoint: String,
@@ -131,18 +131,20 @@ mod ffi {
     }
 }
 
+// Callers can format these arguments before validation, including an endpoint with user-info
+// or a signed query.
 impl std::fmt::Debug for ffi::ObjectStoreConfigArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObjectStoreConfigArgs")
-            .field("endpoint", &self.endpoint)
-            .field("region", &self.region)
+            .field("endpoint", &"<redacted>")
+            .field("region", &"<redacted>")
             .field("access_key", &"<redacted>")
             .field("secret_key", &"<redacted>")
             .field("session_token", &"<redacted>")
             .field("transport", &self.transport)
             .field("signing_mode", &self.signing_mode)
-            .field("ca_bundle_path", &self.ca_bundle_path)
-            .field("uri_prefix", &self.uri_prefix)
+            .field("ca_bundle_path", &"<redacted>")
+            .field("uri_prefix", &"<redacted>")
             .finish()
     }
 }

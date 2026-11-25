@@ -34,7 +34,7 @@ def arguments(**overrides):
         iterations=2,
         pin_after_iteration=0,
         pin="none",
-        pin_compression=False,
+        compression_plan_dir=None,
         data_source="duckdb",
         run_timeout=30,
         query_timeout=3,
@@ -349,7 +349,7 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
             dict(concurrency_mode="cooperative", stream_order="permuted"),
             dict(concurrency_mode="cooperative", concurrency=1, profile="cold"),
             dict(pin="parquet"),
-            dict(pin_compression=True),
+            dict(compression_plan_dir="/plans"),
             dict(validation_memory_limit_mb=0),
         ):
             with self.subTest(values=values), self.assertRaises(SystemExit):

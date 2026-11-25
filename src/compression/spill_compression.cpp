@@ -98,14 +98,6 @@ namespace {
 
 constexpr char const* kBitpackPlan =
   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
-constexpr char const* kDeltaBitpackPlan =
-  "input -> delta -> differences\n"
-  "delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
-constexpr char const* kDeltaRleBitpackPlan =
-  "input -> delta -> differences\n"
-  "delta.differences -> rle -> runs, values\n"
-  "delta.differences.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
-  "delta.differences.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 constexpr char const* kDictionaryPlan =
   "input -> dictionary -> keys_offsets, keys_chars, indices\n"
   "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
@@ -142,42 +134,112 @@ constexpr double kMinDeltaSaving = 0.9;
 constexpr double kMinPinRleSavingOfColumn = 0.25;
 
 enum class plan_use { spill, pin };
+/// Detecting the divisor slows the encode by about a tenth, so a bitpack takes it only
+/// when it is estimated to shrink the stream by at least this much.
+constexpr double kMinGcdSaving = 0.95;
+/// Largest power of 5 the encoder folds into a chunk's divisor.
+constexpr int kMaxDivisorPow5 = 27;
+
+/// A plan line bitpacking @p input, with divisor detection when @p gcd.
+std::string bitpack_line(std::string const& input, bool gcd)
+{
+  return input + (gcd ? " -> bitpack_gcd" : " -> bitpack") +
+         " -> chunk_min, chunk_count, chunk_bits, packed\n";
+}
+
+/// Estimated bytes of a bitpacked stream, without and with its per-chunk divisor.
+struct bitpack_estimate {
+  double plain;
+  double gcd;
+
+  [[nodiscard]] bool use_gcd() const { return gcd < kMinGcdSaving * plain; }
+  [[nodiscard]] double bytes() const { return use_gcd() ? gcd : plain; }
+};
 
 /// Estimated bitpack size of a stream of values pushed one at a time: each chunk at the
-/// bit width of its range, plus its min/count/width header.
+/// bit width of its range, plus its min/count/width header. Alongside, the size with the
+/// divisor bitpack_gcd would fold into each chunk: the 2^a * 5^b dividing every v - v0,
+/// for the chunk's first value v0, which is exactly the one dividing every v - min.
+/// Like the encoder, it caps the divisor to fit the stream's signed lane, whose width is
+/// also that of each stored divisor.
 class bitpack_size_estimate {
  public:
+  explicit bitpack_size_estimate(std::size_t lane_bytes)
+    : lane_bytes_{lane_bytes},
+      max_divisor_{(static_cast<unsigned __int128>(1) << (8 * lane_bytes - 1)) - 1}
+  {
+  }
+
   void push(__int128 value)
   {
-    lo_ = count_ == 0 ? value : std::min(lo_, value);
-    hi_ = count_ == 0 ? value : std::max(hi_, value);
+    if (count_ == 0) {
+      lo_ = hi_ = first_ = value;
+      diff_or_           = 0;
+      pow5_              = kMaxDivisorPow5;
+    } else {
+      lo_       = std::min(lo_, value);
+      hi_       = std::max(hi_, value);
+      auto diff = static_cast<unsigned __int128>(value > first_ ? value - first_ : first_ - value);
+      diff_or_ |= diff;
+      for (int e = 0; diff != 0 && e < pow5_; ++e, diff /= 5) {
+        if (diff % 5 != 0) { pow5_ = e; }
+      }
+    }
     if (++count_ == kBitpackChunk) { close_chunk(); }
   }
 
-  /// The estimate, counting a partial last chunk.
-  double finish()
+  /// The estimates, counting a partial last chunk.
+  bitpack_estimate finish()
   {
     close_chunk();
-    return bytes_;
+    // The divisor channel is stored, one lane-wide slot per chunk, once any chunk has one.
+    return {plain_, any_divisor_ ? gcd_ + static_cast<double>(lane_bytes_ * chunks_) : plain_};
   }
 
  private:
+  static int bit_width(unsigned __int128 v)
+  {
+    int bits = 0;
+    for (; v != 0; v >>= 1) {
+      ++bits;
+    }
+    return bits;
+  }
+
   void close_chunk()
   {
     if (count_ == 0) { return; }
-    auto range = static_cast<unsigned __int128>(hi_ - lo_);
-    int bits   = 0;
-    for (; range != 0; range >>= 1) {
-      ++bits;
+    auto const range = static_cast<unsigned __int128>(hi_ - lo_);
+    auto const rows  = static_cast<double>(count_);
+    plain_ += rows * bit_width(range) / 8 + 16;
+    // The encoder's order: the powers of 5, then of 2, each while the product still fits.
+    unsigned __int128 divisor = 1;
+    if (diff_or_ != 0) {
+      for (int e = 0; e < pow5_ && divisor <= max_divisor_ / 5; ++e) {
+        divisor *= 5;
+      }
+      for (auto v = diff_or_; (v & 1) == 0 && divisor <= max_divisor_ / 2; v >>= 1) {
+        divisor <<= 1;
+      }
     }
-    bytes_ += static_cast<double>(count_) * bits / 8 + 16;
+    any_divisor_ = any_divisor_ || divisor != 1;
+    gcd_ += rows * bit_width(range / divisor) / 8 + 16;
+    ++chunks_;
     count_ = 0;
   }
 
+  std::size_t lane_bytes_;
+  unsigned __int128 max_divisor_;
   __int128 lo_{0};
   __int128 hi_{0};
+  __int128 first_{0};
+  unsigned __int128 diff_or_{0};
+  int pow5_{0};
   std::size_t count_{0};
-  double bytes_{0};
+  std::size_t chunks_{0};
+  bool any_divisor_{false};
+  double plain_{0};
+  double gcd_{0};
 };
 
 /// Integer-valued columns (integers, decimals up to 64 bits, dates and times) choose
@@ -185,7 +247,8 @@ class bitpack_size_estimate {
 /// size on a prefix sample. Sorted keys, which often reach a spill still in order, pack
 /// far smaller as differences, and runs of equal keys smaller still as runs. The sample
 /// is bounded (kIntegerSampleRows), so estimating it on the host costs little next to
-/// the GPU encode that follows.
+/// the GPU encode that follows. Each bitpack of the chosen plan detects its per-chunk
+/// divisor only where the sample says that pays.
 std::string integer_plan(cudf::column_view const& column, ::cuda::stream_ref stream, plan_use use)
 {
   auto const width = cudf::size_of(column.type());
@@ -200,10 +263,10 @@ std::string integer_plan(cudf::column_view const& column, ::cuda::stream_ref str
 
   bool const is_unsigned = cudf::is_unsigned(column.type());
   auto const shift       = 64 - 8 * static_cast<int>(width);
-  bitpack_size_estimate values;
-  bitpack_size_estimate deltas;
-  bitpack_size_estimate run_lengths;
-  bitpack_size_estimate run_values;
+  bitpack_size_estimate values{width};
+  bitpack_size_estimate deltas{width};
+  bitpack_size_estimate run_lengths{sizeof(std::int32_t)};  // rle stores its run counts as int32
+  bitpack_size_estimate run_values{width};
   __int128 previous      = 0;
   __int128 run_value     = 0;
   std::size_t run_length = 0;
@@ -232,19 +295,30 @@ std::string integer_plan(cudf::column_view const& column, ::cuda::stream_ref str
   run_lengths.push(static_cast<__int128>(run_length));
   run_values.push(run_value);
 
-  auto const bitpack = values.finish();
-  auto const delta   = deltas.finish();
-  auto const rle     = run_lengths.finish() + run_values.finish();
+  auto const bitpack  = values.finish();
+  auto const delta    = deltas.finish();
+  auto const runs     = run_lengths.finish();
+  auto const run_vals = run_values.finish();
+  auto const rle      = runs.bytes() + run_vals.bytes();
+  auto const rle_plan = [&] {
+    return "input -> delta -> differences\n"
+           "delta.differences -> rle -> runs, values\n" +
+           bitpack_line("delta.differences.runs", runs.use_gcd()) +
+           bitpack_line("delta.differences.values", run_vals.use_gcd());
+  };
+  auto const delta_plan = [&] {
+    return "input -> delta -> differences\n" + bitpack_line("delta.differences", delta.use_gcd());
+  };
   if (use == plan_use::pin) {
-    bool const take_delta = delta < kMinDeltaSaving * bitpack;
-    auto const filterable = take_delta ? delta : bitpack;
+    bool const take_delta = delta.bytes() < kMinDeltaSaving * bitpack.bytes();
+    auto const filterable = take_delta ? delta.bytes() : bitpack.bytes();
     auto const sample     = static_cast<double>(rows * width);
-    if (filterable - rle >= kMinPinRleSavingOfColumn * sample) { return kDeltaRleBitpackPlan; }
-    return take_delta ? kDeltaBitpackPlan : kBitpackPlan;
+    if (filterable - rle >= kMinPinRleSavingOfColumn * sample) { return rle_plan(); }
+    return take_delta ? delta_plan() : bitpack_line("input", bitpack.use_gcd());
   }
-  if (rle < kMinDeltaSaving * std::min(bitpack, delta)) { return kDeltaRleBitpackPlan; }
-  if (delta < kMinDeltaSaving * bitpack) { return kDeltaBitpackPlan; }
-  return kBitpackPlan;
+  if (rle < kMinDeltaSaving * std::min(bitpack.bytes(), delta.bytes())) { return rle_plan(); }
+  if (delta.bytes() < kMinDeltaSaving * bitpack.bytes()) { return delta_plan(); }
+  return bitpack_line("input", bitpack.use_gcd());
 }
 
 std::string default_plan(cudf::column_view const& column, ::cuda::stream_ref stream, plan_use use)

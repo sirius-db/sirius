@@ -101,7 +101,7 @@ TEST_CASE("a failed distributed window aborts its query on the other ranks",
                                                  sirius::exchange::make_stream_id(query, 1),
                                                  nullptr,
                                                  gpu,
-                                                 rmm::cuda_stream_default,
+                                                 ::cuda::stream_ref{cudaStream_t{}},
                                                  std::chrono::seconds{60}),
                     Catch::Matchers::ContainsSubstring("rank 0 failed"));
   CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds{30});

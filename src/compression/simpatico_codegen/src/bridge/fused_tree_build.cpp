@@ -28,7 +28,8 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree, NodeId nid, Buil
   PlanNode const& node = tree.nodes[nid];
 
   if (node.op == "bitpack") {
-    auto t = jit::FusedTree::make(OpKind::Bitpack);
+    auto t         = jit::FusedTree::make(OpKind::Bitpack);
+    t->bitpack_gcd = node.attrs.bitpack_gcd;
     out.preorder.push_back({t.get(), nid, false, 0});
     return t;
   }

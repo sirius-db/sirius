@@ -176,7 +176,7 @@ chunks upload the same compressed bytes whether or not the decode keeps the dict
 upload term, so each narrow column must justify itself through the plan.
 
 The pass walks the physical tree bottom-up with the same traversal and per-operator column maps
-the propagation pass uses (including DELIM_JOIN sub-trees), tracing each candidate column's
+the propagation pass uses, tracing each candidate column's
 carrier from its scan upward and accumulating four use flags:
 
 - **transport** — the carrier survives into a hash-join payload output (the feeder
@@ -192,9 +192,8 @@ carrier from its scan upward and accumulating four use flags:
 - **evaluator restore** — any other reference occurrence inside an evaluated expression, which
   the evaluator restores unconditionally;
 - **boundary restore** — the carrier dies where propagation inserts a restore projection: join
-  keys, value-sensitive aggregate inputs, ineligible aggregates, unmodeled operators, entry into
-  a DELIM_JOIN sub-root (propagation restores the sub-root's children in place, so sub-root
-  operators award no transport), or survival to the plan root.
+  keys, value-sensitive aggregate inputs, ineligible aggregates, unmodeled operators, or survival
+  to the plan root.
 
 The verdict per column is: keep narrow iff transport, or (no boundary restore and (narrow
 comparison or no evaluator restore)). Every other column's sidecar entry is flipped back to
@@ -339,7 +338,6 @@ the finished sidecars at wrap time rather than through a propagation case:
 | PARTITION / CONCAT (hash-join feeder) | `wrap_join_child` | Keys native, payloads narrow (sidecar copied from the join child) |
 | PARTITION (NLJ feeder) | `wrap_join_child` | Native (NLJ children are restored at the boundary) |
 | PARTITION / MERGE_GROUP_BY (grouped aggregate) | `wrap_hash_group_by` | Group keys narrow, aggregate states native (sidecar copied from the aggregate) |
-| PARTITION (DELIM distinct) | `wrap_delim_distinct` | Native (`distinct_root` is restored in place) |
 | MERGE_AGGREGATE / TOP_N chain / sort chain | other wraps | Native boundaries |
 | GPU_SCAN + DYNAMIC_FILTER leaf pair | `wrap_table_scan_source` | Planned dynamic-filter targets native, payloads narrow (both stamped with the scan sidecar) |
 

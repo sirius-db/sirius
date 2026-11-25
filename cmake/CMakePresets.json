@@ -9,6 +9,10 @@
       "name": "release"
     },
     {
+      "configurePreset": "release-meld",
+      "name": "release-meld"
+    },
+    {
       "configurePreset": "relwithdebinfo",
       "name": "relwithdebinfo"
     },
@@ -84,6 +88,17 @@
       "displayName": "GCC Release",
       "inherits": "base",
       "name": "release"
+    },
+    {
+      "binaryDir": "${fileDir}/../build/release-meld",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SIMPATICO_ENABLE_MELD": "ON",
+        "SIMPATICO_MELD_SOURCE_DIR": "${fileDir}/../../meld"
+      },
+      "displayName": "GCC Release, with Meld's decoders",
+      "inherits": "base",
+      "name": "release-meld"
     },
     {
       "binaryDir": "${fileDir}/../build/relwithdebinfo",

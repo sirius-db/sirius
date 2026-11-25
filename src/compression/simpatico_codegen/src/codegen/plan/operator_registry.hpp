@@ -67,6 +67,11 @@ std::vector<OperatorInfo> const& operator_registry();
 // Registry row for an OpId.
 OperatorInfo const& op_info(OpId id);
 
+// The DSL name of a Bitpack that also folds a per-chunk divisor 2^a * 5^b out of its
+// residuals. It parses to a "bitpack" node with op_attrs::bitpack_gcd set, so paths,
+// persisted trees and the decoder see a plain Bitpack.
+inline constexpr std::string_view kBitpackGcdName = "bitpack_gcd";
+
 // Resolve a DSL compressor name (including parameterised suffix forms) to its
 // OpId, or nullopt if unrecognised.
 std::optional<OpId> op_id_from_name(std::string const& name);

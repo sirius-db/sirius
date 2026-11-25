@@ -420,6 +420,7 @@ std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
  */
 class parquet_batch_coalescer : public batch_coalescer {
  public:
+  bool asynchronous_preparation() const noexcept override { return true; }
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                           std::shared_ptr<scan_plan const> plan,
@@ -525,6 +526,7 @@ class parquet_batch_coalescer : public batch_coalescer {
         (schema_changed || _partition_values != file->partition_values ||
          _disable_pushdown != file->disable_filter_pushdown ||
          _requires_row_positions != file->requires_row_positions ||
+         _run_visibility_class != file->visibility_class ||
          (_run_reader_options != file->reader_options && !same_virtual_projection) ||
          mapping_changed)) {
       auto batch = emit_current();
@@ -541,6 +543,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     _partition_values       = file->partition_values;
     _disable_pushdown       = file->disable_filter_pushdown;
     _requires_row_positions = file->requires_row_positions;
+    _run_visibility_class   = file->visibility_class;
 
     std::vector<cudf::size_type> cur_rgs;
     std::size_t cur_output             = 0;
@@ -741,6 +744,8 @@ class parquet_batch_coalescer : public batch_coalescer {
   bool _disable_pushdown          = false;
   bool _requires_row_positions    = false;
   bool _contains_position_deletes = false;
+  /// Visibility class of the current run; a file with another one starts a new batch.
+  std::shared_ptr<void const> _run_visibility_class;
   /// Reader options of the current run. Projected and natural reads cannot share
   /// a split.
   std::shared_ptr<cudf::io::parquet_reader_options> _run_reader_options;
@@ -910,7 +915,8 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
                                                             bind.projected_output_count,
                                                             bind.partition_indices,
                                                             bind.virtual_columns,
-                                                            allow_metadata_only));
+                                                            allow_metadata_only,
+                                                            bind.delete_key_primary_indices));
   if (allow_metadata_only && (_plan->carrier_batch_index || _plan->data_columns.empty())) {
     _read_mode = parquet_read_mode::METADATA_ONLY;
   }
@@ -1671,7 +1677,9 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   std::unordered_set<std::size_t> pure_filter_chunk_indices;
   // Empty evolved files have a footer schema but no column chunks to account.
   if (file_projected && (!mapping || !metadata.row_groups.empty())) {
-    auto const filter_only_positions = _plan->filter_only_batch_positions();
+    // Delete keys are read and dropped like pure-filter columns, so they are accounted alike.
+    auto filter_only_positions = _plan->filter_only_batch_positions();
+    filter_only_positions.merge(_plan->delete_key_batch_positions());
     bool const has_data_output = std::ranges::any_of(_plan->columns.data_roles, [](auto role) {
       return role == scan_column_layout::data_role::OUTPUT;
     });

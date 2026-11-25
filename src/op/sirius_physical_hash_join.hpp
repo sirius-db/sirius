@@ -226,7 +226,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! The indices/types of the rhs columns that need to be output
   join_projection_columns rhs_output_columns;
 
-  //! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
+  //! DuckDB's `mark_types` of a MARK join; empty for other join types
   duckdb::vector<sirius::logical_type> delim_types;
 
   mutable bool unique_build_keys = false;
@@ -302,7 +302,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void set_kept_build_streaming(bool enabled) noexcept { _kept_build_streaming = enabled; }
   [[nodiscard]] bool kept_build_streaming() const noexcept
   {
-    return _kept_build_streaming && !_is_delim_join_inner &&
+    return _kept_build_streaming &&
            (join_type == duckdb::JoinType::RIGHT_SEMI || join_type == duckdb::JoinType::RIGHT_ANTI);
   }
 
@@ -532,8 +532,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// Null-matching flag for the equi-keys passed to cuDF joins, cached at
   /// construction (conditions and join_type are fixed thereafter). cuDF applies one
   /// flag to all key columns, so it is EQUAL (null-safe -- NULL matches NULL) only
-  /// when EVERY equi-key is IS NOT DISTINCT FROM; a plain `=` key (including mixed
-  /// joins such as delim joins) forces UNEQUAL. A MARK join follows the same rule:
+  /// when EVERY equi-key is IS NOT DISTINCT FROM; a plain `=` key (including a join
+  /// that mixes the two kinds) forces UNEQUAL. A MARK join follows the same rule:
   /// all-null-safe keys use EQUAL and emit definite marks (see mark_is_null_safe),
   /// anything containing a plain key uses UNEQUAL and the IN/EXISTS three-valued
   /// result logic. A MARK join *mixing* the two is rejected at plan time.
@@ -586,12 +586,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   }
 
  public:
-  //! True when this HJ is the internal `delim.join` of a RIGHT_DELIM_JOIN (set in its
-  //! constructor). The delim join owns its execution: `is_sink()` returns false and
-  //! `build_join_pipelines` skips build-side externalization.
-  [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
-  void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
-
   [[nodiscard]] bool single_join_error_on_multiple_rows() const
   {
     return single_join_error_on_multiple_rows_;
@@ -601,19 +595,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     single_join_error_on_multiple_rows_ = value;
   }
 
-  // Sink Interface
-  //! The inner join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule
-  //! applies (sink iff parent is PARTITION or RIGHT_DELIM_JOIN).
-  bool is_sink() const override
-  {
-    if (_is_delim_join_inner) { return false; }
-    return sirius_physical_operator::is_sink();
-  }
-
   void on_finalize_operator() override;
 
  protected:
-  bool _is_delim_join_inner  = false;
   bool _kept_build_streaming = false;
 
   /// Kept-build BUILD_PROBE task for one slot: build (SCHEDULED) and probe, or emit

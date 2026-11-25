@@ -72,7 +72,7 @@ void install_physical_schema(sirius::op::sirius_physical_operator& op,
  * The residency gate decides what can be narrow from the carriers stored in the pinned cache; this
  * pass decides what should stay narrow for the query. A GPU-tier serve pays no host-to-GPU upload,
  * so a narrow column must earn its keep inside the plan: the pass walks the tree bottom-up with the
- * same operator column maps `propagate_compressed_schema` uses (including DELIM_JOIN sub-trees) and
+ * same operator column maps `propagate_compressed_schema` uses and
  * classifies every use of each candidate column of a scan marked `sidecar_from_gpu_tier_pin`. A
  * column stays narrow iff it survives into a hash-join payload output or an eligible
  * grouped-aggregate key output (transport benefit), or it engages a narrow-domain
@@ -101,7 +101,7 @@ std::size_t apply_tier_narrowing_policy(sirius::op::sirius_physical_operator& pl
  * the aggregate do not constrain their value carriers. Shapes outside its preconditions (multiple
  * grouping sets, grouping functions, AVG or COUNT(DISTINCT) partial layouts) fall through to the
  * native boundary. Every other operator type restores all of its children to native and clears its
- * own sidecar; the `join` and `distinct_root` sub-trees of a DELIM_JOIN are likewise forced native.
+ * own sidecar.
  *
  * This pass runs on the pre-wrap tree only: pipeline wrapper operators (PARTITION, CONCAT,
  * MERGE_*, SORT_PARTITION, SORT_SAMPLE, GPU_SCAN, DYNAMIC_FILTER) are inserted afterwards by
@@ -137,7 +137,7 @@ void prune_immediate_scan_restores(duckdb::unique_ptr<sirius::op::sirius_physica
  * @brief Run the compressed-materialization pass pipeline over a complete plan.
  *
  * A tree with no physical sidecars returns immediately. Otherwise, when every logical type in the
- * tree (including DELIM_JOIN sub-trees) maps to a cuDF carrier, runs `apply_tier_narrowing_policy`,
+ * tree maps to a cuDF carrier, runs `apply_tier_narrowing_policy`,
  * `propagate_compressed_schema`, `restore_native_schema`, and `prune_immediate_scan_restores` in
  * that order; an unmappable tree instead clears every sidecar so the plan is entirely native.
  * Returns the number of narrow targets the tier policy retracted, for the caller to record.

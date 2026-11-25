@@ -285,6 +285,29 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
 }
 
 TEST_CASE_METHOD(DomainEvidenceFixture,
+                 "a column alias does not hide pinned domain evidence",
+                 "[integration][gpu_execution][dynamic_filter][domain_evidence][build_key_domain]")
+{
+  using source = sirius::op::dynamic_filter_domain_source;
+  build("first.parquet");
+  pin("first.parquet", "gpu");
+  // The file's columns are (payload, k, other, marker) and the pin declares `k` unique. The
+  // aliases trade the names of the first two. Matched by alias, neither column would carry the
+  // name its pin holds, and both would lose their evidence.
+  auto const aliased = [&](std::string const& key) {
+    return "SELECT p.p FROM read_parquet(" + directory.file_literal("probe.parquet") +
+           ") p JOIN read_parquet(" + directory.file_literal("first.parquet") +
+           ") AS b(k, payload, other, marker) ON p.k = b." + key;
+  };
+  auto const declared = evidence(aliased("payload"));
+  CHECK(declared.source == source::pinned_parquet_exact);
+  CHECK(declared.declared_unique);
+  auto const undeclared = evidence(aliased("k"));
+  CHECK(undeclared.source == source::pinned_parquet_exact);
+  CHECK_FALSE(undeclared.declared_unique);
+}
+
+TEST_CASE_METHOD(DomainEvidenceFixture,
                  "bound domain evidence is copied and discarded after a pin replacement",
                  "[integration][gpu_execution][dynamic_filter][domain_evidence][build_key_domain]")
 {

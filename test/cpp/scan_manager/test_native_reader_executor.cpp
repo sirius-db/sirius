@@ -15,7 +15,10 @@
  */
 
 #include "catch.hpp"
+#include "exec/thread_util.hpp"
 #include "scan_manager/preparation_fixture.hpp"
+
+#include <future>
 
 using namespace sirius::scan_manager;
 using namespace sirius::test::preparation;
@@ -143,4 +146,44 @@ TEST_CASE("partial native worker startup rolls back before admitting readers",
   leases.clear();
   CHECK(created == 3);
   CHECK_NOTHROW(executor.stop());
+}
+
+TEST_CASE("lazy native workers use the saved startup mask", "[native_runtime][startup_affinity]")
+{
+  using namespace sirius::exec::thread_util;
+  auto cpus = get_current_thread_affinity();
+  REQUIRE_FALSE(cpus.empty());
+  native_reader_executor executor(1, 1, cpus);
+  auto gate         = std::make_shared<preparation_gate>();
+  auto notification = executor.observe(preparation_wakeup{gate});
+  std::vector<std::unique_ptr<native_reader_executor::lease>> leases;
+  std::vector<int> caller_after;
+  std::exception_ptr error;
+  struct observe : native_reader_executor::operation {
+    std::promise<std::vector<int>> result;
+    void run() noexcept override { result.set_value(get_current_thread_affinity()); }
+  };
+  auto operation = std::make_unique<observe>();
+  auto ready     = operation->result.get_future();
+  std::thread caller([&] {
+    try {
+      scoped_thread_affinity narrow(std::vector<int>{cpus.front()});
+      leases       = executor.reserve(1);
+      caller_after = get_current_thread_affinity();
+      leases.front()->submit(std::move(operation));
+    } catch (...) {
+      error = std::current_exception();
+    }
+  });
+  caller.join();
+  if (error) std::rethrow_exception(error);
+  REQUIRE(ready.wait_for(2s) == std::future_status::ready);
+  CHECK(ready.get() == cpus);
+  CHECK(caller_after == std::vector<int>{cpus.front()});
+  {
+    std::unique_lock lock(gate->mutex);
+    REQUIRE(gate->cv.wait_for(lock, 2s, [&] { return leases.front()->idle(); }));
+  }
+  leases.clear();
+  executor.stop();
 }

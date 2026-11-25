@@ -528,6 +528,59 @@ TEST_CASE("GPU errors precede terminal task destruction even when logging throws
   lifecycle.close(next_query);
 }
 
+TEST_CASE("A finalize failure after a successful task fails the query, not the process",
+          "[gpu_pipeline_executor][issue-1625]")
+{
+  using namespace std::chrono_literals;
+  auto completion = std::make_shared<sirius::pipeline::completion_handler>();
+  auto done       = completion->get_awaitable();
+
+  const auto query = sirius::make_query_id(7);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(query);
+  auto manager    = initialize_memory_manager(1);
+  auto* mem_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(mem_space);
+
+  // A terminal pipeline whose sole task succeeds; destroying that task finalizes `failing`.
+  sirius::op::test_physical_operator terminal(
+    sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR, {}, 0);
+  sirius::op::test_physical_operator failing(
+    sirius::op::SiriusPhysicalOperatorType::PROJECTION, {}, 0);
+  failing.add_finalize_listener([] { throw std::runtime_error("finalize failed"); });
+  auto pipe = std::make_shared<sirius::pipeline::sirius_pipeline>(
+    sirius::pipeline::pipeline_build_context{sirius::test::make_test_telemetry_context()});
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*pipe, terminal);
+  build_state.add_pipeline_operator(*pipe, failing);
+  build_state.set_pipeline_sink(*pipe, &terminal, 1);
+  pipe->set_query_id(query);
+  pipe->set_completion_handler(completion);
+  auto global = std::make_shared<test_gpu_pipeline_task_global_state>();
+  global->set_pipeline(pipe);
+  global->set_completion_handler(completion);
+
+  sirius::exec::channel<std::unique_ptr<sirius::pipeline::task_request>> requests;
+  sirius::pipeline::gpu_pipeline_executor executor(lifecycle,
+                                                   {1, "finalize-failure"},
+                                                   mem_space,
+                                                   requests.make_publisher(),
+                                                   nullptr,
+                                                   sirius::test::make_test_telemetry_context());
+  executor.start();
+  REQUIRE(executor.schedule(std::make_unique<sirius_pipeline_task>(
+    1, std::make_unique<test_gpu_pipeline_task_local_state>(nullptr), global)));
+  REQUIRE(done.wait_for(5s) == std::future_status::ready);
+  CHECK_THROWS_WITH(done.get(), "finalize failed");
+  lifecycle.quiesce_and_wait_for_submissions(query);
+  lifecycle.wait_for_work(query);
+  executor.stop();
+  CHECK(global->executed_count.load() == 1);
+  CHECK(global->error_count.load() == 0);
+  CHECK_FALSE(pipe->is_pipeline_finished());
+  lifecycle.close(query);
+}
+
 TEST_CASE("bounded pool survives a throwing error sink and releases its slot",
           "[bounded_thread_pool]")
 {

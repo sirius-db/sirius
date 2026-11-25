@@ -19,7 +19,6 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -47,7 +46,7 @@
 // output), narrow_comparison (engages a narrow-domain comparison or BETWEEN), evaluator_restore
 // (any other reference occurrence inside an expression), and boundary_restore (dies where
 // propagation would insert a restore projection: join keys, value-sensitive aggregate inputs,
-// ineligible or unmodeled operators, entry into a DELIM_JOIN sub-root, the plan root). The verdict
+// ineligible or unmodeled operators, the plan root). The verdict
 // per column is `keep iff transport or (not boundary_restore and (narrow_comparison or not
 // evaluator_restore))`.
 //
@@ -88,12 +87,6 @@ struct policy_state {
 // Output position -> candidate index for one subtree, sized to the operator's output width; an
 // empty slot means that output column carries no candidate narrow carrier.
 using carried_columns = std::vector<std::optional<std::size_t>>;
-
-bool is_delim_join(sirius::op::sirius_physical_operator const& op) noexcept
-{
-  return op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-         op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
-}
 
 void mark_boundary_restore(policy_state& state, carried_columns const& columns)
 {
@@ -294,30 +287,6 @@ void classify_expression(sirius::ast::node const& expr,
     expr.v);
 }
 
-carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy_state& state);
-
-// Analyze one DELIM_JOIN sub-tree. Propagation restores every child of @p sub_root in place and
-// clears the sub-root's own sidecar, so the sub-root's operator case never runs here: it can
-// award no transport and forward no carrier, and every carried column reaching the sub-root's
-// input boundary is a boundary restore. A TABLE_SCAN sub-root has no inputs; its own seeded
-// outputs die at the cleared sub-root output instead. A DELIM_JOIN sub-root recurses into its
-// internal sub-trees the same way.
-void analyze_delim_subtree(sirius::op::sirius_physical_operator& sub_root, policy_state& state)
-{
-  if (sub_root.type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
-    mark_boundary_restore(state, analyze_subtree(sub_root, state));
-    return;
-  }
-  for (auto& child : sub_root.children) {
-    if (child) { mark_boundary_restore(state, analyze_subtree(*child, state)); }
-  }
-  if (is_delim_join(sub_root)) {
-    auto& delim = sub_root.Cast<sirius::op::sirius_physical_delim_join>();
-    if (delim.join) { analyze_delim_subtree(*delim.join, state); }
-    if (delim.distinct_root) { analyze_delim_subtree(*delim.distinct_root, state); }
-  }
-}
-
 // Bottom-up walk returning the carried-column map of @p op 's output. Each case mirrors the
 // propagation case of the same operator: a use is recorded on the origin candidate, then the map
 // is transformed the way propagation forwards carriers. Falling out of the switch is the native
@@ -328,12 +297,6 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
   child_maps.reserve(op.children.size());
   for (auto& child : op.children) {
     child_maps.push_back(child ? analyze_subtree(*child, state) : carried_columns{});
-  }
-
-  if (is_delim_join(op)) {
-    auto& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
-    if (delim.join) { analyze_delim_subtree(*delim.join, state); }
-    if (delim.distinct_root) { analyze_delim_subtree(*delim.distinct_root, state); }
   }
 
   // The policy runs before propagation, so scans own the only sidecars in the tree.

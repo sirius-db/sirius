@@ -73,6 +73,9 @@ struct bitjoin_attrs {
 struct op_attrs {
   std::optional<bitextract_attrs> bitextract;
   std::optional<bitjoin_attrs> bitjoin;
+  // A Bitpack from `bitpack_gcd`: its encoder detects the per-chunk divisor. Encode-only,
+  // so it is not persisted; a divisor-free Bitpack decodes the same either way.
+  bool bitpack_gcd = false;
 };
 
 struct PlanNode {

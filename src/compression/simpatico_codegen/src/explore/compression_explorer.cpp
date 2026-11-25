@@ -407,7 +407,7 @@ operator_trial try_operator(std::string const& name,
   }
   // Integer-only preprocessing operators
   if ((name == "delta" || name == "for" || name == "zigzag" || name == "bitpack" ||
-       name == "rle") &&
+       name == kBitpackGcdName || name == "rle") &&
       !is_int && !is_float) {
     r.error_message = name + ": requires numeric input";
     return r;
@@ -641,8 +641,21 @@ exploration_result explore_column_compression(cudf::column_view input,
         auto const& pend = candidate->pending[pi];
 
         for (auto const& op_name : all_ops) {
-          auto trial = try_operator(op_name, pend.column, stream, mr);
+          // One bitpack trial covers both variants: it detects divisors, and the step is
+          // named bitpack_gcd only if a chunk found one, so a plan pays for detection
+          // only where it shrinks the output.
+          bool const bitpack = op_name == "bitpack";
+          auto trial =
+            try_operator(bitpack ? std::string(kBitpackGcdName) : op_name, pend.column, stream, mr);
           if (!trial.success) continue;
+          std::string step_op = op_name;
+          if (bitpack &&
+              std::any_of(
+                trial.outputs.begin(), trial.outputs.end(), [](compressible_output const& o) {
+                  return o.name == "chunk_divisors" && o.view.size() > 0;
+                })) {
+            step_op = kBitpackGcdName;
+          }
 
           if (config.verbose && depth == 0) {
             double tr = (double)pend.size_bytes / std::max<size_t>(trial.output_bytes, 1);
@@ -658,7 +671,7 @@ exploration_result explore_column_compression(cudf::column_view input,
 
           auto output_names = format_output_names(trial.outputs);
           std::ostringstream dsl_line;
-          dsl_line << pend.path << " -> " << op_name;
+          dsl_line << pend.path << " -> " << step_op;
           if (!output_names.empty() && !is_terminal_compressor(op_name))
             dsl_line << " -> " << output_names;
 
@@ -679,7 +692,9 @@ exploration_result explore_column_compression(cudf::column_view input,
               (pend.path == "input") ? op_name + "." + out.name : pend.path + "." + out.name;
             size_t out_sz = column_size_bytes_ex(out.view, stream);
             pending_item po{out_path, out.view, out_sz};
-            if (is_term)
+            // An empty channel (bitpack's chunk_divisors without a divisor) has nothing to
+            // compress, so it would only take beam slots.
+            if (is_term || out.view.size() == 0)
               child->leaves.push_back(po);
             else
               child->pending.push_back(po);

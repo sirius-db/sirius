@@ -20,7 +20,6 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -63,25 +62,11 @@ bool native_physical_schema_is_mappable(sirius::op::sirius_physical_operator con
     op.types, [](auto const& type) { return sirius::get_cudf_type(type).has_value(); });
 }
 
-bool is_delim_join(sirius::op::sirius_physical_operator const& op) noexcept
-{
-  return op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-         op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
-}
-
 bool compressed_schema_tree_is_mappable(sirius::op::sirius_physical_operator const& op)
 {
   if (!native_physical_schema_is_mappable(op)) { return false; }
   for (auto const& child : op.children) {
     if (child && !compressed_schema_tree_is_mappable(*child)) { return false; }
-  }
-
-  if (is_delim_join(op)) {
-    auto const& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
-    if (delim.join && !compressed_schema_tree_is_mappable(*delim.join)) { return false; }
-    if (delim.distinct_root && !compressed_schema_tree_is_mappable(*delim.distinct_root)) {
-      return false;
-    }
   }
   return true;
 }
@@ -92,14 +77,6 @@ bool compressed_schema_tree_has_overrides(sirius::op::sirius_physical_operator c
   for (auto const& child : op.children) {
     if (child && compressed_schema_tree_has_overrides(*child)) { return true; }
   }
-
-  if (is_delim_join(op)) {
-    auto const& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
-    if (delim.join && compressed_schema_tree_has_overrides(*delim.join)) { return true; }
-    if (delim.distinct_root && compressed_schema_tree_has_overrides(*delim.distinct_root)) {
-      return true;
-    }
-  }
   return false;
 }
 
@@ -109,12 +86,6 @@ void clear_compressed_schema_tree(duckdb::unique_ptr<sirius::op::sirius_physical
   slot->set_physical_types({});
   for (auto& child : slot->children) {
     clear_compressed_schema_tree(child);
-  }
-
-  if (is_delim_join(*slot)) {
-    auto& delim = slot->Cast<sirius::op::sirius_physical_delim_join>();
-    clear_compressed_schema_tree(delim.join);
-    clear_compressed_schema_tree(delim.distinct_root);
   }
 }
 
@@ -282,18 +253,6 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
   if (!slot) { return; }
   for (auto& child : slot->children) {
     propagate_compressed_schema(child);
-  }
-
-  if (is_delim_join(*slot)) {
-    auto& delim = slot->Cast<sirius::op::sirius_physical_delim_join>();
-    if (delim.join) {
-      propagate_compressed_schema(delim.join);
-      restore_native_output_in_place(delim.join);
-    }
-    if (delim.distinct_root) {
-      propagate_compressed_schema(delim.distinct_root);
-      restore_native_output_in_place(delim.distinct_root);
-    }
   }
 
   switch (slot->type) {
@@ -534,11 +493,6 @@ void prune_immediate_scan_restores(duckdb::unique_ptr<sirius::op::sirius_physica
   if (!slot) { return; }
   for (auto& child : slot->children) {
     prune_immediate_scan_restores(child);
-  }
-  if (is_delim_join(*slot)) {
-    auto& delim = slot->Cast<sirius::op::sirius_physical_delim_join>();
-    prune_immediate_scan_restores(delim.join);
-    prune_immediate_scan_restores(delim.distinct_root);
   }
 
   if (slot->type != sirius::op::SiriusPhysicalOperatorType::PROJECTION ||
