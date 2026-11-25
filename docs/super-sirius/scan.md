@@ -373,7 +373,7 @@ CALL pin_table('/path/to/lineitem.parquet',
                cols = ['l_orderkey', 'l_quantity', 'l_extendedprice', 'l_shipdate']);
 
 -- A duckdb-native base table can be pinned too:
-CALL pin_table('my_table', name = 'my_table', format = 'duckdb', tier = 'host');
+CALL pin_table(format = 'duckdb', name = 'my_table', tier = 'host');
 
 SELECT SUM(l_extendedprice * l_quantity)
   FROM read_parquet('/path/to/lineitem.parquet')
@@ -700,6 +700,8 @@ S3 has no direct-to-device transport in this backend. Device reads allocate enou
 **LIST and glob expansion.** `sirius_httpfs` expands S3 globs with paginated `ListObjectsV2` requests. It sends the longest static directory prefix to S3, then applies the remaining pattern locally. `*`, `?`, and `[...]` match within one path segment; a segment equal to `**` can cross directories. Bucket wildcards are rejected.
 
 Pages are processed as they arrive, so listing memory is bounded by one page plus the matches retained for DuckDB. `list_max_scanned` limits inspected objects and `list_max_matches` limits retained matches. Reaching either limit raises an error instead of returning an incomplete file list. Results are sorted by URI, and LIST metadata lets globbed parquet files use the footer-probe open without a separate HEAD.
+
+**DuckDB's external file cache.** What DuckDB reads through `sirius_httpfs` passes through DuckDB's external file cache (EFC). By default (`scan_manager.httpfs_external_file_cache: false`) the file system reports a freshness deadline that forbids reuse: DuckDB requests the needed ranges and retains no EFC byte blocks; the probe stash and metadata caches remain separate. With `true`, DuckDB may fetch an object no larger than its remote cache block whole (2 MiB by default), which after a footer probe requires another data GET when the whole-file range is not already in the stash, and it can serve a later read of the unchanged object from the cache; without it, a planning that reads an Iceberg Parquet position-delete file through the CPU reader can fetch the same bytes again. The ETag and size the file system reports are the same either way, and DuckDB's own validation of them is unaffected. The policy is taken when a file is opened, so it belongs in the configuration the database starts with. GPU Parquet column-data reads use cuCascade directly; bind-time footer reads, the footer-statistics pass with `sirius_analyze_parquet` and `pin_table`, and the CPU Parquet delete reader use this file-system path.
 
 **Authorization.** cuCascade's `request_authorizer` signs each request attempt and returns the request URL and headers. LIST uses the separate `authorize_list` entry point, which custom authorizers must implement if they support glob expansion.
 

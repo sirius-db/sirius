@@ -192,6 +192,10 @@ CALL unpin_table('lineitem');
 `tier = 'gpu'` pins columns in GPU memory for the fastest scans; `tier = 'host'` pins them in
 pinned host memory instead, for tables larger than GPU memory.
 
+A DuckDB table must be stored in a database file, not in memory, and checkpointed (`CHECKPOINT`)
+before it is pinned. Pinning one turns off WAL auto-checkpointing for the database instance;
+unpinning does not turn it back on.
+
 Deletes and committed inserts on pinned DuckDB tables are reconciled per query. `UPDATE`,
 `MERGE ... UPDATE`, and `INSERT ... ON CONFLICT DO UPDATE` are rejected while the target table is
 pinned; run `CALL unpin_table(...)` before updating it. An explicit `CHECKPOINT` while a pin is
@@ -248,7 +252,7 @@ Sirius loads its settings from a YAML config file, searched in this order:
 2. `./sirius.yaml` (current working directory)
 3. `~/.sirius/sirius.yaml`
 
-If no config file is found, built-in defaults apply (95% GPU memory, 8 GiB pinned host memory per NUMA node). See the [Configuration reference](super-sirius/configuration.md) for all options: memory tiers, thread pools, operator parameters, and runtime `SET` variables. An example config is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
+If no config file is found, built-in defaults apply (95% of GPU memory, and 90% of each NUMA node's RAM as pinned host memory). See the [Configuration reference](super-sirius/configuration.md) for all options: memory tiers, thread pools, operator parameters, and runtime `SET` variables. An example config is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
 ## Disk Spilling
 

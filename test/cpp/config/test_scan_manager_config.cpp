@@ -1642,6 +1642,22 @@ TEST_CASE("Native runtime YAML rejects insufficient reader capacity",
                   sirius::configuration_input_error);
 }
 
+TEST_CASE("Sirius HTTPFS cache policy YAML accepts only booleans and known keys",
+          "[scan_manager][config][httpfs_efc_feature]")
+{
+  for (auto const* value : {"true", "false"}) {
+    CAPTURE(value);
+    REQUIRE_NOTHROW(load_scan_manager(
+      "sirius_httpfs_policy.yaml",
+      scan_manager_yaml(std::string("      httpfs_external_file_cache: ") + value + "\n")));
+  }
+  CHECK_THROWS(load_scan_manager("sirius_httpfs_policy_bad.yaml",
+                                 scan_manager_yaml("      httpfs_external_file_cache: perhaps\n")));
+  CHECK_THROWS(load_scan_manager(
+    "sirius_httpfs_policy_unknown.yaml",
+    scan_manager_yaml("      httpfs_external_file_cache: true\n      httpfs_cache_typo: false\n")));
+}
+
 TEST_CASE("metadata worker YAML records explicit counts even when equal to default",
           "[config][metadata_worker_defaults]")
 {

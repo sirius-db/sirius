@@ -994,6 +994,45 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
 
 }  // namespace
 
+// DuckDB stores these settings in the client context; NULL leaves the engine's limit in force.
+static void SetParquetFooterStatisticsReadLimit(ClientContext& /*context*/,
+                                                SetScope /*scope*/,
+                                                Value& parameter)
+{
+  if (!parameter.IsNull() && parameter.GetValue<int64_t>() < -1) {
+    throw InvalidInputException(
+      "A footer-statistics read limit is -1 (no limit), 0 (cached statistics only) or the most "
+      "footers to read for one scan; got %s",
+      parameter.ToString());
+  }
+}
+
+// Session-only: a GLOBAL value could be reset away, and DuckDB then calls the option unrecognized.
+static void add_footer_read_limit_option(DBConfig& config, char const* name, char const* files)
+{
+  ExtensionOption option(
+    StringUtil::Format(
+      "The most footers of %s files parquet_footer_statistics reads for one scan; a scan that "
+      "needs more is planned without them. -1: no limit, 0: cached statistics only, NULL: "
+      "sirius.operator_params.%s",
+      files,
+      name),
+    LogicalType::BIGINT,
+    SetParquetFooterStatisticsReadLimit,
+    Value(LogicalType::BIGINT),
+    SetScope::SESSION,
+    /*is_debug=*/false,
+    /*is_deprecated=*/false);
+  option.supports_global = false;
+  config.AddExtensionOption(name, std::move(option));
+  // DuckDB keeps no value for a NULL default; reading the option then fails. Store the NULL.
+  optional_ptr<const ConfigurationOption> builtin;
+  auto const index = config.TryGetSettingIndex(name, builtin);
+  if (index.IsValid() && !config.user_settings.IsSet(index.GetIndex())) {
+    config.SetOption(index.GetIndex(), Value(LogicalType::BIGINT));
+  }
+}
+
 static bool parquet_footer_statistics_enabled(ClientContext& context)
 {
   Value setting;
@@ -3823,6 +3862,9 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "all their footers, which DuckDB itself reads only with union_by_name",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true));
+
+  add_footer_read_limit_option(config, "parquet_footer_statistics_max_remote_reads", "remote");
+  add_footer_read_limit_option(config, "parquet_footer_statistics_max_local_reads", "local");
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
