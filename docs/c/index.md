@@ -105,16 +105,25 @@ sirius_object_store_registry_with_store() returns a new registry with one store 
 replaced when the prefix is already present; release the input once the result replaces it.
 One configuration can serve several prefixes.
 
-A prefix is empty, `s3://bucket/` or `s3://bucket/prefix/`. An unmatchable object key is refused
-before any store is selected. Otherwise the longest matching prefix wins; only the URI scheme is
-case-folded. The empty prefix is the fallback when no nonempty prefix matches.
+Register an empty prefix for the S3 fallback, or a prefix such as `s3://bucket/` or
+`s3://bucket/data/`. Write the scheme in lowercase. The bucket may contain ASCII letters,
+digits, `.`, `_` and `-`; it must not be empty, `.` or `..`. End each prefix component with `/`;
+components after the bucket must not be empty, equal `.` or `..`, or contain `%`. A prefix
+cannot contain `?` or `#`.
 
-A NULL pointer with nonzero size or a NUL byte in the range is SIRIUS_INVALID_ARGUMENT. A prefix
-that fails the shape or segment checks is SIRIUS_INVALID_CONFIGURATION; an available diagnostic
-names the reason, not the supplied value. Building a registry reads no file and consults no I/O
-backend.
+Matching compares the lookup scheme without regard to ASCII case and compares bucket and key
+bytes exactly. A nonempty registry refuses an empty key after the bucket/key separator, an
+empty, `.` or `..` key segment, a trailing slash, or a literal `%` in the key before selecting
+any store, even if only the fallback is registered. For example, plan construction keeps `%2F`
+as written; the matcher refuses that key rather than treating it as `/`. Otherwise the longest
+matching prefix wins. If no nonempty prefix matches, the fallback can serve only a URI beginning
+with `s3://` in either ASCII case.
 
-No engine API consumes a registry yet.
+A NULL prefix pointer with a nonzero size or a NUL byte in the supplied range gives
+`SIRIUS_INVALID_ARGUMENT`. A prefix that fails the grammar checks gives
+`SIRIUS_INVALID_CONFIGURATION`; an available diagnostic names `uri_prefix` and the reason, not
+the supplied value. Building a registry reads no file and consults no I/O backend. No engine API
+consumes a registry yet.
 
 ## Engine context
 

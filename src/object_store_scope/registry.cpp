@@ -33,7 +33,7 @@ registry::outcome registry::publish(std::shared_ptr<const settings> value,
   std::shared_ptr<const scope_set> published;
   {
     std::lock_guard update(_update_mutex);
-    auto next = with_entry(*capture(), candidate->value->uri_prefix, candidate);
+    auto next = with_entry(*capture(), candidate);
     published = next;
     std::lock_guard lock(_mutex);
     retired = std::exchange(_set, std::move(next));
@@ -55,7 +55,7 @@ registry::outcome registry::drop(std::string_view uri_prefix)
       return e->value->uri_prefix == uri_prefix;
     });
     if (!present) { return {}; }
-    auto next = with_entry(*current, uri_prefix, nullptr);
+    auto next = without_entry(*current, uri_prefix);
     published = next;
     std::lock_guard lock(_mutex);
     retired = std::exchange(_set, std::move(next));

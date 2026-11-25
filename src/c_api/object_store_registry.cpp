@@ -17,15 +17,6 @@ namespace {
 namespace scope = sirius::object_store_scope;
 using sirius::c_api::fail;
 using sirius::c_api::invoke_redacted;
-
-// The reasons check_uri_prefix() gives for a prefix a caller may supply. Any other reason is an
-// internal invariant failure.
-bool refuses_prefix(scope::reason why) noexcept
-{
-  using scope::reason;
-  return why == reason::prefix_shape || why == reason::prefix_no_trailing_slash ||
-         why == reason::prefix_query_or_fragment || why == reason::prefix_unmatchable_segment;
-}
 }  // namespace
 
 void sirius_object_store_registry_retain(sirius_object_store_registry* registry) noexcept
@@ -61,8 +52,6 @@ sirius_status sirius_object_store_registry_with_store(const sirius_object_store_
       return fail(
         SIRIUS_INVALID_ARGUMENT, "Registry, configuration or output pointer is NULL", error);
     }
-    // The range is checked and copied after the output slots are cleared, with no write to the
-    // caller's storage in between.
     if (!uri_prefix && uri_prefix_size != 0) {
       return fail(SIRIUS_INVALID_ARGUMENT, "Text is NULL with a nonzero size", error);
     }
@@ -71,7 +60,7 @@ sirius_status sirius_object_store_registry_with_store(const sirius_object_store_
     }
     auto const key = std::string_view{uri_prefix ? uri_prefix : "", uri_prefix_size};
     if (auto const refused = scope::check_uri_prefix(key)) {
-      if (!refuses_prefix(refused->why)) {
+      if (refused->field != "uri_prefix" || !scope::is_prefix_reason(refused->why)) {
         return fail(SIRIUS_INTERNAL_ERROR, "Unexpected prefix validation reason", error);
       }
       // The status is settled. The text is built only when a diagnostic was asked for, and a
@@ -88,7 +77,7 @@ sirius_status sirius_object_store_registry_with_store(const sirius_object_store_
     auto store = std::make_shared<const scope::entry>(
       scope::entry{std::make_shared<const scope::settings>(std::move(value)), nullptr});
     *out = new sirius_object_store_registry{
-      .stores = scope::with_entry(*registry->stores, key, std::move(store))};
+      .stores = scope::with_entry(*registry->stores, std::move(store))};
     return sirius_status{SIRIUS_SUCCESS};
   });
 }

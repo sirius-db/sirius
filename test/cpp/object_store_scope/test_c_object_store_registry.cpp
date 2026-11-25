@@ -1,4 +1,5 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
+#include "c_api/error_internal.hpp"
 #include "c_api/object_store_registry_internal.hpp"
 #include "object_store_scope/validation.hpp"
 #include "test_helpers.hpp"
@@ -13,7 +14,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <future>
+#include <latch>
 #include <memory>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -125,14 +129,14 @@ call_result registry_call(Call call,
       CHECK(message.find(token) == std::string::npos);
     }
   }
-  REQUIRE(status == wanted);
+  CHECK(status == wanted);
   if (wanted == SIRIUS_SUCCESS) {
     if (diagnostic) { CHECK(err == nullptr); }
     REQUIRE(value);
     REQUIRE(value->stores);
   } else {
     if (output) { CHECK(raw == nullptr); }
-    if (diagnostic) { REQUIRE(error); }
+    if (diagnostic) { CHECK(error); }
   }
   return {std::move(value), std::move(message)};
 }
@@ -229,6 +233,35 @@ TEST_CASE("C registry replaces only the equal key and retains independent versio
   CHECK_FALSE(core::resolve(*a->stores, "s3://bucket/a/file").hit);
 }
 
+TEST_CASE("C registry folds the lookup scheme but not the bucket", "[object_store_c_registry]")
+{
+  auto const expected = values("case");
+  auto scoped         = add(empty_registry().get(), "s3://MiX_ed.-/", config_for(expected).get());
+  check_hit(*scoped, "S3://MiX_ed.-/x", expected, "s3://MiX_ed.-/");
+  auto const miss = core::resolve(*scoped->stores, "S3://mix_ed.-/x");
+  CHECK_FALSE(miss.hit);
+  CHECK_FALSE(miss.refused);
+}
+
+TEST_CASE("C registry default checks raw keys before serving only S3", "[object_store_c_registry]")
+{
+  auto const expected = values("fallback");
+  auto only           = add(empty_registry().get(), "", config_for(expected).get());
+  check_hit(*only, "S3://b/x", expected, "");
+  for (auto uri : {"s3://b/a%2Fb", "https://b/a%2Fb"}) {
+    auto const result = core::resolve(*only->stores, uri);
+    CHECK_FALSE(result.hit);
+    REQUIRE(result.refused);
+    CHECK(result.refused->kind == core::refusal_kind::unmatchable_key);
+  }
+  for (auto uri : {"https://h/x", "gs://b/x", "/tmp/m.json"}) {
+    CAPTURE(uri);
+    auto const result = core::resolve(*only->stores, uri);
+    CHECK_FALSE(result.refused);
+    CHECK_FALSE(result.hit);
+  }
+}
+
 TEST_CASE("C registry chooses the longest prefix in every insertion order",
           "[object_store_c_registry]")
 {
@@ -305,41 +338,94 @@ TEST_CASE("C registry refusals clear outputs and preserve the source", "[object_
     }
     struct row {
       std::string_view key;
-      core::reason reason;
+      std::string_view message;
     };
-    for (auto const& test :
-         {row{bad, core::reason::prefix_shape},
-          row{"s3://bucket/RGC-PREFIX", core::reason::prefix_no_trailing_slash},
-          row{"s3://bucket/?RGC-PREFIX/", core::reason::prefix_query_or_fragment},
-          row{"s3://bucket/#RGC-PREFIX/", core::reason::prefix_query_or_fragment},
-          row{"s3://bucket/RGC-PREFIX/../", core::reason::prefix_unmatchable_segment}}) {
-      auto message = "uri_prefix: " + core::describe({"uri_prefix", test.reason});
-      refused(
-        true, true, true, test.key.data(), test.key.size(), SIRIUS_INVALID_CONFIGURATION, message);
+    constexpr auto shape  = "uri_prefix: must be s3://bucket/ or s3://bucket/prefix/";
+    constexpr auto suffix = "uri_prefix: must not contain a query or fragment";
+    constexpr auto segment =
+      "uri_prefix: contains a segment no key can match byte-for-byte "
+      "(empty, '.', '..' or percent-encoded)";
+    for (auto const& test : {row{bad, shape},
+                             row{"S3://bucket/", shape},
+                             row{"s3://", shape},
+                             row{"s3:///", shape},
+                             row{"s3://bucket/RGC-PREFIX", "uri_prefix: must end with '/'"},
+                             row{"s3://bucket/?RGC-PREFIX/", suffix},
+                             row{"s3://bucket/#RGC-PREFIX/", suffix},
+                             row{"s3://bucket/RGC-PREFIX/../", segment},
+                             row{"s3://bucket/./", segment},
+                             row{"s3://bucket/%2F/", segment},
+                             row{"s3://bucket//", segment}}) {
+      refused(true,
+              true,
+              true,
+              test.key.data(),
+              test.key.size(),
+              SIRIUS_INVALID_CONFIGURATION,
+              test.message);
     }
   }
 }
 
-TEST_CASE("C registry reads a prefix only after clearing its output slots",
+TEST_CASE("C registry rejects invalid buckets without changing its parent",
           "[object_store_c_registry]")
 {
-  auto expected = values("alias");
+  auto expected = values("bad-bucket");
   auto cfg      = config_for(expected);
   auto source   = add(empty_registry().get(), "s3://keep/", cfg.get());
-  for (bool const in_error : {false, true}) {
-    registry_call(
-      [&](auto out, auto err) {
-        auto bytes =
-          in_error ? reinterpret_cast<char const*>(err) : reinterpret_cast<char const*>(out);
-        auto end     = bytes + (in_error ? sizeof(*err) : sizeof(*out));
-        auto nonzero = std::find_if(bytes, end, [](char c) { return c != 0; });
-        REQUIRE(nonzero != end);
-        return sirius_object_store_registry_with_store(
-          source.get(), nonzero, 1, cfg.get(), out, err);
-      },
-      SIRIUS_INVALID_ARGUMENT);
-    REQUIRE(source->stores->size() == 1);
-    check_hit(*source, "s3://keep/file", expected, "s3://keep/");
+  auto original = check_hit(*source, "s3://keep/file", expected, "s3://keep/");
+  for (std::string_view key : {"s3://../",
+                               "s3://./",
+                               "s3://bad bucket/",
+                               "s3://user:secret@bucket/",
+                               "s3://host:9000/",
+                               "s3://hi\xff/"}) {
+    for (bool diagnostic : {false, true}) {
+      CAPTURE(key, diagnostic);
+      auto result = registry_call(
+        [&](auto out, auto err) {
+          return sirius_object_store_registry_with_store(
+            source.get(), key.data(), key.size(), cfg.get(), out, err);
+        },
+        SIRIUS_INVALID_CONFIGURATION,
+        diagnostic);
+      if (diagnostic) {
+        CHECK(result.diagnostic ==
+              "uri_prefix: bucket must use only ASCII letters, digits, "
+              "'.', '_' or '-' and must not be '.' or '..'");
+      }
+      REQUIRE(source->stores->size() == 1);
+      auto current = check_hit(*source, "s3://keep/file", expected, "s3://keep/");
+      CHECK(current == original);
+    }
+  }
+}
+
+TEST_CASE("Object-store C boundary never forwards exception text", "[object_store_c_registry]")
+{
+  struct allocation_error : std::bad_alloc {
+    const char* what() const noexcept override { return "RGC-EXCEPTION-SENTINEL"; }
+  };
+  for (bool allocation : {false, true}) {
+    for (bool diagnostic : {false, true}) {
+      sirius_error* raw = nullptr;
+      auto status =
+        sirius::c_api::invoke_redacted(diagnostic ? &raw : nullptr, [&]() -> sirius_status {
+          if (allocation) { throw allocation_error{}; }
+          throw std::runtime_error("RGC-EXCEPTION-SENTINEL");
+        });
+      std::unique_ptr<sirius_error, decltype(&sirius_error_destroy)> error(raw,
+                                                                           sirius_error_destroy);
+      CHECK(status == (allocation ? SIRIUS_ALLOCATION_FAILURE : SIRIUS_INTERNAL_ERROR));
+      if (diagnostic) {
+        REQUIRE(error);
+        std::string_view text{sirius_error_message(raw), sirius_error_message_size(raw)};
+        CHECK_FALSE(text.empty());
+        CHECK(text.find("RGC-EXCEPTION-SENTINEL") == std::string_view::npos);
+      } else {
+        CHECK_FALSE(error);
+      }
+    }
   }
 }
 
@@ -404,20 +490,31 @@ TEST_CASE("C registry defers environmental CA and RDMA checks", "[object_store_c
 TEST_CASE("C registry derives from separately owned references on concurrent workers",
           "[object_store_c_registry]")
 {
-  auto const expected = values("worker");
-  auto cfg            = config_for(expected);
-  auto source         = empty_registry();
-  std::array<std::string, 4> const keys{"s3://a/", "s3://b/", "s3://c/", "s3://d/"};
+  auto const original = values("parent");
+  auto const sibling  = values("sibling");
+  auto parent         = add(empty_registry().get(), "s3://a/", config_for(original).get());
+  auto source         = add(parent.get(), "s3://keep/", config_for(sibling).get());
+  auto old            = check_hit(*source, "s3://a/file", original, "s3://a/");
+  auto kept           = check_hit(*source, "s3://keep/file", sibling, "s3://keep/");
+  std::array<std::string, 4> const keys{"s3://a/", "s3://a/", "s3://c/", "s3://d/"};
+  std::array const expected{values("one"), values("two"), values("three"), values("four")};
+  std::array const configs{config_for(expected[0]),
+                           config_for(expected[1]),
+                           config_for(expected[2]),
+                           config_for(expected[3])};
+  std::latch ready(keys.size());
   std::vector<std::future<std::pair<sirius_status, registry_ptr>>> workers;
   workers.reserve(keys.size());
   // If launching a worker throws, destroying start unblocks all earlier futures before they join.
   std::promise<void> start;
   auto go = start.get_future().share();
-  for (auto const& key : keys) {
+  for (std::size_t i = 0; i < keys.size(); ++i) {
     sirius_object_store_registry_retain(source.get());
     registry_ptr ref(source.get(), sirius_object_store_registry_release);
-    workers.push_back(
-      std::async(std::launch::async, [ref = std::move(ref), go, key, c = cfg.get()]() mutable {
+    workers.push_back(std::async(
+      std::launch::async,
+      [ref = std::move(ref), &ready, go, key = keys[i], c = configs[i].get()]() mutable {
+        ready.count_down();
         go.get();
         registry* raw = nullptr;
         auto status   = sirius_object_store_registry_with_store(
@@ -426,6 +523,7 @@ TEST_CASE("C registry derives from separately owned references on concurrent wor
         return std::make_pair(status, registry_ptr(raw, sirius_object_store_registry_release));
       }));
   }
+  ready.wait();
   start.set_value();
   for (auto& worker : workers) {
     worker.wait();
@@ -435,8 +533,18 @@ TEST_CASE("C registry derives from separately owned references on concurrent wor
     REQUIRE(status == SIRIUS_SUCCESS);
     REQUIRE(result);
     REQUIRE(result->stores);
-    REQUIRE(result->stores->size() == 1);
-    check_hit(*result, keys[i] + "file", expected, keys[i]);
+    REQUIRE(result->stores->size() == (i < 2 ? 2 : 3));
+    check_hit(*result, keys[i] + "file", expected[i], keys[i]);
+    auto child_sibling = check_hit(*result, "s3://keep/file", sibling, "s3://keep/");
+    CHECK(child_sibling == kept);
+    if (i >= 2) {
+      auto unchanged = check_hit(*result, "s3://a/file", original, "s3://a/");
+      CHECK(unchanged == old);
+    }
   }
-  CHECK(source->stores->empty());
+  REQUIRE(source->stores->size() == 2);
+  auto parent_entry   = check_hit(*source, "s3://a/file", original, "s3://a/");
+  auto parent_sibling = check_hit(*source, "s3://keep/file", sibling, "s3://keep/");
+  CHECK(parent_entry == old);
+  CHECK(parent_sibling == kept);
 }

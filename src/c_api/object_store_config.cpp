@@ -94,6 +94,7 @@ bool refuses_build(scope::reason why) noexcept
     case reason::prefix_shape:
     case reason::prefix_no_trailing_slash:
     case reason::prefix_query_or_fragment:
+    case reason::prefix_bucket:
     case reason::prefix_unmatchable_segment:
     case reason::transport_unavailable: return false;
   }

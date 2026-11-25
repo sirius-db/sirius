@@ -47,18 +47,24 @@ SIRIUS_EXPORT sirius_status sirius_object_store_registry_create(
 /** Derive a registry in which config is the store for uri_prefix.
  * registry, config and out_registry must not be NULL. uri_prefix is uri_prefix_size bytes,
  * copied before the call returns. A size of zero is the empty prefix. A NULL uri_prefix with a
- * nonzero size, or a range that contains a NUL byte, is SIRIUS_INVALID_ARGUMENT. Any other prefix
- * must be `s3://bucket/` or `s3://bucket/prefix/`: a bucket, a trailing slash, no query or
- * fragment, and no segment an object key cannot match byte for byte (empty, `.`, `..`, or
- * containing `%`); otherwise the call returns SIRIUS_INVALID_CONFIGURATION.
+ * nonzero size, or a range that contains a NUL byte, is SIRIUS_INVALID_ARGUMENT.
+ *
+ * A nonempty prefix must have the form `s3://bucket/` or `s3://bucket/prefix/`. Write the
+ * `s3://` scheme in lowercase. The bucket must consist of one or more ASCII letters, digits,
+ * `.`, `_` or `-` and must not be `.` or `..`. The prefix must not contain `?` or `#`. Each
+ * segment after the bucket must be nonempty and followed by `/`. It must not be `.` or `..` or
+ * contain a `%` byte. A prefix that violates these rules gives `SIRIUS_INVALID_CONFIGURATION`.
  *
  * A store the registry already holds for the same prefix bytes is replaced; the other
  * stores are kept. The registry keeps its own copy of the configuration's settings: one
  * configuration can serve several prefixes, and it may be released after the call.
  *
- * An unmatchable object key is refused before any store is selected. Otherwise the longest
- * matching prefix wins; only the URI scheme is case-folded. The empty prefix is the fallback
- * when no nonempty prefix matches.
+ * With at least one store registered, the matcher refuses an empty key after the bucket/key
+ * separator, a trailing slash, an empty, `.` or `..` key segment, or any literal `%` byte in the
+ * key. This applies even when the empty prefix is the only entry. No key bytes are decoded or
+ * rewritten. Otherwise the longest matching prefix wins; only the lookup URI's scheme is
+ * compared without regard to ASCII case. The empty prefix, if registered, is a fallback only for
+ * URIs beginning with `s3://` in either ASCII case.
  * @code{.c}
  * sirius_object_store_registry *next = NULL;
  * sirius_status status = sirius_object_store_registry_with_store(
