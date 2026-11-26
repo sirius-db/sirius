@@ -84,10 +84,12 @@ are listed beside the right ones, so a failure says which rule broke:
                                     meet one file, a delete manifest whose schema has no bounds
                                     fields, a NULL key whose delete records no null count,
                                     string bounds truncated to 16 characters, a delete beside
-                                    both files next to one that meets both, and a delete whose
-                                    own bounds are 2000 characters long. Skipping a delete whose
-                                    range still meets a file, or whose NULL key does, returns
-                                    deleted rows.
+                                    both files next to one that meets both, a delete whose own
+                                    bounds are 2000 characters long, and six deletes with
+                                    61-character bounds. Skipping a delete whose range still
+                                    meets a file, or whose NULL key does, returns deleted rows.
+                                    One more manifest, listed by no snapshot, has a literal %20
+                                    in its name and no live entry.
   iceberg_v2_eq_manifest_shapes     Two data manifests of different shape. One records every
                                     metric map. The other has no null_value_counts field and a
                                     zero NaN count, and its data file holds a NULL key outside
@@ -99,10 +101,12 @@ are listed beside the right ones, so a failure says which rule broke:
   iceberg_v2_eq_duplicate_entry     For the plan only. The data manifest lists its data file
                                     twice; the second entry's bounds are beside a delete that
                                     matches the file.
+  iceberg_v2_eq_repeated_bound      The bounds maps of the data file list the key twice. The
+                                    first pair is beside a delete that matches the file, the
+                                    second is the file's. Taking the first skips the delete.
   iceberg_v2_eq_bounds_stream       For the plan only: its data files are not written. A data
                                     manifest large enough that a streamed read hands out entries
-                                    before it ends, a delete beside their bounds, and a later
-                                    data manifest.
+                                    before it ends, and a delete beside their bounds.
 
 Hand-forged, like the other delete fixtures: pyiceberg does not write delete files, and the only
 independent writer of equality deletes is Flink. Avro schemas are copied from an existing
@@ -214,7 +218,8 @@ class Table:
     def _manifest(self, name, content, spec_id, entries):
         """entries: [(status, explicit_sequence_or_None, file, content, partition, equality_ids)],
         optionally followed by the file's column metrics: a dict with any of `lower_bounds`,
-        `upper_bounds` ({field_id: serialized value}) and the count maps ({field_id: n}).
+        `upper_bounds` ({field_id: serialized value}) and the count maps ({field_id: n}). A
+        map given as a list of (field_id, value) pairs is written as it is, repeats included.
         """
         import fastavro
 
@@ -255,7 +260,12 @@ class Table:
             metrics,
         ) in entries:
             metrics = {
-                name: [{"key": k, "value": v} for k, v in sorted(values.items())]
+                name: [
+                    {"key": k, "value": v}
+                    for k, v in (
+                        sorted(values.items()) if isinstance(values, dict) else values
+                    )
+                ]
                 for name, values in (metrics or {}).items()
             }
             rows.append(
@@ -1148,7 +1158,8 @@ KEY_RANGES = {
         4,
         5,
         6,
-    ],  # s = 2000 times "z": the delete's own bounds are 4000 bytes
+    ],  # s = 2000 times "z": bounds longer than a plan reads by default
+    13: [1, 2, 3, 4, 5, 6],  # six delete files of s, each with 61-byte bounds
 }
 
 
@@ -1261,6 +1272,20 @@ def build_key_ranges():
             )
         ],
     )
+    delete(
+        13,
+        [
+            (
+                [(3, "s", pa.string(), ["z" * 60 + str(n)])],
+                [3],
+                metrics(s=("z" * 60 + str(n), "z" * 60 + str(n))),
+            )
+            for n in range(6)
+        ],
+    )
+    # A manifest no snapshot lists, whose only entry is deleted. Its name holds a literal %20:
+    # a reader that decodes it takes the name for that of a manifest with a space.
+    t._manifest("m%20data.avro", 0, 0, [(2, None, a, 0, None, None)])
     t.finish()
 
 
@@ -1427,13 +1452,13 @@ def build_duplicate_entry():
     t.finish()
 
 
-# Entries of the first data manifest of iceberg_v2_eq_bounds_stream. With 1024-byte bounds of
-# an unrelated column they come to about 12 MiB, past the 10 MiB a streamed result buffers.
+# Entries of the data manifest of iceberg_v2_eq_bounds_stream. With 1024-byte bounds of an
+# unrelated column they come to about 13 MiB, past the 10 MiB a streamed result buffers.
 STREAM_ENTRIES = 6144
 
 
 def build_bounds_stream():
-    """A data manifest that a streamed read hands out in parts, and a later one."""
+    """A data manifest that a streamed read hands out in parts."""
     import pyarrow as pa
 
     t = Table(
@@ -1481,8 +1506,39 @@ def build_bounds_stream():
             )
         ],
     )
-    later = (1, None, unwritten("data-later.parquet"), 0, None, None, recorded)
-    t.commit("append", [("m-data-3.avro", 0, 0, [later])])
+    t.finish()
+
+
+def build_repeated_bound():
+    """A data file whose bounds maps list the key twice; the first pair is not the file's."""
+    import pyarrow as pa
+
+    t = Table("iceberg_v2_eq_repeated_bound", [[(1, "id", "long"), (2, "k", "long")]])
+    long = lambda value: struct.pack("<q", value)  # noqa: E731
+    a = t.parquet(
+        "data-a.parquet",
+        [(1, "id", pa.int64(), [1, 2, 3]), (2, "k", pa.int64(), [10, 20, 30])],
+    )
+    repeated = {
+        "lower_bounds": [(2, long(200)), (2, long(10))],
+        "upper_bounds": [(2, long(300)), (2, long(30))],
+        "null_value_counts": {2: 0},
+    }
+    t.commit(
+        "append", [("m-data-1.avro", 0, 0, [(1, None, a, 0, None, None, repeated)])]
+    )
+    delete = t.parquet("delete-eq-2.parquet", [(2, "k", pa.int64(), [20])])
+    t.commit(
+        "delete",
+        [
+            (
+                "m-delete-2.avro",
+                1,
+                0,
+                [(1, None, delete, 2, None, [2], _long_bounds(20, 20))],
+            )
+        ],
+    )
     t.finish()
 
 
@@ -1598,6 +1654,7 @@ FIXTURES = {
         [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)],
     ),
     "iceberg_v2_eq_duplicate_entry": (build_duplicate_entry, None),
+    "iceberg_v2_eq_repeated_bound": (build_repeated_bound, [(1, 10), (3, 30)]),
     "iceberg_v2_eq_bounds_stream": (build_bounds_stream, None),
 }
 

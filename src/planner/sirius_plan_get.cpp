@@ -147,18 +147,14 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
       return std::nullopt;
     return column->type;
   };
-  auto const bounds_limit =
-    counters && counters->track_units && counters->equality_key_bounds_bytes_limit_for_testing
-      ? *counters->equality_key_bounds_bytes_limit_for_testing
-      : op::scan::kMaxEqualityKeyBoundsBytes;
-  auto const comparisons_limit =
-    counters && counters->track_units && counters->equality_key_bounds_comparisons_limit_for_testing
-      ? *counters->equality_key_bounds_comparisons_limit_for_testing
-      : op::scan::kMaxEqualityKeyBoundsComparisons;
+  auto const options = duckdb::query_operator_options(context);
+  op::scan::equality_key_bounds_limits const bounds_limits{
+    options->iceberg_equality_key_bounds_max_bytes,
+    options->iceberg_equality_key_bounds_max_comparisons,
+    options->iceberg_equality_key_bound_max_length};
   op::scan::iceberg_equality_plan plan;
   try {
-    plan = op::scan::read_equality_plan(
-      context, inventory, files_limit, key_type, bounds_limit, comparisons_limit);
+    plan = op::scan::read_equality_plan(context, inventory, files_limit, key_type, bounds_limits);
   } catch (op::scan::equality_plan_error const& e) {
     return iceberg_decline(scan_reason::iceberg_equality_plan_unproven, e.what());
   }

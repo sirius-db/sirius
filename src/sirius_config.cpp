@@ -692,6 +692,11 @@ try {
   ops.enable_delim_aggregate_reuse             = op.enable_delim_aggregate_reuse.get();
   ops.prove_unique_keys                        = op.pin_table_prove_unique_keys.get();
   ops.unique_exact_max_bytes                   = op.pin_table_unique_exact_max_bytes.get().count();
+  ops.iceberg_equality_key_bounds_max_bytes =
+    op.iceberg_equality_key_bounds_max_bytes.get().count();
+  ops.iceberg_equality_key_bounds_max_comparisons =
+    op.iceberg_equality_key_bounds_max_comparisons.get();
+  ops.iceberg_equality_key_bound_max_length = op.iceberg_equality_key_bound_max_length.get();
   ops.enable_exists_minmax_rewrite             = op.enable_exists_minmax_rewrite.get();
   ops.enable_partial_aggregate_below_join      = op.enable_partial_aggregate_below_join.get();
   ops.enable_subquery_key_carry                = op.enable_subquery_key_carry.get();

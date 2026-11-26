@@ -245,6 +245,9 @@ struct physical_check_counters {
   std::atomic<uint64_t> iceberg_manifest_walks{0};
   std::atomic<uint64_t> iceberg_dv_manifest_reads{0};
   std::atomic<uint64_t> iceberg_delete_payload_loads{0};
+  // Data-file entries whose key bounds an equality-delete plan kept, whether or not its read of
+  // them then completed.
+  std::atomic<uint64_t> iceberg_key_bounds_entries_read{0};
   std::atomic<uint64_t> iceberg_delete_reader_io_failures{0};
   std::atomic<uint64_t> iceberg_delete_identity_failures{0};
   std::atomic<uint64_t> descriptor_mismatches{0};
@@ -282,8 +285,6 @@ struct physical_check_counters {
   std::optional<int64_t> statement_equality_limit_for_testing;
   std::optional<std::size_t> equality_files_per_data_file_limit_for_testing;
   std::optional<std::size_t> idle_rest_context_limit_for_testing;
-  std::optional<std::size_t> equality_key_bounds_bytes_limit_for_testing;
-  std::optional<std::size_t> equality_key_bounds_comparisons_limit_for_testing;
   std::function<void(scan_manager::scan_envelope&)> preparation_envelope_for_testing;
   void parquet_phase(std::string const& file, bool footer) const
   {

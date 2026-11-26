@@ -32,6 +32,9 @@ sirius:
     fused_scan_max_membership_sources: 4
     pin_table_prove_unique_keys: false
     pin_table_unique_exact_max_bytes: 9MiB
+    iceberg_equality_key_bounds_max_bytes: 10MiB
+    iceberg_equality_key_bounds_max_comparisons: 1234
+    iceberg_equality_key_bound_max_length: 48
     scan_task_batch_size: 1MiB
     max_sort_partition_bytes: 2MiB
     max_sort_partition_memory_fraction: 0.25
