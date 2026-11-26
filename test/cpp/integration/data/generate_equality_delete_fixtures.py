@@ -59,9 +59,16 @@ are listed beside the right ones, so a failure says which rule broke:
   iceberg_v3_eq_no_row_lineage      A V3 table without first-row-id and next-row-id, as older
                                     writers left them. Deletes do not depend on row lineage, so
                                     the table is read like any other.
-  iceberg_v2_eq_remote_delete       The equality delete is recorded under an s3:// URI; data and
-                                    metadata are local. The GPU path reads equality deletes from
-                                    local files only and must decline before opening it.
+  iceberg_v2_eq_remote_delete       The equality delete is recorded under an http:// URI; data
+                                    and metadata are local. No Sirius backend reads that URI, so
+                                    the GPU path must decline before opening it.
+  iceberg_v2_eq_avro_delete         The equality delete is recorded as an Avro file, which the
+                                    spec allows. The GPU path reads Parquet delete files and
+                                    must decline before opening it.
+  iceberg_v2_eq_avro_delete_older   The same Avro delete, committed before the only data file. A
+                                    delete applies to data with a strictly lower sequence
+                                    number, so this one applies to nothing: no reader opens it,
+                                    and its format must not decline the scan.
 
 Hand-forged, like the other delete fixtures: pyiceberg does not write delete files, and the only
 independent writer of equality deletes is Flink. Avro schemas are copied from an existing
@@ -138,6 +145,9 @@ class Table:
         self.specs = partition_specs or [[]]
         self.snapshots, self.manifests, self.seq = [], [], 0
         self.v1_manifests = set()  # data manifests to write as format version 1 did
+        self.file_formats = (
+            {}
+        )  # file_format of an entry by path, where it is not PARQUET
         if self.root.exists():
             shutil.rmtree(self.root)
         (self.root / "data").mkdir(parents=True)
@@ -204,7 +214,7 @@ class Table:
                     "data_file": {
                         "content": kind,
                         "file_path": path,
-                        "file_format": "PARQUET",
+                        "file_format": self.file_formats.get(path, "PARQUET"),
                         "partition": partition or {},
                         "record_count": count,
                         "file_size_in_bytes": size,
@@ -968,21 +978,32 @@ def build_unsupported_keys():
     t.finish()
 
 
-def build_remote_delete():
+def build_unread_delete(name, delete_path, file_format="PARQUET", applies=True):
+    """applies=False commits the delete before the data file, so it applies to nothing."""
     import pyarrow as pa
 
-    t = Table("iceberg_v2_eq_remote_delete", fruit_schema())
-    data = t.parquet(
-        "data-1.parquet",
-        [
-            (1, "fruit", pa.string(), ["apple", "banana", "cherry"]),
-            (2, "count", pa.int64(), [1, 2, 3]),
-        ],
-    )
-    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data, 0, None, None)])])
-    # Recorded in the manifest and never written: nothing may open it.
-    delete = ("s3://sirius-equality-delete.invalid/delete-eq-2.parquet", 1, 540)
-    t.commit("delete", [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, None, [1])])])
+    t = Table(name, fruit_schema())
+    t.file_formats[delete_path] = file_format
+
+    def append():
+        seq = t.seq + 1
+        data = t.parquet(
+            f"data-{seq}.parquet",
+            [
+                (1, "fruit", pa.string(), ["apple", "banana", "cherry"]),
+                (2, "count", pa.int64(), [1, 2, 3]),
+            ],
+        )
+        entry = (1, None, data, 0, None, None)
+        t.commit("append", [(f"m-data-{seq}.avro", 0, 0, [entry])])
+
+    def delete():
+        # Recorded in the manifest and never written: nothing may open it.
+        entry = (1, None, (delete_path, 1, 540), 2, None, [1])
+        t.commit("delete", [(f"m-delete-{t.seq + 1}.avro", 1, 0, [entry])])
+
+    for commit in (append, delete) if applies else (delete, append):
+        commit()
     t.finish()
 
 
@@ -1085,7 +1106,30 @@ FIXTURES = {
         build_no_row_lineage,
         [("apple", 1), ("cherry", 3)],
     ),
-    "iceberg_v2_eq_remote_delete": (build_remote_delete, None),
+    "iceberg_v2_eq_remote_delete": (
+        lambda: build_unread_delete(
+            "iceberg_v2_eq_remote_delete",
+            "http://sirius-equality-delete.invalid/delete-eq-2.parquet",
+        ),
+        None,
+    ),
+    "iceberg_v2_eq_avro_delete": (
+        lambda: build_unread_delete(
+            "iceberg_v2_eq_avro_delete",
+            str(REL / "iceberg_v2_eq_avro_delete/data/delete-eq-2.avro"),
+            "AVRO",
+        ),
+        None,
+    ),
+    "iceberg_v2_eq_avro_delete_older": (
+        lambda: build_unread_delete(
+            "iceberg_v2_eq_avro_delete_older",
+            str(REL / "iceberg_v2_eq_avro_delete_older/data/delete-eq-1.avro"),
+            "AVRO",
+            applies=False,
+        ),
+        [("apple", 1), ("banana", 2), ("cherry", 3)],
+    ),
 }
 
 

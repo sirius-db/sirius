@@ -978,6 +978,11 @@ requires startup configuration.
   Level and enable are governed by DuckDB, not `sirius_log_level`.
 - **`noop`**: discards all logs.
 
+Each statement's SQL text is logged at `info` when it begins. `CREATE SECRET` and `ATTACH` are the
+exception, also when `EXPLAIN` wraps them: their literals are credentials, so the log names the
+statement kind and withholds the text.
+The statement is classified with DuckDB's tokenizer.
+
 Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA
 error reports, and its I/O layer where enabled) go to the same sink, prefixed `[cucascade]`.
 cuCascade's own gate mirrors what the active sink accepts: `sirius_log_level` under `spdlog`,
@@ -1317,6 +1322,7 @@ SET enable_runtime_size_estimation = true;   -- off by default
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `gpu_execution` | true | Enable transparent GPU execution for plain SQL queries. When enabled, supported queries are automatically intercepted and executed on the GPU. When disabled, only explicit `CALL gpu_execution('...')` uses the GPU. |
+| `sirius_s3_header_signing` | false | Sign S3 requests whose credentials come from a DuckDB secret in the `Authorization` header instead of a presigned URL. Needed for endpoints that refuse presigned URLs. See [scan.md](scan.md#s3--object-store-backend). |
 
 When `LOAD sirius` cannot load a CUDA backend, the loader registers `gpu_execution` with default
 `false` and rejects `SET gpu_execution = true` and `CALL gpu_execution(...)` with the reason, which

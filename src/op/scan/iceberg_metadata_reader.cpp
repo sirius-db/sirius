@@ -15,6 +15,7 @@
  */
 
 #include "io/path_utils.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
 #include "yyjson.hpp"
 
 #include <cudf/concatenate.hpp>
@@ -229,11 +230,13 @@ std::unordered_set<std::string> iceberg_files_without_partition_values(
   return files;
 }
 
-inventory_result read_delete_inventory(duckdb::ClientContext& context,
-                                       std::string const& table_path,
-                                       std::optional<int64_t> snapshot_id,
-                                       std::string_view injection,
-                                       std::string_view expected_table_uuid)
+inventory_result read_delete_inventory(
+  duckdb::ClientContext& context,
+  std::string const& table_path,
+  std::optional<int64_t> snapshot_id,
+  std::string_view injection,
+  std::string_view expected_table_uuid,
+  std::function<std::string(duckdb::ClientContext&)> const& unconfirmed_table)
 {
   auto counters = iceberg_counters(context);
   iceberg_metadata_connection metadata_conn(context);
@@ -242,7 +245,9 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   if (snapshot_id.has_value()) {
     source += ", snapshot_from_id = " + std::to_string(snapshot_id.value());
   }
-  if (!expected_table_uuid.empty() && iceberg_metadata_accepts_expected_table_uuid(context)) {
+  bool const extension_checks_uuid =
+    !expected_table_uuid.empty() && iceberg_metadata_accepts_expected_table_uuid(context);
+  if (extension_checks_uuid) {
     source +=
       ", expected_table_uuid = '" + escape_sql_string(std::string(expected_table_uuid)) + "'";
   }
@@ -255,6 +260,13 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   // Injection is latched by the planning attempt, after the original scan bound successfully.
   if (injection == "missing") throw inventory_query_error("", true);
   if (injection == "fail") throw inventory_query_error("injected inventory query failure", false);
+  if (unconfirmed_table && !extension_checks_uuid) {
+    // Returned, not thrown: an exception from the callback would invalidate this connection's
+    // transaction, which the inventory query below runs in.
+    std::string reason;
+    conn.read_catalog([&](duckdb::ClientContext& inner) { reason = unconfirmed_table(inner); });
+    if (!reason.empty()) throw inventory_query_error(reason, false, /*unconfirmed=*/true);
+  }
   // One query supplies the equality count and the inventory the equality plan is checked against.
   if (counters) ++counters->iceberg_manifest_walks;
   auto meta_result = conn.Submit(
@@ -265,6 +277,7 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   if (!meta_result) throw inventory_query_error("", true);
   if (meta_result->HasError()) throw inventory_query_error(meta_result->GetError(), false);
   inventory_result result{iceberg_delete_inventory{}, 0};
+  result.inventory->table = table_path;
   std::vector<duckdb::unique_ptr<duckdb::DataChunk>> chunks;
   uint64_t bytes      = sizeof(iceberg_delete_inventory);
   uint64_t peak_bytes = bytes;
@@ -642,7 +655,8 @@ iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext& context,
 
     if (content == kPositionDeletes) {
       auto const& file_format = row.file_format;
-      if (file_format == kFormatPuffin) {
+      // Writers disagree on the case: DuckDB records "puffin".
+      if (duckdb::StringUtil::CIEquals(file_format, kFormatPuffin)) {
         // iceberg_metadata() omits the V3 fields, so re-read the manifest via read_avro.
         auto const& manifest_path = row.manifest_path;
         ++puffin_rows_from_metadata[{manifest_path, sirius::io::strip_file_scheme(filepath)}];
@@ -1065,9 +1079,21 @@ void materialize_equality_deletes(duckdb::ClientContext& context,
     std::vector<std::unique_ptr<cudf::table>> tables;
     std::vector<cudf::table_view> views;
     for (auto file : group_files[group_index]) {
-      if (auto counters = iceberg_counters(context)) ++counters->iceberg_delete_payload_loads;
+      auto const counters = iceberg_counters(context);
+      if (counters) ++counters->iceberg_delete_payload_loads;
+      auto const& path = plan.files[file].file_path;
+      if (counters && counters->track_units && counters->iceberg_equality_open_for_testing)
+        counters->iceberg_equality_open_for_testing(path);
+      auto file_ioctx = ioctx;
+      if (sirius::io::s3::is_s3_path(path)) {
+        file_ioctx = resources.remote_ioctx ? resources.remote_ioctx(path) : nullptr;
+        // Never read as "no deletes": the scan would return the rows this file removes.
+        if (!file_ioctx)
+          throw std::runtime_error(
+            "[iceberg] no S3 backend is available to read equality-delete file '" + path + "'");
+      }
       tables.push_back(read_equality_delete_file(
-        plan.files[file], ioctx, ids, plan, resources.stream, resources.mr));
+        plan.files[file], file_ioctx, ids, plan, resources.stream, resources.mr));
       views.push_back(tables.back()->view());
     }
     data.equality_delete_groups[group_index] =

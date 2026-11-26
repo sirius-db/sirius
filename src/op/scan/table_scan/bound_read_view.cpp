@@ -678,27 +678,56 @@ std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
   identity.fingerprint.hash = duckdb::Hash(text.data(), text.size());
   return std::make_shared<bound_read_identity const>(std::move(identity));
 }
+
+// What a verified Iceberg scan publishes about its binding, or nullopt when it publishes nothing.
+std::optional<duckdb::BindInfo> iceberg_bind_info(duckdb::BoundTableFunction const& function,
+                                                  duckdb::FunctionData const* bind_data,
+                                                  duckdb::ClientContext& context)
+{
+  if (!function.get_bind_info || !bind_data) return std::nullopt;
+  duckdb::TableFunctionGetBindInfoInput input(context,
+                                              const_cast<duckdb::FunctionData*>(bind_data));
+  auto info = function.get_bind_info(input);
+  // A path scan binds as EXTERNAL and a catalog table as TABLE; both publish these options.
+  if (info.type != duckdb::ScanType::EXTERNAL && info.type != duckdb::ScanType::TABLE) {
+    return std::nullopt;
+  }
+  return info;
+}
+
+// The published option @p name when it is present, not NULL and of @p type.
+duckdb::Value const* bind_option(duckdb::BindInfo const& info,
+                                 char const* name,
+                                 duckdb::LogicalTypeId type)
+{
+  auto const it = info.options.find(name);
+  return it != info.options.end() && !it->second.IsNull() && it->second.type().id() == type
+           ? &it->second
+           : nullptr;
+}
 }  // namespace
+
+std::optional<std::string> capture_iceberg_table_uuid(duckdb::BoundTableFunction const& function,
+                                                      duckdb::FunctionData const* bind_data,
+                                                      duckdb::ClientContext& context)
+{
+  auto const info = iceberg_bind_info(function, bind_data, context);
+  if (!info) return std::nullopt;
+  auto const* uuid = bind_option(*info, "table_uuid", duckdb::LogicalTypeId::VARCHAR);
+  if (!uuid || duckdb::StringValue::Get(*uuid).empty()) return std::nullopt;
+  return duckdb::StringValue::Get(*uuid);
+}
 
 std::optional<iceberg_snapshot_binding> capture_iceberg_snapshot(
   duckdb::BoundTableFunction const& function,
   duckdb::FunctionData const* bind_data,
   duckdb::ClientContext& context)
 {
-  if (!function.get_bind_info || !bind_data) return std::nullopt;
-  duckdb::TableFunctionGetBindInfoInput input(context,
-                                              const_cast<duckdb::FunctionData*>(bind_data));
-  auto const info = function.get_bind_info(input);
-  if (info.type != duckdb::ScanType::EXTERNAL) return std::nullopt;
-  auto const option = [&](char const* name, duckdb::LogicalTypeId type) -> duckdb::Value const* {
-    auto const it = info.options.find(name);
-    return it != info.options.end() && !it->second.IsNull() && it->second.type().id() == type
-             ? &it->second
-             : nullptr;
-  };
-  auto const* uuid   = option("table_uuid", duckdb::LogicalTypeId::VARCHAR);
-  auto const* id     = option("snapshot_id", duckdb::LogicalTypeId::BIGINT);
-  auto const* schema = option("schema_id", duckdb::LogicalTypeId::INTEGER);
+  auto const info = iceberg_bind_info(function, bind_data, context);
+  if (!info) return std::nullopt;
+  auto const* uuid   = bind_option(*info, "table_uuid", duckdb::LogicalTypeId::VARCHAR);
+  auto const* id     = bind_option(*info, "snapshot_id", duckdb::LogicalTypeId::BIGINT);
+  auto const* schema = bind_option(*info, "schema_id", duckdb::LogicalTypeId::INTEGER);
   if (!uuid || !id || !schema) return std::nullopt;
   auto const& table_uuid = duckdb::StringValue::Get(*uuid);
   auto const snapshot_id = id->GetValue<int64_t>();

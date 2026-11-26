@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "io/scoped_object_store_configs.hpp"
+
 #include <cucascade/io/rest/s3/list_parser.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
@@ -128,10 +130,12 @@ class sirius_httpfs : public duckdb::FileSystem {
 /// their LIST size in @c extended_info->options["file_size"]. Throws (never
 /// truncates) once more than @p max_matches keys match — "narrow the glob
 /// prefix"; wildcards in the bucket segment are rejected. @p max_matches unset
-/// → the backend's configured cap (@c rest.list_max_matches).
+/// → the backend's configured cap (@c rest.list_max_matches). @p planned, when
+/// set, is the S3 configuration to list with instead of the prefix's current one.
 duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   std::string const& pattern,
   sirius::scan_manager::sirius_scan_manager& scan_manager,
-  std::optional<std::size_t> max_matches = std::nullopt);
+  std::optional<std::size_t> max_matches                           = std::nullopt,
+  sirius::io::scoped_object_store_configs::snapshot const* planned = nullptr);
 
 }  // namespace sirius::io::s3
