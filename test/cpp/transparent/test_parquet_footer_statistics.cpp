@@ -2360,3 +2360,64 @@ TEST_CASE_METHOD(FooterAdmissionFixture,
   CHECK(footer_detail::footer_read_count() == reads);
   CHECK_FALSE(footer_fix_rows(*covered));
 }
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - a column's range limits its distinct values",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]")
+{
+  using sirius::transparent::parquet_scan_value_span;
+  using span = std::optional<std::uint64_t>;
+
+  // x covers [0, 200) across the two files. y holds the even numbers from 0 to 198 and NULLs: 199
+  // values lie in that range, though it holds 100 of them.
+  auto const multi = con->ExtractPlan("SELECT x, y FROM v WHERE x >= 150");
+  auto const* get  = first_get(*multi);
+  REQUIRE(get != nullptr);
+  CHECK(parquet_scan_value_span(*get, 0) == span{200});
+  CHECK(parquet_scan_value_span(*get, 1) == span{199});
+  CHECK(parquet_scan_value_span(*get, 2) == std::nullopt);
+
+  // One file: its own range.
+  auto const single =
+    con->ExtractPlan("SELECT x FROM read_parquet('" + (dir / "f1.parquet").string() + "')");
+  auto const* single_get = first_get(*single);
+  REQUIRE(single_get != nullptr);
+  CHECK(parquet_scan_value_span(*single_get, 0) == span{100});
+}
+
+TEST_CASE_METHOD(FooterAdmissionFixture,
+                 "parquet footer statistics - a column's value span goes where the scan's row "
+                 "count goes",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]")
+{
+  using span         = std::optional<std::uint64_t>;
+  auto const span_of = [](duckdb::LogicalOperator const& plan) {
+    auto const* get = footer_parquet_get(plan);
+    REQUIRE(get != nullptr);
+    return sirius::transparent::parquet_scan_value_span(*get, 0);
+  };
+
+  // A second planning reads no footer and merges nothing: it takes the spans with the merged
+  // statistics it reuses.
+  auto first       = plan();
+  auto const reads = footer_detail::footer_read_count();
+  auto second      = plan();
+  CHECK(footer_detail::footer_read_count() == reads);
+  CHECK(footer_detail::merged_statistics_cache_size() == 1);
+  CHECK(span_of(*first) == span{200});
+  CHECK(span_of(*second) == span{200});
+
+  // A copy of the plan has them, and keeps them when the plan it was copied from forgets.
+  auto copy = footer_fix_copy(*con, *first);
+  CHECK(span_of(*copy) == span{200});
+  sirius::transparent::forget_parquet_scan_row_counts(*first);
+  CHECK_FALSE(span_of(*first));
+  CHECK(span_of(*copy) == span{200});
+
+  // A scan over the read limit has neither a row count nor a span.
+  footer_detail::clear_caches_for_testing();
+  local_limit(0);
+  auto uncovered = plan();
+  CHECK_FALSE(footer_fix_rows(*uncovered));
+  CHECK_FALSE(span_of(*uncovered));
+}

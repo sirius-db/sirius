@@ -35,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -128,6 +129,17 @@ struct cache_entry {
   std::list<std::string const*>::iterator position;
 };
 
+/// Per column of a scan's bind: how many values lie from the smallest to the largest the column
+/// holds across the scan's files, where the footers give an integer range.
+using value_span_list = std::vector<std::optional<std::uint64_t>>;
+
+/// What the footers of a scan's files say of its columns together.
+struct merged_facts {
+  /// The `column_statistics` value, or NULL when the files say nothing the option can carry.
+  duckdb::Value statistics;
+  std::shared_ptr<value_span_list const> value_spans;
+};
+
 /// The merged, verified statistics a scan was last given, with the ids of the per-file records they
 /// were merged from. The entry fits a scan only while the cache answers each of its files with the
 /// same record. It holds ids, not the records, so it keeps none of them alive.
@@ -135,7 +147,7 @@ struct merge_entry {
   std::vector<std::uint64_t> files;
   decltype(duckdb::MultiFileBindData::names) names;
   decltype(duckdb::MultiFileBindData::types) types;
-  duckdb::Value statistics;
+  merged_facts facts;
 };
 
 std::mutex cache_mutex;
@@ -156,6 +168,9 @@ struct row_count_entry {
   std::size_t rows;
   /// Groups copied counts for the test accessor.
   std::uint64_t serial;
+  /// The value spans of the scan's columns, shared with the copies of its plan. Null until the
+  /// planning that counted the rows has merged the columns.
+  std::shared_ptr<value_span_list const> value_spans;
 };
 
 /// Keyed by the file list of a scan's bind data, which a plan owns and each plan copy has anew, so
@@ -200,11 +215,14 @@ void sweep_row_counts_locked()
 
 void keep_row_count_locked(duckdb::shared_ptr<duckdb::MultiFileList> const& list,
                            std::size_t rows,
-                           std::uint64_t serial)
+                           std::uint64_t serial,
+                           std::shared_ptr<value_span_list const> value_spans = nullptr)
 {
   if (row_counts.size() >= row_count_sweep_at) { sweep_row_counts_locked(); }
   row_counts.insert_or_assign(
-    list.get(), row_count_entry{duckdb::weak_ptr<duckdb::MultiFileList>(list), rows, serial});
+    list.get(),
+    row_count_entry{
+      duckdb::weak_ptr<duckdb::MultiFileList>(list), rows, serial, std::move(value_spans)});
 }
 
 std::string cache_key(std::string const& options_identity, std::string const& path)
@@ -415,29 +433,77 @@ std::string quoted(std::string const& name)
   return result + '"';
 }
 
-/// The `column_statistics` value describing \p bind's columns across \p files, or NULL when the
-/// files say nothing the option can carry.
-duckdb::Value merged_statistics(duckdb::MultiFileBindData const& bind,
-                                std::vector<std::shared_ptr<file_statistics const>> const& files)
+/// The statistics of \p bind's column \p i across \p files, or null when it is generated, or a
+/// file lacks them or types the column differently.
+duckdb::unique_ptr<duckdb::BaseStatistics> merged_column(
+  duckdb::MultiFileBindData const& bind,
+  std::vector<std::shared_ptr<file_statistics const>> const& files,
+  duckdb::idx_t i)
+{
+  if (bind.IsGeneratedColumn(i)) { return nullptr; }
+  duckdb::unique_ptr<duckdb::BaseStatistics> merged;
+  for (auto const& file : files) {
+    auto const* stats = find(*file, bind.names[i]);
+    if (!stats || stats->GetType() != bind.types[i]) { return nullptr; }
+    if (merged) {
+      merged->Merge(*stats);
+    } else {
+      merged = stats->ToUnique();
+    }
+  }
+  return merged;
+}
+
+/// The integer a statistics bound holds, or nullopt for a type that is not stored as an integer
+/// of up to 64 bits. A DECIMAL gives its unscaled value and a DATE its day number, which count
+/// values as well as the values themselves do.
+std::optional<__int128> integer_of(duckdb::Value const& value)
+{
+  if (value.IsNull()) { return std::nullopt; }
+  switch (value.type().InternalType()) {
+    case duckdb::PhysicalType::INT8: return value.GetValueUnsafe<int8_t>();
+    case duckdb::PhysicalType::INT16: return value.GetValueUnsafe<int16_t>();
+    case duckdb::PhysicalType::INT32: return value.GetValueUnsafe<int32_t>();
+    case duckdb::PhysicalType::INT64: return value.GetValueUnsafe<int64_t>();
+    case duckdb::PhysicalType::UINT8: return value.GetValueUnsafe<uint8_t>();
+    case duckdb::PhysicalType::UINT16: return value.GetValueUnsafe<uint16_t>();
+    case duckdb::PhysicalType::UINT32: return value.GetValueUnsafe<uint32_t>();
+    case duckdb::PhysicalType::UINT64: return value.GetValueUnsafe<uint64_t>();
+    default: return std::nullopt;
+  }
+}
+
+/// How many values lie from the smallest to the largest \p merged holds, or nullopt when it gives
+/// no integer range.
+std::optional<std::uint64_t> value_span(duckdb::BaseStatistics const& merged)
+{
+  if (merged.GetStatsType() != duckdb::StatisticsType::NUMERIC_STATS ||
+      !duckdb::NumericStats::HasMinMax(merged)) {
+    return std::nullopt;
+  }
+  auto const low  = integer_of(duckdb::NumericStats::Min(merged));
+  auto const high = integer_of(duckdb::NumericStats::Max(merged));
+  if (!low || !high || *high < *low) { return std::nullopt; }
+  auto const span = *high - *low + 1;
+  if (span > static_cast<__int128>(std::numeric_limits<std::uint64_t>::max())) {
+    return std::nullopt;
+  }
+  return static_cast<std::uint64_t>(span);
+}
+
+/// What the footers of \p files say of \p bind's columns together: the `column_statistics` value
+/// describing them, NULL when they say nothing the option can carry, and each column's value span.
+/// Both come from one merge of each column, so the spans cost a scan no pass of their own.
+merged_facts merged_statistics(duckdb::MultiFileBindData const& bind,
+                               std::vector<std::shared_ptr<file_statistics const>> const& files)
 {
   auto const text = duckdb::LogicalType::VARCHAR;
+  value_span_list spans(bind.names.size());
   std::vector<duckdb::Value> keys, values;
   for (duckdb::idx_t i = 0; i < bind.names.size(); ++i) {
-    if (bind.IsGeneratedColumn(i)) { continue; }
-    duckdb::unique_ptr<duckdb::BaseStatistics> merged;
-    for (auto const& file : files) {
-      auto const* stats = find(*file, bind.names[i]);
-      if (!stats || stats->GetType() != bind.types[i]) {
-        merged = nullptr;
-        break;
-      }
-      if (merged) {
-        merged->Merge(*stats);
-      } else {
-        merged = stats->ToUnique();
-      }
-    }
+    auto const merged = merged_column(bind, files, i);
     if (!merged) { continue; }
+    spans[i] = value_span(*merged);
     std::vector<duckdb::Value> names, given;
     // Without a null count DuckDB keeps the column's NULLs unknown; a zero proves there are none.
     if (!merged->CanHaveNull()) {
@@ -455,9 +521,11 @@ duckdb::Value merged_statistics(duckdb::MultiFileBindData const& bind,
     keys.emplace_back(quoted(bind.names[i].GetIdentifierName()));
     values.push_back(duckdb::Value::MAP(text, text, std::move(names), std::move(given)));
   }
-  if (keys.empty()) { return duckdb::Value(); }
-  return duckdb::Value::MAP(
-    text, duckdb::LogicalType::MAP(text, text), std::move(keys), std::move(values));
+  auto value_spans = std::make_shared<value_span_list const>(std::move(spans));
+  if (keys.empty()) { return {duckdb::Value(), std::move(value_spans)}; }
+  return {duckdb::Value::MAP(
+            text, duckdb::LogicalType::MAP(text, text), std::move(keys), std::move(values)),
+          std::move(value_spans)};
 }
 
 std::string merge_cache_key(duckdb::LogicalGet const& get)
@@ -470,9 +538,9 @@ std::string merge_cache_key(duckdb::LogicalGet const& get)
   return key;
 }
 
-std::optional<duckdb::Value> cached_merge(std::string const& key,
-                                          scan_statistics const& scan,
-                                          duckdb::MultiFileBindData const& bind)
+std::optional<merged_facts> cached_merge(std::string const& key,
+                                         scan_statistics const& scan,
+                                         duckdb::MultiFileBindData const& bind)
 {
   std::lock_guard guard(cache_mutex);
   auto const found = merges.find(key);
@@ -482,15 +550,15 @@ std::optional<duckdb::Value> cached_merge(std::string const& key,
         found->second.files, scan.files, {}, {}, [](auto const& file) { return file->id; })) {
     return std::nullopt;
   }
-  return found->second.statistics;
+  return found->second.facts;
 }
 
-/// Keeps \p statistics for the next planning of the scan, if it can answer one: every record must
+/// Keeps \p facts for the next planning of the scan, if it can answer one: every record must
 /// be the one the cache holds for its file, and the entry must fit beside the others.
 void remember_merge(std::string const& key,
                     scan_statistics const& scan,
                     duckdb::MultiFileBindData const& bind,
-                    duckdb::Value const& statistics)
+                    merged_facts const& facts)
 {
   std::lock_guard guard(cache_mutex);
   if (auto const old = merges.find(key); old != merges.end()) { erase_merge_locked(old); }
@@ -504,7 +572,7 @@ void remember_merge(std::string const& key,
                              merge_references + scan.files.size() > capacities.merge_references)) {
     erase_merge_locked(merges.begin());
   }
-  merge_entry entry{{}, bind.names, bind.types, statistics};
+  merge_entry entry{{}, bind.names, bind.types, facts};
   entry.files.reserve(scan.files.size());
   for (auto const& file : scan.files) {
     entry.files.push_back(file->id);
@@ -541,6 +609,18 @@ void remember_row_count(duckdb::shared_ptr<duckdb::MultiFileList> const& list, s
 {
   std::lock_guard guard(cache_mutex);
   keep_row_count_locked(list, rows, next_row_count_serial++);
+}
+
+/// Adds the value spans of its scan's columns to the row count kept for \p list. They belong to
+/// the same planning as the count, and go when it goes.
+void remember_value_spans(duckdb::MultiFileList const* list,
+                          std::shared_ptr<value_span_list const> value_spans)
+{
+  std::lock_guard guard(cache_mutex);
+  auto const found = row_counts.find(list);
+  if (found != row_counts.end() && answers(found->second, list)) {
+    found->second.value_spans = std::move(value_spans);
+  }
 }
 
 bool add_statistics(duckdb::ClientContext& context,
@@ -590,16 +670,30 @@ bool add_statistics(duckdb::ClientContext& context,
     total_rows += file->num_rows;
   }
   remember_row_count(bind->file_list, total_rows);
-  if (single_file) { return false; }
+  if (single_file) {
+    // DuckDB has this file's statistics itself; only its value spans are kept.
+    value_span_list spans(bind->names.size());
+    for (duckdb::idx_t i = 0; i < spans.size(); ++i) {
+      if (auto const column = merged_column(*bind, scan.files, i)) {
+        spans[i] = value_span(*column);
+      }
+    }
+    remember_value_spans(bind->file_list.get(),
+                         std::make_shared<value_span_list const>(std::move(spans)));
+    return false;
+  }
   auto const scan_key = merge_cache_key(get);
-  if (auto const hit = cached_merge(scan_key, scan, *bind)) {
-    options.column_statistics = *hit;
+  if (auto hit = cached_merge(scan_key, scan, *bind)) {
+    remember_value_spans(bind->file_list.get(), std::move(hit->value_spans));
+    options.column_statistics = std::move(hit->statistics);
   } else {
-    auto statistics = merged_statistics(*bind, scan.files);
-    if (statistics.IsNull()) { return false; }
-    options.column_statistics = std::move(statistics);
+    auto merged = merged_statistics(*bind, scan.files);
+    // Files that say nothing the option can carry give no range either.
+    if (merged.statistics.IsNull()) { return false; }
+    remember_value_spans(bind->file_list.get(), merged.value_spans);
+    options.column_statistics = merged.statistics;
     options.VerifyColumnStatistics(bind->names, bind->types);
-    remember_merge(scan_key, scan, *bind, options.column_statistics);
+    remember_merge(scan_key, scan, *bind, merged);
   }
   return true;
 }
@@ -678,10 +772,25 @@ void copy_parquet_scan_row_count(duckdb::LogicalGet const& from, duckdb::Logical
     if (found == row_counts.end() || !answers(found->second, source->get())) { return; }
     auto const rows   = found->second.rows;
     auto const serial = found->second.serial;
-    keep_row_count_locked(*target, rows, serial);
+    auto value_spans  = found->second.value_spans;
+    keep_row_count_locked(*target, rows, serial, std::move(value_spans));
   } catch (std::bad_alloc const&) {
     // The copy plans without the count.
   }
+}
+
+std::optional<std::uint64_t> parquet_scan_value_span(duckdb::LogicalGet const& get,
+                                                     std::size_t column)
+{
+  auto const* list = file_list_of(get);
+  if (!list) { return std::nullopt; }
+  std::lock_guard guard(cache_mutex);
+  auto const found = row_counts.find(list->get());
+  if (found == row_counts.end() || !answers(found->second, list->get()) ||
+      !found->second.value_spans || column >= found->second.value_spans->size()) {
+    return std::nullopt;
+  }
+  return (*found->second.value_spans)[column];
 }
 
 std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,

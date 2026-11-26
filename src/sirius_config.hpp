@@ -135,8 +135,9 @@ constexpr bool DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE = true;
 /// table into one scan and a per-key MIN/MAX aggregate.
 constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
 
-/// Aggregate below an inner join that only adds variable-width columns the aggregate groups by,
-/// and combine the partial results above it.
+/// Aggregate below a join that only adds variable-width columns the aggregate groups by, and
+/// combine the partial results above it. The join is an inner join, or an outer join that keeps
+/// every row of the aggregated side.
 constexpr bool DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN = true;
 
 /// Restrict every table a delim subquery ties to its correlation column by an equality, before
@@ -356,9 +357,10 @@ struct operator_params {
   /// `rewrite_correlated_inequality_exists`.
   bool enable_exists_minmax_rewrite = config::DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE;
 
-  /// Compute `SUM`/`MIN`/`MAX` per join key below an inner join whose other side only adds
+  /// Compute `SUM`/`MIN`/`MAX` per join key below a join whose other side only adds
   /// variable-width group-by columns, so the join repeats them once per key instead of once per
-  /// row. See `push_partial_aggregates_below_joins`.
+  /// row. The join is an inner join, or an outer join that keeps every row of the aggregated
+  /// side. See `push_partial_aggregates_below_joins`.
   bool enable_partial_aggregate_below_join = config::DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN;
 
   /// Under `delim_join_as_cte`, a subquery restricted to the outer rows' keys on one column also

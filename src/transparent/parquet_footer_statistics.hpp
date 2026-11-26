@@ -82,10 +82,22 @@ struct footer_read_limits {
 /// are dropped lazily.
 [[nodiscard]] std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get);
 
-/// \brief Make the row count of every Parquet scan in \p plan unknown.
+/// \brief How many values lie from the smallest to the largest that column \p column holds across
+/// all files of \p get (max - min + 1), or nullopt when the footers give it no integer range.
+/// \p get is a Parquet scan add_parquet_footer_statistics covered, a one-file scan too, and
+/// \p column counts the scan's columns as its bind names them. The column cannot hold more distinct
+/// values than that. Integers, DATEs and DECIMALs of up to 18 digits have such a range.
+///
+/// The spans are kept with the scan's row count: a plan and its copies have them exactly when
+/// parquet_scan_row_count answers, so a scan over a read limit has neither.
+[[nodiscard]] std::optional<std::uint64_t> parquet_scan_value_span(duckdb::LogicalGet const& get,
+                                                                   std::size_t column);
+
+/// \brief Make the row count of every Parquet scan in \p plan unknown, and its value spans.
 void forget_parquet_scan_row_counts(duckdb::LogicalOperator const& plan);
 
-/// \brief Give \p to, the copy of the scan \p from in a copy of its plan, the row count of \p from.
+/// \brief Give \p to, the copy of the scan \p from in a copy of its plan, the row count of \p from
+/// and its value spans.
 void copy_parquet_scan_row_count(duckdb::LogicalGet const& from, duckdb::LogicalGet const& to);
 
 /// \brief Read the footer statistics of \p paths into the cache add_parquet_footer_statistics uses,
