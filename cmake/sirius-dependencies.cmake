@@ -11,9 +11,9 @@ find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
 find_package(cuvs REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
-# CRoaring decodes Iceberg Puffin deletion vectors (portable Roaring). Host-side
-# only; the same library duckdb-iceberg uses for the same blob, so the two
-# readers agree by construction.
+# CRoaring is the reference for Iceberg Puffin deletion vectors (portable
+# Roaring) and the library duckdb-iceberg decodes them with. The Sirius reader
+# parses the format itself; the unit tests check it against CRoaring.
 find_package(roaring REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(utf8proc REQUIRED CONFIG)

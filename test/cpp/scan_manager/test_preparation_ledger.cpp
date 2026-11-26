@@ -673,27 +673,28 @@ TEST_CASE("HOST adapter serves a multi-block request from blocks that are not ad
           "[scan_preparation][ledger][host]")
 {
   cucascade::memory::host_memory_space_config config;
-  config.numa_id              = 0;
-  config.memory_capacity      = 16 * 1024;
+  config.numa_id = 0;
+  // One 16-block pool; the capacity leaves the reservation room beside the blocks held below.
+  config.memory_capacity      = 32 * 1024;
   config.block_size           = 1024;
   config.pool_size            = 16;
   config.initial_number_pools = 1;
   cucascade::memory::memory_reservation_manager manager({config});
   auto* resource = manager.get_memory_space(cucascade::memory::Tier::HOST, 0)
                      ->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  // A pool that has been in use: only four blocks are free and no two of them are neighbours,
+  // whatever order the pool hands them out in.
+  std::vector<decltype(resource->allocate_multiple_blocks(1024))> held;
+  for (auto blocks = resource->get_free_blocks(); blocks > 0; --blocks)
+    held.push_back(resource->allocate_multiple_blocks(1024));
+  REQUIRE(held.size() == 16);
+  std::sort(held.begin(), held.end(), [](auto const& a, auto const& b) {
+    return a->get_blocks().front() < b->get_blocks().front();
+  });
+  for (auto index : {0, 2, 4, 6})
+    held[static_cast<size_t>(index)].reset();
   auto initial_free = resource->get_free_blocks();
-  {
-    // A pool that has been in use: six blocks come back out of address order, so the next
-    // ones it hands out are not neighbours.
-    std::vector<decltype(resource->allocate_multiple_blocks(1024))> held;
-    for (int i = 0; i < 6; ++i)
-      held.push_back(resource->allocate_multiple_blocks(1024));
-    std::sort(held.begin(), held.end(), [](auto const& a, auto const& b) {
-      return a->get_blocks().front() < b->get_blocks().front();
-    });
-    for (auto index : {1, 3, 5, 0, 2, 4})
-      held[static_cast<size_t>(index)].reset();
-  }
+  REQUIRE(initial_free == 4);
   host_reservation_provider provider(manager);
   std::array<scan_envelope, 1> envelope{scan_envelope{{{{2048}, 2048}}, {}, true}};
   preparation_ledger ledger(provider);

@@ -115,7 +115,7 @@ class datasource_puffin_source final : public puffin_byte_source {
     for (auto destination : destinations)
       total += destination.size();
     return read_at_offset(total, [&] {
-      // One dispatch for all blocks, which lets the backend fuse the adjacent ranges.
+      // Submit all destination blocks in one datasource call.
       std::vector<cucascade::io::slice> slices;
       slices.reserve(destinations.size());
       auto offset = static_cast<std::size_t>(offset_);
@@ -847,8 +847,9 @@ decoded_positions parse_deletion_vector_blob(byte_blocks blob,
   if (count_only) return result;
 
   if (allocator) {
-    // Each bitmap decodes in order, so only out-of-order high keys leave anything to sort.
-    // Checking first matters over blocks, where a sort costs several times one over a buffer.
+    // Puffin orders the bitmaps by key and each decodes in order, so only a file that breaks
+    // that order has anything to sort. Such a file pays for it: a sort over blocks costs
+    // several times one over a buffer.
     auto const decoded = result.charged();
     if (!std::is_sorted(decoded.begin(), decoded.end())) std::sort(decoded.begin(), decoded.end());
   } else {

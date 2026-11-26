@@ -4656,7 +4656,10 @@ TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU refe
     REQUIRE(std::system(command.c_str()) == 0);
   };
 
-  auto const prefix = std::string{"deferred-dv-positive"};
+  // Longer than the scratch path, so relocation lengthens each Puffin footer: a delete manifest
+  // that kept the size from before it would have the deferred reader refuse the file.
+  auto const prefix =
+    "deferred-dv-positive-" + std::string(remote_directory.path().string().size(), 'x');
   auto const remote = "s3://" + env->bucket + "/" + prefix;
   generate(local_directory.path(), "");
   generate(remote_directory.path(), remote);
@@ -4686,6 +4689,7 @@ TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU refe
   set_gpu_execution(con, false);
   auto local_result = require_query_ok(con, local_sql);
   auto expected     = collect_rows(*local_result);
+  std::sort(expected.begin(), expected.end());
 
   auto& context         = require_sirius_context(fixture);
   auto counters         = context.physical_counters();
@@ -4725,7 +4729,10 @@ TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU refe
   auto remote_result = con.Query(remote_sql);
   REQUIRE(remote_result);
   REQUIRE_FALSE(remote_result->HasError());
-  CHECK(collect_rows(*remote_result) == expected);
+  // The scan does not promise row order across batches.
+  auto remote_rows = collect_rows(*remote_result);
+  std::sort(remote_rows.begin(), remote_rows.end());
+  CHECK(remote_rows == expected);
   CHECK(deferred_route);
   CHECK(opened_path == remote + "/" + table + "/data/a.puffin");
 }

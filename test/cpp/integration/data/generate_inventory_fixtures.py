@@ -295,7 +295,6 @@ for variant, names in (
 # bitmap is serialized by CRoaring (pyroaring, installed with pyiceberg).
 import zlib
 
-import pyarrow as pa
 from pyroaring import BitMap
 
 rows = 150_000
@@ -419,6 +418,17 @@ if len(sys.argv) > 2:
         if rows and "manifest_path" in rows[0]:
             for row in rows:
                 row["manifest_length"] = Path(row["manifest_path"]).stat().st_size
+        else:
+            # The footer rewrite above changed the length of each relocated Puffin, and the
+            # deferred reader refuses a file longer than the size its manifest records.
+            for row in rows:
+                sidecar = Path(row["data_file"]["file_path"])
+                if (
+                    sidecar.suffix == ".puffin"
+                    and out in sidecar.parents
+                    and sidecar.is_file()
+                ):
+                    row["data_file"]["file_size_in_bytes"] = sidecar.stat().st_size
         write(path, schema, metadata, relocate(rows))
 
 print(out)
