@@ -1,0 +1,58 @@
+# siriusfuzz profile for the table path of GROUP BY (`agg_table_enabled`,
+# src/cuda/agg_table and src/op/aggregate/table_aggregate*).
+#
+#   pixi run fuzz run --config test/fuzz/config/agg_table.toml --duration 30m --workers 2
+#
+# What it changes against config/default.toml (every key not listed here keeps the default of
+# siriusfuzz/config.py, which default.toml mirrors):
+#
+# - The table path is ON in the Sirius YAML the workers load, so every generated query is
+#   compared GPU(table on) against CPU, and a wrong aggregate is a plain `mismatch`.
+#   Workers alternate between two YAMLs: agg_table_on.yaml (default table budget) and
+#   agg_table_small.yaml (a 64 KiB table, so most rows are returned by the fold and take the
+#   existing path, and one scan batch per row group).
+# - The one setting variant turns the table path OFF, so every query that matched the CPU is
+#   rerun on the existing path and compared with the table path's rows (`variant_mismatch`).
+# - Tables are larger, up to 260000 rows: DuckDB stores 122880 rows per row group, so about
+#   half the tables reach the aggregate in two or three batches under agg_table_small.yaml.
+#   Datasets take a few seconds to generate and load; each one serves more queries.
+# - Fewer joins, subquery levels, CTEs and set operations, so more of the budget goes to plain
+#   SELECT ... GROUP BY. The generator has no weight for GROUP BY itself: it picks 1 to 3 keys
+#   of any enabled type per grouped query, so single fixed-width keys (the table's case), several
+#   keys and VARCHAR keys (the existing path's) all come up.
+# - Integer edge values (type minimum and maximum, 0 and -1) are four times as frequent; -1 and
+#   -2 are the table's reserved keys, and "small" numeric ranges already cover both.
+#
+# NaN and infinities stay off, as in default.toml. Add `--set data.edge_values.nan_inf=true` to
+# fuzz them; expect findings from the existing path too, which returns an arbitrary non-NaN
+# member for MIN / MAX of a group that holds a NaN.
+#
+# The YAML keys `operator_params.agg_table_enabled` and `agg_table_budget_bytes` and the setting
+# `agg_table_enabled` must exist in the build under test. A setting the build does not know is
+# skipped with a log line, and the run then never compares the two paths.
+
+[features.joins]
+max_tables = 2
+
+[features.subqueries]
+max_depth = 1
+
+[features.complexity]
+query = 0.08
+
+[data]
+tables = [2, 4]
+rows = [2000, 260000]
+
+[data.edge_values]
+probability = 0.08
+int_extremes = true
+
+[variants]
+per_query = 1
+[variants.settings]
+agg_table_enabled = [false]
+
+[sirius]
+configs = ["test/fuzz/config/agg_table_on.yaml", "test/fuzz/config/agg_table_small.yaml"]
+dataset_queries = 400
