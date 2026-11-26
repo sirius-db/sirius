@@ -8,7 +8,7 @@ Follow the [source quick start](docs/README.md#quick-start) to clone Sirius and
 initialize the build submodules. Run the same submodule command in new worktrees.
 
 ```bash
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) pixi run make
+pixi run make
 ```
 
 ## Running tests
