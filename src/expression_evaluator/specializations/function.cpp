@@ -77,47 +77,51 @@ using evaluate_result = expression_evaluator::evaluate_result;
 
 namespace {
 
-// The valid scalar 1 of a signed integer or scale-0 DECIMAL128 (HUGEINT) type; nullptr otherwise.
-std::unique_ptr<cudf::scalar> make_one(cudf::data_type type,
-                                       ::cuda::stream_ref stream,
-                                       rmm::device_async_resource_ref mr)
+/**
+ * @brief A valid scalar of a signed integer type, or of the scale-0 DECIMAL128 carrier of HUGEINT,
+ * holding `value.template operator()<T>()` for its value type T; nullptr for any other type.
+ */
+template <typename Value>
+std::unique_ptr<cudf::scalar> make_signed_scalar(cudf::data_type type,
+                                                 Value const& value,
+                                                 ::cuda::stream_ref stream,
+                                                 rmm::device_async_resource_ref mr)
 {
   if (type.id() == cudf::type_id::DECIMAL128 && type.scale() == 0) {
     return std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
-      __int128_t{1}, numeric::scale_type{0}, true, stream, mr);
+      value.template operator()<__int128_t>(), numeric::scale_type{0}, true, stream, mr);
   }
   if (!cudf::is_integral_not_bool(type) || cudf::is_unsigned(type)) { return nullptr; }
   return cudf::type_dispatcher(type, [&]<typename T>() -> std::unique_ptr<cudf::scalar> {
     if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
-      return std::make_unique<cudf::numeric_scalar<T>>(T{1}, true, stream, mr);
+      return std::make_unique<cudf::numeric_scalar<T>>(
+        value.template operator()<T>(), true, stream, mr);
     } else {
-      throw internal_exception("modulo divisor needs a signed integer type");
+      throw internal_exception("expected a signed integer type");
     }
   });
 }
 
 /**
- * @brief Read-only preflight for // and %; the caller performs the arithmetic.
+ * @brief Checks the operands of // and % before cuDF arithmetic, and returns a replacement
+ * divisor when % needs one; the caller performs the arithmetic.
  *
- * Safe pairs and pairs containing NULL return normally. A valid zero divisor, or for //
- * a valid signed-minimum/-1 pair, throws not_implemented_exception before cuDF arithmetic,
- * requesting runtime CPU replay when enabled or safe query failure otherwise.
- * This guard neither mutates operands nor produces an arithmetic result. Replay
- * supplies DuckDB's errors and settings. Inside CASE or COALESCE, the exception first
- * makes the evaluator retry the division on only the rows its branch selects.
+ * Safe pairs and pairs containing NULL return nullopt, and the caller divides by
+ * @p right_result. A valid zero divisor, or for // a valid signed-minimum/-1 pair, throws
+ * not_implemented_exception, requesting runtime CPU replay when enabled or safe query failure
+ * otherwise. Replay supplies DuckDB's errors and settings. Inside CASE or COALESCE, the
+ * exception first makes the evaluator retry the division on only the rows its branch selects.
  *
  * The remainder of a signed minimum by -1 is 0, but C++ leaves evaluating it undefined
- * because the quotient overflows. When % meets such a pair and no zero divisor, the guard
- * returns the divisor to use in place of @p right_result: a copy with every -1 replaced
- * by 1, which leaves each remainder unchanged because x % -1 == x % 1 == 0. It returns
- * nullopt otherwise.
+ * because the quotient overflows. When % meets such a pair and no zero divisor, this returns
+ * the divisor to use in place of @p right_result: a copy with every -1 replaced by 1, which
+ * leaves each remainder unchanged because x % -1 == x % 1 == 0. The operands are not modified.
  */
-[[nodiscard]] std::optional<evaluate_result> require_safe_division(
-  function_id function,
-  evaluate_result const& left_result,
-  evaluate_result const& right_result,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr)
+[[nodiscard]] std::optional<evaluate_result> checked_divisor(function_id function,
+                                                             evaluate_result const& left_result,
+                                                             evaluate_result const& right_result,
+                                                             ::cuda::stream_ref stream,
+                                                             rmm::device_async_resource_ref mr)
 {
   if ((!left_result.is_scalar() && left_result.get_column_view().is_empty()) ||
       (!right_result.is_scalar() && right_result.get_column_view().is_empty())) {
@@ -160,22 +164,9 @@ std::unique_ptr<cudf::scalar> make_one(cudf::data_type type,
   auto is_zero =
     cudf::binary_operation(right, zero, cudf::binary_operator::EQUAL, boolean_type, stream, mr);
 
-  std::unique_ptr<cudf::scalar> minimum;
-  if (left.type().id() == cudf::type_id::DECIMAL128 && left.type().scale() == 0) {
-    // HUGEINT uses this physical carrier. SQL DECIMAL(38, 0) cannot reach its minimum.
-    minimum = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
-      std::numeric_limits<__int128_t>::min(), numeric::scale_type{0}, true, stream, mr);
-  } else if (cudf::is_integral_not_bool(left.type()) && !cudf::is_unsigned(left.type())) {
-    minimum =
-      cudf::type_dispatcher(left.type(), [&]<typename T>() -> std::unique_ptr<cudf::scalar> {
-        if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
-          return std::make_unique<cudf::numeric_scalar<T>>(
-            std::numeric_limits<T>::min(), true, stream, mr);
-        } else {
-          throw internal_exception("division minimum needs a signed integer type");
-        }
-      });
-  }
+  // HUGEINT's DECIMAL128 carrier gets its minimum too; SQL DECIMAL(38, 0) cannot reach it.
+  auto const minimum = make_signed_scalar(
+    left.type(), []<typename T>() { return std::numeric_limits<T>::min(); }, stream, mr);
   // Set when the numerator's type has a signed minimum: the divisors equal to -1, and the zero
   // divisors together with the minimum/-1 pairs.
   std::unique_ptr<cudf::column> is_minus_one;
@@ -202,9 +193,10 @@ std::unique_ptr<cudf::scalar> make_one(cudf::data_type type,
   };
   if (!holds(exceptional ? exceptional->view() : is_zero->view())) { return std::nullopt; }
   // Without a zero divisor, % only has minimum/-1 pairs left: divide by 1 in place of every -1.
-  // A divisor type that make_one does not cover is rejected instead.
+  // A divisor type without a signed scalar 1 is rejected instead.
   if (function == function_id::mod && exceptional && !holds(is_zero->view())) {
-    if (auto one = make_one(right.type(), stream, mr)) {
+    if (auto one =
+          make_signed_scalar(right.type(), []<typename T>() { return T{1}; }, stream, mr)) {
       if (right_result.is_scalar()) { return evaluate_result(std::move(one)); }
       return evaluate_result(cudf::copy_if_else(*one, right, is_minus_one->view(), stream, mr));
     }
@@ -498,7 +490,7 @@ evaluate_result expression_evaluator::evaluate_function_kernel(
     auto right = left.is_scalar() ? evaluate_as_column(*args[1])
                                   : evaluate(*args[1], evaluation_mode::MATERIALIZE);
     if (division_requires_check(alt)) {
-      if (auto divisor = require_safe_division(resolved_id, left, right, _stream, _mr)) {
+      if (auto divisor = checked_divisor(resolved_id, left, right, _stream, _mr)) {
         right = std::move(*divisor);
       }
     }
