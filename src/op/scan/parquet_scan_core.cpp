@@ -1206,7 +1206,9 @@ parquet_scan_core::file_pick parquet_scan_core::pick_position(std::size_t claim,
       std::size_t tenths = 0;
       if (auto const& ctx = _file_ctxs[i]; ctx && ctx->uses_fs_cache()) {
         auto const held = ctx->cache()->residency(_file_paths[_selected_file_indices[i]]);
-        if (held.object_bytes > 0) { tenths = held.resident_bytes * 10 / held.object_bytes; }
+        if (held && held->object_bytes > 0) {
+          tenths = held->resident_bytes * 10 / held->object_bytes;
+        }
       }
       by_cached.emplace_back(tenths, i);
     }
