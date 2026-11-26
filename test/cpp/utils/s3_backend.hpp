@@ -16,11 +16,26 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <string_view>
 
 namespace sirius::test {
+
+/// An identity of the managed SeaweedFS instance that may read the objects under @c prefix of the
+/// test bucket and nothing else: the store refuses its key pair for every other request.
+struct s3_prefix_reader {
+  std::string_view prefix;  ///< Key prefix, ending in '/'.
+  std::string_view access_key;
+  std::string_view secret_key;
+};
+
+/// Two such identities over disjoint prefixes.
+inline constexpr std::array<s3_prefix_reader, 2> s3_prefix_readers{{
+  {"reader-a/", "siriustest-reader-a", "siriustest-reader-a-secret"},
+  {"reader-b/", "siriustest-reader-b", "siriustest-reader-b-secret"},
+}};
 
 /**
  * @brief Lazily bring up the SeaweedFS test backend for the [s3] integration tests.
