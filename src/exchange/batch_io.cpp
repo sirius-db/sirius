@@ -23,7 +23,6 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
-#include <cudf/version_config.hpp>
 
 #include <rmm/aligned.hpp>
 #include <rmm/error.hpp>
@@ -75,15 +74,11 @@ mask_buffer make_mask(std::size_t bytes,
                       ::cuda::stream_ref stream,
                       rmm::device_async_resource_ref mr)
 {
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
   return mask_buffer{
     stream,
     mr,
     (bytes / sizeof(mask_buffer::value_type)) + (bytes % sizeof(mask_buffer::value_type) != 0),
     ::cuda::no_init};
-#else
-  return mask_buffer{bytes, stream, mr};
-#endif
 }
 
 void buffer_kinds(column_metadata const& c, std::vector<bool>& masks)

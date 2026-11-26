@@ -16,7 +16,6 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/mr/callback_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
-#include <rmm/version_config.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -1318,23 +1317,13 @@ TEST_CASE("Empty nested COPY avoids an excluded ambient GPU and restores the cal
   // Install only after runtime initialization, which may probe every visible GPU.
   // Any RMM allocation on excluded GPU0 during export is a regression.
   std::atomic<std::size_t> excluded_allocations{0};
-  rmm::mr::callback_memory_resource reject_excluded
-  {
-#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 12)
+  rmm::mr::callback_memory_resource reject_excluded{
     [](::cuda::stream_ref, std::size_t, std::size_t, void* arg) -> void* {
-#else
-    [](std::size_t, ::cuda::stream_ref, void* arg) -> void* {
-#endif
       ++*static_cast<std::atomic<std::size_t>*>(arg);
       throw std::logic_error("Empty export allocated on excluded GPU0");
     },
-#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 12)
-      [](::cuda::stream_ref, void*, std::size_t, std::size_t, void*) {},
-#else
-      [](void*, std::size_t, ::cuda::stream_ref, void*) {},
-#endif
-      &excluded_allocations
-  };
+    [](::cuda::stream_ref, void*, std::size_t, std::size_t, void*) {},
+    &excluded_allocations};
   auto previous =
     rmm::mr::set_per_device_resource(rmm::cuda_device_id{0},
                                      ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
