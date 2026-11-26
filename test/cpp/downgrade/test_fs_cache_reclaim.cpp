@@ -600,6 +600,60 @@ TEST_CASE("A delayed HOST reclaim does not hold up ready requests and is cancele
   CHECK(delayed.get() != nullptr);
 }
 
+TEST_CASE("An eligible HOST retry runs ahead of newer ready requests",
+          "[downgrade_executor][fs_cache][downgrade_lifecycle]")
+{
+  reclaim_fixture fixture;
+  fixture.start();
+  std::promise<void> entered;
+  auto processing = entered.get_future();
+  std::promise<void> release;
+  auto released         = release.get_future().share();
+  absl::Cleanup unblock = [&] { release.set_value(); };
+  fixture.executor->request_free_memory(
+    0,
+    [] { return true; },
+    [entered = std::move(entered), released](std::size_t, std::exception_ptr) mutable noexcept {
+      entered.set_value();
+      released.wait_for(10s);
+    });
+  REQUIRE(processing.wait_for(2s) == std::future_status::ready);
+
+  auto next_completion = std::make_shared<std::atomic<std::size_t>>(0);
+  auto enqueue         = [&](std::chrono::milliseconds delay) {
+    std::promise<std::size_t> done;
+    auto result = done.get_future();
+    fixture.executor->request_free_memory(
+      0,
+      [] { return true; },
+      [done = std::move(done), next_completion](std::size_t,
+                                                std::exception_ptr error) mutable noexcept {
+        if (error) {
+          done.set_exception(error);
+        } else {
+          done.set_value(next_completion->fetch_add(1, std::memory_order_relaxed));
+        }
+      },
+      delay);
+    return result;
+  };
+
+  auto later = enqueue(1min);
+  auto retry = enqueue(10ms);
+  std::this_thread::sleep_for(10ms);
+  auto ready = enqueue(0ms);
+  std::move(unblock).Invoke();
+
+  REQUIRE(retry.wait_for(2s) == std::future_status::ready);
+  CHECK(retry.get() == 0);
+  REQUIRE(ready.wait_for(2s) == std::future_status::ready);
+  CHECK(ready.get() == 1);
+  CHECK(later.wait_for(0ms) == std::future_status::timeout);
+  fixture.executor->pause();
+  REQUIRE(later.wait_for(0ms) == std::future_status::ready);
+  CHECK_THROWS(later.get());
+}
+
 namespace {
 
 /// One SiriusContext whose HOST executor binds the default local cache, with no DISK tier and a

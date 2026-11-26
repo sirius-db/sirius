@@ -31,6 +31,7 @@
 #include <chrono>
 #include <exception>
 #include <format>
+#include <functional>
 #include <limits>
 #include <new>
 #include <numeric>
@@ -927,49 +928,74 @@ bool downgrade_executor::enqueue_request(std::unique_ptr<downgrade_request>& req
     if (!_request_queue_open) { return false; }
     // Allocate the queue entry before taking ownership. A failed insertion leaves
     // the request and its callback with the submitting call.
-    auto entry    = _requests.emplace(std::chrono::steady_clock::now() + delay, nullptr);
-    entry->second = std::move(request);
+    const auto ready_at = std::chrono::steady_clock::now() + delay;
+    const auto order    = _next_request_order++;
+    if (delay == std::chrono::milliseconds::zero()) {
+      _ready_requests.emplace_back(ready_at, order, nullptr);
+      _ready_requests.back().request = std::move(request);
+    } else {
+      _delayed_requests.emplace_back(ready_at, order, nullptr);
+      _delayed_requests.back().request = std::move(request);
+      std::push_heap(_delayed_requests.begin(), _delayed_requests.end(), std::greater<>{});
+    }
   }
   _request_ready.notify_one();
   return true;
+}
+
+std::unique_ptr<downgrade_request> downgrade_executor::pop_next_request_locked()
+{
+  // Compare both queues so a now-eligible retry can run even while immediate requests arrive.
+  if (!_delayed_requests.empty() &&
+      (_ready_requests.empty() || _ready_requests.front() > _delayed_requests.front())) {
+    std::pop_heap(_delayed_requests.begin(), _delayed_requests.end(), std::greater<>{});
+    auto request = std::move(_delayed_requests.back().request);
+    _delayed_requests.pop_back();
+    return request;
+  }
+  if (_ready_requests.empty()) { return nullptr; }
+  auto request = std::move(_ready_requests.front().request);
+  _ready_requests.pop_front();
+  return request;
 }
 
 std::unique_ptr<downgrade_request> downgrade_executor::take_ready_request()
 {
   std::unique_lock lock(_request_mutex);
   while (_request_queue_open) {
-    if (_requests.empty()) {
+    if (!_ready_requests.empty()) { return pop_next_request_locked(); }
+    if (_delayed_requests.empty()) {
       _request_ready.wait(lock);
       continue;
     }
-    const auto ready_at = _requests.begin()->first;
-    if (ready_at > std::chrono::steady_clock::now()) {
-      _request_ready.wait_until(lock, ready_at);
-      continue;
-    }
-    return std::move(_requests.extract(_requests.begin()).mapped());
+    const auto ready_at = _delayed_requests.front().ready_at;
+    if (ready_at <= std::chrono::steady_clock::now()) { return pop_next_request_locked(); }
+    _request_ready.wait_until(lock, ready_at);
   }
   return nullptr;
 }
 
 void downgrade_executor::cancel_pending_requests()
 {
-  decltype(_requests) pending;
-  {
-    std::lock_guard lock(_request_mutex);
-    pending.swap(_requests);
-  }
+  // The queue is closed and the consumer is joined. Drain in eligibility order and invoke
+  // completions outside the request mutex.
   std::exception_ptr cancellation;
-  if (!pending.empty()) {
-    try {
-      throw std::runtime_error("downgrade executor shutting down");
-    } catch (...) {
-      // Keep the allocation exception if constructing the diagnostic failed. Each callback
-      // still needs to settle its query before the canceled request releases its task.
-      cancellation = std::current_exception();
+  for (;;) {
+    std::unique_ptr<downgrade_request> req;
+    {
+      std::lock_guard lock(_request_mutex);
+      req = pop_next_request_locked();
     }
-  }
-  for (auto& [ready_at, req] : pending) {
+    if (!req) { break; }
+    if (!cancellation) {
+      try {
+        throw std::runtime_error("downgrade executor shutting down");
+      } catch (...) {
+        // Keep the allocation exception if constructing the diagnostic failed. Each callback
+        // still needs to settle its query before the canceled request releases its task.
+        cancellation = std::current_exception();
+      }
+    }
     if (req->on_complete) {
       req->on_complete(0, cancellation);
     } else {

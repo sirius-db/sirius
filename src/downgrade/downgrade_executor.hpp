@@ -35,10 +35,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <future>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -252,6 +252,7 @@ class downgrade_executor {
   void set_request_queue_open(bool open);
   bool enqueue_request(std::unique_ptr<downgrade_request>& request,
                        std::chrono::milliseconds delay = {});
+  std::unique_ptr<downgrade_request> pop_next_request_locked();
   std::unique_ptr<downgrade_request> take_ready_request();
   void cancel_pending_requests();
 
@@ -270,13 +271,28 @@ class downgrade_executor {
   bool has_viable_downgrade_target() const;
 
  private:
+  struct queued_request {
+    std::chrono::steady_clock::time_point ready_at;
+    std::uint64_t order;
+    std::unique_ptr<downgrade_request> request;
+
+    bool operator>(const queued_request& other) const noexcept
+    {
+      if (ready_at != other.ready_at) { return ready_at > other.ready_at; }
+      return order > other.order;
+    }
+  };
+
   exec::downgrade_executor_config _config;
   std::unique_ptr<exec::bounded_thread_pool> _pool;
   std::mutex _request_mutex;
   std::condition_variable _request_ready;
-  bool _request_queue_open{false};  // guarded by _request_mutex
-  std::multimap<std::chrono::steady_clock::time_point, std::unique_ptr<downgrade_request>>
-    _requests;  // guarded by _request_mutex
+  // Queue state is guarded by _request_mutex. Immediate submissions form a FIFO, and requests
+  // with a delay form a min-heap by eligibility time and submission order.
+  bool _request_queue_open{false};
+  std::uint64_t _next_request_order{0};
+  std::deque<queued_request> _ready_requests;
+  std::vector<queued_request> _delayed_requests;
   std::thread _processing_thread;
   std::thread _monitor_thread;
   std::atomic<bool> _monitor_request_enqueued{false};
