@@ -127,7 +127,7 @@ struct PlanNode {
   // describe every key; decode does not recheck each offset.
   std::int64_t dictionary_key_width_hint = -1;
 
-  // Bytes (offsets plus chars) of a `dictionary` node's keys, -1 when unknown. Written by the
+  // Bytes allocated to a `dictionary` node's keys, -1 when unknown. Written by the
   // compress walk (plan/compress.cpp) before the tree is published and never serialized, so a
   // deserialized tree leaves it unknown. Consumed by probe_column.
   std::int64_t dictionary_keys_bytes = -1;

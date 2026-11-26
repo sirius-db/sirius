@@ -190,9 +190,9 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
 /// by a gather, a mask, or a split, copies its keys whole.
 inline constexpr std::size_t dictionary_output_max_keys_bytes = std::size_t{512} * 1024;
 
-/// The bytes (offsets plus chars) of the STRING keys of DICTIONARY32 @p dictionary; zero for one
-/// without a keys child, as a zero-row dictionary may be.
-std::size_t dictionary_keys_bytes(cudf::column_view const& dictionary, ::cuda::stream_ref stream);
+/// The bytes allocated to the STRING keys of DICTIONARY32 @p dictionary, known on the host without
+/// waiting on a stream; zero for one without a keys child, as a zero-row dictionary may be.
+std::size_t dictionary_keys_bytes(cudf::column const& dictionary);
 
 /// What one plan can do for a decode beyond reconstructing its column.
 ///

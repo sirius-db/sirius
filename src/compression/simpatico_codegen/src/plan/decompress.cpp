@@ -848,10 +848,9 @@ std::unique_ptr<cudf::column> DecodeWalk::dictionary_output_of(compressed_repres
   if (sources.empty() || !(sources.front() == ValueId{0, 0})) { return nullptr; }
   auto* const dictionary = dynamic_cast<dictionary_compressed_representation*>(&rep);
   if (dictionary == nullptr || !dictionary->dict_column) { return nullptr; }
-  auto const recorded = tree.nodes[nid].dictionary_keys_bytes;
-  auto const keys_bytes =
-    recorded >= 0 ? static_cast<std::size_t>(recorded)
-                  : dictionary_keys_bytes(dictionary->dict_column->view(), frame.stream());
+  auto const recorded   = tree.nodes[nid].dictionary_keys_bytes;
+  auto const keys_bytes = recorded >= 0 ? static_cast<std::size_t>(recorded)
+                                        : dictionary_keys_bytes(*dictionary->dict_column);
   if (keys_bytes > dictionary_output_max_keys_bytes) { return nullptr; }
   if (owned) { return std::move(dictionary->dict_column); }
   return std::make_unique<cudf::column>(
@@ -1514,14 +1513,10 @@ column_decode_caps probe_column(PlanTree const& tree)
   return caps;
 }
 
-std::size_t dictionary_keys_bytes(cudf::column_view const& dictionary, ::cuda::stream_ref stream)
+std::size_t dictionary_keys_bytes(cudf::column const& dictionary)
 {
   if (dictionary.num_children() <= cudf::dictionary_column_view::keys_column_index) { return 0; }
-  cudf::strings_column_view const keys(cudf::dictionary_column_view(dictionary).keys());
-  auto const offsets_bytes = keys.size() == 0 ? 0
-                                              : static_cast<std::size_t>(keys.offsets().size()) *
-                                                  cudf::size_of(keys.offsets().type());
-  return offsets_bytes + static_cast<std::size_t>(keys.chars_size(stream));
+  return dictionary.child(cudf::dictionary_column_view::keys_column_index).alloc_size();
 }
 
 mask_source_status decode_request(mask_decode_request const& request, decode_frame& frame)

@@ -238,17 +238,19 @@ enum class narrow_domain : uint8_t { NONE, SIGNED_INTEGER, UNSIGNED_INTEGER, DEC
  * @brief Most bytes (offsets plus chars) the keys of one batch's dictionary carrier may take
  *
  * Every gather, mask, and split of a batch copies its dictionary's keys whole, so a batch whose
- * keys exceed this carries the column as STRING instead.
+ * keys exceed this carries the column as STRING instead. Whatever makes a carrier enforces this:
+ * the decode that returns one and every concatenation that merges keys, so a consumer may rely on
+ * it without measuring.
  */
 inline constexpr std::size_t dictionary_carrier_max_keys_bytes = std::size_t{512} * 1024;
 
 /**
- * @brief Returns the bytes (offsets plus chars) of the STRING keys of DICTIONARY32 @p column
+ * @brief Returns the bytes allocated to the STRING keys of DICTIONARY32 @p column
  *
+ * The sizes of an owned column's buffers are known on the host, so this does not wait on a stream.
  * A column without a keys child, as a zero-row dictionary may be, has none.
  */
-[[nodiscard]] std::size_t dictionary_keys_bytes(cudf::column_view const& column,
-                                                ::cuda::stream_ref stream);
+[[nodiscard]] std::size_t dictionary_keys_bytes(cudf::column const& column);
 
 /**
  * @brief Decodes DICTIONARY32 @p column of STRING keys to STRING
@@ -266,7 +268,8 @@ inline constexpr std::size_t dictionary_carrier_max_keys_bytes = std::size_t{512
  * its STRING values in others
  *
  * `cudf::concatenate` rejects such a mix, so a column that mixes the two forms is decoded to
- * STRING in every table; a column every table carries as a dictionary stays one.
+ * STRING in every table; a column every table carries as a dictionary stays one unless its merged
+ * keys exceed `dictionary_carrier_max_keys_bytes`.
  */
 [[nodiscard]] std::unique_ptr<cudf::table> concatenate_carriers(
   std::vector<cudf::table_view> tables,

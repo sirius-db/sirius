@@ -285,14 +285,10 @@ bool is_dictionary_carrier_of(cudf::data_type carrier, cudf::data_type native) n
   return carrier.id() == cudf::type_id::DICTIONARY32 && native.id() == cudf::type_id::STRING;
 }
 
-std::size_t dictionary_keys_bytes(cudf::column_view const& column, ::cuda::stream_ref stream)
+std::size_t dictionary_keys_bytes(cudf::column const& column)
 {
   if (column.num_children() <= cudf::dictionary_column_view::keys_column_index) { return 0; }
-  cudf::strings_column_view const keys(cudf::dictionary_column_view(column).keys());
-  auto const offsets_bytes = keys.size() == 0 ? 0
-                                              : static_cast<std::size_t>(keys.offsets().size()) *
-                                                  cudf::size_of(keys.offsets().type());
-  return offsets_bytes + static_cast<std::size_t>(keys.chars_size(stream));
+  return column.child(cudf::dictionary_column_view::keys_column_index).alloc_size();
 }
 
 std::unique_ptr<cudf::column> decode_dictionary_carrier(cudf::column_view const& column,
@@ -332,7 +328,15 @@ std::unique_ptr<cudf::table> concatenate_carriers(std::vector<cudf::table_view> 
       table      = cudf::table_view(columns);
     }
   }
-  return cudf::concatenate(tables, stream, mr);
+  // Merging keys can take a carrier past the cap that each input kept to.
+  auto columns = cudf::concatenate(tables, stream, mr)->release();
+  for (auto& column : columns) {
+    if (column->type().id() == cudf::type_id::DICTIONARY32 &&
+        dictionary_keys_bytes(*column) > dictionary_carrier_max_keys_bytes) {
+      column = decode_dictionary_carrier(column->view(), stream, mr);
+    }
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
 }
 
 bool numeric_range_fits(cudf::data_type target, const numeric_range& range) noexcept

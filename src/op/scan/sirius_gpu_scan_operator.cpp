@@ -278,15 +278,9 @@ std::vector<carrier_conversion_plan> preflight_physical_schema(
     auto const& column = table.column(column_idx);
     auto const actual  = column.type();
     auto const target  = targets[column_idx];
-    // A dictionary carrier is a hint: a batch whose keys exceed the cap carries its strings.
-    if (actual == target && actual.id() == cudf::type_id::DICTIONARY32 &&
-        dictionary_keys_bytes(column, stream) > dictionary_carrier_max_keys_bytes) {
-      plan.push_back(
-        {actual, cudf::data_type{cudf::type_id::STRING}, carrier_conversion_kind::RESTORE});
-      continue;
-    }
-    // A chunk that decoded to strings (stored without a dictionary root, or decoded on a route that
-    // cannot return one) stays STRING, which every consumer of a carrier accepts.
+    // A chunk that decoded to strings (stored without a dictionary root, decoded on a route that
+    // cannot return one, or with keys over the carrier cap) stays STRING, which every consumer of a
+    // carrier accepts. A carrier the decode returned is within the cap.
     if (actual == target ||
         (has_explicit_physical_schema && is_dictionary_carrier_of(target, actual))) {
       plan.push_back({actual, target, carrier_conversion_kind::NONE});

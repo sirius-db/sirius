@@ -24,6 +24,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "operator/operator_test_utils.hpp"
@@ -36,10 +37,15 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
+
+#include <rmm/cuda_stream.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -68,11 +74,21 @@ std::vector<std::string> to_host(cudf::column_view column)
   if (column.size() == 0) { return {}; }
   auto const stream = cudf::get_default_stream();
   cudf::strings_column_view const view(column);
-  std::vector<int32_t> offsets(column.size() + 1);
-  cudaMemcpy(offsets.data(),
-             view.offsets().data<int32_t>() + column.offset(),
-             offsets.size() * sizeof(int32_t),
-             cudaMemcpyDeviceToHost);
+  // A column rebuilt from host memory may have 64-bit offsets.
+  std::vector<int64_t> offsets(column.size() + 1);
+  if (view.offsets().type().id() == cudf::type_id::INT64) {
+    cudaMemcpy(offsets.data(),
+               view.offsets().data<int64_t>() + column.offset(),
+               offsets.size() * sizeof(int64_t),
+               cudaMemcpyDeviceToHost);
+  } else {
+    std::vector<int32_t> narrow(offsets.size());
+    cudaMemcpy(narrow.data(),
+               view.offsets().data<int32_t>() + column.offset(),
+               narrow.size() * sizeof(int32_t),
+               cudaMemcpyDeviceToHost);
+    std::ranges::copy(narrow, offsets.begin());
+  }
   std::string chars(static_cast<std::size_t>(view.chars_size(stream)), '\0');
   cudaMemcpy(chars.data(), view.chars_begin(stream), chars.size(), cudaMemcpyDeviceToHost);
   std::vector<std::string> values;
@@ -108,14 +124,14 @@ TEST_CASE("a dictionary carrier decodes to its strings", "[dictionary_carrier]")
       CHECK(decoded->type().id() == cudf::type_id::STRING);
       CHECK(decoded->size() == 0);
     }
-    CHECK(sirius::dictionary_keys_bytes(childless->view(), stream) == 0);
+    CHECK(sirius::dictionary_keys_bytes(*childless) == 0);
   }
-  SECTION("rows decode to their values, and the keys count offsets and chars")
+  SECTION("rows decode to their values, and the keys count their offsets and chars")
   {
     std::vector<std::string> const values{"a", "bb", "ccc", "a", "bb"};
     auto const source  = strings(values);
     auto const encoded = encode(source->view());
-    CHECK(sirius::dictionary_keys_bytes(encoded->view(), stream) == 4 * sizeof(int32_t) + 6);
+    CHECK(sirius::dictionary_keys_bytes(*encoded) == 4 * sizeof(int32_t) + 6);
     auto const decoded = sirius::decode_dictionary_carrier(encoded->view(), stream);
     CHECK(to_host(decoded->view()) == values);
   }
@@ -171,6 +187,22 @@ TEST_CASE("concatenating carriers decodes only a column that mixes the two forms
       {cudf::table_view{{childless->view()}}, cudf::table_view{{childless->view()}}}, stream);
     CHECK(out->num_rows() == 0);
   }
+  SECTION("dictionaries whose merged keys exceed the cap leave as strings")
+  {
+    // 6,000 distinct 64-byte keys each, about 400 KiB: under the cap alone, over it merged.
+    auto values    = repeated(6'000, 6'000, 64);
+    auto const low = encode(strings(values)->view());
+    for (auto& value : values) {
+      value.front() = 'w';
+    }
+    auto const high = encode(strings(values)->view());
+    REQUIRE(sirius::dictionary_keys_bytes(*low) <= sirius::dictionary_carrier_max_keys_bytes);
+    auto const out = sirius::concatenate_carriers(
+      {cudf::table_view{{low->view()}}, cudf::table_view{{high->view()}}}, stream);
+    REQUIRE(out->get_column(0).type().id() == cudf::type_id::STRING);
+    CHECK(out->num_rows() == 12'000);
+    CHECK(to_host(out->get_column(0).view()).back() == values.back());
+  }
 }
 
 TEST_CASE("hash partitioning decodes a carrier key and a carrier whose keys every split copies",
@@ -204,4 +236,79 @@ TEST_CASE("hash partitioning decodes a carrier key and a carrier whose keys ever
     CHECK(view.column(2).type().id() == cudf::type_id::STRING);
   }
   CHECK(total == rows);
+}
+
+TEST_CASE("even partitioning decodes a carrier whose keys every split copies",
+          "[dictionary_carrier]")
+{
+  auto* space                = sirius::test::operator_utils::get_default_gpu_space();
+  auto const stream          = cudf::get_default_stream();
+  constexpr std::size_t rows = 20'000;
+  auto const small_values    = repeated(4, rows, 8);
+  auto const large_values    = repeated(rows, rows, 64);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(encode(strings(small_values)->view()));
+  columns.push_back(encode(strings(large_values)->view()));
+  auto const batch = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                             *space,
+                                             stream,
+                                             sirius::telemetry::batch_telemetry_info{});
+  auto const parts =
+    sirius::op::gpu_partition_impl::evenly_partition(batch->to_read_only(), 4, stream, *space);
+  REQUIRE(parts.size() == 4);
+  std::vector<std::string> small_out;
+  std::vector<std::string> large_out;
+  for (auto const& part : parts) {
+    auto const view = sirius::get_cudf_table_view(*part);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::DICTIONARY32);
+    REQUIRE(view.column(1).type().id() == cudf::type_id::STRING);
+    auto const decoded = sirius::decode_dictionary_carrier(view.column(0), stream);
+    auto const small   = to_host(decoded->view());
+    auto const large   = to_host(view.column(1));
+    small_out.insert(small_out.end(), small.begin(), small.end());
+    large_out.insert(large_out.end(), large.begin(), large.end());
+  }
+  CHECK(small_out == small_values);
+  CHECK(large_out == large_values);
+}
+
+TEST_CASE("a dictionary carrier survives a spill to the host and back", "[dictionary_carrier]")
+{
+  auto const manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu          = const_cast<cucascade::memory::memory_space*>(
+    manager->get_memory_space(cucascade::memory::Tier::GPU, 0));
+  auto* host = const_cast<cucascade::memory::memory_space*>(
+    manager->get_memory_space(cucascade::memory::Tier::HOST, 0));
+  REQUIRE(gpu != nullptr);
+  REQUIRE(host != nullptr);
+  // The spill's batched copy needs a stream other than the default one.
+  rmm::cuda_stream const owned_stream;
+  ::cuda::stream_ref const stream{owned_stream.value()};
+  auto const values = repeated(5, 1'000, 8);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(encode(strings(values)->view()));
+  columns.push_back(strings(values));
+  auto const batch = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                             *gpu,
+                                             stream,
+                                             sirius::telemetry::batch_telemetry_info{});
+  CUDF_CUDA_TRY(cudaStreamSynchronize(cudf::get_default_stream().get()));
+  auto& registry = sirius::converter_registry::get();
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(registry, host, stream);
+  }
+  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu, stream);
+  }
+  owned_stream.synchronize();
+
+  auto const view = sirius::get_cudf_table_view(*batch);
+  REQUIRE(view.column(0).type().id() == cudf::type_id::DICTIONARY32);
+  auto const decoded =
+    sirius::decode_dictionary_carrier(view.column(0), cudf::get_default_stream());
+  CHECK(to_host(decoded->view()) == values);
+  CHECK(to_host(view.column(1)) == values);
 }
