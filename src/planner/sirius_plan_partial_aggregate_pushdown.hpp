@@ -65,6 +65,11 @@ struct partial_aggregate_pushdown_result {
 /// SUM over an integer or a DECIMAL of up to 64 bits or over a floating-point value, MIN and MAX,
 /// whose combined result has the original type, so nothing above the aggregate changes.
 ///
+/// Pushed only where that pays: where the aggregate above groups by the pushed aggregate's keys,
+/// or by columns that inner joins equate with them, or where the scan statistics show at least
+/// `min_rows_per_key` rows per key. Never where a key is proven unique, since such an aggregate
+/// would combine nothing.
+///
 /// An aggregate over a join that is left alone reports why. The reasons are short fixed names
 /// (`aggregate:count_star`, `other-side:filtered`, ...), and every independent one is listed, so a
 /// plan's report tells which limits would all have to go for the rule to apply.
