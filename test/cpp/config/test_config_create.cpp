@@ -253,9 +253,10 @@ std::string describe(const sirius::sirius_config& c, bool in_effect = false)
     "op.df_keep", o.dynamic_filter_keep_threshold)("op.size_est", o.enable_runtime_size_estimation)(
     "op.sum_bound", o.enable_decimal_sum_stats_bound)(
     "op.zone_prune", o.enable_pinned_zone_map_pruning)("op.hw", o.use_hw_decompression)(
-    "op.cm", o.enable_compressed_materialization)("op.unique", o.prove_unique_keys)(
-    "op.unique_bytes", o.unique_exact_max_bytes)("op.dense", o.enable_dense_count_join)(
-    "op.delim", o.enable_delim_aggregate_reuse)("op.minmax", o.enable_exists_minmax_rewrite)(
+    "op.cm", o.enable_compressed_materialization)("op.dict", o.enable_dictionary_carrier)(
+    "op.unique", o.prove_unique_keys)("op.unique_bytes", o.unique_exact_max_bytes)(
+    "op.dense", o.enable_dense_count_join)("op.delim", o.enable_delim_aggregate_reuse)(
+    "op.minmax", o.enable_exists_minmax_rewrite)(
     "op.partial", o.enable_partial_aggregate_below_join)("op.carry", o.enable_subquery_key_carry)(
     "op.exists", o.enable_exists_from_aggregate)("op.footer_remote",
                                                  o.parquet_footer_statistics_max_remote_reads)(
@@ -608,6 +609,7 @@ TEST_CASE("every key of a configuration reaches its runtime field", "[config][co
   CHECK_FALSE(o.enable_pinned_zone_map_pruning);
   CHECK_FALSE(o.enable_decimal_sum_stats_bound);
   CHECK_FALSE(o.enable_compressed_materialization);
+  CHECK(o.enable_dictionary_carrier);
   CHECK_FALSE(o.enable_dense_count_join);
   CHECK_FALSE(o.enable_delim_aggregate_reuse);
   CHECK_FALSE(o.prove_unique_keys);

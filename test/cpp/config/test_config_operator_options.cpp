@@ -245,6 +245,7 @@ TEST_CASE("every operator option's fallback and audience", "[config][config_oper
   check(op.enable_pinned_zone_map_pruning, true);
   check(op.enable_decimal_sum_stats_bound, true);
   check(op.enable_compressed_materialization, true);
+  check(op.enable_dictionary_carrier, true);
   check(op.enable_dense_count_join, true);
   check(op.enable_delim_aggregate_reuse, true);
   check(op.pin_table_prove_unique_keys, true);

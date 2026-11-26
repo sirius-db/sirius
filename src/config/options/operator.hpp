@@ -219,6 +219,11 @@ struct operator_options : block_base<operator_options> {
       .fallback(defaults().enable_compressed_materialization)
       .describe("narrower carriers for eligible integer and DECIMAL values")
       .build();
+  config_option<bool> enable_dictionary_carrier =
+    option<bool>("enable_dictionary_carrier")
+      .fallback(defaults().enable_dictionary_carrier)
+      .describe("dictionary carriers for VARCHAR columns of a dictionary-encoded pin")
+      .build();
   config_option<bool> enable_dense_count_join = option<bool>("enable_dense_count_join")
                                                   .fallback(defaults().enable_dense_count_join)
                                                   .describe("fused count-over-outer-join operator")
@@ -342,6 +347,7 @@ struct operator_options : block_base<operator_options> {
       enable_pinned_zone_map_pruning,
       enable_decimal_sum_stats_bound,
       enable_compressed_materialization,
+      enable_dictionary_carrier,
       enable_dense_count_join,
       enable_delim_aggregate_reuse,
       pin_table_prove_unique_keys,

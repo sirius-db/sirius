@@ -687,6 +687,7 @@ try {
   ops.enable_pinned_zone_map_pruning           = op.enable_pinned_zone_map_pruning.get();
   ops.enable_decimal_sum_stats_bound           = op.enable_decimal_sum_stats_bound.get();
   ops.enable_compressed_materialization        = op.enable_compressed_materialization.get();
+  ops.enable_dictionary_carrier                = op.enable_dictionary_carrier.get();
   ops.enable_dense_count_join                  = op.enable_dense_count_join.get();
   ops.enable_delim_aggregate_reuse             = op.enable_delim_aggregate_reuse.get();
   ops.prove_unique_keys                        = op.pin_table_prove_unique_keys.get();

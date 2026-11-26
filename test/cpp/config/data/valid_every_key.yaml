@@ -174,6 +174,7 @@ sirius:
     enable_pinned_zone_map_pruning: false
     enable_decimal_sum_stats_bound: false
     enable_compressed_materialization: false
+    enable_dictionary_carrier: true
     enable_dense_count_join: false
     enable_delim_aggregate_reuse: false
     pin_table_prove_unique_keys: false
