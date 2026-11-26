@@ -32,6 +32,8 @@ struct EnvironmentView {
 Digest request_identity(const RequestView& request);
 Digest environment_identity(const EnvironmentView& environment);
 Digest content_identity(std::string_view content);
+// For compilers other than NVRTC, each under a `domain` of its own.
+Digest framed_identity(std::string_view domain, std::span<const std::string_view> fields);
 std::string hex_digest(const Digest& digest);
 
 struct CompilationIdentity {

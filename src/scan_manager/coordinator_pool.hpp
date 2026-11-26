@@ -66,7 +66,7 @@ class coordinator_pool {
     std::shared_ptr<state> state_;
     std::shared_ptr<entry> entry_;
   };
-  explicit coordinator_pool(size_t workers);
+  explicit coordinator_pool(size_t workers, std::vector<int> cpu_affinity = {});
   ~coordinator_pool();
   coordinator_pool(coordinator_pool const&)            = delete;
   coordinator_pool& operator=(coordinator_pool const&) = delete;
@@ -85,6 +85,7 @@ class coordinator_pool {
   void before_thread_for_testing(std::function<void(size_t)>);
 
  private:
+  std::vector<int> cpu_affinity_;
   void start_workers();
   std::shared_ptr<state> state_;
   std::mutex lifecycle_mutex_;

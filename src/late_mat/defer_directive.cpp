@@ -29,6 +29,9 @@ std::atomic<std::uint64_t>& install_counter() noexcept
   static std::atomic<std::uint64_t> installed{0};
   return installed;
 }
+
+std::atomic<std::uint64_t> decode_reported_batches{0};
+std::atomic<std::uint64_t> composed_batches{0};
 }  // namespace
 
 std::uint64_t deferrals_installed() noexcept
@@ -39,6 +42,18 @@ std::uint64_t deferrals_installed() noexcept
 void note_deferral_installed() noexcept
 {
   install_counter().fetch_add(1, std::memory_order_relaxed);
+}
+
+survivor_batch_counts survivor_batches() noexcept
+{
+  return {.decode_reported = decode_reported_batches.load(std::memory_order_relaxed),
+          .composed        = composed_batches.load(std::memory_order_relaxed)};
+}
+
+void note_survivor_batch(bool composed) noexcept
+{
+  decode_reported_batches.fetch_add(1, std::memory_order_relaxed);
+  if (composed) { composed_batches.fetch_add(1, std::memory_order_relaxed); }
 }
 
 bool deferred_scan_output::defers(std::size_t position) const noexcept

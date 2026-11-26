@@ -95,7 +95,7 @@ inline void null_every_seventh(cudf::column& column, ::cuda::stream_ref stream)
       words[static_cast<std::size_t>(i) / 32] |= 1u << (i % 32);
     }
   }
-  auto mask = cudf::create_null_mask(rows, cudf::mask_state::ALL_NULL, stream);
+  auto mask = cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, stream);
   RMM_CUDA_TRY(cudaMemcpyAsync(mask.data(),
                                words.data(),
                                words.size() * sizeof(std::uint32_t),

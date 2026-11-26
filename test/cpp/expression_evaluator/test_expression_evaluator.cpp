@@ -3446,21 +3446,28 @@ TEMPLATE_TEST_CASE("function results narrower than their SQL type compose inside
   }
 }
 
-TEST_CASE("timestamp casts check microsecond overflow", "[expression_evaluator][timestamp_bounds]")
+TEST_CASE("timestamp casts to a finer precision check overflow",
+          "[expression_evaluator][timestamp_bounds]")
 {
   auto* space         = get_default_gpu_space();
   auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
-  auto const seconds  = GENERATE(true, false);
-  auto const source   = seconds ? sirius::type_id::TIMESTAMP_SEC : sirius::type_id::TIMESTAMP_MS;
+  auto const [source, target, scale] = GENERATE(table<sirius::type_id, sirius::type_id, int64_t>({
+    {sirius::type_id::TIMESTAMP_SEC, sirius::type_id::TIMESTAMP_MS, 1000},
+    {sirius::type_id::TIMESTAMP_SEC, sirius::type_id::TIMESTAMP, 1000000},
+    {sirius::type_id::TIMESTAMP_SEC, sirius::type_id::TIMESTAMP_NS, 1000000000},
+    {sirius::type_id::TIMESTAMP_MS, sirius::type_id::TIMESTAMP, 1000},
+    {sirius::type_id::TIMESTAMP_MS, sirius::type_id::TIMESTAMP_NS, 1000000},
+    {sirius::type_id::TIMESTAMP, sirius::type_id::TIMESTAMP_NS, 1000},
+  }));
+
   auto const source_type = sirius::logical_type::make(source);
-  int64_t const scale    = seconds ? 1000000 : 1000;
+  auto const target_type = sirius::logical_type::make(target);
   int64_t const max      = std::numeric_limits<int64_t>::max();
   int64_t const min      = std::numeric_limits<int64_t>::min();
-  auto expr              = sirius::ast::node{sirius::ast::cast{
-    make_ref_typed(0, source_type), sirius::logical_type::make(sirius::type_id::TIMESTAMP)}};
-  auto stream            = cudf::get_default_stream();
-  auto mr                = get_resource_ref(*space);
-  auto run               = [&](std::vector<int64_t> const& ticks, bool valid = true) {
+  auto expr   = sirius::ast::node{sirius::ast::cast{make_ref_typed(0, source_type), target_type}};
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+  auto run    = [&](std::vector<int64_t> const& ticks, bool valid = true) {
     auto col =
       cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
                                 ticks.size(),
@@ -3501,6 +3508,43 @@ TEST_CASE("timestamp casts check microsecond overflow", "[expression_evaluator][
     auto out = run({});
     CHECK(out->num_rows() == 0);
   }
+}
+
+TEST_CASE("TIMESTAMP_NS to TIMESTAMP casts round to the nearest microsecond",
+          "[expression_evaluator][timestamp_bounds]")
+{
+  auto* space         = get_default_gpu_space();
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const source_type = sirius::logical_type::make(sirius::type_id::TIMESTAMP_NS);
+  auto const target_type = sirius::logical_type::make(sirius::type_id::TIMESTAMP);
+  int64_t const max      = std::numeric_limits<int64_t>::max();
+  // Ties round away from the epoch and infinity sentinels pass through. The last row is NULL.
+  std::vector<int64_t> const ticks = {
+    -1500, -1499, -500, -499, 0, 499, 500, 1499, 1500, -max, max, max - 1, -(max - 1), 0};
+  std::vector<int64_t> const expected = {
+    -2, -1, -1, 0, 0, 0, 1, 1, 2, -max, max, 9223372036854776, -9223372036854776};
+  auto expr   = sirius::ast::node{sirius::ast::cast{make_ref_typed(0, source_type), target_type}};
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+  auto col    = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, ticks.size(), cudf::mask_state::ALL_VALID, stream, mr);
+  REQUIRE(cudaMemcpy(col->mutable_view().data<int64_t>(),
+                     ticks.data(),
+                     ticks.size() * sizeof(int64_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  cudf::set_null_mask(col->mutable_view().null_mask(), 13, 14, false, stream);
+  col->set_null_count(1);
+  auto view         = cudf::bit_cast(col->view(), sirius::require_cudf_type(source_type));
+  auto out          = run_native_ast(*space, &expr, cudf::table_view{{view}}, strategy);
+  auto const result = out->view().column(0);
+  CHECK(result.type().id() == cudf::type_id::TIMESTAMP_MICROSECONDS);
+  std::vector<bool> expected_valids(expected.size(), true);
+  expected_valids.push_back(false);
+  CHECK(copy_valids_to_host(result) == expected_valids);
+  // The NULL row's payload is unspecified.
+  auto actual = copy_column_to_host<int64_t>(result);
+  actual.resize(expected.size());
+  CHECK(actual == expected);
 }
 
 TEST_CASE("subsecond extraction preserves minimum finite ticks",

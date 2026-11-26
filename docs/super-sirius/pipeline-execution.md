@@ -17,7 +17,7 @@ operators[0] --> operators[1] --> ... --> operators[N-1]
 - `sink` is an alias for the last operator — it also has a `sink()` method called after the execute loop
 - `operators` contains **all** operators, including source and sink (unlike DuckDB where source/sink are separate from the operators list)
 
-Each operator's `execute()` method is called in sequence by `compute_task()`. After the loop, the sink's `sink()` method is called via `publish_output()` to push results to downstream ports.
+Each operator's `execute()` entry point is called in sequence by `compute_task()`. After the loop, the sink's `sink()` method is called via `publish_output()` to push results to downstream ports.
 
 Pipelines are connected through **ports** on operators. When a sink pushes output into ports, a **task creator** monitors data availability and creates `gpu_pipeline_task` objects. These tasks are scheduled on the `gpu_pipeline_executor`, which manages GPU memory, CUDA streams, and a thread pool.
 
@@ -47,6 +47,20 @@ After pipeline finalization, `source` and `sink` are simply aliases for the firs
 - `sink(output_data, stream)` — called on the **last** operator by `publish_output()` to push results to downstream ports
 
 See [Operators](operators.md) for the complete operator reference.
+
+### Delivery metadata
+
+Before invoking `execute()`, the GPU task stamps `delivery_metadata` onto the actual
+input, after any deferred-column materialization. The metadata contains the original
+task ID and retry count; rescheduling retains the original ID, including zero.
+The retry count describes the attempt and is not part of the deduplication key.
+A replacement payload need not propagate metadata: the executor stamps each operator
+invocation and overwrites any metadata inherited from an upstream task.
+
+Parquet COPY requires this metadata and keys its query-local session by original task
+ID. Two tasks may consume the same shared physical batch and still count as separate
+deliveries. No query ID or separate contextual execution method is needed. Delivery
+metadata does not change physical batch identity, scan receipts, or row ordering.
 
 ### Ports
 
@@ -85,7 +99,7 @@ parallel::itask                          // base: local_state + global_state + e
 - `gpu_pipeline_task_global_state` — holds the `sirius_pipeline` to execute
 - `gpu_pipeline_task_local_state` — holds input `data_batch` vector, memory reservation, `_start_operator_index` (for OOM resume), `retry_count`
 
-**`compute_task(stream)`** iterates through **all** operators in the pipeline (source through sink inclusive), calling `execute()` on each:
+**`compute_task(stream)`** iterates through **all** operators in the pipeline (source through sink inclusive), calling `execute()` on each with delivery metadata on the input:
 ```cpp
 auto operators = pipeline->get_operators();  // includes source and sink
 for (size_t i = start_index; i < operators.size(); i++) {
@@ -108,6 +122,9 @@ pipeline->get_sink()->sink(output_data, stream);
 4. Processing handles released automatically on scope exit
 
 The **destructor** calls `pipeline->mark_task_completed()` to update pipeline completion tracking.
+Completing the last task finalizes the pipeline's operators, which can throw. The destructor
+cannot propagate that, so it reports the exception to the query's completion handler: the query
+fails and the process keeps running.
 
 **`get_output_consumers()`** returns the first operator of each parent pipeline — these downstream operators are scheduled next by the GPU executor.
 
@@ -366,9 +383,9 @@ The reservation request size comes from the task's memory-history estimate (`pea
 
 After a task completes:
 
-1. Retrieve `output_consumers` — first operators of parent pipelines
-2. If query not complete: call `task_creator->schedule(consumer)` for each
-3. If pipeline sink is `RESULT_COLLECTOR` and pipeline is finished: `completion_handler->mark_completed()`
+1. Check whether `pipeline->is_query_terminal()` (RESULT_COLLECTOR, STREAMING_SINK, or COPY_TO_FILE) and the pipeline is finished
+2. If complete: `completion_handler->mark_completed()`
+3. Otherwise, retrieve `output_consumers` — first operators of parent pipelines — and call `task_creator->schedule(consumer)` for each
 
 The completion check happens **before** scheduling downstream tasks to prevent scheduling tasks that reference already-destroyed operators.
 
@@ -385,6 +402,26 @@ parent-cascade paths can finish a pipeline without returning through the GPU epi
 as a `std::weak_ptr`, preventing retired pipelines from retaining a handler.
 The pipeline obtains a strong reference under `_status_mutex` and calls `mark_completed()` only
 after releasing the lock and finishing all pipeline access.
+
+`pipeline_finished` is set only after the operators are finalized, so the lock-free
+`is_pipeline_finished()` never reports a pipeline whose finalize is still running or has failed.
+If `finalize_operator()` throws, the pipeline records the failure under `_status_mutex` and
+rethrows to its caller, which reports the error. The pipeline then stays unfinished: it is not
+finalized again, it never signals completion, and no downstream pipeline can treat its input as
+complete and finish the query in its place.
+
+An exhausted LIMIT is the one case where a terminal pipeline finishes without waiting for its
+upstream pipelines, so success can be signalled while an upstream finalize is still running. The
+handler accepts only the first signal and drops the later error. The pipeline keeps the
+exception (`finalize_error()`), and `sirius_engine::execute()` calls
+`rethrow_finalize_failure()` on the query's pipelines after `retire_query_work()` has waited for
+all work, so the query fails instead of returning its result.
+
+A query that has already failed drops a later finalize error the same way, and the handler's
+error callback, which marks the runtime unavailable after a fatal device error, never sees it.
+So when a failed or cancelled query retires its work, `sirius_engine::quiesce_plan_users()`
+passes every recorded finalize failure to `query_lifecycle_registry::report_failure()` through
+`report_finalize_failures()`.
 
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,

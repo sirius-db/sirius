@@ -92,6 +92,8 @@ class sirius_engine {
   void initialize_internal(op::sirius_physical_operator& physical_result_collector);
   //! Execute the sirius engine
   void execute();
+  // Cleanup of side-effecting sinks is safe only after all plan users retire.
+  [[nodiscard]] bool plan_users_quiescent() const noexcept { return plan_users_quiescent_; }
   //! Reset the sirius engine
   void reset();
   //! Cancel the tasks

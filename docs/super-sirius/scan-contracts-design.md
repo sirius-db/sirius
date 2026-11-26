@@ -35,7 +35,7 @@ A source rejected before its scan node exists still gets a classified lookup ver
 
 Sirius verifies supported scan functions against trusted definitions and the current catalog. A matching function name is insufficient.
 
-Loadable builds require ABI-compatible exports of `duckdb::TableScanFunction::GetFunction()` and `duckdb_extension_parquet_describe` from the host DuckDB module. Sirius checks that each resolved entry point belongs to that module. Both `RTLD_LOCAL` and `RTLD_GLOBAL` loading are supported.
+Loadable builds obtain ABI-compatible `duckdb::TableScanFunction::GetFunction()` and `duckdb_extension_parquet_describe` from the host DuckDB module, first from its dynamic exports (`dlsym`). The official DuckDB CLI exports nothing, so there is a second path that reads the static symbol table (`.symtab`) of the mapped image. It opens the mapped file itself through `/proc/self/map_files` (or the path, accepted only if device and inode match the mapping), requires the file's program header table to equal the one the loader reports for the module, takes the one definition with that name (GLOBAL or WEAK, otherwise a single LOCAL), requires the address to lie in the module (`dladdr1`), and compares the function's first bytes in memory with the file. Each check failing yields no reference. A host stripped of `.symtab` has no trusted reference. Both `RTLD_LOCAL` and `RTLD_GLOBAL` loading are supported.
 
 If a trusted definition is unavailable, Sirius warns once per source and declines its GPU scans. CPU fallback still depends on fallback settings and source policy. Iceberg definitions are established when its extension loads and also require the host Parquet descriptor.
 
@@ -123,7 +123,7 @@ Adapters using this driver must also handle the following integration responsibi
 
 ### Execution and ownership
 
-The coordinator claims work, coalesces results and publishes batches after GPU consumers are ready. Metadata-only attempts advance on the query owner without another thread. An attempt with query-owner or native-reader sources runs coordination independently of reader calls: on the manager's shared pool by default, or on a dedicated thread when `coordinator_workers` is `0`. All drivers use the same bounded control steps, publication gate and retirement path. Sources choose where their jobs run:
+The coordinator claims work, coalesces results and publishes batches after GPU consumers are ready. Parquet/Iceberg attempts advance coordination independently and dispatch coalescing to the existing metadata worker pool. Other metadata-only attempts advance on the query owner without another thread. An attempt with asynchronous coalescing, query-owner sources or native-reader sources runs coordination independently of reader calls: on the manager's shared pool by default, or on a dedicated thread when `coordinator_workers` is `0`. All drivers use the same bounded control steps, publication gate and retirement path. Sources choose where their jobs run:
 
 | Execution domain | Work and cleanup | Use |
 |---|---|---|
@@ -186,7 +186,7 @@ The action limit bounds work count, not hook duration. Adapters used with the sh
 |---|---|
 | `try_claim` | Returns work, pending or exhausted without entering a reader. Parquet/Iceberg resolve and read inside the job. DuckDB-native storage walks must finish during manager setup; its legacy claim fallback can still perform the walk if setup is bypassed. |
 | Job submission | Metadata enqueue does not wait for a worker slot; query-owner/native handoff uses the admitted mailbox or lease. Submission may allocate and take locks. |
-| Coalescer `advance`, `partial_emit`, `flush`; input construction | Manipulate prepared metadata and allocate descriptors. Datasource duplication shares existing handles. Allocation, locks and capture destruction still run inline. |
+| Coalescer `advance`, `partial_emit`, `flush`; input construction | Parquet coalescer operations run asynchronously on metadata workers; other coalescers and input construction remain inline. Datasource duplication shares existing handles. |
 | `prepare_prefetch` | Does not wait for eviction or device progress. It takes cache locks, allocates buffers and invokes ready completion callbacks inline. |
 | Final publication | Readahead registration and connector insertion run under the gate; no arbitrary adapter hooks are allowed there. Their locks and allocations remain part of the step. |
 | Source/output close and released captures | Metadata close and output notifications can run inline. Query-owner/native reader close and accepted-job disposal stay in their assigned execution domain. |
@@ -280,3 +280,42 @@ On the explicit path, the rebound validator returns a policy refusal separately 
 Iceberg manifest queries use a separate read-only connection with recursive GPU execution disabled and finish before native leases are acquired. Parquet position-delete files use the shared reader in the caller's active transaction, with its filesystem and credentials. Callers must discard partial results if reading fails.
 
 Related documentation: [Scan](scan.md), [Physical Plan Generation](physical-plan-generation.md), and [Streaming Fragments](streaming-fragments.md).
+
+### Asynchronous Parquet coalescing
+
+Parquet coalescers opt into worker execution via `asynchronous_preparation()`. The coordinator
+submits `advance`, partial emission and final flush through the existing query-scoped metadata
+dispatcher. Each source has at most one pending operation, with an owning input and completion;
+no references into recyclable result slots cross the worker boundary. Completion snapshots
+carry the cursor, retained byte count and first-retained timestamp. The coordinator reads those
+snapshots rather than concurrently inspecting the mutable coalescer, then publishes through
+the existing admission gate. A pending operation reserves that source's next emission opportunity.
+
+Partial-batch deadlines schedule work rather than directly invoking the coalescer. Cancellation
+closes publication immediately; running operations finish before the dispatcher reports drain.
+Queued operations may be discarded. Source close and cleanup occur only after dispatcher drain,
+so input metadata and coalescer dependencies outlive all accepted work. Workers report coalescer
+exceptions outside the publication gate before completing their dispatcher work, including when
+normal EOS has closed the gate and no controller will consume the result. Routed pool-submission
+failures likewise reach query completion before pending work is discarded or final dispatcher
+drain is observable. The first query error wins. Cancellation does not preempt an in-progress
+library call.
+
+Workers have permanent NUMA-domain assignments. Independent metadata jobs rotate across the
+query's eligible domains; a whole job runs in its assigned domain, while each source's coalescer
+retains its selected domain. There is no persistent per-file routing state or cross-domain stealing.
+The dispatcher fairly selects the two work classes without executing callbacks on the submitting
+coordinator. Completed operations are consumed in rotating source
+order, at most one per control turn; a repeatedly ready source cannot continually bypass another
+ready completion. These policies do not preempt running reads or bound shared admission delay.
+See configuration for CPU allowance, fallback rules and separate worker-thread budgets.
+
+### Shared startup CPU boundary
+
+CPU-allowance discovery belongs to cuCascade, separately from hardware topology. Sirius saves
+the intersection of the main-thread mask and deployment allowance when configuration resolves.
+Metadata domains, pool affinity and lazy I/O/control/exchange startup use that snapshot rather
+than rediscovering a boundary from whichever DuckDB worker makes the call. Explicit pool masks
+can narrow the snapshot, and REST-reactor reservations further restrict worker CPUs. Temporary
+startup scopes preserve the caller's CUDA/thread-local context and restore CPU affinity; they
+do not move coalescing back to the query owner or change memory policy.

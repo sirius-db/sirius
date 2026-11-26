@@ -58,7 +58,6 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   RECURSIVE_CTE_SCAN,
   RECURSIVE_RECURRING_CTE_SCAN,
   CTE_SCAN,
-  DELIM_SCAN,
   EXPRESSION_SCAN,
   POSITIONAL_SCAN,
   // -----------------------------
@@ -70,8 +69,6 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   CROSS_PRODUCT,
   PIECEWISE_MERGE_JOIN,
   IE_JOIN,
-  LEFT_DELIM_JOIN,
-  RIGHT_DELIM_JOIN,
   POSITIONAL_JOIN,
   ASOF_JOIN,
   // -----------------------------

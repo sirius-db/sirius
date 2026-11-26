@@ -60,7 +60,6 @@ target_sources(
           scan/puffin_reader.cpp
           scan/positional_delete_filter.cpp
           scan/equality_delete_filter.cpp
-          scan/iceberg_delete_pipeline.cpp
           scan/iceberg_gpu_ingestible.cpp
           scan/iceberg_dv_preparation.cpp
           dynamic_filter/dynamic_filter_key_domain.cpp
@@ -76,9 +75,7 @@ target_sources(
           sirius_physical_streaming_source.cpp
           sirius_physical_concat.cpp
           sirius_physical_cte.cpp
-          sirius_physical_delim_join.cpp
           sirius_physical_dense_count_join.cpp
-          sirius_physical_dummy_scan.cpp
           sirius_physical_empty_result.cpp
           sirius_physical_filter.cpp
           sirius_physical_gpu_values.cpp
@@ -97,6 +94,7 @@ target_sources(
           sirius_physical_passthrough_sink.cpp
           sirius_physical_projection.cpp
           sirius_physical_replicate.cpp
+          sirius_physical_parquet_sink.cpp
           sirius_physical_result_collector.cpp
           sirius_physical_sort_partition.cpp
           sirius_physical_sort_sample.cpp
@@ -109,6 +107,7 @@ target_sources(
           sirius_physical_window.cpp
           aggregate/average.cu
           aggregate/wide_integer_sum.cu
+          join/kept_build_marks.cu
           partition/crc32_partition_hash.cu
           replicate/gpu_replicate_impl.cu
           scan/equality_delete_mask.cu)

@@ -26,13 +26,9 @@ namespace sirius::test {
  * @brief Arms the `operator new` fault helper
  * (`test/cpp/utils/dynamic_filter_host_allocation_fault.cpp`) on the calling thread until
  * destruction.
- *
- * Only `scripts/run_dynamic_filter_host_allocation_fault.py` preloads the helper, for the hidden
- * `[host_allocation_fault]` tests, which must first require `available()`.
  */
 class scoped_host_allocation_fault {
  public:
-  /** @brief Matches allocations made inside `accumulated_bloom_builder::make_filters`. */
   static constexpr int filter_shell_scope = 1;
   /** @brief Matches every allocation. */
   static constexpr int every_allocation_scope = 2;

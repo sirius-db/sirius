@@ -57,7 +57,7 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Motivation:** A `MERGE_GROUP_BY` / `MERGE_TOP_N` operator normally forms its own terminal pipeline whose only downstream is a streaming chain ending at the sink (typically `RESULT_COLLECTOR`). That standalone pipeline costs an extra task launch and a repository round-trip for no additional parallelism.
 
-**Mechanism:** At plan time `mark_fusable_merge_pipelines()` walks parent pointers from each merge to the first downstream sink. When that path is unary and streaming and the sink accepts a fused input, the merge is marked to fuse. The merge's `build_pipelines()` override then adds itself as an intermediate operator to the downstream pipeline and recurses into its child (which still cuts the upstream boundary), instead of opening a new terminal pipeline. Total-input structural sinks (`ORDER_BY`, `TOP_N`, an outer `GROUP BY`) are fusable because they already buffer their full input. Excluded: join/CTE/delim terminals, partition sinks, delim-owned distinct merges, and `MERGE_AGGREGATE` (ungrouped aggregate).
+**Mechanism:** At plan time `mark_fusable_merge_pipelines()` walks parent pointers from each merge to the first downstream sink. When that path is unary and streaming and the sink accepts a fused input, the merge is marked to fuse. The merge's `build_pipelines()` override then adds itself as an intermediate operator to the downstream pipeline and recurses into its child (which still cuts the upstream boundary), instead of opening a new terminal pipeline. Total-input structural sinks (`ORDER_BY`, `TOP_N`, an outer `GROUP BY`) are fusable because they already buffer their full input. Excluded: join/CTE terminals, partition sinks, and `MERGE_AGGREGATE` (ungrouped aggregate).
 
 **Code path:**
 - `src/planner/sirius_physical_plan_generator.cpp` — `mark_fusable_merge_pipelines()`, `terminal_sink_supports_fusion()`
@@ -141,16 +141,16 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
-### Subquery Aggregates from the Delim Join's Rows
+### Subquery Aggregates from the Delim CTE's Rows
 
-**Motivation:** DuckDB decorrelates `l_quantity < (SELECT avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)` (TPC-H q17) and q2's `MIN(ps_supplycost)` over the EUROPE suppliers into a delim join whose subquery side joins the outer rows' distinct keys back to a fresh scan of the subquery's tables. When the outer rows already hold every subquery row for their key, that second scan, and the join against the keys, are redundant.
+**Motivation:** DuckDB decorrelates `l_quantity < (SELECT avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)` (TPC-H q17) and q2's `MIN(ps_supplycost)` over the EUROPE suppliers into a delim CTE of the outer rows `O` and an aggregate whose input `I` joins the outer rows' distinct keys back to a fresh scan of the subquery's tables. When the outer rows already hold every subquery row for their key, that second scan, and the join against the keys, are redundant.
 
-**Mechanism:** a logical rewrite on the transparent path's copy of DuckDB's optimized plan, before Sirius plans it. `DELIM_JOIN(O, ... AGGREGATE(I))` becomes `CTE(O) { JOIN(CTE_SCAN, ... AGGREGATE(CTE_SCAN)) }` with the same join type and conditions: the outer rows are materialized once and grouped by their key. Under `delim_join_as_cte = true`, where DuckDB has already made `O` a CTE and restricts `I` by a SEMI join against `SELECT DISTINCT key FROM CTE_SCAN`, the aggregate's input becomes a scan of that CTE instead. The aggregate keeps its table indexes, so nothing above it changes.
+**Mechanism:** a logical rewrite on the transparent path's copy of DuckDB's optimized plan, before Sirius plans it. DuckDB has made `O` a CTE and restricts `I` by a SEMI join against `SELECT DISTINCT key FROM CTE_SCAN`; the aggregate's input becomes a scan of that CTE instead, grouped by the key. The aggregate keeps its table indexes, so nothing above it changes.
 
-**When it applies:** both sides are flattened into a product of leaves filtered by the conjunction of their predicates. `I` must be the subquery's rows `S` restricted by one `S.a = key` equality, and `O` must be `S' x P` where every leaf of `S` maps to exactly one scan of the same table view (or of the same CTE) in `S'`, the predicates over `S'` alone are exactly `S`'s, and every predicate across `S'` and `P` reads `S'` only through `a`. The join key must be `a` or a column of `P` equated with it. Then the outer rows with key `k` are `S`'s rows with `a = k`, each repeated the same number of times, which leaves MIN and MAX unchanged, and AVG too when its input is an INTEGER, a BIGINT, or a DECIMAL of width 5 to 18 (a DOUBLE sum depends on the order rows are added in). Repetition also scales AVG's sum: DuckDB sums those inputs in 128 bits, which no row count can overflow, while SMALLINT and DECIMAL(1-4) sum in 64 bits and HUGEINT and DECIMAL(19-38) in 128 bits, either of which can overflow on repeated rows where the original aggregate does not. A `key IS NOT NULL` filter replaces the subquery's `=` when no join already rejects NULL keys. Anything else declines: SUM, COUNT, DISTINCT or filtered aggregates, extra filters on either side, correlation on another column, an aggregate argument the outer rows do not output, or more than one duplicate-eliminated column.
+**When it applies:** both sides are flattened into a product of leaves filtered by the conjunction of their predicates. `I` must be the subquery's rows `S` restricted by one `S.a = key` equality, and `O` must be `S' x P` where every leaf of `S` maps to exactly one scan of the same table view (or of the same CTE) in `S'`, the predicates over `S'` alone are exactly `S`'s, and every predicate across `S'` and `P` reads `S'` only through `a`. The join key must be `a` or a column of `P` equated with it. Then the outer rows with key `k` are `S`'s rows with `a = k`, each repeated the same number of times, which leaves MIN and MAX unchanged, and AVG too when its input is an INTEGER, a BIGINT, or a DECIMAL of width 5 to 18 (a DOUBLE sum depends on the order rows are added in). Repetition also scales AVG's sum: DuckDB sums those inputs in 128 bits, which no row count can overflow, while SMALLINT and DECIMAL(1-4) sum in 64 bits and HUGEINT and DECIMAL(19-38) in 128 bits, either of which can overflow on repeated rows where the original aggregate does not. A `key IS NOT NULL` filter replaces the subquery's `=` when no join already rejects NULL keys. Anything else declines: SUM, COUNT, DISTINCT or filtered aggregates, extra filters on either side, correlation on another column, an aggregate argument the outer rows do not output, or more than one correlation key column.
 
 **Code path:**
-- `src/planner/sirius_plan_delim_aggregate_reuse.cpp` — matcher (`match_aggregate`) and both rewrites
+- `src/planner/sirius_plan_delim_aggregate_reuse.cpp` — matcher (`match_aggregate`) and the rewrite
 - `src/transparent/sirius_optimizer_extension.cpp` — runs it on the captured plan copy, planning without it if it throws
 - `src/transparent/read_view_registry.cpp` — read-view validation accepts a plan that reads an identical view fewer times
 
@@ -160,13 +160,10 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Motivation:** `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)` ("another row with the same key and a different value") decorrelates into a join of the outer rows and `t` on `=` with `<>` as a residual, which emits every same-key pair. TPC-H q21 has an `EXISTS` and a `NOT EXISTS` of this form over `lineitem`, so it also scans `lineitem` three times.
 
-**Mechanism:** `rewrite_correlated_inequality_exists` runs on the transparent path's copy of DuckDB's optimized plan (`sirius_optimizer_hook`), before column bindings are resolved, so a replacement only has to emit the same bindings as the nodes it replaces. If it throws, the plan is copied again without it. It matches each subquery in either shape DuckDB produces:
+**Mechanism:** `rewrite_correlated_inequality_exists` runs on the transparent path's copy of DuckDB's optimized plan (`sirius_optimizer_hook`), before column bindings are resolved, so a replacement only has to emit the same bindings as the nodes it replaces. If it throws, the plan is copied again without it. It matches each subquery in the shape DuckDB produces:
 
 ```
-delim_join_as_cte = false:  DELIM_JOIN (SEMI/ANTI, or MARK under FILTER(mark); IS NOT DISTINCT FROM)
-                             ├─ outer rows
-                             └─ [PROJECTION...] ← INNER JOIN(T, DELIM_GET) on  t.k = d.k  AND  t.x <> d.x
-delim_join_as_cte = true:   [RIGHT_]SEMI/ANTI JOIN(outer rows, T) on  t.k = outer.k  AND  t.x <> outer.x
+[RIGHT_]SEMI/ANTI JOIN(outer rows, T) on  t.k = outer.k  AND  t.x <> outer.x
 ```
 
 Either comparison may be null-safe (`IS NOT DISTINCT FROM` for the key, `IS DISTINCT FROM` for the value). Two or more matched joins nested through their outer rows whose scans read the same source (`capture_bound_read_view`) on the same base key column are replaced together, with one scan of `T`:
@@ -181,17 +178,17 @@ CTE rows = outer rows
               ← SEMI JOIN(T, SELECT DISTINCT k FROM CTE_SCAN rows) on t.k = k
 ```
 
-This is the shape DuckDB itself gives a correlated scalar aggregate under `delim_join_as_cte = true`, so the merged plan has no delim join in either setting. Columns that operators above read from the outer rows are read from the CTE scan instead.
+This is the shape DuckDB itself gives a correlated scalar aggregate. Columns that operators above read from the outer rows are read from the CTE scan instead.
 
 `EXISTS ... t.x <> outer.x` holds exactly when `MIN(t.x) <> outer.x OR MAX(t.x) <> outer.x` over the rows with that key, with NULL comparisons never counting as different. For `IS DISTINCT FROM` the aggregate also records whether a NULL `t.x` was seen. For NOT EXISTS the filter keeps rows with no group and rows whose comparison is unknown. When some subqueries compare keys null-safely and others with `=`, the latter skip the NULL-key group through an `IS NOT NULL` predicate. A lone subquery is left alone: replacing its join with a `GROUP BY` over the same rows is rarely faster.
 
-Plain SEMI/ANTI joins (`delim_join_as_cte = true`) over a table pinned in GPU memory, with every column they read, are left unmerged unless they are estimated not to fit on the GPU. Each such join scans its subquery's table and hashes its rows. That beats the merged aggregate only when the scans are cheap and the rows fit: q21 at SF1000 on a GB300 runs in 0.475 s unmerged against 0.531 s merged with `lineitem` pinned in GPU memory, but 8.2 s against 6.5 s without the pin. On a 32 GB RTX 4500 reading from S3, merging wins at SF1000 (10.7 s against 11.7 s) and at SF3000, where the unmerged joins spill (271 s against 54 s). The size estimate is the largest subquery scan's base-table row count times its key and value widths, since DuckDB's estimates of the subqueries' filters can be several times too low. The budget is the smallest GPU's downgrade threshold (`downgrade_trigger_fraction` of its capacity). Delim joins are merged regardless, as the merge was faster in every measured case.
+SEMI/ANTI joins over a table pinned in GPU memory, with every column they read, are left unmerged unless they are estimated not to fit on the GPU. Each such join scans its subquery's table and hashes its rows. That beats the merged aggregate only when the scans are cheap and the rows fit: q21 at SF1000 on a GB300 runs in 0.475 s unmerged against 0.531 s merged with `lineitem` pinned in GPU memory, but 8.2 s against 6.5 s without the pin. On a 32 GB RTX 4500 reading from S3, merging wins at SF1000 (10.7 s against 11.7 s) and at SF3000, where the unmerged joins spill (271 s against 54 s). The size estimate is the largest subquery scan's base-table row count times its key and value widths, since DuckDB's estimates of the subqueries' filters can be several times too low. The budget is the smallest GPU's downgrade threshold (`downgrade_trigger_fraction` of its capacity).
 
 Because the merged plan reads one view fewer times than the original, `compare_read_views` (`src/transparent/read_view_registry.cpp`) accepts a candidate that reads an identical view fewer times, while still rejecting one that reads a new view, reads a view more often, or drops the only scan of a view.
 
 **Limits:**
 - Exactly one key and one value correlation, on an `INTEGER`/`BIGINT` key. The value must be an integer, fixed-point, temporal or duration type.
-- With `delim_join_as_cte = true`, plans where DuckDB keeps the delim join as a MARK join over a CTE scan (filtered or nullable subqueries) are not matched.
+- Plans where DuckDB keeps the subquery as a MARK join over a CTE scan (filtered or nullable subqueries) are not matched.
 
 **Code path:** `src/planner/sirius_plan_exists_rewrite.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp`
 
@@ -252,7 +249,15 @@ Every row the filter keeps has `x = y`, so the added join removes only rows the 
 
 **Code path:** `src/planner/delim_cte_rewrites.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp` (`rewrite_delim_ctes`), for queries headed to the GPU.
 
-**Config:** `enable_subquery_key_carry` (default `false`, see [Configuration](configuration.md)). Off by default for now: the rewrite is not yet tested on multiple GPUs, and a query that falls back to the CPU after the hook has run executes the rewritten plan.
+**CPU fallback:** this rule and the next one edit DuckDB's own plan, which DuckDB also builds its CPU plan from. They therefore run only for a statement that can reach the GPU: GPU execution on, Sirius initialized, and a statement that returns rows (`INSERT ... SELECT`, `CREATE TABLE AS` and `COPY` are left alone, so a [Parquet `COPY`](parquet-output.md) that Sirius runs on the GPU is planned without the two rules). When Sirius then does not run a query a rule changed, the CPU gets the plan DuckDB makes alone:
+
+- If GPU planning turns the query down, `OnFinalizePrepare` asks DuckDB to plan the statement again (`ATTEMPT_TO_REBIND`), and the connection state records that it is re-planning for the CPU, which keeps both optimizer hooks out of that second pass.
+- A statement that returns rows but is not a `SELECT` is planned again the same way, since Sirius runs only `SELECT`s: `EXPLAIN ANALYZE`, and `INSERT`, `UPDATE` or `DELETE` with `RETURNING`.
+- If the GPU fails while running the query, `PhysicalSiriusExecution` plans the statement's SQL again under the internal-query guard and runs that plan. An `EXECUTE` of a prepared statement, or a statement with parameters, cannot be planned from its text, so it runs the CPU plan built from the rewritten plan, which returns the same rows. The plan made here lacks the Parquet footer statistics the pre-optimize hook adds.
+
+`transparent_execution_stats::fallback_replans` counts all three. A plain `EXPLAIN` is the exception: it shows the rewritten plan, since it describes what the GPU is given and executes nothing.
+
+**Config:** `enable_subquery_key_carry` (default `true`, see [Configuration](configuration.md)).
 
 ### EXISTS Answered from an Aggregate Subquery
 
@@ -278,13 +283,13 @@ The aggregate has a group for a key exactly when `S` has a row for it, which is 
 - Both sides read the same rows: flattened into leaves and predicates, their scans are the same sources in the same order (`capture_bound_read_view`, selector included), their predicates are the same set, and the key is the same column.
 - NULL keys are handled alike: the subquery matches keys with `=`, so a null-safe `EXISTS` qualifies only when its side carries `IS NOT NULL` on the key column.
 - Only the join-back and the key read see the CTE's rows, and DuckDB's own conditions for restricting them hold.
-- The outer side `X` still selects rows without the `EXISTS` (a predicate that is not a column equality or a NULL check, DuckDB's test for keeping a delim CTE), and can produce at most a quarter of the subquery's largest scan. Without the `EXISTS`, the CTE holds all of `X`. The bound on `X` is the product of its scans' rows, not their sum: nothing proves a join key unique, so a join may pair every row of one table with every row of another. `X` must be table scans under inner joins, cross products, filters and projections; any other operator declines.
+- The outer side `X` still selects rows without the `EXISTS` (a predicate that is not a column equality or a NULL check, DuckDB's test for keeping a delim CTE), and can produce at most a quarter of the subquery's largest scan. Without the `EXISTS`, the CTE holds all of `X`. The bound on `X` is the product of its scans' rows, not their sum: nothing proves a join key unique, so a join may pair every row of one table with every row of another. `X` must be table scans under inner joins, cross products, filters and projections; any other operator declines. Every scan of `X` must also have a row estimate: DuckDB reports a scan whose table function gives none (CSV, Arrow and most extension scans) as one row, which would pass for a tiny table. A subquery scan without an estimate is left out of "largest".
 
 **Limits:** the two subqueries must list their tables in the same order. An `EXISTS` with no aggregate subquery over the same rows is untouched.
 
 **Code path:** `src/planner/delim_cte_rewrites.cpp` (`match_exists_twin`), sharing `flatten` with the delim aggregate reuse (`src/planner/sirius_plan_flat_tree.cpp`); called from `src/transparent/sirius_optimizer_extension.cpp` for queries headed to the GPU.
 
-**Config:** `enable_exists_from_aggregate` (default `false`, see [Configuration](configuration.md)). Off by default for now, for the same two reasons as the rule above, and because a scan DuckDB has no row estimate for reports one row, which passes the size guard on `X`.
+**Config:** `enable_exists_from_aggregate` (default `true`, see [Configuration](configuration.md)). A CPU fallback is handled as for the rule above.
 
 ### Sorted-Key Grouped Aggregation
 

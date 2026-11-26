@@ -150,7 +150,7 @@ void null_rows(cudf::column& column, Pred is_null)
   }
   auto stream = utils::default_stream();
   auto mask   = cudf::create_null_mask(
-    rows, cudf::mask_state::ALL_NULL, stream, utils::get_resource_ref(*env().gpu));
+    rows, cudf::mask_state::UNINITIALIZED, stream, utils::get_resource_ref(*env().gpu));
   RMM_CUDA_TRY(cudaMemcpyAsync(mask.data(),
                                words.data(),
                                words.size() * sizeof(std::uint32_t),

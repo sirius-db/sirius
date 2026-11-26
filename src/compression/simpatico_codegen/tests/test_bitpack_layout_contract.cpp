@@ -44,19 +44,20 @@ std::unique_ptr<cudf::table> make_layout_fixture()
     switch (chunk) {
       case 0:
         // Zero-bit chunk: all residuals from chunk_min are zero.
-        host[static_cast<std::size_t>(i)] = 7;
+        host[static_cast<std::size_t>(i)] = 40;
         break;
       case 1:
-        // One-bit chunk.
-        host[static_cast<std::size_t>(i)] = 100 + (pos & 1);
+        // One-bit chunk, after its common divisor 20 is divided out.
+        host[static_cast<std::size_t>(i)] = 100 + 20 * (pos & 1);
         break;
       case 2:
         // Ten-bit chunk.
         host[static_cast<std::size_t>(i)] = pos;
         break;
       default:
-        // Partial final chunk with a 16-bit range.
-        host[static_cast<std::size_t>(i)] = pos == kPartialRows - 1 ? 65535 : 0;
+        // Partial final chunk with a 16-bit range. Its one non-zero residual, 65533, is
+        // coprime to 10, so the divisor is 1 and it keeps exercising a wide bit width.
+        host[static_cast<std::size_t>(i)] = pos == kPartialRows - 1 ? 65534 : 1;
         break;
     }
   }
@@ -148,11 +149,15 @@ void test_compact_persistence_and_decode()
   auto const mr     = rmm::mr::get_current_device_resource_ref();
 
   auto compressed = simpatico::compress_with_plan(
-    input->view(), "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n", stream, mr);
+    input->view(),
+    "input -> bitpack_gcd -> chunk_min, chunk_count, chunk_bits, packed\n",
+    stream,
+    mr);
 
   auto const description  = compressed.describe(stream);
   auto const& leaf        = find_bitpack_leaf(description);
   auto const& counts_desc = find_buffer(leaf, "chunk_count");
+  auto const& divs_desc   = find_buffer(leaf, "chunk_divisors");
   auto const& bits_desc   = find_buffer(leaf, "chunk_bits");
   auto const& packed_desc = find_buffer(leaf, "packed");
 
@@ -161,6 +166,11 @@ void test_compact_persistence_and_decode()
   expect(counts == std::vector<std::int32_t>({1024, 1024, 1024, kPartialRows}),
          "unexpected per-chunk counts");
   expect(bits == std::vector<std::uint8_t>({0, 1, 10, 16}), "unexpected per-chunk bit widths");
+  // The folded-in common divisor of the residuals: chunk 1 alternates 100 and 120, so
+  // its divisor is 20. Chunk 0 is constant and the others have residuals coprime to 10,
+  // so their divisor is the no-op 1.
+  auto const divisors = copy_buffer<std::int32_t>(divs_desc);
+  expect(divisors == std::vector<std::int32_t>({1, 20, 1, 1}), "unexpected per-chunk divisors");
 
   std::uint64_t expected_words = 0;
   for (std::size_t i = 0; i < counts.size(); ++i) {
@@ -267,6 +277,23 @@ void test_int64_widths_and_tail()
 
 }  // namespace
 
+// Plain bitpack does not detect divisors: chunk 1's 100/120 packs at the 5 bits of its
+// range, and the divisor channel is dropped.
+void test_plain_bitpack_skips_divisor()
+{
+  auto input        = make_layout_fixture();
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+
+  auto compressed = simpatico::compress_with_plan(
+    input->view(), "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n", stream, mr);
+  auto const description = compressed.describe(stream);
+  auto const& leaf       = find_bitpack_leaf(description);
+  auto const bits        = copy_buffer<std::uint8_t>(find_buffer(leaf, "chunk_bits"));
+  expect(bits == std::vector<std::uint8_t>({0, 5, 10, 16}), "unexpected plain bit widths");
+  expect(find_buffer(leaf, "chunk_divisors").num_rows == 0, "plain bitpack kept divisors");
+}
+
 int main()
 {
   if (cudaSetDevice(0) != cudaSuccess) {
@@ -275,6 +302,7 @@ int main()
   }
   try {
     test_compact_persistence_and_decode();
+    test_plain_bitpack_skips_divisor();
     test_int64_widths_and_tail();
     std::printf("test_bitpack_layout_contract: PASS\n");
     return 0;
