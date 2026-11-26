@@ -66,8 +66,9 @@ constexpr std::size_t pci_bus_id_bytes    = NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE;
 // One of the sender's TCP lanes: kind | u32 lane | u32 lanes | u64 receive mirror base |
 // u64 receive mirror bytes | the lane agent's metadata.
 constexpr char lane_kind = '\x7d';
-// Lanes a host's ranks share by default: enough connections to fill a 200 Gb/s port.
-constexpr std::uint32_t host_lanes = 16;
+// Lanes a host's ranks share by default. Each lane pins its send slots and a share of the receive
+// mirror; 16 of them exceeded a 15 GiB locked-memory limit (ulimit -l) on RoCE NICs, and 4 fit.
+constexpr std::uint32_t host_lanes = 4;
 
 // The main agent's metadata, for the peer's writer: kind | the metadata.
 constexpr char metadata_kind = '\x7c';

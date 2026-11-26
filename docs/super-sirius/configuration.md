@@ -1124,7 +1124,7 @@ connected, none of these settings can change, on any connection.
 | `sirius_exchange_frame_bytes` | 16777216 | The exchange's frame size; a positive multiple of 256 up to 1 GiB. One write covers up to half a peer's receive frames, or one frame over TCP lanes. Same on every rank. |
 | `sirius_exchange_send_frames` | 32 | Send frames, shared by all peers; they bound the bytes in flight. Same on every rank. |
 | `sirius_exchange_recv_frames_per_peer` | 16 | Receive frames (credits) each peer may fill; ring memory grows with this times the peers. A TCP lane carries one frame, so fewer frames than lanes leave lanes idle. Same on every rank. |
-| `sirius_exchange_tcp_lanes` | 0 | TCP lanes per rank to ranks on other hosts (at most 64). 0 shares 16 among the ranks on this host, at least 2 each. Set it before `sirius_exchange_rank`. |
+| `sirius_exchange_tcp_lanes` | 0 | TCP lanes per rank to ranks on other hosts (at most 64). 0 shares 4 among the ranks on this host, at least 2 each. Set it before `sirius_exchange_rank`. |
 | `sirius_distributed_query_id` | 0 | Number of the next distributed query, which numbers its exchange streams. Set by the [gateway](distributed-gateway.md) on every rank; it must increase, and gaps are fine. 0 numbers queries per process. |
 
 ### Pinned Tables

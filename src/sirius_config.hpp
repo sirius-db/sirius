@@ -245,7 +245,7 @@ struct operator_params {
   /// Distributed execution: receive frames (credits) each peer may fill; over TCP lanes, one per
   /// lane in flight.
   uint32_t exchange_recv_frames_per_peer = 16;
-  /// Distributed execution: TCP lanes per rank to ranks on other hosts; 0 shares 16 among the
+  /// Distributed execution: TCP lanes per rank to ranks on other hosts; 0 shares 4 among the
   /// ranks on this host.
   uint32_t exchange_tcp_lanes = 0;
 

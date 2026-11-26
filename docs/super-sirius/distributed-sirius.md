@@ -149,7 +149,7 @@ one frame, so the transport sends such a peer one frame per write instead of a r
 A write copies the frame device-to-host into a free slot (the send frame is then free), and the
 lane thread writes the slot into the peer's receive mirror; the peer lands it as a host-staged
 write. A rank makes its mirror, if it has none yet, when it first chooses this path for a peer.
-`sirius_exchange_tcp_lanes` sets the lanes per rank (default 16 shared by the ranks on the host,
+`sirius_exchange_tcp_lanes` sets the lanes per rank (default 4 shared by the ranks on the host,
 at least 2), and `sirius_exchange_recv_frames_per_peer` the frames a peer may have in flight (a
 lane carries one). Every rank must use the same `sirius_exchange_host_staging` and
 `sirius_exchange_mnnvl`; a rank offered

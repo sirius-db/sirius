@@ -87,7 +87,7 @@ class nixl_fabric : public fabric {
     host_staging staging{host_staging::automatic};
     /// require: fail unless every peer is reached over the NVLink fabric.
     mnnvl_mode mnnvl{mnnvl_mode::automatic};
-    /// TCP lanes per rank, at most max_tcp_lanes; 0 shares 16 among the ranks whose listener host
+    /// TCP lanes per rank, at most max_tcp_lanes; 0 shares 4 among the ranks whose listener host
     /// is this one's (at least 2 each).
     std::uint32_t lanes{0};
     /// Pinned send slots of a frame each, per lane.

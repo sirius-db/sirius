@@ -55,7 +55,7 @@ struct nixl_exchange_options {
   std::uint32_t recv_frames_per_peer = 16;
   host_staging staging               = host_staging::automatic;
   mnnvl_mode mnnvl                   = mnnvl_mode::automatic;
-  /// TCP lanes per rank (at most max_tcp_lanes); 0 shares 16 among the ranks on this host.
+  /// TCP lanes per rank (at most max_tcp_lanes); 0 shares 4 among the ranks on this host.
   std::uint32_t tcp_lanes = 0;
   transport::options transport_options;
 };

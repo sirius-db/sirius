@@ -216,7 +216,7 @@ On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid
 | `sirius_gateway_sirius_extension` | | Sirius extension the ranks load; empty runs CPU ranks, for tests |
 | `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings, so it cannot change them |
 | `sirius_gateway_exchange_host_staging` | `auto` | `sirius_exchange_host_staging` for every rank: `auto` (TCP lanes to ranks on other hosts), `always`, `never` or `remote` |
-| `sirius_gateway_exchange_tcp_lanes` | 0 | `sirius_exchange_tcp_lanes` for every rank, at most 64; 0 shares 16 lanes among the ranks of a host |
+| `sirius_gateway_exchange_tcp_lanes` | 0 | `sirius_exchange_tcp_lanes` for every rank, at most 64; 0 shares 4 lanes among the ranks of a host |
 | `sirius_gateway_exchange_mnnvl` | `auto` | `sirius_exchange_mnnvl` for every rank: `auto`, `require` or `off` put the rings in fabric memory, for NVLink between nodes |
 | `sirius_gateway_exchange_frame_bytes` | 16777216 | `sirius_exchange_frame_bytes` for every rank |
 | `sirius_gateway_exchange_send_frames` | 32 | `sirius_exchange_send_frames` for every rank |

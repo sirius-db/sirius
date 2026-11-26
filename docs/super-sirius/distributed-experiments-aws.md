@@ -409,16 +409,16 @@ That run kept its spill folder inside the run's folder; the script's sampler wat
 Ranks on different machines exchange over **TCP lanes**: the data is staged in pinned host
 memory and sent over parallel TCP connections
 ([Distributed Sirius](distributed-sirius.md)). It is the default (`exchange.host_staging: auto`,
-`exchange.tcp_lanes: 0`, which is 16 lanes); each rank's log says
-`host-staged over TCP lanes` for a peer on another machine.
+`exchange.tcp_lanes: 0`, which is 4 lanes; the runs here had 16, the default then); each rank's
+log says `host-staged over TCP lanes` for a peer on another machine.
 
 - **Without the lanes the exchange is the limit.** On four `g7e.8xlarge` at commit `caba1b34`,
   NIXL over UCX's TCP transport moved about 0.25 GB/s per machine, and all 22 queries at SF1000
   from S3 took 65.7 s warm on one machine, 197.6 s on two and 330.0 s on four. With the lanes:
   65.7, 79.7 and 56.4 s.
-- **Keep the default of 16 lanes.** With `tcp_lanes: 2` on four machines at SF3000, Q5 and Q13
-  crashed in their warm run (a CUDA illegal address) and Q9 returned a wrong answer (546,176 rows
-  for 175). That build also held an experimental change to the lanes' idle loop, since removed,
+- **Do not go below the default.** These runs had 16 lanes, the default then (now 4). With
+  `tcp_lanes: 2` on four machines at SF3000, Q5 and Q13 crashed in their warm run (a CUDA illegal
+  address) and Q9 returned a wrong answer (546,176 rows for 175). That build also held an experimental change to the lanes' idle loop, since removed,
   so which of the two caused it is not known. Two machines with 2 lanes were correct.
 - **The lanes cost something on small data.** At SF1000 two machines (79.7 s warm) were slower
   than one (65.7 s). One thread per rank stays busy in NIXL's worker while the rank is idle. Not
@@ -674,7 +674,7 @@ document. On an instance, also:
 | Several machines: `Permission denied (publickey)` or a host-key question from the run script | `ssh` from the gateway's machine to the others is not set up: see [Several machines](#several-machines) |
 | Several machines: the node check fails on another machine only | The checkout, build or data is missing there or at another path |
 | Several machines are slower than one, and the rank logs do not say `host-staged over TCP lanes` | The build has no TCP lanes: see [Exchange between machines](#exchange-between-machines) |
-| Several machines: a crash with a CUDA illegal address, or a wrong answer, with `tcp_lanes: 2` | Seen at SF3000 on four machines: keep the default of 16 lanes |
+| Several machines: a crash with a CUDA illegal address, or a wrong answer, with `tcp_lanes: 2` | Seen at SF3000 on four machines, where 16 lanes were correct: do not go below the default |
 | SF10000 on several machines: Q10 ends with `GPU pipeline task exceeded maximum retry limit (100)` | Out of GPU memory in a hash join. Not solved |
 | The same arm is much slower on a second run, with no error | Maybe AWS shaping the network: see [Data on S3](#data-on-s3) |
 | Q3 or Q18 differ from the reference | LIMIT tie: pass `--ties` |
