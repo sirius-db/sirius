@@ -1945,6 +1945,9 @@ bool compressed_materialization_enabled(ClientContext& context)
 
 bool dictionary_carrier_enabled(ClientContext& context)
 {
+  // The exchange wire cannot send a dictionary, and decoding one at the exchange would leave the
+  // operators above it planned for the carrier.
+  if (query_operator_options(context)->distributed()) { return false; }
   Value setting;
   if (context.TryGetCurrentSetting("enable_dictionary_carrier", setting) && !setting.IsNull()) {
     return setting.GetValue<bool>();

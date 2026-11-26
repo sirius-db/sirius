@@ -1260,7 +1260,7 @@ bool like_swar_fastpath_enabled(ClientContext& context);
 bool compressed_materialization_enabled(ClientContext& context);
 
 /// \brief Read the per-session `enable_dictionary_carrier` setting, resolved per connection like
-/// `enable_compressed_materialization`.
+/// `enable_compressed_materialization`. A distributed connection plans no dictionary carrier.
 bool dictionary_carrier_enabled(ClientContext& context);
 
 /// \brief Print the "GPU execution failed, falling back to DuckDB" banner with the GPU error.

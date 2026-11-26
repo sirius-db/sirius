@@ -19,7 +19,6 @@
 #include "data/data_batch_utils.hpp"
 #include "exchange/exchange_service.hpp"
 #include "exchange/wire.hpp"
-#include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "sirius/exception.hpp"
@@ -34,10 +33,8 @@
 #include <cucascade/data/data_batch.hpp>
 
 #include <algorithm>
-#include <memory>
 #include <optional>
 #include <utility>
-#include <vector>
 
 namespace sirius::op {
 namespace {
@@ -78,35 +75,6 @@ std::optional<null_key_split> split_null_keys(cucascade::read_only_data_batch co
       cudf::apply_boolean_mask(table, null_keys->view(), stream, mr), *space, stream, telemetry),
     make_data_batch(
       cudf::apply_boolean_mask(table, keyed->view(), stream, mr), *space, stream, telemetry)};
-}
-
-/// @p batch with its dictionary carriers decoded, which the wire cannot send; null when it has
-/// none.
-std::shared_ptr<cucascade::data_batch> decode_carriers(
-  cucascade::read_only_data_batch const& batch,
-  ::cuda::stream_ref stream,
-  telemetry::batch_telemetry_info const& telemetry)
-{
-  auto const table = get_cudf_table_view(batch);
-  if (std::ranges::none_of(table, [](cudf::column_view const& column) {
-        return column.type().id() == cudf::type_id::DICTIONARY32;
-      })) {
-    return nullptr;
-  }
-  auto* space = batch.get_memory_space();
-  if (space == nullptr) {
-    throw sirius::internal_exception("exchange sink: the input batch is not resident");
-  }
-  auto const mr = space->get_default_allocator();
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.reserve(table.num_columns());
-  for (auto const& column : table) {
-    columns.push_back(column.type().id() == cudf::type_id::DICTIONARY32
-                        ? sirius::decode_dictionary_carrier(column, stream, mr)
-                        : std::make_unique<cudf::column>(column, stream, mr));
-  }
-  return make_data_batch(
-    std::make_unique<cudf::table>(std::move(columns)), *space, stream, telemetry);
 }
 
 }  // namespace
@@ -179,24 +147,20 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
   std::vector<std::shared_ptr<cucascade::data_batch>> slices;
   std::vector<std::size_t> ranks;
   bool row_to_every_rank = false;
+  if (!batches.empty()) {
+    std::lock_guard lock{_input_schema_mutex};
+    if (!_input_schema) { _input_schema = cudf::empty_like(get_cudf_table_view(batches.front())); }
+  }
   for (std::size_t b = 0; b < handles.size(); ++b) {
-    auto const decoded    = decode_carriers(batches[b], stream, batch_telemetry());
-    auto const decoded_ro = decoded ? std::optional{decoded->to_read_only()} : std::nullopt;
-    auto const& batch     = decoded ? *decoded_ro : batches[b];
-    auto const& handle    = decoded ? decoded : handles[b];
-    if (b == 0) {
-      std::lock_guard lock{_input_schema_mutex};
-      if (!_input_schema) { _input_schema = cudf::empty_like(get_cudf_table_view(batch)); }
-    }
     // Nothing to send, and a range exchange's boundaries may not exist when no rank has rows.
-    if (get_cudf_table_view(batch).num_rows() == 0) { continue; }
+    if (get_cudf_table_view(batches[b]).num_rows() == 0) { continue; }
     if (_spec.null_keys_to_every_rank && !row_to_every_rank &&
         !_every_rank_has_a_row.load(std::memory_order_acquire)) {
-      auto* space = batch.get_memory_space();
+      auto* space = batches[b].get_memory_space();
       if (space == nullptr) {
         throw sirius::internal_exception("exchange sink: the input batch is not resident");
       }
-      auto const first = cudf::slice(get_cudf_table_view(batch), {0, 1}, stream);
+      auto const first = cudf::slice(get_cudf_table_view(batches[b]), {0, 1}, stream);
       auto row         = make_data_batch(
         std::make_unique<cudf::table>(first.front(), stream, space->get_default_allocator()),
         *space,
@@ -210,10 +174,10 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
     }
     std::vector<std::shared_ptr<cucascade::data_batch>> routed;
     auto split = _spec.null_keys_to_every_rank
-                   ? split_null_keys(batch, _spec.key_columns, stream, batch_telemetry())
+                   ? split_null_keys(batches[b], _spec.key_columns, stream, batch_telemetry())
                    : std::nullopt;
     if (!split) {
-      routed = route(batch, handle, stream);
+      routed = route(batches[b], handles[b], stream);
     } else {
       for (exchange::rank_t r = 0; r < _service->world_size(); ++r) {
         slices.push_back(split->null_keys);

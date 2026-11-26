@@ -99,6 +99,8 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
                                 "late_materialization_min_boundaries",
                                 "late_materialization_min_value_x_boundaries",
                                 "scan_task_batch_size",
+                                "hash_partition_bytes",
+                                "sirius_exchange_peers",
                                 "pin_table_compression",
                                 "pin_table_compression_min_batch_size_bytes",
                                 "pin_table_compression_max_compressed_fraction",
@@ -282,4 +284,39 @@ TEST_CASE_METHOD(DictionaryCarrierFixture,
   compare_gpu_vs_cpu("SELECT m, p FROM mixed JOIN probe ON m = key");
   compare_gpu_vs_cpu("SELECT m, count(*), max(p) FROM mixed JOIN probe ON m = key GROUP BY m");
   compare_gpu_vs_cpu("SELECT DISTINCT m FROM mixed");
+}
+
+TEST_CASE_METHOD(DictionaryCarrierFixture,
+                 "dictionary carrier - min and max of carried columns, split into partitions",
+                 "[integration][gpu_execution][dictionary_carrier]")
+{
+  auto const tier = GENERATE(as<std::string>{}, "gpu", "host");
+  CAPTURE(tier);
+  pin_compressed(tier);
+  REQUIRE(carried_dictionaries("SELECT low, min(nullable), max(nullable) FROM t GROUP BY low") > 0);
+  run_ok("SET enable_duckdb_fallback = false;");
+  for (bool const partitioned : {false, true}) {
+    CAPTURE(partitioned);
+    // About ten partitions of `t`, so aggregates merge and join feeders split their payloads.
+    if (partitioned) { run_ok("SET hash_partition_bytes = 1048576;"); }
+    for (auto const* query : {
+           "SELECT min(low), max(low), min(nullable), max(nullable) FROM t",
+           "SELECT low, min(nullable), max(nullable), count(*) FROM t GROUP BY low",
+           "SELECT \"group\", min(low), max(low) FROM t GROUP BY \"group\"",
+           "SELECT low, nullable, \"group\", w FROM t JOIN dim ON low = key WHERE x % 10 = 0",
+           "SELECT nullable, count(*), sum(w) FROM t JOIN dim ON low = key GROUP BY nullable",
+         }) {
+      compare_gpu_vs_cpu(query);
+    }
+  }
+}
+
+TEST_CASE_METHOD(DictionaryCarrierFixture,
+                 "dictionary carrier - a distributed query plans none",
+                 "[integration][gpu_execution][dictionary_carrier]")
+{
+  pin_compressed("gpu");
+  REQUIRE(carried_dictionaries("SELECT low, count(*) FROM t GROUP BY low") == 1);
+  run_ok("SET sirius_exchange_peers = '127.0.0.1:62998,127.0.0.1:62999';");
+  CHECK(carried_dictionaries("SELECT low, count(*) FROM t GROUP BY low") == 0);
 }
