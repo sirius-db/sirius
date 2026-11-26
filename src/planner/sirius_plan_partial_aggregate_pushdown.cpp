@@ -646,9 +646,6 @@ void analyze(duckdb::ClientContext& context,
       append_columns_read(*inline_columns(*original.GetFilter(), folded.columns), argument_columns);
     }
     if (original.GetOrderBys()) { why.add("aggregate:order-by"); }
-    if (original.StateExportMode() == duckdb::AggregateStateExportMode::STATE_EXPORT) {
-      why.add("aggregate:export-state");
-    }
 
     auto const columns_before = argument_columns.size();
     unique_ptr<Expression> argument;

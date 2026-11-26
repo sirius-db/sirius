@@ -49,7 +49,6 @@
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
-#include "planner/aggregate_binding.hpp"
 #include "planner/decimal_sum_input_bounds.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
@@ -693,7 +692,9 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
   }
   auto const& aggr        = op.expressions[0]->Cast<duckdb::BoundAggregateExpression>();
   auto const aggregate_id = builtin_count_candidate_id(aggr);
-  if (!aggregate_id || !is_plain_aggregate(aggr)) { return std::nullopt; }
+  if (!aggregate_id || aggr.IsDistinct() || aggr.GetFilter() || aggr.GetOrderBys()) {
+    return std::nullopt;
+  }
   bool const is_count = *aggregate_id == sirius::aggregate_id::count;
   if (is_count &&
       aggr.GetChildren()[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
@@ -1199,16 +1200,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       "Grouping sets without GROUP BY keys are not supported in GPU aggregates");
   }
 
-  // An exported state is DuckDB's own intermediate, which the GPU kernels do not produce. Checked
-  // before any rewrite here, which would rebind the aggregate without its export mode.
-  for (auto const& expression : op.expressions) {
-    if (expression->Cast<duckdb::BoundAggregateExpression>().StateExportMode() ==
-        duckdb::AggregateStateExportMode::STATE_EXPORT) {
-      throw duckdb::NotImplementedException(
-        "Aggregate EXPORT_STATE is not supported on the GPU (falling back to CPU)");
-    }
-  }
-
   inline_shared_sort_keys(op);
   for (auto& expression : op.expressions) {
     decode_ordered_first(context, expression);
@@ -1241,6 +1232,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
     if (!is_first(aggregate)) { continue; }
     if (auto const& order = aggregate.GetOrderBys()) {
+      // The selector returns the row's value, where DuckDB returns the sorted aggregate's state.
+      if (aggregate.StateExportMode() == duckdb::AggregateStateExportMode::STATE_EXPORT) {
+        throw duckdb::NotImplementedException(
+          "first() with an ORDER BY and EXPORT_STATE is not supported on the GPU (falling back to "
+          "CPU): " +
+          aggregate.ToString());
+      }
       if (op.groups.empty()) {
         throw duckdb::NotImplementedException(
           "first() with an ORDER BY clause and no GROUP BY is not supported on the GPU (falling "

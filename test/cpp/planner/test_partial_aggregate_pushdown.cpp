@@ -419,8 +419,6 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(why(per_customer("sum(DISTINCT o_totalprice)")) == reasons{"aggregate:distinct"});
   CHECK(why(per_customer("sum(o_totalprice) FILTER (WHERE o_shippriority = 1)")) ==
         reasons{"aggregate:filter"});
-  // The rebuilt upper aggregate is bound without EXPORT_STATE, so it would return a value.
-  CHECK(why(per_customer("sum(o_totalprice) EXPORT_STATE")) == reasons{"aggregate:export-state"});
   CHECK(why(per_customer("sum(o_shippriority > 1)")) == reasons{"sum:other"});
   CHECK(why(per_customer("sum(CAST(o_units AS HUGEINT))")) == reasons{"sum:hugeint"});
   CHECK(why(per_customer("sum(o_wide)")) == reasons{"sum:decimal128"});

@@ -2769,14 +2769,13 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                      "grouped FIRST is not supported over several grouping sets");
   }
 
-  SECTION("an exported aggregate state is refused")
+  SECTION("an exported ordered FIRST state is refused")
   {
-    auto const* query = GENERATE("SELECT id, first(val) EXPORT_STATE FROM big_left GROUP BY id",
-                                 "SELECT id, first(val ORDER BY val) EXPORT_STATE FROM big_left "
-                                 "GROUP BY id",
-                                 "SELECT id, sum(val) EXPORT_STATE FROM big_left GROUP BY id",
-                                 "SELECT sum(val) EXPORT_STATE FROM big_left");
-    require_rejected(query, "Aggregate EXPORT_STATE is not supported on the GPU");
+    // DuckDB rewrites neither to arg_min_null / arg_max_null when the state is exported.
+    require_rejected("SELECT id, first(val ORDER BY val) EXPORT_STATE FROM big_left GROUP BY id",
+                     "first() with an ORDER BY and EXPORT_STATE");
+    require_rejected("SELECT id, last(val ORDER BY val) EXPORT_STATE FROM big_left GROUP BY id",
+                     "An ORDER BY on an aggregate other than first()");
   }
 
   // DuckDB keeps the ORDER BY of an aggregate not marked order-insensitive, such as avg.

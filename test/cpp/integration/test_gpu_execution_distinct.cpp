@@ -1286,6 +1286,14 @@ TEST_CASE_METHOD(DistinctFixture,
 }
 
 TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution exported ordered FIRST state falls back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  expect_plan_fallback_matches_cpu(
+    "SELECT k, first(v ORDER BY t) EXPORT_STATE AS s FROM dist_ord GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution floating AVG with an ORDER BY falls back at plan time",
                  "[integration][gpu_execution][distinct][aggregate]")
 {

@@ -42,10 +42,4 @@ duckdb::unique_ptr<duckdb::BoundAggregateExpression> bind_builtin_aggregate(
   return binder.BindAggregateFunction(std::move(function), std::move(children), std::move(filter));
 }
 
-bool is_plain_aggregate(duckdb::BoundAggregateExpression const& aggregate)
-{
-  return !aggregate.IsDistinct() && !aggregate.GetFilter() && !aggregate.GetOrderBys() &&
-         aggregate.StateExportMode() != duckdb::AggregateStateExportMode::STATE_EXPORT;
-}
-
 }  // namespace sirius::planner

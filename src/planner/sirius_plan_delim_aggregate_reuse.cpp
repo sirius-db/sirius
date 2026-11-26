@@ -32,7 +32,6 @@
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "log/logging.hpp"
-#include "planner/aggregate_binding.hpp"
 #include "planner/sirius_plan_flat_tree.hpp"
 
 #include <algorithm>
@@ -72,7 +71,10 @@ bool reusable_aggregate(Expression const& expression)
 {
   if (expression.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) { return false; }
   auto const& aggregate = expression.Cast<duckdb::BoundAggregateExpression>();
-  if (!is_plain_aggregate(aggregate) || aggregate.GetChildren().size() != 1) { return false; }
+  if (aggregate.IsDistinct() || aggregate.GetFilter() || aggregate.GetOrderBys() ||
+      aggregate.GetChildren().size() != 1) {
+    return false;
+  }
   auto const name = aggregate.Function().GetName().GetIdentifierName();
   if (name == "min" || name == "max") { return true; }
   if (name != "avg") { return false; }
