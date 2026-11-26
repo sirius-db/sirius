@@ -822,7 +822,8 @@ void task_creator::manager_loop()
                           // is the NUMA key verbatim (-1 = "unknown"), matching the
                           // pipelineable locality block above. Only the query's admitted
                           // GPUs are walked: a chunk sent to an excluded GPU would be moved by
-                          // the clamp below onto a GPU that already has its own chunk.
+                          // the clamp below onto a GPU that already has its own chunk. With no
+                          // admitted GPU on that NUMA node the chunk gets no preference here.
                           auto const host  = space->get_device_id();
                           auto const local = sirius::memory::admitted_local_gpus(
                             _topology_index->gpus_of(host), query_state->active_gpu_ids);
