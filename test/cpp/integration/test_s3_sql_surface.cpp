@@ -5177,6 +5177,34 @@ TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credenti
     CHECK(catalog.load_table_requests() - eq_loads_before == 2);
     CHECK(cpu_rows(eq_source) == kept);
 
+    // The load holds the context that reads the delete files until it ends, and an execution
+    // need not follow it: a load that fails ends the statement. With no idle context allowed,
+    // the load gives its contexts back when it ends. When it succeeds, none is left once the
+    // statement's scans are lowered, before any of them has opened a file. When it fails
+    // before its second file, none is left after the statement.
+    counters->idle_rest_context_limit_for_testing = 0;
+    std::optional<std::size_t> contexts_after_load;
+    counters->after_lowering_for_testing = [&] {
+      contexts_after_load = sirius_ctx->get_scan_manager().rest_context_count();
+    };
+    auto const loads_before = stats().iceberg_delete_payload_loads;
+    expect_gpu(eq_query, kept, 1, eq_data);
+    counters->after_lowering_for_testing = {};
+    CHECK(stats().iceberg_delete_payload_loads == loads_before + 2);
+    REQUIRE(contexts_after_load);
+    CHECK(*contexts_after_load == 0);
+    std::size_t opened                          = 0;
+    counters->iceberg_equality_open_for_testing = [&](std::string const&) {
+      if (++opened == 2) { throw std::runtime_error("injected: second delete file"); }
+    };
+    auto const failed                           = con.Query(eq_query);
+    counters->iceberg_equality_open_for_testing = {};
+    REQUIRE(failed);
+    CHECK(failed->HasError());
+    CHECK(opened == 2);
+    CHECK(sirius_ctx->get_scan_manager().rest_context_count() == 0);
+    counters->idle_rest_context_limit_for_testing.reset();
+
     // The path form reads the same files with a static secret.
     require_query_ok(con,
                      "CREATE SECRET eq_static (TYPE S3, KEY_ID " + sql_quote(env->access_key) +

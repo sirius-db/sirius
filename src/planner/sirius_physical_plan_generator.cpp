@@ -469,11 +469,21 @@ std::shared_ptr<const sirius::op::scan::IcebergDeleteData> load_scan_delete_payl
   auto stream = sirius::memory::runtime_stream_pool::acquire(space);
   // A remote delete file opens with the configuration this statement planned for it. A context
   // built for a configuration its path has since left belongs to this load, so keep one each.
-  std::unordered_map<std::uint64_t, std::shared_ptr<cucascade::io::ioctx>> planned_ioctxs;
+  // The load may be the last reader of the others, and an execution need not follow it: once
+  // they are let go, on a return or an error, the idle contexts beyond the bound are dropped.
+  struct planned_contexts {
+    sirius::scan_manager::sirius_scan_manager& manager;
+    std::unordered_map<std::uint64_t, std::shared_ptr<cucascade::io::ioctx>> by_config;
+    ~planned_contexts()
+    {
+      by_config.clear();
+      manager.idle_rest_sweeper()->sweep();
+    }
+  } planned_ioctxs{scan_manager, {}};
   auto const remote_ioctx = [&](std::string const& path) -> std::shared_ptr<cucascade::io::ioctx> {
     auto const planned = info.s3_configs.find(path);
     if (planned == info.s3_configs.end()) { return nullptr; }
-    auto& io_ctx = planned_ioctxs[planned->second.id];
+    auto& io_ctx = planned_ioctxs.by_config[planned->second.id];
     if (!io_ctx) { io_ctx = scan_manager.io_ctx_for(path, &planned->second); }
     return io_ctx;
   };
