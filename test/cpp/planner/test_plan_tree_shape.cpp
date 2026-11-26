@@ -2783,6 +2783,16 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                      "is not a plain reference to a child column");
   }
 
+  SECTION("an ordered FIRST over a NOCASE or lower() key is refused")
+  {
+    auto const* query =
+      GENERATE("SELECT pk, first(pk ORDER BY pname COLLATE NOCASE) FROM parts GROUP BY pk",
+               "SELECT pk, last(pk ORDER BY lower(pname)) FROM parts GROUP BY pk",
+               "SELECT pk, first(pk ORDER BY pname COLLATE NOCASE), max(lower(pname)) FROM parts "
+               "GROUP BY pk");
+    require_rejected(query, "NOCASE-collated or lower() ORDER BY key");
+  }
+
   SECTION("an ungrouped ordered FIRST is refused")
   {
     // The ungrouped operator takes the first row of each batch, which no ORDER BY steers.

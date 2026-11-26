@@ -243,6 +243,28 @@ bool is_decodable_sort_key(duckdb::Expression const& expression)
   return true;
 }
 
+// Whether @p expression calls lower(), directly or through a column of the projections below,
+// where common-subexpression elimination can move it. NOCASE collates a key as lower(key).
+bool reads_lower(duckdb::Expression const& expression, duckdb::LogicalOperator const& child)
+{
+  if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
+      expression.Cast<duckdb::BoundFunctionExpression>().Function().GetName().GetIdentifierName() ==
+        "lower") {
+    return true;
+  }
+  if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF &&
+      child.type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
+    auto const& projection = child.Cast<duckdb::LogicalProjection>();
+    auto const index       = expression.Cast<duckdb::BoundReferenceExpression>().Index();
+    return index < projection.expressions.size() &&
+           reads_lower(*projection.expressions[index], *projection.children[0]);
+  }
+  bool found = false;
+  duckdb::ExpressionIterator::EnumerateChildren(
+    expression, [&](duckdb::Expression const& term) { found = found || reads_lower(term, child); });
+  return found;
+}
+
 // Number of references to column @p index of the child anywhere in @p expression.
 std::size_t count_references(duckdb::Expression const& expression, duckdb::idx_t index)
 {
@@ -1188,6 +1210,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       first_ordered = &aggregate;
       for (auto const& key : order->orders) {
         reject_nested_column_operation(*key.expression, "an aggregate ORDER BY");
+        // Until #2598 is fixed: the GPU lower() folds some characters differently from DuckDB's,
+        // so it can rank rows differently.
+        if (reads_lower(*key.expression, *op.children[0])) {
+          throw duckdb::NotImplementedException(
+            "first() with a NOCASE-collated or lower() ORDER BY key is not supported on the GPU "
+            "(falling back to CPU); an ordered last() counts as first(): " +
+            aggregate.ToString());
+        }
       }
     }
     // One carried row per key answers one grouping set, and the set expansion copies no carried

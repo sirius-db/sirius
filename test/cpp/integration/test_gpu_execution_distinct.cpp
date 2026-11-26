@@ -915,14 +915,6 @@ TEST_CASE_METHOD(DistinctFixture,
       "SELECT k, first(v ORDER BY t), sum(t) FILTER (WHERE t > 25) FROM dist_ord GROUP BY k");
   }
 
-  // NOCASE lowers `s` before the sort. Under binary order group 2's descending winner is 'abc'
-  // (v 7); under NOCASE it is 'Ba' (v 9). Lower-cased values are unique in every group.
-  SECTION("a collated key")
-  {
-    compare_gpu_vs_cpu(
-      "SELECT k, first(v ORDER BY s COLLATE NOCASE DESC, t) FROM dist_ord GROUP BY k");
-  }
-
   // `t` as DECIMAL and as DATE, so the sort runs on fixed-point and timestamp-days storage. Under
   // `DESC NULLS FIRST` groups 1 and 2 keep their middle NULL row, which no unordered route keeps.
   SECTION("DECIMAL and DATE keys")
@@ -1043,36 +1035,57 @@ TEST_CASE_METHOD(DistinctFixture,
   compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord WHERE t = 26 ORDER BY t");
 }
 
-// Known issue #2598, not fixed here: the GPU lower() maps U+0130 to "i" + U+0307 where DuckDB maps
-// it to "i", so a NOCASE key that differs there keeps another row. Pins the GPU route and its wrong
-// value; when either changes, replace the checks with compare_gpu_vs_cpu.
+// The GPU lower() maps U+0130 to "i" + U+0307 where DuckDB maps it to "i" (#2598), so a NOCASE key
+// could keep another row; every key that reads lower() falls back.
 TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution first(v ORDER BY ...) under NOCASE diverges from DuckDB (#2598)",
+                 "gpu_execution ordered FIRST over a NOCASE or lower() key falls back at plan time",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
   // DuckDB orders 'ia' (from 'İa') before 'ib' and keeps v 1; the GPU's 'i̇a' sorts after 'ib'.
   run_ok("CREATE TABLE dist_nocase (k INTEGER, s VARCHAR, v INTEGER);");
   run_ok("INSERT INTO dist_nocase VALUES (1, 'İa', 1), (1, 'ib', 2);");
   run_ok("CHECKPOINT;");
-  auto const* query = "SELECT first(v ORDER BY s COLLATE NOCASE) FROM dist_nocase GROUP BY k";
 
-  run_ok("SET gpu_execution = true;");
-  auto const before = sirius::test::get_transparent_execution_stats(*con);
-  auto gpu          = con->Query(query);
-  REQUIRE(gpu);
-  REQUIRE_FALSE(gpu->HasError());
-  sirius::test::require_transparent_execution_delta(
-    before, sirius::test::get_transparent_execution_stats(*con), 1, 0, 1);
-  REQUIRE(gpu->RowCount() == 1);
-  CHECK(gpu->Collection().GetValue(0, 0) == duckdb::Value::INTEGER(2));
+  SECTION("an explicit collation")
+  {
+    expect_plan_fallback_matches_cpu(
+      "SELECT k, first(v ORDER BY s COLLATE NOCASE) FROM dist_nocase GROUP BY k");
+    expect_plan_fallback_matches_cpu(
+      "SELECT k, last(v ORDER BY s COLLATE NOCASE DESC) FROM dist_nocase GROUP BY k");
+  }
 
-  run_ok("SET gpu_execution = false;");
-  auto cpu = con->Query(query);
-  run_ok("SET gpu_execution = true;");
-  REQUIRE(cpu);
-  REQUIRE_FALSE(cpu->HasError());
-  REQUIRE(cpu->RowCount() == 1);
-  CHECK(cpu->Collection().GetValue(0, 0) == duckdb::Value::INTEGER(1));
+  SECTION("a lower() key")
+  {
+    expect_plan_fallback_matches_cpu(
+      "SELECT k, first(v ORDER BY lower(s)) FROM dist_nocase GROUP BY k");
+  }
+
+  // Two FIRSTs share the sort key, and a max(lower(s)) beside one moves lower(s) into the
+  // projection below, so in both the aggregate's key reads a projected column.
+  SECTION("a collated key the aggregate reads from a projection")
+  {
+    expect_plan_fallback_matches_cpu(
+      "SELECT k, first(v ORDER BY s COLLATE NOCASE), first(s ORDER BY s COLLATE NOCASE) FROM "
+      "dist_nocase GROUP BY k");
+    expect_plan_fallback_matches_cpu(
+      "SELECT k, first(v ORDER BY s COLLATE NOCASE), max(lower(s)) FROM dist_nocase GROUP BY k");
+  }
+
+  SECTION("a default collation")
+  {
+    auto const prior_result = con->Query("SELECT current_setting('default_collation');");
+    REQUIRE(prior_result);
+    REQUIRE_FALSE(prior_result->HasError());
+    auto const prior = prior_result->Collection().GetValue(0, 0);
+    {
+      sirius::test::scoped_sirius_setting collation{*con, "default_collation", "nocase"};
+      expect_plan_fallback_matches_cpu("SELECT k, first(v ORDER BY s) FROM dist_nocase GROUP BY k");
+    }
+    // A failed restore would leak nocase into every later integration case.
+    REQUIRE(
+      con->Query("SELECT current_setting('default_collation');")->Collection().GetValue(0, 0) ==
+      prior);
+  }
 }
 
 TEST_CASE_METHOD(DistinctBulkFixture,
