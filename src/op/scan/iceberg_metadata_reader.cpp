@@ -32,6 +32,9 @@
 #include <cucascade/io/io_context.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/types/value_map.hpp>
+#include <duckdb/common/vector/map_vector.hpp>
+#include <duckdb/common/vector/struct_vector.hpp>
+#include <duckdb/common/vector/unified_vector_format.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
@@ -394,34 +397,76 @@ std::string bound_bytes(duckdb::Value const& value)
            : duckdb::StringValue::Get(value);
 }
 
-/// What a manifest entry's `data_file` records about field @p id. The three maps are optional
-/// fields, so they are looked up by name: a manifest without them records nothing.
-key_bounds key_bounds_of(duckdb::Value const& data_file, int32_t id)
-{
-  auto const entry = [&](char const* name) {
-    if (data_file.IsNull() || data_file.type().id() != duckdb::LogicalTypeId::STRUCT)
-      return duckdb::Value();
-    auto const& members = duckdb::StructValue::GetChildren(data_file);
+/// What the `data_file` column of a manifest chunk records about keys. The three maps are
+/// optional fields, so they are looked up by name: a manifest without them records nothing.
+/// They are read from the column's child vectors: turning each `data_file` into a value takes
+/// time in proportion to the columns the table records metrics of.
+class key_bounds_reader {
+ public:
+  explicit key_bounds_reader(duckdb::Vector const& data_file)
+  {
+    if (data_file.GetType().id() != duckdb::LogicalTypeId::STRUCT) return;
+    data_file.ToUnifiedFormat(_rows);
+    auto const& members = duckdb::StructVector::GetEntries(data_file);
     for (duckdb::idx_t member = 0; member < members.size(); ++member) {
-      auto const& map = members[member];
-      if (duckdb::StructType::GetChildName(data_file.type(), member) != name || map.IsNull() ||
-          map.type().id() != duckdb::LogicalTypeId::MAP)
-        continue;
-      for (auto const& pair : duckdb::MapValue::GetChildren(map)) {
-        auto const& fields = duckdb::StructValue::GetChildren(pair);
-        if (!fields[0].IsNull() && fields[0].GetValue<int32_t>() == id) return fields[1];
-      }
+      auto const& name = duckdb::StructType::GetChildName(data_file.GetType(), member);
+      auto* map        = name == "lower_bounds"        ? &_lower
+                         : name == "upper_bounds"      ? &_upper
+                         : name == "null_value_counts" ? &_nulls
+                                                       : nullptr;
+      if (map != nullptr) map->bind(members[member]);
     }
-    return duckdb::Value();
-  };
-  auto const nulls = entry("null_value_counts");
-  return {bound_bytes(entry("lower_bounds")),
-          bound_bytes(entry("upper_bounds")),
-          !nulls.IsNull() && nulls.GetValue<int64_t>() == 0};
-}
+  }
 
-/// Takes one data file's bounds; false to stop reading.
-using key_bounds_sink = std::function<bool(std::string, std::vector<key_bounds>)>;
+  /// What the entry in row @p row records about field @p id.
+  [[nodiscard]] key_bounds of(duckdb::idx_t row, int32_t id) const
+  {
+    if (_rows.sel == nullptr || !_rows.validity.RowIsValid(_rows.sel->get_index(row))) return {};
+    auto const nulls = _nulls.find(row, id);
+    return {bound_bytes(_lower.find(row, id)),
+            bound_bytes(_upper.find(row, id)),
+            !nulls.IsNull() && nulls.GetValue<int64_t>() == 0};
+  }
+
+ private:
+  /// One map of field ID to value. A column of another shape is left unbound and finds nothing.
+  struct metric_map {
+    void bind(duckdb::Vector const& map)
+    {
+      if (map.GetType().id() != duckdb::LogicalTypeId::MAP ||
+          duckdb::MapType::KeyType(map.GetType()).id() != duckdb::LogicalTypeId::INTEGER)
+        return;
+      map.ToUnifiedFormat(lists);
+      duckdb::MapVector::GetKeys(map).ToUnifiedFormat(keys);
+      values = &duckdb::MapVector::GetValues(map);
+    }
+
+    [[nodiscard]] duckdb::Value find(duckdb::idx_t row, int32_t id) const
+    {
+      if (values == nullptr) return duckdb::Value();
+      auto const index = lists.sel->get_index(row);
+      if (!lists.validity.RowIsValid(index)) return duckdb::Value();
+      auto const entry = duckdb::UnifiedVectorFormat::GetData<duckdb::list_entry_t>(lists)[index];
+      auto const* ids  = duckdb::UnifiedVectorFormat::GetData<int32_t>(keys);
+      for (auto at = entry.offset; at < entry.offset + entry.length; ++at) {
+        auto const key = keys.sel->get_index(at);
+        if (keys.validity.RowIsValid(key) && ids[key] == id) return values->GetValue(at);
+      }
+      return duckdb::Value();
+    }
+
+    duckdb::UnifiedVectorFormat lists, keys;
+    duckdb::Vector const* values = nullptr;
+  };
+
+  duckdb::UnifiedVectorFormat _rows;
+  metric_map _lower, _upper, _nulls;
+};
+
+/// Takes the bounds of one data file and the manifest its entry was read from; false to stop
+/// reading.
+using key_bounds_sink =
+  std::function<bool(std::string const&, std::string const&, std::vector<key_bounds>)>;
 
 /// Hands @p sink what the live entries of @p manifests record for @p ids, one entry per ID.
 /// False when the manifests cannot be read or @p sink stops: bounds are optional and so is
@@ -433,23 +478,27 @@ bool read_key_bounds(iceberg_metadata_connection& connection,
                      std::vector<int32_t> const& ids,
                      key_bounds_sink const& sink)
 {
-  std::string sql = "SELECT data_file.file_path, data_file FROM read_avro([";
+  std::string sql = "SELECT data_file.file_path, data_file, filename FROM read_avro([";
   for (auto const manifest : manifests)
     sql += (sql.back() == '[' ? "'" : ", '") + escape_sql_string(std::string(manifest)) + "'";
-  sql += "]) WHERE status <> 2";
+  sql += "], filename = true) WHERE status <> 2";
   try {
     auto result = connection.get().Submit(sql);
     if (!result || result->HasError()) return false;
     duckdb::QueryResultStream<> stream(std::move(result));
     while (auto chunk = stream.Fetch()) {
       if (chunk->size() == 0) break;
+      chunk->Flatten();
+      key_bounds_reader const bounds(chunk->data[1]);
       for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
-        auto const data_file = chunk->GetValue(1, row);
         std::vector<key_bounds> keys;
         keys.reserve(ids.size());
         for (auto const id : ids)
-          keys.push_back(key_bounds_of(data_file, id));
-        if (!sink(chunk->GetValue(0, row).ToString(), std::move(keys))) return false;
+          keys.push_back(bounds.of(row, id));
+        if (!sink(chunk->GetValue(0, row).ToString(),
+                  chunk->GetValue(2, row).ToString(),
+                  std::move(keys)))
+          return false;
       }
     }
     if (stream.HasError()) return false;
@@ -509,7 +558,8 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
                                          iceberg_delete_inventory const& inventory,
                                          std::size_t max_files_per_data_file,
                                          equality_key_types const& key_types,
-                                         std::size_t max_key_bounds_bytes)
+                                         std::size_t max_key_bounds_bytes,
+                                         std::size_t max_key_bounds_comparisons)
 {
   auto const fail = [](std::string const& what) {
     return equality_plan_error("[iceberg] equality deletes: " + what);
@@ -538,22 +588,30 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
   // One manifest's live entries of one content kind, with the spec its header names. Kind 0 is
   // not tested: a data manifest holds data files only, and has no `content` field when format
   // version 1 wrote it. The inventory supplies the manifest paths, so the table path is not
-  // resolved again.
+  // resolved again. The read is streamed, so one chunk of entries is held and not the
+  // manifest's: the result hands out the next chunk, or null after the last, and throws when
+  // the read fails part way as it does when it fails at once.
   auto const read_manifest = [&](std::string_view manifest, std::string const& columns, int kind) {
-    auto const path = "'" + escape_sql_string(std::string(manifest)) + "'";
-    auto result     = metadata_conn.Query(
+    auto const path       = "'" + escape_sql_string(std::string(manifest)) + "'";
+    auto const unreadable = [&fail, name = std::string(manifest)](std::string const& why) {
+      return fail("manifest '" + name + "' could not be read: " + why);
+    };
+    auto result = metadata_conn.get().Submit(
       "SELECT data_file.file_path, data_file.\"partition\", "
-          "(SELECT value FROM avro_metadata(" +
+      "(SELECT value FROM avro_metadata(" +
       path +
       ") WHERE key = 'partition-spec-id'), "
-          "(SELECT value FROM avro_metadata(" +
+      "(SELECT value FROM avro_metadata(" +
       path + ") WHERE key = 'partition-spec')" + columns + " FROM read_avro(" + path + ") WHERE " +
       (kind == 0 ? "" : "data_file.\"content\" = " + std::to_string(kind) + " AND ") +
       "status <> 2");
     if (!result || result->HasError())
-      throw fail("manifest '" + std::string(manifest) +
-                 "' could not be read: " + (result ? result->GetError() : "null result"));
-    return result;
+      throw unreadable(result ? result->GetError() : "null result");
+    return [stream = std::make_unique<duckdb::QueryResultStream<>>(std::move(result)), unreadable] {
+      auto chunk = stream->Fetch();
+      if (!chunk && stream->HasError()) throw unreadable(stream->GetError());
+      return chunk;
+    };
   };
   // Marks @p path as read from @p manifest, or refuses an entry the inventory does not list there.
   auto const claim = [&](std::unordered_map<std::string_view, listed>& files,
@@ -594,21 +652,38 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
   std::set<std::string_view> delete_manifests;
   for (auto const& [path, entry] : deletes)
     delete_manifests.insert(entry.manifest);
+  // The bounds kept for the plan are host memory that grows with the delete and data files.
+  // Above the ceiling none are kept and nothing is pruned.
+  std::size_t bounds_bytes = 0;
+  auto const bounds_fit    = [&](std::vector<key_bounds> const& keys) {
+    bounds_bytes += sizeof(key_bounds) * keys.size();
+    for (auto const& key : keys)
+      bounds_bytes += key.lower.size() + key.upper.size();
+    return bounds_bytes <= max_key_bounds_bytes;
+  };
   // What each delete file records about its keys, in `equality_ids` order; empty when the
-  // caller compares no bounds.
+  // caller compares no bounds or they do not fit.
   std::vector<std::vector<key_bounds>> delete_bounds;
+  bool collect = static_cast<bool>(key_types);
   for (auto const manifest : delete_manifests) {
     // The bounds come with the entries, as the whole `data_file`: they are optional fields, and
     // naming a field a manifest does not have fails the query and aborts this connection's
     // transaction.
-    auto result = read_manifest(manifest,
-                                std::string(", data_file.equality_ids, data_file.record_count, "
-                                            "data_file.file_size_in_bytes") +
-                                  (key_types ? ", data_file" : ""),
-                                2);
+    auto const with_bounds = collect;
+    auto const next_chunk =
+      read_manifest(manifest,
+                    std::string(", data_file.equality_ids, data_file.record_count, "
+                                "data_file.file_size_in_bytes") +
+                      (with_bounds ? ", data_file" : ""),
+                    2);
     while (true) {
-      auto chunk = result->Fetch();
+      auto chunk = next_chunk();
       if (!chunk || chunk->size() == 0) break;
+      std::optional<key_bounds_reader> bounds;
+      if (with_bounds) {
+        chunk->Flatten();
+        bounds.emplace(chunk->data[7]);
+      }
       for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
         auto const [path, entry] = claim(deletes, chunk->GetValue(0, row).ToString(), manifest);
         iceberg_equality_delete_file file;
@@ -634,13 +709,17 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
         file.record_count       = rows.GetValue<int64_t>();
         file.file_size_in_bytes = bytes.GetValue<int64_t>();
         std::vector<key_bounds> keys;
-        if (key_types) {
+        if (bounds && collect) {
           try {
-            auto const data_file = chunk->GetValue(7, row);
             for (auto const id : file.equality_ids)
-              keys.push_back(key_bounds_of(data_file, id));
+              keys.push_back(bounds->of(row, id));
           } catch (std::exception const&) {
             keys.clear();  // Maps of an unexpected shape prove nothing.
+          }
+          if (!bounds_fit(keys)) {
+            collect = false;
+            keys.clear();
+            delete_bounds.assign(delete_bounds.size(), {});
           }
         }
         delete_bounds.push_back(std::move(keys));
@@ -706,15 +785,11 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
           std::binary_search(ranged_ids.begin(), ranged_ids.end(), files[file].equality_ids[key]) &&
           !delete_bounds[file][key].lower.empty() && !delete_bounds[file][key].upper.empty();
   }
-  // The bounds kept for the plan are host memory that grows with the data files. Above the
-  // ceiling none are kept and nothing is pruned.
-  std::size_t bounds_bytes = 0;
-  auto const keep_bounds   = [&](std::string path, std::vector<key_bounds> keys) {
-    bounds_bytes += path.size() + sizeof(key_bounds) * keys.size();
-    for (auto const& key : keys)
-      bounds_bytes += key.lower.size() + key.upper.size();
-    if (bounds_bytes > max_key_bounds_bytes) return false;
-    data_bounds.insert_or_assign(std::move(path), std::move(keys));
+  // A data file's bounds are kept with its path, under the same ceiling.
+  auto const keep_bounds = [&](std::string_view path, std::vector<key_bounds> keys) {
+    bounds_bytes += path.size();
+    if (!bounds_fit(keys)) return false;
+    data_bounds.emplace(std::string(path), std::move(keys));
     return true;
   };
 
@@ -727,22 +802,27 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
   std::unordered_map<std::string_view, placement> placed;
   if (!by_partition.empty()) {
     for (auto const manifest : data_manifests) {
-      auto result = read_manifest(manifest, usable ? ", data_file" : "", 0);
+      auto const with_bounds = usable;
+      auto const next_chunk  = read_manifest(manifest, with_bounds ? ", data_file" : "", 0);
       while (true) {
-        auto chunk = result->Fetch();
+        auto chunk = next_chunk();
         if (!chunk || chunk->size() == 0) break;
+        std::optional<key_bounds_reader> bounds;
+        if (with_bounds) {
+          chunk->Flatten();
+          bounds.emplace(chunk->data[4]);
+        }
         for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
           auto const path = claim(data, chunk->GetValue(0, row).ToString(), manifest).first;
           placed.emplace(
             path,
             placement{spec_id_of(chunk->GetValue(2, row), manifest), chunk->GetValue(1, row)});
-          if (!usable) continue;
+          if (!bounds || !usable) continue;
           try {
-            auto const data_file = chunk->GetValue(4, row);
             std::vector<key_bounds> keys;
             for (auto const id : ranged_ids)
-              keys.push_back(key_bounds_of(data_file, id));
-            usable = keep_bounds(std::string(path), std::move(keys));
+              keys.push_back(bounds->of(row, id));
+            usable = keep_bounds(path, std::move(keys));
           } catch (std::exception const&) {
             usable = false;  // Maps of an unexpected shape prove nothing.
           }
@@ -751,8 +831,21 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
     }
     require_all_read(data);
   } else if (usable) {
-    // The last query on this connection: it may fail.
-    usable = read_key_bounds(metadata_conn, data_manifests, ranged_ids, keep_bounds);
+    // The last query on this connection: it may fail. An entry counts when the inventory lists
+    // its path in the manifest it was read from and no entry of that path came before: two
+    // entries may record different bounds, and nothing says which to trust.
+    usable = read_key_bounds(
+      metadata_conn,
+      data_manifests,
+      ranged_ids,
+      [&](std::string const& path, std::string const& manifest, std::vector<key_bounds> keys) {
+        auto const found = data.find(path);
+        if (found == data.end() || found->second.read ||
+            sirius::io::strip_file_scheme(found->second.manifest) != manifest)
+          return false;
+        found->second.read = true;
+        return keep_bounds(found->first, std::move(keys));
+      });
   }
   if (!usable) data_bounds.clear();
 
@@ -788,9 +881,10 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
   iceberg_equality_plan plan;
   std::vector<bool> applies(files.size(), false);
   // The data files each list of deletes is ordered against: (data sequence number, data file).
-  using domain = std::vector<std::pair<int64_t, uint32_t>>;
+  using domain = std::vector<std::pair<int64_t, std::size_t>>;
   std::unordered_map<std::vector<scoped_delete> const*, domain> domains;
-  uint32_t data_index = 0;
+  std::size_t data_index = 0;
+  std::size_t compared   = 0;
   for (auto const& [path, entry] : data) {
     std::vector<uint32_t> applicable;
     std::vector<key_bounds> const* data_keys = nullptr;
@@ -805,8 +899,14 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
         scope.begin(), scope.end(), entry.sequence, [](int64_t sequence, scoped_delete const& d) {
           return sequence < d.sequence;
         });
-      for (; first != scope.end() && applicable.size() <= max_files_per_data_file; ++first)
-        if (!ruled_out(first->file, data_keys)) applicable.push_back(first->file);
+      for (; first != scope.end() && applicable.size() <= max_files_per_data_file; ++first) {
+        // Past the budget a delete file is kept without being compared: it may match.
+        if (data_keys != nullptr && compared < max_key_bounds_comparisons) {
+          ++compared;
+          if (ruled_out(first->file, data_keys)) continue;
+        }
+        applicable.push_back(first->file);
+      }
     };
     add(everywhere);
     if (auto const place = placed.find(path); place != placed.end()) {
@@ -826,50 +926,25 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
 
   // Deletes share a scope when they apply to the same data files by sequence number and
   // partition, whatever the bounds ruled out. In one list those are the deletes that follow the
-  // same number of its data files; across lists the sets are compared, found by a hash of the
-  // set and then checked.
-  struct scope_set {
-    domain const* files;
-    std::size_t count;
-    uint32_t scope;
-  };
-  auto const same_files = [](domain const& a, domain const& b, std::size_t count) {
-    if (&a == &b) return true;
-    std::vector<uint32_t> in_a, in_b;
-    for (std::size_t i = 0; i < count; ++i) {
-      in_a.push_back(a[i].second);
-      in_b.push_back(b[i].second);
-    }
-    std::sort(in_a.begin(), in_a.end());
-    std::sort(in_b.begin(), in_b.end());
-    return in_a == in_b;
-  };
-  std::map<std::pair<std::size_t, uint64_t>, scope_set> scope_of_set;
-  uint32_t scopes = 0;
+  // same number of its data files. Every data file is in the list of `everywhere` and in at
+  // most one partition's, in the same order, so the first n files of two lists are the same
+  // files exactly when both end at the same file: (n, that file) names the set.
+  std::map<std::pair<std::size_t, std::size_t>, uint32_t> scope_of_set;
   for (auto& [deletes, data_files] : domains) {
     std::sort(data_files.begin(), data_files.end());
-    // hashes[n] identifies the first n data files as a set.
-    std::vector<uint64_t> hashes(data_files.size() + 1, 0);
-    for (std::size_t i = 0; i < data_files.size(); ++i)
-      hashes[i + 1] = hashes[i] + duckdb::Hash<uint64_t>(data_files[i].second);
     std::ptrdiff_t preceding = -1;
     uint32_t scope           = 0;
     for (auto const& scoped : *deletes) {
       auto const below =
         std::lower_bound(
-          data_files.begin(), data_files.end(), std::pair{scoped.sequence, uint32_t{0}}) -
+          data_files.begin(), data_files.end(), std::pair{scoped.sequence, std::size_t{0}}) -
         data_files.begin();
       if (below != preceding) {
         auto const count = static_cast<std::size_t>(below);
-        auto const known = scope_of_set.find({count, hashes[count]});
-        if (known != scope_of_set.end() && same_files(*known->second.files, data_files, count)) {
-          scope = known->second.scope;
-        } else {
-          scope = ++scopes;
-          if (known == scope_of_set.end())
-            scope_of_set.emplace(std::pair{count, hashes[count]},
-                                 scope_set{&data_files, count, scope});
-        }
+        auto const last  = count == 0 ? std::size_t{0} : data_files[count - 1].second;
+        scope            = scope_of_set
+                  .emplace(std::pair{count, last}, static_cast<uint32_t>(scope_of_set.size() + 1))
+                  .first->second;
       }
       preceding                = below;
       files[scoped.file].scope = scope;

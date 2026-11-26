@@ -136,8 +136,12 @@ inline constexpr int64_t kMaxEqualityDeleteRowsPerStatement  = 64LL * 1024 * 102
 inline constexpr int64_t kMaxEqualityDeleteBytesPerStatement = 1024LL * 1024 * 1024;
 /// Not a memory bound: every batch is probed once per applicable delete group.
 inline constexpr std::size_t kMaxEqualityDeleteFilesPerDataFile = 64;
-/// Host bytes of the data files' key bounds one plan keeps; above it no bounds are compared.
+/// Host bytes of the key bounds one plan keeps, of delete and data files together; above it no
+/// bounds are compared.
 inline constexpr std::size_t kMaxEqualityKeyBoundsBytes = 256ULL * 1024 * 1024;
+/// Pairs of a delete file and a data file whose bounds one plan compares. Past it a delete file
+/// stays on the lists it was not compared for.
+inline constexpr std::size_t kMaxEqualityKeyBoundsComparisons = 4ULL * 1024 * 1024;
 
 /// Running total of the equality deletes a statement has agreed to load.
 struct equality_delete_charge {
@@ -189,14 +193,16 @@ using equality_key_types = std::function<std::optional<duckdb::LogicalType>(int3
  * for theirs, once for the statement, when a delete file records a usable range.
  *
  * @param max_files_per_data_file A data file's list stops growing one past this.
- * @param max_key_bounds_bytes Host bytes of data-file bounds to keep; above it nothing is pruned.
+ * @param max_key_bounds_bytes Host bytes of bounds to keep; above it nothing is pruned.
+ * @param max_key_bounds_comparisons Pairs of files to compare; past it no more is pruned.
  */
 iceberg_equality_plan read_equality_plan(
   duckdb::ClientContext&,
   iceberg_delete_inventory const& inventory,
   std::size_t max_files_per_data_file,
-  equality_key_types const& key_types = {},
-  std::size_t max_key_bounds_bytes    = kMaxEqualityKeyBoundsBytes);
+  equality_key_types const& key_types    = {},
+  std::size_t max_key_bounds_bytes       = kMaxEqualityKeyBoundsBytes,
+  std::size_t max_key_bounds_comparisons = kMaxEqualityKeyBoundsComparisons);
 iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext&,
                                                  std::string const&,
                                                  iceberg_delete_inventory&&);

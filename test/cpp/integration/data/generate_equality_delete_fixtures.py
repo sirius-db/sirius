@@ -82,10 +82,27 @@ are listed beside the right ones, so a failure says which rule broke:
                                     NULL key facing a file with NULLs, a delete without bounds, a
                                     composite key disjoint in one column, two deletes that each
                                     meet one file, a delete manifest whose schema has no bounds
-                                    fields, a NULL key whose delete records no null count, and
-                                    string bounds truncated to 16 characters. Skipping a delete
-                                    whose range still meets a file, or whose NULL key does,
-                                    returns deleted rows.
+                                    fields, a NULL key whose delete records no null count,
+                                    string bounds truncated to 16 characters, a delete beside
+                                    both files next to one that meets both, and a delete whose
+                                    own bounds are 2000 characters long. Skipping a delete whose
+                                    range still meets a file, or whose NULL key does, returns
+                                    deleted rows.
+  iceberg_v2_eq_manifest_shapes     Two data manifests of different shape. One records every
+                                    metric map. The other has no null_value_counts field and a
+                                    zero NaN count, and its data file holds a NULL key outside
+                                    the bounds of a delete that has a NULL key. Taking another
+                                    map for the missing null counts skips the delete and returns
+                                    the NULL row.
+  iceberg_v2_eq_manifest_shapes_bare_first
+                                    The same table with the two manifests in the other order.
+  iceberg_v2_eq_duplicate_entry     For the plan only. The data manifest lists its data file
+                                    twice; the second entry's bounds are beside a delete that
+                                    matches the file.
+  iceberg_v2_eq_bounds_stream       For the plan only: its data files are not written. A data
+                                    manifest large enough that a streamed read hands out entries
+                                    before it ends, a delete beside their bounds, and a later
+                                    data manifest.
 
 Hand-forged, like the other delete fixtures: pyiceberg does not write delete files, and the only
 independent writer of equality deletes is Flink. Avro schemas are copied from an existing
@@ -105,6 +122,7 @@ DATA = pathlib.Path(__file__).resolve().parent
 REL = pathlib.Path("test/cpp/integration/data")
 TEMPLATE = DATA / "iceberg_eq_seq_number" / "metadata"
 POS_PATH_ID, POS_POS_ID = 2147483546, 2147483545
+BOUNDS_FIELDS = ("lower_bounds", "upper_bounds", "null_value_counts")
 
 
 def _avro(path):
@@ -165,9 +183,7 @@ class Table:
         self.file_formats = (
             {}
         )  # file_format of an entry by path, where it is not PARQUET
-        self.bare_manifests = (
-            set()
-        )  # manifests whose schema leaves the bounds fields out
+        self.bare_manifests = {}  # manifest -> the metric fields its schema leaves out
         if self.root.exists():
             shutil.rmtree(self.root)
         (self.root / "data").mkdir(parents=True)
@@ -198,7 +214,7 @@ class Table:
     def _manifest(self, name, content, spec_id, entries):
         """entries: [(status, explicit_sequence_or_None, file, content, partition, equality_ids)],
         optionally followed by the file's column metrics: a dict with any of `lower_bounds`,
-        `upper_bounds` ({field_id: serialized value}) and `null_value_counts` ({field_id: n}).
+        `upper_bounds` ({field_id: serialized value}) and the count maps ({field_id: n}).
         """
         import fastavro
 
@@ -256,9 +272,9 @@ class Table:
                         "record_count": count,
                         "file_size_in_bytes": size,
                         "column_sizes": None,
-                        "value_counts": None,
+                        "value_counts": metrics.get("value_counts"),
                         "null_value_counts": metrics.get("null_value_counts"),
-                        "nan_value_counts": None,
+                        "nan_value_counts": metrics.get("nan_value_counts"),
                         "lower_bounds": metrics.get("lower_bounds"),
                         "upper_bounds": metrics.get("upper_bounds"),
                         "key_metadata": None,
@@ -272,7 +288,7 @@ class Table:
         if v1:
             _as_v1_manifest(schema, meta, rows)
         if name in self.bare_manifests:
-            bounds = ("lower_bounds", "upper_bounds", "null_value_counts")
+            bounds = self.bare_manifests[name]
             for field in schema["fields"]:
                 if field["name"] == "data_file":
                     field["type"]["fields"] = [
@@ -587,7 +603,7 @@ def build_partitioned(name="iceberg_v2_eq_partitioned", v1_data_manifest=False):
     if v1_data_manifest:
         # Written before the table recorded bounds, while the delete in partition A records them.
         t.v1_manifests.add("m-data-1.avro")
-        t.bare_manifests.add("m-data-1.avro")
+        t.bare_manifests["m-data-1.avro"] = BOUNDS_FIELDS
         one = struct.pack("<q", 1)
         in_a_metrics = {
             "lower_bounds": {1: one},
@@ -1119,6 +1135,20 @@ KEY_RANGES = {
         5,
         6,
     ],  # s = 20 times "z", bounds truncated to 16 as Iceberg Java does
+    11: [
+        1,
+        3,
+        4,
+        6,
+    ],  # k in [100, 110] beside both files, and k = 20 and 50 in a second file
+    12: [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    ],  # s = 2000 times "z": the delete's own bounds are 4000 bytes
 }
 
 
@@ -1200,7 +1230,7 @@ def build_key_ranges():
         7,
         [(k([20]), [2], metrics((20, 20))), (k([45]), [2], metrics((45, 45)))],
     )
-    t.bare_manifests.add("m-delete-8.avro")
+    t.bare_manifests["m-delete-8.avro"] = BOUNDS_FIELDS
     delete(8, [(k([20]), [2], None)])
     delete(9, [(k([None, 100]), [2], metrics((100, 100), k_nulls=None))])
     # truncate(16) keeps a prefix as the lower bound and rounds the upper bound's prefix up.
@@ -1211,6 +1241,23 @@ def build_key_ranges():
                 [(3, "s", pa.string(), ["z" * 20])],
                 [3],
                 metrics(s=("z" * 16, "z" * 15 + "{")),
+            )
+        ],
+    )
+    delete(
+        11,
+        [
+            (k([100, 110]), [2], metrics((100, 110))),
+            (k([20, 50]), [2], metrics((20, 50))),
+        ],
+    )
+    delete(
+        12,
+        [
+            (
+                [(3, "s", pa.string(), ["z" * 2000])],
+                [3],
+                metrics(s=("z" * 2000, "z" * 2000)),
             )
         ],
     )
@@ -1285,9 +1332,164 @@ def build_partition_bounds():
     t.finish()
 
 
+def build_manifest_shapes(name="iceberg_v2_eq_manifest_shapes", bare_first=False):
+    """Data file a in a manifest with every metric map, data file b in one without null counts."""
+    import pyarrow as pa
+
+    t = Table(name, [[(1, "id", "long"), (2, "k", "long")]])
+    long = lambda value: struct.pack("<q", value)  # noqa: E731
+
+    def data(file_name, ids, ks):
+        return t.parquet(
+            file_name, [(1, "id", pa.int64(), ids), (2, "k", pa.int64(), ks)]
+        )
+
+    full = {
+        "lower_bounds": {2: long(10)},
+        "upper_bounds": {2: long(30)},
+        "value_counts": {2: 3},
+        "null_value_counts": {2: 0},
+        "nan_value_counts": {2: 0},
+    }
+    # Read by position, the zero NaN count sits where the other manifest keeps its null count.
+    bare = {
+        "lower_bounds": {2: long(40)},
+        "upper_bounds": {2: long(50)},
+        "value_counts": {2: 3},
+        "nan_value_counts": {2: 0},
+    }
+    files = [
+        (data("data-a.parquet", [1, 2, 3], [10, 20, 30]), full),
+        (data("data-b.parquet", [4, 5, 6], [40, 50, None]), bare),
+    ]
+    for n, (file, metrics) in enumerate(reversed(files) if bare_first else files, 1):
+        manifest = f"m-data-{n}.avro"
+        if metrics is bare:
+            t.bare_manifests[manifest] = ("null_value_counts",)
+        t.commit(
+            "append", [(manifest, 0, 0, [(1, None, file, 0, None, None, metrics)])]
+        )
+    delete = t.parquet("delete-eq-3.parquet", [(2, "k", pa.int64(), [None, 100])])
+    recorded = {
+        "lower_bounds": {2: long(100)},
+        "upper_bounds": {2: long(100)},
+        "null_value_counts": {2: 1},
+    }
+    t.commit(
+        "delete",
+        [("m-delete-3.avro", 1, 0, [(1, None, delete, 2, None, [2], recorded)])],
+    )
+    t.finish()
+
+
+def _long_bounds(low, high):
+    """Bounds of the long field 2 without NULLs, as a manifest records them."""
+    return {
+        "lower_bounds": {2: struct.pack("<q", low)},
+        "upper_bounds": {2: struct.pack("<q", high)},
+        "null_value_counts": {2: 0},
+    }
+
+
+def build_duplicate_entry():
+    """One data file listed twice; the second entry's bounds are not the file's."""
+    import pyarrow as pa
+
+    t = Table("iceberg_v2_eq_duplicate_entry", [[(1, "id", "long"), (2, "k", "long")]])
+    a = t.parquet(
+        "data-a.parquet",
+        [(1, "id", pa.int64(), [1, 2, 3]), (2, "k", pa.int64(), [10, 20, 30])],
+    )
+    entries = [
+        (1, None, a, 0, None, None, _long_bounds(10, 30)),
+        (1, None, a, 0, None, None, _long_bounds(200, 300)),
+    ]
+    t.commit("append", [("m-data-1.avro", 0, 0, entries)])
+    # The first delete matches the file. The file's own bounds rule the second one out.
+    deletes = [
+        (t.parquet("delete-eq-2-0.parquet", [(2, "k", pa.int64(), [20])]), (20, 20)),
+        (t.parquet("delete-eq-2-1.parquet", [(2, "k", pa.int64(), [100])]), (100, 110)),
+    ]
+    t.commit(
+        "delete",
+        [
+            (
+                "m-delete-2.avro",
+                1,
+                0,
+                [
+                    (1, None, file, 2, None, [2], _long_bounds(*bounds))
+                    for file, bounds in deletes
+                ],
+            )
+        ],
+    )
+    t.finish()
+
+
+# Entries of the first data manifest of iceberg_v2_eq_bounds_stream. With 1024-byte bounds of
+# an unrelated column they come to about 12 MiB, past the 10 MiB a streamed result buffers.
+STREAM_ENTRIES = 6144
+
+
+def build_bounds_stream():
+    """A data manifest that a streamed read hands out in parts, and a later one."""
+    import pyarrow as pa
+
+    t = Table(
+        "iceberg_v2_eq_bounds_stream",
+        [[(1, "id", "long"), (2, "k", "long"), (3, "s", "string")]],
+    )
+    recorded = _long_bounds(10, 30)
+    recorded["lower_bounds"][3] = b"a" * 1024
+    recorded["upper_bounds"][3] = b"c" * 1024
+
+    def unwritten(name):
+        return (str(t.rel / "data" / name), 3, 1000)
+
+    t.commit(
+        "append",
+        [
+            (
+                "m-data-1.avro",
+                0,
+                0,
+                [
+                    (
+                        1,
+                        None,
+                        unwritten(f"data-{n:04d}.parquet"),
+                        0,
+                        None,
+                        None,
+                        recorded,
+                    )
+                    for n in range(STREAM_ENTRIES)
+                ],
+            )
+        ],
+    )
+    delete = t.parquet("delete-eq-2.parquet", [(2, "k", pa.int64(), [100])])
+    t.commit(
+        "delete",
+        [
+            (
+                "m-delete-2.avro",
+                1,
+                0,
+                [(1, None, delete, 2, None, [2], _long_bounds(100, 110))],
+            )
+        ],
+    )
+    later = (1, None, unwritten("data-later.parquet"), 0, None, None, recorded)
+    t.commit("append", [("m-data-3.avro", 0, 0, [later])])
+    t.finish()
+
+
 # name -> (builder, expectation). The expectation is the rows a correct reader returns for the
 # current snapshot, a {snapshot sequence: rows} map for a table of sibling snapshots, or None
-# for a table DuckDB cannot read from this machine.
+# for a table that is not checked against DuckDB: one it cannot read from this machine, or one
+# only a plan reads.
 FIXTURES = {
     "iceberg_v2_eq_wide_delete_file": (
         build_wide_delete_file,
@@ -1385,6 +1587,18 @@ FIXTURES = {
         build_key_ranges,
         {seq: [(i,) for i in ids] for seq, ids in KEY_RANGES.items()},
     ),
+    "iceberg_v2_eq_manifest_shapes": (
+        build_manifest_shapes,
+        [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)],
+    ),
+    "iceberg_v2_eq_manifest_shapes_bare_first": (
+        lambda: build_manifest_shapes(
+            "iceberg_v2_eq_manifest_shapes_bare_first", bare_first=True
+        ),
+        [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)],
+    ),
+    "iceberg_v2_eq_duplicate_entry": (build_duplicate_entry, None),
+    "iceberg_v2_eq_bounds_stream": (build_bounds_stream, None),
 }
 
 
@@ -1393,7 +1607,7 @@ def verify(name, expected):
     import duckdb
 
     if expected is None:
-        print(f"  {name}: skipped - not readable from this machine")
+        print(f"  {name}: skipped - not checked against DuckDB")
         return True
     con = duckdb.connect()
     con.execute("LOAD iceberg")
