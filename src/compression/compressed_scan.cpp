@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -804,18 +805,19 @@ decompress_result decompress_chunk(
     // The plain decode below applies no join filter.
     out.outcome.membership_skipped = requested_membership_probes(request) > 0;
     // Only a DICTIONARY32 entry changes a plain decode; widening targets apply to compacted ones.
-    std::vector<std::optional<cudf::data_type>> dictionary_outputs(selected.size());
-    bool wants_dictionary = false;
-    for (std::size_t i = 0; i < request.output_types.size() && i < selected.size(); ++i) {
-      if (request.output_types[i] && request.output_types[i]->id() == cudf::type_id::DICTIONARY32) {
-        dictionary_outputs[i] = request.output_types[i];
-        wants_dictionary      = true;
-      }
-    }
+    auto const requested     = std::min(request.output_types.size(), selected.size());
+    auto const is_dictionary = [&](std::size_t i) {
+      return request.output_types[i] &&
+             request.output_types[i]->id() == cudf::type_id::DICTIONARY32;
+    };
     static_assert(
       simpatico::dictionary_output_max_keys_bytes == sirius::dictionary_carrier_max_keys_bytes,
       "a pin plans the dictionary carriers its decode returns");
-    if (wants_dictionary) {
+    if (std::ranges::any_of(std::views::iota(std::size_t{0}, requested), is_dictionary)) {
+      std::vector<std::optional<cudf::data_type>> dictionary_outputs(selected.size());
+      for (std::size_t i = 0; i < requested; ++i) {
+        if (is_dictionary(i)) { dictionary_outputs[i] = request.output_types[i]; }
+      }
       out.table = simpatico::decompress(chunk, selected, predicates, dictionary_outputs, lanes, mr);
     } else {
       out.table = predicates.empty()
