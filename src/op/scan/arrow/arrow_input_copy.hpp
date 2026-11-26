@@ -25,6 +25,8 @@ struct arrow_copy_limits {
 namespace detail {
 // The caller keeps complete source roots readable/immutable through validation and copy.
 // These helpers account only for detached output/staging, never for native input allocation.
+// Native producers retain resource errors. Arrow push translates an out-of-bounds offer
+// to invalid_argument at the offer boundary.
 void validate_arrow_copy_input(ArrowSchema const&,
                                ArrowArray const&,
                                materialization_program const&,

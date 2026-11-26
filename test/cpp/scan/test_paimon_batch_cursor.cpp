@@ -16,18 +16,21 @@
 
 #include "catch.hpp"
 #include "op/scan/paimon/paimon_batch_cursor.hpp"
+#include "scan_manager/preparation_ledger.hpp"
 
 #include <duckdb/common/arrow/arrow.hpp>
 #include <paimon/reader/batch_reader.h>
 
 #include <functional>
 #include <stop_token>
+#include <string_view>
 #include <system_error>
 using namespace sirius::op::scan;
 namespace {
 struct observation {
   int reads = 0, closes = 0, releases = 0, active_roots = 0, destroyed = 0;
-  bool read_error = false, read_throw = false, close_error = false, eof_schema = false;
+  paimon::Status read_status;
+  bool read_throw = false, close_error = false, eof_schema = false;
   std::weak_ptr<void> owners;
   bool check_owners = false;
   std::vector<int64_t> rows{0, 2};
@@ -69,7 +72,7 @@ class reader final : public paimon::BatchReader {
     ++state->reads;
     if (state->on_read) state->on_read();
     if (state->read_throw) throw std::runtime_error("selected thrown read error");
-    if (state->read_error) return paimon::Status::IOError("selected read error");
+    if (!state->read_status.ok()) return state->read_status;
     if (cursor < state->rows.size()) return roots(state->rows[cursor++], *state);
     if (state->eof_schema) {
       auto eof = roots(0, *state);
@@ -92,7 +95,7 @@ class reader final : public paimon::BatchReader {
 };
 paimon_batch_cursor make_cursor(std::shared_ptr<observation> const& state)
 {
-  return paimon_batch_cursor(std::make_unique<reader>(state), state, 2);
+  return paimon_batch_cursor(std::make_unique<reader>(state), state);
 }
 }  // namespace
 TEST_CASE("Paimon cursor preserves zero rows and retires EOF once", "[paimon_cursor]")
@@ -101,14 +104,14 @@ TEST_CASE("Paimon cursor preserves zero rows and retires EOF once", "[paimon_cur
   auto cursor = make_cursor(state);
   std::vector<int64_t> rows;
   auto accept = [&](ArrowSchema const&, ArrowArray const& array) { rows.push_back(array.length); };
-  REQUIRE(cursor.consume({}, accept));
+  REQUIRE(cursor.consume({}, 2, accept));
   REQUIRE(state->releases == 2);
-  REQUIRE(cursor.consume({}, accept));
+  REQUIRE(cursor.consume({}, 2, accept));
   REQUIRE(state->releases == 4);
-  REQUIRE_FALSE(cursor.consume({}, accept));
+  REQUIRE_FALSE(cursor.consume({}, 2, accept));
   REQUIRE(rows == std::vector<int64_t>{0, 2});
   REQUIRE(state->closes == 1);
-  REQUIRE_FALSE(cursor.consume({}, accept));
+  REQUIRE_FALSE(cursor.consume({}, 2, accept));
   cursor.close();
   REQUIRE(state->reads == 3);
   REQUIRE(state->closes == 1);
@@ -121,10 +124,10 @@ TEST_CASE("Paimon cursor releases roots on normalization failure and never retri
   auto fail   = [](ArrowSchema const&, ArrowArray const&) {
     throw std::runtime_error("copy failure");
   };
-  REQUIRE_THROWS_WITH(cursor.consume({}, fail), "copy failure");
+  REQUIRE_THROWS_WITH(cursor.consume({}, 2, fail), "copy failure");
   REQUIRE(state->active_roots == 0);
   REQUIRE(state->releases == 2);
-  REQUIRE_THROWS_WITH(cursor.consume({}, fail), "copy failure");
+  REQUIRE_THROWS_WITH(cursor.consume({}, 2, fail), "copy failure");
   REQUIRE(state->reads == 1);
   cursor.close();
   REQUIRE(state->closes == 1);
@@ -132,14 +135,44 @@ TEST_CASE("Paimon cursor releases roots on normalization failure and never retri
 TEST_CASE("Paimon cursor latches native errors without reporting EOF", "[paimon_cursor]")
 {
   auto state = std::make_shared<observation>();
-  SECTION("returned status") { state->read_error = true; }
+  SECTION("returned status")
+  {
+    state->read_status = paimon::Status::IOError("selected read error");
+  }
   SECTION("thrown exception") { state->read_throw = true; }
   auto cursor = make_cursor(state);
   auto accept = [](ArrowSchema const&, ArrowArray const&) {};
-  REQUIRE_THROWS(cursor.consume({}, accept));
-  REQUIRE_THROWS(cursor.consume({}, accept));
+  REQUIRE_THROWS(cursor.consume({}, 2, accept));
+  REQUIRE_THROWS(cursor.consume({}, 2, accept));
   REQUIRE(state->reads == 1);
   cursor.close();
+}
+TEST_CASE("Paimon cursor preserves SDK resource and cancellation status", "[paimon_cursor]")
+{
+  auto state  = std::make_shared<observation>();
+  auto cursor = make_cursor(state);
+  auto accept = [](ArrowSchema const&, ArrowArray const&) { FAIL("failed batch was delivered"); };
+  auto const code    = GENERATE(paimon::StatusCode::CapacityError,
+                             paimon::StatusCode::OutOfMemory,
+                             paimon::StatusCode::Cancelled);
+  state->read_status = paimon::Status(code, "selected status");
+  for (int attempt = 0; attempt != 2; ++attempt) {
+    try {
+      (void)cursor.consume({}, 2, accept);
+      FAIL("failed native batch became data or EOF");
+    } catch (sirius::scan_manager::preparation_resource_error const& failure) {
+      CHECK(code != paimon::StatusCode::Cancelled);
+      CHECK(failure.bound_exceeded == (code == paimon::StatusCode::CapacityError));
+      CHECK(std::string_view(failure.what()).find("selected status") != std::string_view::npos);
+    } catch (std::system_error const& failure) {
+      CHECK(code == paimon::StatusCode::Cancelled);
+      CHECK(failure.code() == std::errc::operation_canceled);
+    }
+  }
+  CHECK(state->reads == 1);
+  CHECK(state->active_roots == 0);
+  cursor.close();
+  CHECK(state->closes == 1);
 }
 TEST_CASE("Paimon cursor stop before and after native call prevents output", "[paimon_cursor]")
 {
@@ -154,14 +187,14 @@ TEST_CASE("Paimon cursor stop before and after native call prevents output", "[p
     state->on_read = [&] { stop.request_stop(); };
   }
   try {
-    cursor.consume(sirius::scan_manager::preparation_stop_token(stop.get_token()), accept);
+    cursor.consume(sirius::scan_manager::preparation_stop_token(stop.get_token()), 2, accept);
     FAIL("stopped read must fail");
   } catch (std::system_error const& error) {
     REQUIRE(error.code() == std::errc::operation_canceled);
   }
   REQUIRE_FALSE(accepted);
   REQUIRE(state->active_roots == 0);
-  REQUIRE_THROWS(cursor.consume({}, accept));
+  REQUIRE_THROWS(cursor.consume({}, 2, accept));
   cursor.close();
 }
 TEST_CASE("Paimon cursor rejects oversized output and reports close failure", "[paimon_cursor]")
@@ -172,7 +205,8 @@ TEST_CASE("Paimon cursor rejects oversized output and reports close failure", "[
   {
     state->rows = {3};
     auto cursor = make_cursor(state);
-    REQUIRE_THROWS(cursor.consume({}, accept));
+    REQUIRE_THROWS_AS(cursor.consume({}, 2, accept),
+                      sirius::scan_manager::preparation_resource_error);
     REQUIRE(state->active_roots == 0);
     cursor.close();
   }
@@ -180,7 +214,7 @@ TEST_CASE("Paimon cursor rejects oversized output and reports close failure", "[
   {
     state->rows = {-1};
     auto cursor = make_cursor(state);
-    REQUIRE_THROWS(cursor.consume({}, accept));
+    REQUIRE_THROWS(cursor.consume({}, 2, accept));
     REQUIRE(state->active_roots == 0);
     cursor.close();
   }
@@ -189,7 +223,7 @@ TEST_CASE("Paimon cursor rejects oversized output and reports close failure", "[
     state->close_error = true;
     auto cursor        = make_cursor(state);
     REQUIRE_THROWS_WITH(cursor.close(), "selected close error");
-    REQUIRE_THROWS_WITH(cursor.consume({}, accept), "selected close error");
+    REQUIRE_THROWS_WITH(cursor.consume({}, 2, accept), "selected close error");
     cursor.close();
     REQUIRE(state->closes == 1);
     REQUIRE(state->destroyed == 1);
@@ -199,8 +233,8 @@ TEST_CASE("Paimon cursor rejects oversized output and reports close failure", "[
     state->rows.clear();
     state->close_error = true;
     auto cursor        = make_cursor(state);
-    REQUIRE_THROWS_WITH(cursor.consume({}, accept), "selected close error");
-    REQUIRE_THROWS_WITH(cursor.consume({}, accept), "selected close error");
+    REQUIRE_THROWS_WITH(cursor.consume({}, 2, accept), "selected close error");
+    REQUIRE_THROWS_WITH(cursor.consume({}, 2, accept), "selected close error");
     cursor.close();
     REQUIRE(state->closes == 1);
     REQUIRE(state->destroyed == 1);
@@ -210,7 +244,7 @@ TEST_CASE("Paimon cursor rejects oversized output and reports close failure", "[
     state->rows.clear();
     state->eof_schema = true;
     auto cursor       = make_cursor(state);
-    REQUIRE_FALSE(cursor.consume({}, accept));
+    REQUIRE_FALSE(cursor.consume({}, 2, accept));
     REQUIRE(state->active_roots == 0);
     REQUIRE(state->releases == 2);
   }
@@ -219,7 +253,7 @@ TEST_CASE("Paimon cursor rejects oversized output and reports close failure", "[
 TEST_CASE("Paimon cursor cleans a reader rejected during construction", "[paimon_cursor]")
 {
   auto state = std::make_shared<observation>();
-  REQUIRE_THROWS_AS(paimon_batch_cursor(std::make_unique<reader>(state), state, 0),
+  REQUIRE_THROWS_AS(paimon_batch_cursor(std::make_unique<reader>(state), {}),
                     std::invalid_argument);
   REQUIRE(state->closes == 1);
   REQUIRE(state->destroyed == 1);
@@ -229,7 +263,7 @@ TEST_CASE("Paimon cursor early close forbids further native reads", "[paimon_cur
   auto state  = std::make_shared<observation>();
   auto cursor = make_cursor(state);
   cursor.close();
-  REQUIRE_THROWS_AS(cursor.consume({}, [](ArrowSchema const&, ArrowArray const&) {}),
+  REQUIRE_THROWS_AS(cursor.consume({}, 2, [](ArrowSchema const&, ArrowArray const&) {}),
                     std::logic_error);
   REQUIRE(state->reads == 0);
   REQUIRE(state->closes == 1);
@@ -257,10 +291,10 @@ TEST_CASE("Paimon cursor stop during detach releases roots and latches failure",
   std::stop_source stop;
   auto detach = [&](ArrowSchema const&, ArrowArray const&) { stop.request_stop(); };
   REQUIRE_THROWS_AS(
-    cursor.consume(sirius::scan_manager::preparation_stop_token(stop.get_token()), detach),
+    cursor.consume(sirius::scan_manager::preparation_stop_token(stop.get_token()), 2, detach),
     std::system_error);
   REQUIRE(state->active_roots == 0);
-  REQUIRE_THROWS_AS(cursor.consume({}, detach), std::system_error);
+  REQUIRE_THROWS_AS(cursor.consume({}, 2, detach), std::system_error);
   REQUIRE(state->reads == 1);
   cursor.close();
 }

@@ -19,6 +19,7 @@
 #include "op/scan/arrow/arrow_input_copy.hpp"
 #include "transparent/replay_admission.hpp"
 
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -42,8 +43,6 @@ std::shared_ptr<owned_arrow_batch> detach(ArrowSchema const& schema,
                                           arrow_copy_limits const& bounds,
                                           admitted_arrow_input admitted)
 {
-  if (array.length > bounds.max_rows)
-    throw sm::preparation_resource_error("Paimon batch exceeds its declared row bound", true);
   auto fields = program.input_types->size();
   if (!schema.format || std::strcmp(schema.format, "+s") || array.offset || array.null_count ||
       schema.n_children != static_cast<int64_t>(fields + 1) ||
@@ -141,7 +140,7 @@ arrow_production paimon_arrow_producer::next(admitted_arrow_input admitted,
     if (impl_->eof) return arrow_end_of_stream{};
     if (!impl_->opened) {
       impl_->opened = true;
-      impl_->cursor = impl_->open(stop);
+      impl_->cursor = impl_->open(impl_->bounds.max_rows, stop);
       impl_->check_stop(stop);
       if (!impl_->cursor) {
         impl_->eof = true;
@@ -149,8 +148,8 @@ arrow_production paimon_arrow_producer::next(admitted_arrow_input admitted,
       }
     }
     std::shared_ptr<owned_arrow_batch> output;
-    bool data =
-      impl_->cursor->consume(stop, [&](ArrowSchema const& schema, ArrowArray const& array) {
+    bool data = impl_->cursor->consume(
+      stop, impl_->bounds.max_rows, [&](ArrowSchema const& schema, ArrowArray const& array) {
         impl_->check_stop(stop);
         output = detach(schema, array, impl_->program, impl_->bounds, admitted);
       });

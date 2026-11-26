@@ -20,7 +20,6 @@
 #include "op/scan/paimon/paimon_arrow_producer.hpp"
 #include "scan/paimon_native_test_fixture.hpp"
 
-#include <paimon/fs/file_system_factory.h>
 #include <paimon/reader/batch_reader.h>
 #endif
 #include "data/data_batch_utils.hpp"
@@ -2944,10 +2943,12 @@ auto scripted_paimon(std::shared_ptr<native_read_script> script,
                      arrow_copy_limits limits = {3, 8192, 8192})
 {
   return std::make_shared<paimon_arrow_producer>(
-    integer_program(), limits, [script = std::move(script)](sm::preparation_stop_token stop) {
+    integer_program(),
+    limits,
+    [script = std::move(script)](int64_t, sm::preparation_stop_token stop) {
       script->stop = stop;
-      return std::make_unique<paimon_batch_cursor>(
-        std::make_unique<native_kind_reader>(script), script, 3);
+      return std::make_unique<paimon_batch_cursor>(std::make_unique<native_kind_reader>(script),
+                                                   script);
     });
 }
 
@@ -3046,7 +3047,7 @@ TEST_CASE("Paimon producer refuses an Arrow source profile before opening a curs
           "[paimon_kind_profile]")
 {
   bool opened = false;
-  auto open   = [&](sm::preparation_stop_token) {
+  auto open   = [&](int64_t, sm::preparation_stop_token) {
     opened = true;
     return std::unique_ptr<paimon_batch_cursor>{};
   };
@@ -3055,41 +3056,6 @@ TEST_CASE("Paimon producer refuses an Arrow source profile before opening a curs
     std::invalid_argument);
   CHECK_FALSE(opened);
 }
-
-#if defined(__GLIBCXX__) && _GLIBCXX_USE_CXX11_ABI
-TEST_CASE("Paimon snapshot budget refusal aborts Arrow preparation before publication",
-          "[arrow_driver][paimon_snapshot_admission]")
-{
-  auto owners   = std::make_shared<sirius::test::paimon::native_fixture>();
-  auto metadata = sirius::test::paimon::fixture_metadata();
-  auto fs       = ::paimon::FileSystemFactory::Get("local", metadata.path, {});
-  REQUIRE(fs.ok());
-  unsigned requests = 0;
-  paimon_snapshot_input_budget budget{std::move(fs).value(), [&](uint64_t bytes) {
-                                        CHECK(bytes > 0);
-                                        ++requests;
-                                        return std::shared_ptr<void>{};
-                                      }};
-  auto open = [&](sm::preparation_stop_token stop) {
-    return open_paimon_read(metadata, {0}, owners->pool, owners, 1, stop, &budget);
-  };
-  materialization_program program{701, 4, {cudf::data_type{cudf::type_id::INT64}}, 0, false};
-  program.input_types = program.output_types;
-  auto producer =
-    std::make_shared<paimon_arrow_producer>(program, arrow_copy_limits{1, 8192, 8192}, open);
-  harness h(producer, program, false);
-  try {
-    (void)h.next();
-    FAIL("snapshot budget refusal completed Arrow preparation");
-  } catch (sm::preparation_resource_error const& error) {
-    CHECK(error.bound_exceeded);
-  }
-  CHECK(requests == 1);
-  CHECK(h.backing.seen->allocations == 0);
-  CHECK(h.ledger->tracked_units() == 0);
-  CHECK(owners->pool->CurrentUsage() == 0);
-}
-#endif
 
 TEST_CASE("Paimon row-kind must be a live plain leaf before any copy", "[paimon_kind_profile]")
 {
@@ -3110,14 +3076,60 @@ TEST_CASE("Paimon row-kind must be a live plain leaf before any copy", "[paimon_
   CHECK(h.ledger->tracked_units() == 0);
 }
 
-TEST_CASE("Paimon producer checks its own row budget before inspecting row kinds",
+TEST_CASE("Paimon worker drains a stopped initial native open without reading",
+          "[paimon_worker_open_stop]")
+{
+  auto script = std::make_shared<native_read_script>();
+  sirius::test::preparation::hold opening;
+  int64_t requested_rows = 0;
+  auto open              = [&](int64_t max_rows, sm::preparation_stop_token stop) {
+    requested_rows = max_rows;
+    script->stop   = stop;
+    opening.wait();
+    return std::make_unique<paimon_batch_cursor>(std::make_unique<native_kind_reader>(script),
+                                                 script);
+  };
+  auto producer = std::make_shared<paimon_arrow_producer>(
+    integer_program(), arrow_copy_limits{3, 8192, 8192}, open);
+  harness h(producer, integer_program(), false);
+  unsigned publications = 0;
+  native_worker_run run;
+  struct release_hold {
+    sirius::test::preparation::hold& opening;
+    ~release_hold() { opening.release(); }
+  } release_on_failure{opening};
+  run.coordinator.add_source(run.source(*h.driver));
+  run.coordinator.after_publication_for_testing([&](auto, auto const&, auto) { ++publications; });
+  run.start();
+  REQUIRE(run.until([&] {
+    std::lock_guard lock(opening.mutex);
+    return opening.entered;
+  }));
+  CHECK(requested_rows == 3);
+  run.coordinator.request_stop(sm::stop_reason::user_cancel);
+  REQUIRE(run.until([&] { return script->stop.stop_requested(); }));
+  CHECK_FALSE(run.quiescent());
+  CHECK(script->reads == 0);
+  CHECK(publications == 0);
+  opening.release();
+  REQUIRE(run.until([&] { return run.quiescent(); }));
+  run.coordinator.drain();
+  auto const error = run.completion.terminal_error();
+  REQUIRE(error);
+  CHECK_THROWS_AS(std::rethrow_exception(error), duckdb::InterruptException);
+  CHECK(publications == 0);
+  CHECK(h.backing.seen->allocations == 0);
+  check_native_retirement(*script, 0, 0);
+  check_native_ledger(h);
+}
+
+TEST_CASE("Paimon producer checks its row budget before inspecting row kinds",
           "[paimon_kind_profile]")
 {
   auto input      = std::make_shared<native_kind_tree>(-1);
   input->kinds[0] = 3;
   auto script     = std::make_shared<native_read_script>();
   script->batches = {input};
-  // The cursor allows three rows, while this producer admits only one.
   harness h(scripted_paimon(script, {1, 8192, 8192}), integer_program(), false);
   check_native_bound(capture_rejection([&] { (void)h.next(); }),
                      "Paimon batch exceeds its declared row bound");
@@ -3389,12 +3401,13 @@ TEST_CASE("Paimon native lane detaches roots before GPU import and cancellation 
   auto native_pool = owners->pool;
   materialization_program program{701, 4, {cudf::data_type{cudf::type_id::INT64}}, 0, false};
   program.input_types = program.output_types;
-  auto open           = [metadata, owners](sm::preparation_stop_token stop) {
-    return open_paimon_read(metadata, {0}, owners->pool, owners, 1, stop);
+  auto open           = [metadata, owners](int64_t max_rows, sm::preparation_stop_token stop) {
+    return open_paimon_read(metadata, {0}, owners->pool, owners, max_rows, stop);
   };
   auto producer = std::make_shared<paimon_arrow_producer>(
     program, arrow_copy_limits{1, 8192, 8192}, std::move(open));
   harness h(producer, program, false);
+  CHECK_FALSE(h.driver->can_serve_cached_view());
   auto manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   rmm::cuda_stream stream;

@@ -1020,7 +1020,7 @@ bound (`scan_source_names`, `src/planner/scan_source_names.hpp`), not by
 bind, or one whose column count differs from the `LogicalGet`'s, falls back to
 `LogicalGet::names`.
 
-## Opt-in native Paimon snapshot admission
+## Opt-in native Paimon reader
 
 `SIRIUS_ENABLE_PAIMON_SDK` builds a native Paimon reader and cursor and defaults to
 `OFF`. The component has no production SQL registration.
@@ -1036,11 +1036,16 @@ contain `arrow/c/abi.h` and can point to the matching Arrow install used to buil
 Paimon. Tests load LocalFS, Avro and Parquet shared modules from the same Paimon
 installation. The runtime loader must resolve the matching core and C++ runtimes.
 
-The optional lease covers the numbered snapshot's ordinary string allocation
-request on this SDK and ABI. The caller must provide a budget and the selected
-filesystem for its bound immutable local snapshot. Production admission also
-requires verified SDK identity and bounds for decoder scratch, retained
-manifests and plans, native batches, and detached and staged output.
+The first job on the native worker plans the retained snapshot and opens one
+cursor. It can also read its first batch. Each later job reads at most one batch
+from that cursor, including when moving across splits. The native path forces
+`read.preparation-window=1` so the SDK prepares one file reader at a time within
+a split. CPU decode feeds GPU import serially through the cursor. The stop token
+is checked around SDK calls. An active stock SDK call must complete before it
+can be drained. The reader uses SDK I/O independently of Sirius's Parquet caches.
+
+Production admission requires a qualified SDK and bounds for planning and
+decoder memory, native batches, detached copies, and staged output.
 
 ## Key Files
 

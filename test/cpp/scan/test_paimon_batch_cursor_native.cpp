@@ -23,16 +23,19 @@
 #include <duckdb/common/arrow/arrow.hpp>
 #include <paimon/fs/file_system_factory.h>
 #include <paimon/memory/memory_pool.h>
+#include <paimon/scan_context.h>
+#include <paimon/table/source/data_split.h>
+#include <paimon/table/source/plan.h>
+#include <paimon/table/source/table_scan.h>
 
 #include <algorithm>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
+#include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
-#include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 using namespace sirius::test::paimon;
@@ -66,195 +69,273 @@ class fault_pool final : public paimon::MemoryPool {
  private:
   std::unique_ptr<paimon::MemoryPool> upstream;
 };
-}  // namespace
 
-#if defined(__GLIBCXX__) && _GLIBCXX_USE_CXX11_ABI
-TEST_CASE("Paimon admits retained snapshot input before allocating its buffer",
-          "[paimon_cursor][paimon_native][paimon_snapshot_admission]")
+struct parquet_stream_counts {
+  std::mutex mutex;
+  size_t live = 0;
+  size_t peak = 0;
+};
+
+// A raw Parquet file reader in the stock SDK retains this input stream until close.
+class counted_parquet_stream final : public paimon::InputStream {
+ public:
+  counted_parquet_stream(std::unique_ptr<paimon::InputStream> input,
+                         std::shared_ptr<parquet_stream_counts> counts)
+    : _input(std::move(input)), _counts(std::move(counts))
+  {
+    std::lock_guard lock(_counts->mutex);
+    _counts->peak = std::max(_counts->peak, ++_counts->live);
+  }
+
+  ~counted_parquet_stream() override
+  {
+    _input.reset();
+    retire();
+  }
+
+  paimon::Status Close() override
+  {
+    auto status = _input->Close();
+    if (status.ok()) retire();
+    return status;
+  }
+
+  paimon::Status Seek(int64_t offset, paimon::SeekOrigin origin) override
+  {
+    return _input->Seek(offset, origin);
+  }
+  paimon::Result<int64_t> GetPos() const override { return _input->GetPos(); }
+  paimon::Result<int64_t> Read(char* buffer, int64_t size) override
+  {
+    return _input->Read(buffer, size);
+  }
+  paimon::Result<int64_t> Read(char* buffer, int64_t size, int64_t offset) override
+  {
+    return _input->Read(buffer, size, offset);
+  }
+  void ReadAsync(char* buffer,
+                 int64_t size,
+                 int64_t offset,
+                 std::function<void(paimon::Status)>&& callback) override
+  {
+    _input->ReadAsync(buffer, size, offset, std::move(callback));
+  }
+  paimon::Result<std::string> GetUri() const override { return _input->GetUri(); }
+  paimon::Result<int64_t> Length() const override { return _input->Length(); }
+
+ private:
+  void retire()
+  {
+    if (_counts) {
+      auto counts = std::move(_counts);
+      std::lock_guard lock(counts->mutex);
+      --counts->live;
+    }
+  }
+
+  std::unique_ptr<paimon::InputStream> _input;
+  std::shared_ptr<parquet_stream_counts> _counts;
+};
+
+class counted_parquet_filesystem final : public paimon::FileSystem {
+ public:
+  explicit counted_parquet_filesystem(std::shared_ptr<paimon::FileSystem> upstream)
+    : _upstream(std::move(upstream))
+  {
+  }
+
+  std::pair<size_t, size_t> live_and_peak() const
+  {
+    std::lock_guard lock(_counts->mutex);
+    return {_counts->live, _counts->peak};
+  }
+
+  paimon::Result<std::unique_ptr<paimon::InputStream>> Open(std::string const& path) const override
+  {
+    return track(path, _upstream->Open(path));
+  }
+  paimon::Result<std::unique_ptr<paimon::InputStream>> Open(
+    paimon::FileStatus const& status) const override
+  {
+    return track(status.GetPath(), _upstream->Open(status));
+  }
+  paimon::Result<std::unique_ptr<paimon::OutputStream>> Create(std::string const& path,
+                                                               bool overwrite) const override
+  {
+    return _upstream->Create(path, overwrite);
+  }
+  paimon::Status Mkdirs(std::string const& path) const override { return _upstream->Mkdirs(path); }
+  paimon::Status Rename(std::string const& from, std::string const& to) const override
+  {
+    return _upstream->Rename(from, to);
+  }
+  paimon::Status Delete(std::string const& path, bool recursive) const override
+  {
+    return _upstream->Delete(path, recursive);
+  }
+  paimon::Result<paimon::FileStatus> GetFileStatus(std::string const& path) const override
+  {
+    return _upstream->GetFileStatus(path);
+  }
+  paimon::Status ListDir(std::string const& path,
+                         std::vector<paimon::BasicFileStatus>* entries) const override
+  {
+    return _upstream->ListDir(path, entries);
+  }
+  paimon::Status ListFileStatus(std::string const& path,
+                                std::vector<paimon::FileStatus>* entries) const override
+  {
+    return _upstream->ListFileStatus(path, entries);
+  }
+  paimon::Result<bool> Exists(std::string const& path) const override
+  {
+    return _upstream->Exists(path);
+  }
+
+ private:
+  paimon::Result<std::unique_ptr<paimon::InputStream>> track(
+    std::string const& path, paimon::Result<std::unique_ptr<paimon::InputStream>> input) const
+  {
+    if (!input.ok() || !path.ends_with(".parquet")) return input;
+    return std::unique_ptr<paimon::InputStream>(
+      std::make_unique<counted_parquet_stream>(std::move(input).value(), _counts));
+  }
+
+  std::shared_ptr<paimon::FileSystem> _upstream;
+  std::shared_ptr<parquet_stream_counts> _counts = std::make_shared<parquet_stream_counts>();
+};
+
+void append_ids(ArrowSchema const& schema, ArrowArray const& array, std::vector<int64_t>& actual)
 {
-  using sirius::op::scan::open_paimon_read;
-  using sirius::op::scan::paimon_snapshot_input_budget;
-  namespace fs = std::filesystem;
-
-  auto owners   = std::make_shared<native_fixture>();
-  auto metadata = fixture_metadata();
-  auto pattern  = (fs::temp_directory_path() / "sirius-paimon-snapshot-XXXXXX").string();
-  REQUIRE(::mkdtemp(pattern.data()));
-  struct temp_directory {
-    fs::path path;
-    ~temp_directory()
-    {
-      std::error_code ignored;
-      fs::remove_all(path, ignored);
-    }
-  } temp{pattern};
-  auto root   = temp.path / "table";
-  auto source = fs::path(metadata.path);
-  fs::copy(source, root, fs::copy_options::recursive);
-  metadata.path      = root.string();
-  auto snapshot      = root / "snapshot/snapshot-1";
-  auto original_size = fs::file_size(snapshot);
-  auto filesystem    = paimon::FileSystemFactory::Get("local", metadata.path, {});
-  REQUIRE(filesystem.ok());
-  uint64_t remaining = 256 * 1024;
-  uint64_t requested = 0;
-  uint64_t reserved  = 0;
-  unsigned requests  = 0;
-  bool replace_path  = false;
-  bool shorten_input = false;
-  paimon_snapshot_input_budget budget{
-    std::move(filesystem).value(), [&](uint64_t bytes) -> std::shared_ptr<void> {
-      ++requests;
-      requested = bytes;
-      if (bytes > remaining) return {};
-      REQUIRE(reserved == 0);
-      if (replace_path) {
-        fs::rename(snapshot, snapshot.string() + ".held");
-        std::ofstream replacement(snapshot);
-        replacement << "{}";
-        REQUIRE(replacement.good());
-      }
-      if (shorten_input) fs::resize_file(snapshot, original_size - 1);
-      auto lease = std::shared_ptr<void>(&reserved, [&](void*) { reserved = 0; });
-      reserved   = bytes;
-      return lease;
-    }};
-  auto open = [&] { return open_paimon_read(metadata, {0}, owners->pool, owners, 1, {}, &budget); };
-
-  SECTION("oversized valid JSON refuses before read and a healthy retry succeeds")
-  {
-    constexpr uint64_t padded_size = 270337;
-    {
-      std::ofstream padded(snapshot, std::ios::app);
-      padded << std::string(padded_size - original_size, ' ');
-      REQUIRE(padded.good());
-    }
-    REQUIRE(fs::file_size(snapshot) == padded_size);
-    try {
-      (void)open();
-      FAIL("oversized snapshot published a cursor");
-    } catch (sirius::scan_manager::preparation_resource_error const& error) {
-      REQUIRE(error.bound_exceeded);
-    }
-    REQUIRE(requests == 1);
-    REQUIRE(requested == padded_size + 1);
-    REQUIRE(reserved == 0);
-    REQUIRE(owners->pool->CurrentUsage() == 0);
-    fs::resize_file(snapshot, original_size);
-  }
-  SECTION("an admitted malformed snapshot releases its lease on failure")
-  {
-    {
-      std::ofstream invalid(snapshot, std::ios::trunc);
-      invalid << std::string(original_size, '?');
-      REQUIRE(invalid.good());
-    }
-    try {
-      (void)open();
-      FAIL("malformed snapshot published a cursor");
-    } catch (sirius::scan_manager::preparation_resource_error const&) {
-      FAIL("malformed snapshot was classified as resource exhaustion");
-    } catch (std::runtime_error const&) {
-    }
-    REQUIRE(requests == 1);
-    REQUIRE(requested == original_size + 1);
-    REQUIRE(reserved == 0);
-    REQUIRE(owners->pool->CurrentUsage() == 0);
-    fs::copy_file(source / "snapshot/snapshot-1", snapshot, fs::copy_options::overwrite_existing);
-  }
-  SECTION("an admitted short snapshot read is an I/O failure and retires its lease")
-  {
-    shorten_input = true;
-    try {
-      (void)open();
-      FAIL("short snapshot read published a cursor");
-    } catch (sirius::scan_manager::preparation_resource_error const&) {
-      FAIL("short snapshot read was classified as resource exhaustion");
-    } catch (std::runtime_error const& error) {
-      REQUIRE(std::string_view(error.what()).find("actual read len") != std::string_view::npos);
-    }
-    REQUIRE(requests == 1);
-    REQUIRE(requested == original_size + 1);
-    REQUIRE(reserved == 0);
-    REQUIRE(owners->pool->CurrentUsage() == 0);
-    shorten_input = false;
-    fs::copy_file(source / "snapshot/snapshot-1", snapshot, fs::copy_options::overwrite_existing);
-  }
-  SECTION("planning and data reads use the supplied filesystem")
-  {
-    metadata.options["file-system"] = "unavailable-for-snapshot-admission-test";
-  }
-  SECTION("size and read use the same open file") { replace_path = true; }
-  SECTION("system-table aliases cannot change the retained data-table root")
-  {
-    metadata.path += "$ro";
-    REQUIRE_THROWS_AS(open(), std::invalid_argument);
-    REQUIRE(requests == 0);
+  REQUIRE(std::string(schema.format) == "+s");
+  REQUIRE(schema.n_children == array.n_children);
+  REQUIRE(array.offset == 0);
+  for (int64_t c = 0; c < schema.n_children; ++c) {
+    auto const& field = *schema.children[c];
+    if (!field.name || std::string(field.name) != "id") continue;
+    auto const& column = *array.children[c];
+    REQUIRE(std::string(field.format) == "l");
+    REQUIRE(column.offset == 0);
+    REQUIRE(column.length == array.length);
+    REQUIRE(column.null_count == 0);
+    REQUIRE(column.n_buffers == 2);
+    auto data = static_cast<int64_t const*>(column.buffers[1]);
+    actual.insert(actual.end(), data, data + column.length);
     return;
   }
-
-  remaining   = original_size + 1;
-  auto cursor = open();
-  REQUIRE(cursor);
-  REQUIRE(requested == remaining);
-  REQUIRE(reserved == 0);
-  std::vector<int64_t> rows;
-  while (cursor->consume({}, [&](ArrowSchema const& schema, ArrowArray const& batch) {
-    REQUIRE(schema.n_children == 2);
-    REQUIRE(std::string(schema.children[1]->name) == "id");
-    auto const& column = *batch.children[1];
-    REQUIRE(column.length == 1);
-    rows.push_back(static_cast<int64_t const*>(column.buffers[1])[column.offset]);
-  })) {}
-  std::sort(rows.begin(), rows.end());
-  REQUIRE(rows == std::vector<int64_t>{1, 1, 2});
-  cursor.reset();
-  REQUIRE(owners->pool->CurrentUsage() == 0);
+  FAIL("Missing projected id field");
 }
-#endif
+}  // namespace
 
 TEST_CASE("Paimon cursor reads retained snapshot from real append files",
           "[paimon_cursor][paimon_native]")
 {
-  auto owners = std::make_shared<native_fixture>();
-  auto pool   = owners->pool;
+  auto owners            = std::make_shared<native_fixture>();
+  auto pool              = owners->pool;
+  auto const snapshot_id = GENERATE(1, 2);
   {
-    auto metadata = fixture_metadata();
-    auto cursor   = sirius::op::scan::open_paimon_read(metadata, {0}, owners->pool, owners, 1, {});
+    auto metadata        = fixture_metadata();
+    metadata.snapshot_id = snapshot_id;
+    std::shared_ptr<paimon::FileSystem> filesystem;
+    if (snapshot_id == 2) {
+      auto local = paimon::FileSystemFactory::Get("local", metadata.path, {});
+      REQUIRE(local.ok());
+      filesystem = std::move(local).value();
+      // The explicitly supplied filesystem must serve both planning and data reads.
+      metadata.options["file-system"]              = "unavailable-for-paimon-native-test";
+      metadata.options["source.split.target-size"] = "1B";
+      auto options                                 = metadata.options;
+      options["scan.mode"]                         = "from-snapshot-full";
+      options["scan.snapshot-id"]                  = "2";
+      auto context                                 = paimon::ScanContextBuilder(metadata.path)
+                       .SetOptions(options)
+                       .SetTableSchema(metadata.schema_json)
+                       .WithFileSystem(filesystem)
+                       .WithMemoryPool(pool)
+                       .Finish();
+      REQUIRE(context.ok());
+      auto scan = paimon::TableScan::Create(std::move(context).value());
+      REQUIRE(scan.ok());
+      auto plan = scan.value()->CreatePlan();
+      REQUIRE(plan.ok());
+      REQUIRE(plan.value()->SnapshotId() == 2);
+      REQUIRE(plan.value()->Splits().size() == 2);
+    }
+    auto cursor =
+      sirius::op::scan::open_paimon_read(metadata, {0}, pool, owners, 1, {}, filesystem);
     REQUIRE(cursor);
     std::vector<int64_t> actual;
     size_t batches = 0;
     auto accept    = [&](ArrowSchema const& schema, ArrowArray const& array) {
       REQUIRE(++batches <= 8);
-      REQUIRE(std::string(schema.format) == "+s");
-      REQUIRE(schema.n_children == array.n_children);
-      REQUIRE(array.offset == 0);
-      bool found = false;
-      for (int64_t c = 0; c < schema.n_children; ++c) {
-        auto const& field = *schema.children[c];
-        if (!field.name || std::string(field.name) != "id") continue;
-        found              = true;
-        auto const& column = *array.children[c];
-        REQUIRE(std::string(field.format) == "l");
-        REQUIRE(column.offset == 0);
-        REQUIRE(column.length == array.length);
-        REQUIRE(column.null_count == 0);
-        REQUIRE(column.n_buffers == 2);
-        auto data = static_cast<int64_t const*>(column.buffers[1]);
-        actual.insert(actual.end(), data, data + column.length);
-      }
-      REQUIRE(found);
+      append_ids(schema, array, actual);
     };
-    while (cursor->consume({}, accept)) {}
+    while (cursor->consume({}, 1, accept)) {}
     REQUIRE(batches > 1);
-    // Independent checked-in corpus expectation: append_a at snapshot A (1).
-    // LATEST is snapshot 2 and has an additional id=3; accidentally reopening latest fails.
+    // Independent corpus expectations: append_a at snapshot 1, append_b at snapshot 2.
     std::sort(actual.begin(), actual.end());
-    REQUIRE(actual == std::vector<int64_t>{1, 1, 2});
-    REQUIRE_FALSE(cursor->consume({}, accept));
+    auto const expected =
+      snapshot_id == 1 ? std::vector<int64_t>{1, 1, 2} : std::vector<int64_t>{1, 1, 2, 3};
+    REQUIRE(actual == expected);
+    REQUIRE_FALSE(cursor->consume({}, 1, accept));
   }
   owners.reset();
   REQUIRE(pool->CurrentUsage() == 0);
+}
+
+TEST_CASE("Paimon native cursor prepares one file at a time within a packed split",
+          "[paimon_cursor][paimon_native]")
+{
+  auto owners                                  = std::make_shared<native_fixture>();
+  auto metadata                                = fixture_metadata();
+  metadata.snapshot_id                         = 2;
+  metadata.options["source.split.target-size"] = "128MB";
+  metadata.options["read.preparation-window"]  = "4";
+  auto local = paimon::FileSystemFactory::Get("local", metadata.path, {});
+  REQUIRE(local.ok());
+  auto filesystem      = std::make_shared<counted_parquet_filesystem>(std::move(local).value());
+  auto options         = metadata.options;
+  options["scan.mode"] = "from-snapshot-full";
+  options["scan.snapshot-id"] = "2";
+  auto context                = paimon::ScanContextBuilder(metadata.path)
+                   .SetOptions(options)
+                   .SetTableSchema(metadata.schema_json)
+                   .WithFileSystem(filesystem)
+                   .WithMemoryPool(owners->pool)
+                   .Finish();
+  REQUIRE(context.ok());
+  auto scan = paimon::TableScan::Create(std::move(context).value());
+  REQUIRE(scan.ok());
+  auto plan = scan.value()->CreatePlan();
+  REQUIRE(plan.ok());
+  REQUIRE(plan.value()->SnapshotId() == 2);
+  REQUIRE(plan.value()->Splits().size() == 1);
+  auto split = std::dynamic_pointer_cast<paimon::DataSplit>(plan.value()->Splits().front());
+  REQUIRE(split);
+  auto const files = split->GetFileList();
+  REQUIRE(files.size() == 2);
+  REQUIRE(files[0].file_path.ends_with(".parquet"));
+  REQUIRE(files[1].file_path.ends_with(".parquet"));
+  REQUIRE(files[0].file_path != files[1].file_path);
+
+  auto cursor =
+    sirius::op::scan::open_paimon_read(metadata, {0}, owners->pool, owners, 1, {}, filesystem);
+  REQUIRE(cursor);
+  std::vector<int64_t> actual;
+  size_t first_batch_live = 0;
+  size_t batches          = 0;
+  auto accept             = [&](ArrowSchema const& schema, ArrowArray const& array) {
+    if (++batches == 1) first_batch_live = filesystem->live_and_peak().first;
+    REQUIRE(batches <= 4);
+    append_ids(schema, array, actual);
+  };
+  while (cursor->consume({}, 1, accept)) {}
+  std::sort(actual.begin(), actual.end());
+  REQUIRE(actual == std::vector<int64_t>{1, 1, 2, 3});
+  auto const [live, peak] = filesystem->live_and_peak();
+  REQUIRE(live == 0);
+  CHECK(first_batch_live == 1);
+  CHECK(peak == 1);
 }
 
 TEST_CASE("Paimon native binding preserves empty and refuses inconsistent selectors",
@@ -332,7 +413,7 @@ TEST_CASE("Paimon native planning allocation refusal cannot become EOF",
   // The failed attempt must not poison a subsequent healthy reader.
   auto cursor = sirius::op::scan::open_paimon_read(metadata, {0}, owners->pool, owners, 1, {});
   REQUIRE(cursor);
-  REQUIRE(cursor->consume({}, [](ArrowSchema const&, ArrowArray const&) {}));
+  REQUIRE(cursor->consume({}, 1, [](ArrowSchema const&, ArrowArray const&) {}));
   cursor->close();
   cursor.reset();
   REQUIRE(owners->pool->CurrentUsage() == 0);
@@ -347,10 +428,10 @@ TEST_CASE("Paimon native read allocation refusal is terminal and drains",
   auto cursor   = sirius::op::scan::open_paimon_read(metadata, {0}, pool, owners, 1, {});
   REQUIRE(cursor);
   pool->reject = true;
-  REQUIRE_THROWS(cursor->consume({}, [](ArrowSchema const&, ArrowArray const&) {}));
+  REQUIRE_THROWS(cursor->consume({}, 1, [](ArrowSchema const&, ArrowArray const&) {}));
   REQUIRE(pool->attempts > 0);
   auto failures = pool->attempts;
-  REQUIRE_THROWS(cursor->consume({}, [](ArrowSchema const&, ArrowArray const&) {}));
+  REQUIRE_THROWS(cursor->consume({}, 1, [](ArrowSchema const&, ArrowArray const&) {}));
   REQUIRE(pool->attempts == failures);
   cursor->close();
   cursor.reset();

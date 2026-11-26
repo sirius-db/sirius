@@ -24,8 +24,8 @@ namespace sirius::op::scan {
 // Bind with arrow_import_binding::emit_empty_source = false for native EOF.
 class paimon_arrow_producer final : public arrow_batch_producer {
  public:
-  using read_factory =
-    std::function<std::unique_ptr<paimon_batch_cursor>(scan_manager::preparation_stop_token)>;
+  using read_factory = std::function<std::unique_ptr<paimon_batch_cursor>(
+    int64_t max_rows, scan_manager::preparation_stop_token)>;
   paimon_arrow_producer(materialization_program, arrow_copy_limits, read_factory);
   ~paimon_arrow_producer() override;
   scan_manager::preparation_execution_domain execution_domain() const noexcept override;

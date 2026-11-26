@@ -16,8 +16,11 @@
 
 #include "op/scan/paimon/paimon_batch_cursor.hpp"
 
+#include "scan_manager/preparation_ledger.hpp"
+
 #include <duckdb/common/arrow/arrow.hpp>
 #include <paimon/reader/batch_reader.h>
+#include <paimon/status.h>
 
 #include <stdexcept>
 #include <system_error>
@@ -40,15 +43,21 @@ void check_stop(scan_manager::preparation_stop_token stop)
     throw std::system_error(std::make_error_code(std::errc::operation_canceled));
 }
 }  // namespace
-paimon_batch_cursor::paimon_batch_cursor(std::unique_ptr<paimon::BatchReader> reader,
-                                         std::shared_ptr<void> owners,
-                                         int64_t max_rows)
-  : native_owners_(std::move(owners)), reader_(std::move(reader)), max_rows_(max_rows)
+void detail::throw_paimon_status(paimon::Status const& status)
 {
-  if (!reader_ || !native_owners_ || max_rows_ <= 0) {
+  if (status.IsCapacityError() || status.IsOutOfMemory())
+    throw scan_manager::preparation_resource_error(status.ToString(), status.IsCapacityError());
+  if (status.IsCancelled())
+    throw std::system_error(std::make_error_code(std::errc::operation_canceled), status.ToString());
+  throw std::runtime_error(status.ToString());
+}
+paimon_batch_cursor::paimon_batch_cursor(std::unique_ptr<paimon::BatchReader> reader,
+                                         std::shared_ptr<void> owners)
+  : native_owners_(std::move(owners)), reader_(std::move(reader))
+{
+  if (!reader_ || !native_owners_) {
     close();
-    throw std::invalid_argument(
-      "Paimon cursor requires a reader, retained owners and positive row limit");
+    throw std::invalid_argument("Paimon cursor requires a reader and retained owners");
   }
 }
 paimon_batch_cursor::~paimon_batch_cursor()
@@ -58,16 +67,19 @@ paimon_batch_cursor::~paimon_batch_cursor()
   } catch (...) {
   }
 }
-bool paimon_batch_cursor::consume(scan_manager::preparation_stop_token stop, consumer const& detach)
+bool paimon_batch_cursor::consume(scan_manager::preparation_stop_token stop,
+                                  int64_t max_rows,
+                                  consumer const& detach)
 {
   if (failure_) std::rethrow_exception(failure_);
   if (phase_ == phase::eof) return false;
   if (phase_ == phase::closed) throw std::logic_error("Paimon cursor closed before EOF");
   try {
-    if (!detach) throw std::invalid_argument("Paimon cursor requires a consumer");
+    if (!detach || max_rows <= 0)
+      throw std::invalid_argument("Paimon cursor requires a consumer and positive row limit");
     check_stop(stop);
     auto result = reader_->NextBatch();
-    if (!result.ok()) throw std::runtime_error(result.status().ToString());
+    if (!result.ok()) detail::throw_paimon_status(result.status());
     native_roots roots{std::move(result).value()};
     check_stop(stop);
     if (paimon::BatchReader::IsEofBatch(roots.value)) {
@@ -77,9 +89,11 @@ bool paimon_batch_cursor::consume(scan_manager::preparation_stop_token stop, con
       return false;
     }
     auto const& [array, schema] = roots.value;
-    if (!array || !schema || !array->release || !schema->release || array->length < 0 ||
-        array->length > max_rows_)
+    if (!array || !schema || !array->release || !schema->release || array->length < 0)
       throw std::runtime_error("Paimon reader returned an invalid batch profile");
+    if (array->length > max_rows)
+      throw scan_manager::preparation_resource_error("Paimon batch exceeds its declared row bound",
+                                                     true);
     detach(*schema, *array);
     check_stop(stop);
     return true;

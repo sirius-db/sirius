@@ -19,7 +19,6 @@
 #include "op/scan/paimon/paimon_read_metadata.hpp"
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <vector>
 
@@ -28,17 +27,10 @@ class FileSystem;
 class MemoryPool;
 }  // namespace paimon
 namespace sirius::op::scan {
-// Opt-in for a bound local, immutable snapshot on the qualified libstdc++ SDK.
-// The caller supplies the selected local filesystem and an accounting lease for the
-// SDK's ordinary heap buffer. An empty lease means the query cannot afford the input.
-struct paimon_snapshot_input_budget {
-  std::shared_ptr<paimon::FileSystem> filesystem;
-  std::function<std::shared_ptr<void>(uint64_t)> try_reserve;
-};
-
 // Run on the serialized native lane, after provider authentication and resource admission.
 // pool bounds only allocations routed through it; this function establishes no all-native quota.
-// No cache or background prefetch is shared. All native owners outlive reader/root cleanup.
+// An explicit filesystem is shared by planning and reading. No Sirius Parquet cache
+// identity or background prefetch is shared. Native owners outlive reader/root cleanup.
 // Null means validated empty-at-bind or a genuinely empty retained plan, never an SDK error.
 std::unique_ptr<paimon_batch_cursor> open_paimon_read(
   paimon_read_metadata const&,
@@ -47,5 +39,5 @@ std::unique_ptr<paimon_batch_cursor> open_paimon_read(
   std::shared_ptr<void> native_modules,
   int64_t max_batch_rows,
   scan_manager::preparation_stop_token,
-  paimon_snapshot_input_budget const* = nullptr);
+  std::shared_ptr<paimon::FileSystem> filesystem = {});
 }  // namespace sirius::op::scan
