@@ -35,6 +35,7 @@
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
@@ -95,7 +96,10 @@ task_scheduler::task_scheduler(
     return nullptr;
   };
 
-  for (const auto* space : mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+  auto host_spaces =
+    cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}.get_candidates(
+      mem_mgr);
+  for (auto* space : host_spaces) {
     _host_pools.push_back({space, find_downgrade(space->get_id())});
   }
 

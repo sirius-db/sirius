@@ -31,6 +31,7 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 
 // sirius exceptions
 #include "sirius/exception.hpp"
@@ -176,8 +177,9 @@ void sirius_physical_materialized_collector::sink_with_reservation(
       if (!required || reservation->size() < *required) { reservation.reset(); }
     }
     if (!reservation) {
-      reservation = memory::try_reserve_host(
-        ctx->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST), *staging_bytes);
+      auto host_spaces = cucascade::memory::any_memory_space_in_tier{Tier::HOST}.get_candidates(
+        ctx->get_memory_manager());
+      reservation = memory::try_reserve_host(host_spaces, *staging_bytes);
       if (!reservation) { throw memory::host_reservation_required(*staging_bytes); }
     }
   }

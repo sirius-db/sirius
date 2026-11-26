@@ -29,6 +29,7 @@
 
 // cucascades
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -320,7 +321,8 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
 
   auto input = pipelineable_operator_data({batch});
   if (use_caller_reservation) {
-    const auto hosts = sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST);
+    const auto hosts =
+      any_memory_space_in_tier{Tier::HOST}.get_candidates(sirius_ctx->get_memory_manager());
     auto reservation = sirius::memory::try_reserve_host(hosts, staging_bytes);
     REQUIRE(reservation != nullptr);
     collector.sink_with_reservation(input, stream, reservation);

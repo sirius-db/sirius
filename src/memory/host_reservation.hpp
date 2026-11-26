@@ -63,16 +63,15 @@ namespace sirius::memory {
 /**
  * @brief Try to reserve enough HOST blocks for a staging payload.
  *
- * @param space Candidate memory space
+ * @param space Candidate memory space whose reservation accounting may change
  * @param bytes Staging payload size in bytes
  * @return The reservation, or nullptr if the space cannot admit it
  */
 [[nodiscard]] inline std::unique_ptr<cucascade::memory::reservation> try_reserve_host(
-  const cucascade::memory::memory_space& space, std::size_t bytes)
+  cucascade::memory::memory_space& space, std::size_t bytes)
 {
   if (auto rounded = host_reservation_size(space, bytes)) {
-    // The manager's view is const. The reservation updates accounting in its owned space.
-    return const_cast<cucascade::memory::memory_space&>(space).make_reservation_or_null(*rounded);
+    return space.make_reservation_or_null(*rounded);
   }
   return nullptr;
 }
@@ -85,9 +84,9 @@ namespace sirius::memory {
  * @return The reservation, or nullptr if no space can admit it
  */
 [[nodiscard]] inline std::unique_ptr<cucascade::memory::reservation> try_reserve_host(
-  std::span<const cucascade::memory::memory_space* const> spaces, std::size_t bytes)
+  std::span<cucascade::memory::memory_space* const> spaces, std::size_t bytes)
 {
-  for (const auto* space : spaces) {
+  for (auto* space : spaces) {
     if (auto reservation = try_reserve_host(*space, bytes)) { return reservation; }
   }
   return nullptr;

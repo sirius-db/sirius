@@ -58,7 +58,7 @@ struct executor_metrics {
 };
 
 struct host_pool_binding {
-  const cucascade::memory::memory_space* space;
+  cucascade::memory::memory_space* space;
   parallel::downgrade_executor* downgrade;  ///< Optional reclaim executor for this pool.
 };
 
