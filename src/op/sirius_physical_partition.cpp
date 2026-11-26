@@ -20,6 +20,7 @@
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
+#include "op/input_free_operator_data.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -50,6 +51,13 @@ constexpr bool producer_requires_full_partition_input(SiriusPhysicalOperatorType
     default: return false;
   }
 }
+
+/// Output of a task that drained producer state (pending_state_source): batches that sink()
+/// publishes to this partition's own input port instead of routing them.
+class requeued_operator_data final : public pipelineable_operator_data {
+ public:
+  using pipelineable_operator_data::pipelineable_operator_data;
+};
 
 }  // namespace
 
@@ -127,6 +135,12 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                                                   ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_partition::execute"};
+  if (_pending_state && dynamic_cast<input_free_operator_data const*>(&input_data) != nullptr) {
+    // A unit of the producer's state, claimed in get_next_task_input_data(). Its rows become
+    // input batches of this partition; sink() publishes them.
+    return std::make_unique<requeued_operator_data>(
+      _pending_state->emit(input_data, stream, batch_telemetry()));
+  }
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (input_batches.size() != 1) {
@@ -242,6 +256,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
 void sirius_physical_partition::sink(operator_data const& input_data, ::cuda::stream_ref)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_partition::sink"};
+  if (auto const* requeued = dynamic_cast<requeued_operator_data const*>(&input_data)) {
+    // The task that produced these is still counted as running, so this pipeline cannot finish
+    // between the push and the tasks that claim the batches.
+    for (auto const& batch : requeued->get_data_batches()) {
+      push_data_batch("default", batch);
+    }
+    return;
+  }
   auto const& output = dynamic_cast<routed_operator_data const&>(input_data);
   auto const routing = layout();
   if (!routing) { throw std::logic_error("partition sink has no layout"); }
@@ -381,9 +403,22 @@ bool sirius_physical_partition::input_complete() const
 
 bool sirius_physical_partition::input_empty() const
 {
+  // State the producer still holds is input that has not arrived yet.
+  if (_pending_state && _pending_state->has_unclaimed()) { return false; }
   return std::all_of(get_ports().begin(), get_ports().end(), [](auto const& p) {
     return !p->repo || p->repo->total_size() == 0;
   });
+}
+
+bool sirius_physical_partition::pending_state_claimable() const
+{
+  return _pending_state && input_complete() && _pending_state->has_unclaimed();
+}
+
+bool sirius_physical_partition::all_ports_empty()
+{
+  // Unclaimed producer state keeps this pipeline open the way a waiting batch does.
+  return !pending_state_claimable() && sirius_physical_operator::all_ports_empty();
 }
 
 std::optional<task_creation_hint> sirius_physical_partition::sizing_hint()
@@ -402,7 +437,20 @@ std::optional<task_creation_hint> sirius_physical_partition::sizing_hint()
 partition_input_stats sirius_physical_partition::input_statistics(bool use_estimate)
 {
   std::lock_guard guard(lock);
-  auto received  = compute_input_totals();
+  auto received = compute_input_totals();
+  if (pending_state_claimable()) {
+    // Rows the producer still holds reach this port through the end-of-input tasks. Count them
+    // now: the layout is fixed before the first claim.
+    auto const pending = _pending_state->unclaimed_totals();
+    received.bytes     = memory::saturating_add(received.bytes, pending.bytes);
+    received.rows      = memory::saturating_add(received.rows, pending.rows);
+    if (received.measured_rows) {
+      received.measured_rows = memory::saturating_add(*received.measured_rows, pending.rows);
+    }
+    if (received.resident_bytes) {
+      received.resident_bytes = memory::saturating_add(*received.resident_bytes, pending.bytes);
+    }
+  }
   auto estimated = use_estimate ? estimated_total_input_bytes() : std::nullopt;
   _sizing_bytes  = estimated.value_or(received.bytes);
   _sizing_basis  = !estimated              ? sizing_basis::measured
@@ -435,6 +483,8 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
     }
     set_layout(*fixed);
   }
+  // With an empty port the base sees nothing to do, but the producer's state is still to drain.
+  if (pending_state_claimable()) { return task_creation_hint{TaskCreationHint::READY, this}; }
   return sirius_physical_operator::get_next_task_hint();
 }
 
@@ -450,6 +500,10 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     set_layout(*fixed);
   }
   if (_input_observer && !_input_observer->before_claim()) { return nullptr; }
+  if (pending_state_claimable()) {
+    // One input-free task per unit of producer state, pinned to the GPU that holds the unit.
+    if (auto unit = _pending_state->claim()) { return unit; }
+  }
   return sirius_physical_operator::get_next_task_input_data();
 }
 

@@ -512,7 +512,70 @@ Hash-based GROUP BY.
 - **FIRST:** each `FIRST` is a carried column, not a cuDF request. The local batch is `[keys..., partials..., carried...]`: one `MIN` over row positions rides the same `cudf::groupby()` call and every carried column is gathered at its result, so all of them come from one row of each group. With carried columns, at least one key and no cuDF request (every all-`FIRST` list, including `SELECT DISTINCT ON (k)` with carried columns), `local_grouped_aggregate()` runs `cudf::distinct` on `[keys..., carried...]` instead. A `FIRST` over several grouping sets or beside `GROUPING()` is refused by `create_plan(LogicalAggregate&)`
 - **Sorted-key path:** a batch whose single fixed-width, null-free key is verified ascending (`keys_ascending()`) is grouped with `cudf::sorted::YES` (run detection and segmented reductions instead of hashing). Unsorted batches keep the hash path. See [Sorted-Key Grouped Aggregation](optimizations.md#sorted-key-grouped-aggregation).
 - **Low-cardinality kernel (enabled by default, `enable_low_cardinality_groupby`):** tried before the cuDF path for batches with one or two non-null one-character STRING keys and at most 64 groups, aggregating SUM/COUNT over non-null DECIMAL64 or INT64 inputs. Kernels in `src/cuda/low_cardinality_groupby.cu` map keys to dense group ids and accumulate per thread in registers (up to 8 groups) or per warp in shared memory (9-64 groups), combining into DECIMAL128 sums and INT64 counts. Any other batch returns `nullptr` and takes the cuDF path. See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation).
+- **Table aggregation (`agg_table_enabled`, off by default):** see below.
 - **Key members:** `group_idx`, `cudf_aggregates`, `cudf_aggregate_idx`, `cudf_aggregate_input_max_abs`, `cudf_aggregate_is_wide_integer_sum`, `aggregate_slots`, `has_avg`, `has_count_distinct`, `has_first`
+
+#### Table aggregation
+**Files:** `src/op/aggregate/table_aggregate.hpp`, `src/op/aggregate/table_aggregate_pending_state.hpp`, `src/cuda/agg_table/agg_table.hpp`
+
+With `agg_table_enabled`, an eligible aggregate folds its input into a hash table that lives
+across batches (`agg_table::table`) instead of running `cudf::groupby` on every batch. The plan
+keeps its shape, `MERGE_GROUP_BY -> PARTITION -> HASH_GROUP_BY`: the table sits inside the local
+aggregate and everything it holds leaves it as partial rows in the local aggregate's own output
+schema, so PARTITION and the merge treat them like any other local output.
+
+- **Eligible:** one key column (fixed-width, at most 64 bits, not floating point) and aggregates
+  that decompose into COUNT, SUM, MIN and MAX (AVG is SUM + COUNT_VALID as above); no grouping
+  sets, COUNT(DISTINCT), STDDEV_SAMP, FIRST, HUGEINT input or narrow carriers; SUM over signed
+  integers, DECIMAL32/64 and DOUBLE; MIN and MAX also over FLOAT (the table orders NaN above
+  every number). `sirius_physical_grouped_aggregate::enable_table_aggregate()`
+  decides at plan time (`wrap_hash_group_by`), then `agg_table::eligible()`. Everything else keeps
+  the cuDF path, as does every aggregate while `enable_runtime_size_estimation` is on.
+- **One table per GPU:** `table_aggregate_state` keeps one table per GPU a task of the aggregate
+  runs on, created on first use from that GPU's memory space. A task folds into the table of its
+  own GPU; tables are never read from another GPU. A group split between two GPUs' tables, or
+  between a table and the cuDF path, is combined by the merge.
+- **Per batch:** a batch keeps the cuDF path whole when its column types are not the planned ones, its key arrives ascending (the sorted-key path keeps priority; the check
+  stops after 8 batches if none was ascending), the GPU's memory space is asking for memory back,
+  or the table's budget cannot be reserved. Otherwise `fold()` applies it; the rows the table
+  returns as not applied are gathered and aggregated by the cuDF path. NULL keys are folded: the
+  table keeps them as one group, like `null_policy::INCLUDE`.
+- **The partial schema is checked, not assumed:** on the first batch the cuDF path aggregates a
+  zero-row slice, and the table's `partial_schema()` must equal that output or widen to it without
+  changing a value. If not, the aggregate keeps the cuDF path for the whole query.
+- **Exactly once under a task replay:** each batch has a record keyed by its
+  `original_batch_ids()` entry: the `agg_table::fold_ticket`, the rows the table did not take, and
+  the partial rows the task flushed. A replay after `rmm::out_of_memory` or a retryable launch
+  failure resumes from the record and never applies a row twice. Records are dropped when
+  `execute()` returns. A batch that was partly applied on one GPU and is replayed on another fails
+  the query (the engine does not pin an unpinned task to the GPU of its first attempt).
+- **Memory:** the budget is `agg_table_memory_fraction` of the GPU's memory space (0.25: the state
+  cannot be spilled), capped by `agg_table_budget_bytes`. A GPU whose share is under 64 MiB, or
+  whose cap is below the smallest table the library builds (2^18 slots, 4 to 20 MiB depending on
+  the aggregates), gets no table and keeps the cuDF path. A space that cannot grant the
+  budget when the table is created leaves the batch on the cuDF path, but the grant is only a
+  probe: the table holds no reservation between folds. A reservation that outlives its task would
+  keep every task waiting for memory on that GPU parked until the end of the input, since a
+  waiter is handed a partial grant only once no reservation is alive. The table allocates as it
+  grows; if a fold runs out of memory, the table stops growing and the replay returns the rows it
+  cannot place.
+- **Flush at a batch boundary:** a task that finds its GPU's memory space over the downgrade
+  threshold, or a table that absorbed under 10% of the rows of its last 8 folds, flushes the table
+  and publishes the partial rows with its own output. Rows a full table consumed and handed back
+  as partial rows do not count as absorbed. After two flushes under pressure, or one for not
+  absorbing, that GPU keeps the cuDF path.
+- **Flush at end of input:** the end of a pipeline's input is not a task, so the aggregate cannot
+  publish what its tables still hold. PARTITION, its consumer, does (`pending_state_source`): once
+  the aggregate's pipeline has finished it claims one input-free task per GPU that holds rows,
+  pinned to that GPU, before it claims batches. The task flushes the table and publishes the
+  partial rows to PARTITION's own input port. PARTITION counts the rows the tables hold when it
+  sizes its layout.
+- **Counters:** `table_aggregate_process_stats()` returns process-wide totals (batches and rows
+  folded, rows returned, batches that skipped the table, replayed folds, flushes of both kinds,
+  folded batches per GPU). Tests take the difference across a query to prove which path ran.
+- **Teardown:** tables without rows are freed when the aggregate's pipeline finishes, the others
+  by their flush task. On error or cancellation the state's destructor frees every table with its
+  own device current; nothing depends on the finalize hook.
 
 ### `sirius_physical_dense_count_join` — `DENSE_COUNT_JOIN`
 **File:** `src/op/sirius_physical_dense_count_join.hpp`, `src/op/sirius_physical_dense_count_join.cpp`, kernels in `src/cuda/dense_count_join_impl.cu`
@@ -577,6 +640,14 @@ Complex join keys are materialized into columns before this description is const
 - **Projected sizing:** aggregate fanout can latch a projected input size under a `PARTIAL`
   ingress; measurements floor the projection. See
   [data management](data-management.md#runtime-data-size-estimation).
+- **Producer state at end of input:** `set_pending_state_source()` binds rows that the producer
+  still holds in operator state when its pipeline ends (the tables of the
+  [table aggregation](#table-aggregation)). After the producer's pipeline has finished, the
+  partition claims one `input_free_operator_data` task per unit of state, pinned to the unit's GPU.
+  `execute()` turns the unit into batches and `sink()` publishes them to the partition's own input
+  port, where they are claimed and routed like every other batch. Unclaimed state keeps
+  `all_ports_empty()` false, makes the partition READY with an empty port, and is counted in
+  `input_statistics()`. Requires the `FULL` ingress.
 - **Dynamic filters:** a hash-join build-input observer records arrivals, certifies before claims,
   contributes before scatter, publishes after successful scatter, and closes on finalization.
 

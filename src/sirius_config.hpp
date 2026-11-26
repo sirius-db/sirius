@@ -156,6 +156,10 @@ constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 0;
 /// pipeline can hold one per thread.
 constexpr double DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION = 0.10;
 
+/// Share of one GPU's memory a grouped aggregation's table may hold while its state cannot be
+/// evicted.
+constexpr double DEFAULT_AGG_TABLE_MEMORY_FRACTION = 0.25;
+
 /// Budget when GPU tier capacity cannot be read at planning time.
 constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
@@ -301,6 +305,26 @@ struct operator_params {
 
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
+
+  /// Fold a grouped aggregation's input into one hash table per GPU that lives across batches
+  /// (`op::table_aggregate_state`) instead of aggregating every batch on its own. Applies to
+  /// one fixed-width key with COUNT, SUM, MIN, MAX and AVG; every other aggregation, and every
+  /// batch a table cannot take, keeps the per-batch path. Ignored while
+  /// `enable_runtime_size_estimation` is on.
+  bool agg_table_enabled = false;
+
+  /// Share of one GPU's memory a table of `agg_table_enabled` may hold, in (0, 1]. The table
+  /// cannot be spilled, so the share is what other operators lose while it lives.
+  double agg_table_memory_fraction = config::DEFAULT_AGG_TABLE_MEMORY_FRACTION;
+
+  /// Cap in bytes on one table of `agg_table_enabled`, below the share above; 0 = no cap.
+  uint64_t agg_table_budget_bytes = 0;
+
+  /// Test hook: the first N table folds of each grouped aggregate throw `rmm::out_of_memory`
+  /// after the fold has been applied, so that the task is replayed with the same batch. The
+  /// failures alternate between inside the table (rows applied, result not built) and after the
+  /// table returned its result.
+  uint64_t test_inject_agg_table_fold_oom = 0;
 
   /// Decide decimal and wide integer SUM widening from base-table statistics at plan time: an
   /// aggregate input with a proven magnitude bound skips the per-batch min/max scan and its stream

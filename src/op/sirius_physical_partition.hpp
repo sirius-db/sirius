@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/aggregate/table_aggregate_pending_state.hpp"
 #include "op/partition/partition_exchange.hpp"
 #include "op/partition/partition_input_observer.hpp"
 #include "pipeline/data_size_estimator.hpp"
@@ -56,6 +57,7 @@ class sirius_physical_partition : public sirius_physical_operator {
   void sink(operator_data const&, ::cuda::stream_ref) override;
   std::optional<task_creation_hint> get_next_task_hint() override;
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+  [[nodiscard]] bool all_ports_empty() override;
   std::size_t no_history_peak_memory_estimate(input_stats const&) const override;
 
   /// Plan-time bindings. No tasks or arrivals may precede these calls.
@@ -66,6 +68,15 @@ class sirius_physical_partition : public sirius_physical_operator {
   void set_input_observer(std::unique_ptr<partition_input_observer> observer)
   {
     _input_observer = std::move(observer);
+  }
+  /// Makes this partition drain rows that its producer still holds in operator state when the
+  /// producer's pipeline ends (see pending_state_source). Once that pipeline has finished, the
+  /// partition claims one input-free task per unit of state; the task turns the unit into batches
+  /// and publishes them to this partition's own input port, where they are sized, claimed and
+  /// routed like every other input batch. Requires a FULL input barrier.
+  void set_pending_state_source(std::shared_ptr<pending_state_source> source)
+  {
+    _pending_state = std::move(source);
   }
   void set_input_barrier(MemoryBarrierType barrier) { _input_barrier = barrier; }
   [[nodiscard]] MemoryBarrierType input_barrier() const { return _input_barrier; }
@@ -98,6 +109,8 @@ class sirius_physical_partition : public sirius_physical_operator {
 
  private:
   partition_input_stats compute_input_totals();
+  /// Whether the producer has finished and still holds state no task has claimed.
+  [[nodiscard]] bool pending_state_claimable() const;
   uint64_t compute_total_bytes() { return compute_input_totals().bytes; }
   std::optional<uint64_t> estimated_total_input_bytes();
 
@@ -106,6 +119,7 @@ class sirius_physical_partition : public sirius_physical_operator {
   std::atomic<std::shared_ptr<partition_layout const>> _layout;
   std::shared_ptr<partition_exchange> _exchange;
   std::unique_ptr<partition_input_observer> _input_observer;
+  std::shared_ptr<pending_state_source> _pending_state;
   duckdb::SiriusContext* _compressed_materialization_observer;
   bool _enable_size_estimation;
   std::optional<pipeline::data_size_estimate> _size_estimate;
