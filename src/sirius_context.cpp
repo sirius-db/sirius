@@ -292,6 +292,10 @@ void SiriusContext::QueryBegin(ClientContext& context)
   // decorates.
   try {
     auto query = context.GetCurrentQuery();
+    // The literals of CREATE SECRET and ATTACH are credentials: log the kind, not the text.
+    if (auto const kind = sirius::credential_statement_kind(query); !kind.empty()) {
+      query = std::string(kind) + " <text withheld: may hold credentials>";
+    }
     // Collapse every run of whitespace (incl. newlines/tabs) to a single space,
     // trim leading/trailing whitespace, and log the full normalized query so
     // log_analysis tools can correlate by SQL text without truncation.
@@ -384,6 +388,9 @@ struct SiriusContext::internal_connection::implementation {
   implementation(ClientContext& outer, AttachedDatabase& database, bool read_only)
     : connection(*outer.db), guard(*connection.context)
   {
+    if (auto state = get_sirius_connection_state(*connection.context)) {
+      state->set_internal_outer(outer.shared_from_this());
+    }
     auto result = connection.Query(read_only ? "BEGIN TRANSACTION READ ONLY" : "BEGIN TRANSACTION");
     if (!read_only) {
       if (!result || result->HasError()) {
@@ -465,6 +472,16 @@ unique_ptr<QueryResult> SiriusContext::internal_connection::Submit(const string&
   // Keep the same read-only transaction and statement restrictions while the
   // caller drains chunks under this connection's InternalQueryGuard.
   return impl_->connection.Submit(impl_->parse(sql));
+}
+
+void SiriusContext::internal_connection::read_catalog(
+  const std::function<void(ClientContext&)>& read)
+{
+  auto& context = *impl_->connection.context;
+  if (!context.transaction.HasActiveTransaction() || !MetaTransaction::Get(context).IsReadOnly()) {
+    throw InvalidInputException("Sirius internal connection lost its read-only transaction");
+  }
+  context.RunFunctionInTransaction([&] { read(context); });
 }
 
 SiriusContext::internal_connection SiriusContext::open_internal_connection(ClientContext& outer)

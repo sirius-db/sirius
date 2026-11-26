@@ -188,16 +188,28 @@ bool is_nested_logical_type(duckdb::LogicalType const& type)
          id == duckdb::LogicalTypeId::MAP;
 }
 
-void install_parquet_s3_configs(sirius::op::scan::parquet_ingestible_table_info const& table_info,
+// Install the S3 configuration this statement resolves for @p path and record it in @p info, so
+// the scan opens the file with it.
+void plan_s3_config(sirius::op::scan::parquet_ingestible_table_info& info,
+                    std::string const& path,
+                    duckdb::ClientContext& context,
+                    duckdb::SiriusContext& sirius_ctx)
+{
+  if (!sirius::io::s3::is_s3_path(path)) { return; }
+  auto config = sirius::io::s3::resolve_duckdb_s3_secret(
+    context, path, sirius_ctx.get_config().get_scan_manager_config().object_store);
+  if (auto planned = sirius_ctx.get_scan_manager().install_s3_config(path, std::move(config))) {
+    info.s3_configs.insert_or_assign(path, std::move(*planned));
+  }
+}
+
+void install_parquet_s3_configs(sirius::op::scan::parquet_ingestible_table_info& table_info,
                                 duckdb::ClientContext& context,
                                 duckdb::SiriusContext* sirius_ctx)
 {
   if (sirius_ctx == nullptr) { return; }
-  auto const& defaults = sirius_ctx->get_config().get_scan_manager_config().object_store;
   for (auto const& path : table_info.resolved_file_paths) {
-    if (!sirius::io::s3::is_s3_path(path)) { continue; }
-    auto config = sirius::io::s3::resolve_duckdb_s3_secret(context, path, defaults);
-    sirius_ctx->get_scan_manager().install_s3_config(path, std::move(config));
+    plan_s3_config(table_info, path, context, *sirius_ctx);
   }
 }
 
@@ -436,10 +448,12 @@ namespace {
 std::shared_ptr<const sirius::op::scan::IcebergDeleteData> load_scan_delete_payload(
   duckdb::ClientContext& context,
   duckdb::SiriusContext& sirius_ctx,
-  std::string const& table_path,
+  sirius::op::scan::iceberg_ingestible_table_info const& info,
   sirius::op::scan::iceberg_delete_discovery const& discovery)
 {
-  auto const& ioctx = sirius_ctx.get_scan_manager().shared_io_ctx();
+  auto const& table_path = info.table_path;
+  auto& scan_manager     = sirius_ctx.get_scan_manager();
+  auto const& ioctx      = scan_manager.shared_io_ctx();
   if (discovery.equality_delete_entries.empty())
     return sirius::op::scan::load_delete_payload(context, table_path, ioctx, discovery);
   auto const spaces =
@@ -453,12 +467,33 @@ std::shared_ptr<const sirius::op::scan::IcebergDeleteData> load_scan_delete_payl
   auto const& space = *spaces.front();
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space.get_device_id()}};
   auto stream = sirius::memory::runtime_stream_pool::acquire(space);
+  // A remote delete file opens with the configuration this statement planned for it. A context
+  // built for a configuration its path has since left belongs to this load, so keep one each.
+  // The load may be the last reader of the others, and an execution need not follow it: once
+  // they are let go, on a return or an error, the idle contexts beyond the bound are dropped.
+  struct planned_contexts {
+    sirius::scan_manager::sirius_scan_manager& manager;
+    std::unordered_map<std::uint64_t, std::shared_ptr<cucascade::io::ioctx>> by_config;
+    ~planned_contexts()
+    {
+      by_config.clear();
+      manager.idle_rest_sweeper()->sweep();
+    }
+  } planned_ioctxs{scan_manager, {}};
+  auto const remote_ioctx = [&](std::string const& path) -> std::shared_ptr<cucascade::io::ioctx> {
+    auto const planned = info.s3_configs.find(path);
+    if (planned == info.s3_configs.end()) { return nullptr; }
+    auto& io_ctx = planned_ioctxs.by_config[planned->second.id];
+    if (!io_ctx) { io_ctx = scan_manager.io_ctx_for(path, &planned->second); }
+    return io_ctx;
+  };
   return sirius::op::scan::load_delete_payload(
     context,
     table_path,
     ioctx,
     discovery,
-    sirius::op::scan::equality_build_resources{stream.get(), space.get_default_allocator()});
+    sirius::op::scan::equality_build_resources{
+      stream.get(), space.get_default_allocator(), remote_ioctx});
 }
 
 //! Build an `iceberg_ingestible_table_info`: the parquet bind data plus the table's delete
@@ -530,11 +565,6 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
       info->field_mapping_requirements = std::move(requirements);
   }
 
-  if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
-    throw duckdb::NotImplementedException("iceberg_scan has no table path parameter");
-  }
-  info->table_path = scan_op.parameters.front().GetValue<std::string>();
-
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
     throw duckdb::NotImplementedException(
@@ -553,15 +583,30 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   auto inventory = std::move(*scan_op.delete_inventory);
   scan_op.delete_inventory.reset();
   if (inventory.equality) widen_scan_for_equality_keys(*info, *inventory.equality);
+  info->table_path = inventory.table;
   if (info->field_mapping_requirements)
     info->files_without_partition_values =
       sirius::op::scan::iceberg_files_without_partition_values(context, inventory);
   auto discovery =
     sirius::op::scan::discover_from_manifests(context, info->table_path, std::move(inventory));
+  // Deletion vectors and equality-delete files are opened by path after this. Install the
+  // credential this statement resolves for them now, as for the data files. A caller that
+  // takes the discovery prunes the vectors to the files it scans first and installs theirs
+  // itself: a vector it never opens must not need a credential Sirius can resolve.
+  if (!supplied_discovery) {
+    for (auto const& dv : discovery.deletion_vector_entries) {
+      plan_s3_config(*info, dv.file_path, context, *sirius_ctx);
+    }
+  }
+  if (discovery.equality_plan) {
+    for (auto const& file : discovery.equality_plan->files) {
+      plan_s3_config(*info, file.file_path, context, *sirius_ctx);
+    }
+  }
   if (supplied_discovery)
     *supplied_discovery = std::move(discovery);
   else
-    info->delete_data = load_scan_delete_payload(context, *sirius_ctx, info->table_path, discovery);
+    info->delete_data = load_scan_delete_payload(context, *sirius_ctx, *info, discovery);
   auto const delete_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - delete_started)
                                 .count();
@@ -651,6 +696,8 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
     });
     uint64_t total = 0;
     for (auto const& dv : descriptors) {
+      // Only the vectors that survived the pruning are opened, so only they get a credential.
+      plan_s3_config(*c.info, dv.file_path, context, *sirius_ctx);
       inspect_remote_puffin(c.scan->contract_id, dv);
       if (dv.record_count < 0 ||
           static_cast<uint64_t>(dv.record_count) > std::numeric_limits<uint64_t>::max() - total) {
@@ -832,10 +879,9 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   for (auto& c : scans) {
     if (!c.info->deferred) {
       duckdb::SiriusContext::InternalQueryGuard guard(context);
-      auto started = std::chrono::steady_clock::now();
-      c.info->delete_data =
-        load_scan_delete_payload(context, *sirius_ctx, c.info->table_path, *c.discovery);
-      auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+      auto started        = std::chrono::steady_clock::now();
+      c.info->delete_data = load_scan_delete_payload(context, *sirius_ctx, *c.info, *c.discovery);
+      auto us             = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - started)
                   .count();
       c.scan->read_views->record_delete_preparation(c.scan->contract_id, us);
@@ -2327,6 +2373,9 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   prepare_scan_statement(*plan, op_params, context);
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
+  if (sirius_ctx && sirius_ctx->physical_counters()->track_units &&
+      sirius_ctx->physical_counters()->after_lowering_for_testing)
+    sirius_ctx->physical_counters()->after_lowering_for_testing();
   if (op_params.distributed()) {
     // The scans above took this rank's share; without the exchanges each rank's answer is partial.
     if (!sirius_ctx) {
