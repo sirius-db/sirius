@@ -38,6 +38,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -85,6 +86,15 @@ task_scheduler::task_scheduler(
   // that is already in _ready_devices.
   _self_publisher.emplace(_task_request_channel.make_publisher());
 
+  // Experimental: SIRIUS_PIPELINE_CPU_NUMA_NODE=<n> runs every GPU's pipeline threads on the CPUs
+  // of NUMA node n instead of their own GPU's socket. The driver's per-entry cost for batched
+  // copies is lower when every thread issuing them shares a socket with the thread that
+  // initialized CUDA.
+  std::optional<int> pipeline_numa_node;
+  if (char const* env = std::getenv("SIRIUS_PIPELINE_CPU_NUMA_NODE"); env && *env) {
+    pipeline_numa_node = std::atoi(env);
+  }
+
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   // Initialize GPU pipeline executors for each available GPU
   for (auto* space : gpu_spaces) {
@@ -93,8 +103,9 @@ task_scheduler::task_scheduler(
     if (sys_topology) {
       auto it = std::find_if(sys_topology->gpus.begin(),
                              sys_topology->gpus.end(),
-                             [device_id](const cucascade::memory::gpu_topology_info& dev) {
-                               return std::cmp_equal(dev.id, device_id);
+                             [&](const cucascade::memory::gpu_topology_info& dev) {
+                               return pipeline_numa_node ? dev.numa_node == *pipeline_numa_node
+                                                         : std::cmp_equal(dev.id, device_id);
                              });
 
       if (it != sys_topology->gpus.end()) {
