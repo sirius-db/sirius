@@ -30,6 +30,8 @@ def write(path, schema, metadata, rows):
 
 # equality_dv: a later commit kept the deletion vector and added an equality delete of `cherry`,
 # so both delete kinds apply to the one data file.
+# equality_bad_dv: a later commit wrote a malformed deletion vector and an equality delete that
+# applies to the data file.
 for mode in ("empty", "equality_bad_dv", "equality_dv"):
     dest = out / mode
     (dest / "metadata").mkdir(parents=True, exist_ok=True)
@@ -39,10 +41,11 @@ for mode in ("empty", "equality_bad_dv", "equality_dv"):
         snapshot["manifest-list"] = str(
             dest / "metadata" / Path(snapshot["manifest-list"]).name
         )
-        if mode == "equality_dv":
+        if mode != "empty":
             snapshot["sequence-number"] = 2
-    if mode == "equality_dv":
+    if mode != "empty":
         meta["last-sequence-number"] = 2
+    if mode == "equality_dv":
         (dest / "data").mkdir(exist_ok=True)
         cherry = pa.table(
             [pa.array(["cherry"], pa.string())],
@@ -69,6 +72,7 @@ for mode in ("empty", "equality_bad_dv", "equality_dv"):
                     row["sequence_number"] = 2
                     row["existing_files_count"] = row["added_files_count"]
                 elif row["content"] == 1:
+                    row["sequence_number"] = 2
                     row["added_files_count"] = 2
         else:
             for row in rows:
@@ -96,6 +100,7 @@ for mode in ("empty", "equality_bad_dv", "equality_dv"):
                         referenced_data_file=None,
                     )
                 else:
+                    eq.update(sequence_number=2, file_sequence_number=2)
                     eq["data_file"].update(
                         content=2,
                         file_format="PARQUET",

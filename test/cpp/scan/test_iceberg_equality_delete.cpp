@@ -141,6 +141,14 @@ EqualityDeleteGroup build_group(std::vector<int32_t> key_field_ids,
     std::move(key_field_ids), std::move(key_primary_indices), views, test_stream(), test_mr());
 }
 
+/// Adds @p group to the replica of the current device.
+void add_group(IcebergDeleteData& data, EqualityDeleteGroup group)
+{
+  if (data.equality_replicas.empty())
+    data.equality_replicas.push_back({rmm::get_current_cuda_device(), {}});
+  data.equality_replicas.back().groups.push_back(std::move(group));
+}
+
 /// Routes cuDF's default device allocations through @p stats for a scope.
 struct scoped_device_resource {
   explicit scoped_device_resource(rmm::mr::statistics_resource_adaptor& stats)
@@ -209,13 +217,13 @@ TEST_CASE("iceberg equality delete - filter removes exactly the matching rows", 
   cudf::table delete_file{std::move(del)};
 
   auto data = std::make_shared<IcebergDeleteData>();
-  data->equality_delete_groups.push_back(build_group({1}, {0}, {delete_file.view()}));
+  add_group(*data, build_group({1}, {0}, {delete_file.view()}));
 
   std::vector<std::unique_ptr<cudf::column>> batch_cols;
   batch_cols.push_back(int32_column({1, 2, 3, 4, 5}));
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, 0, {0}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {0}};
   std::vector<batch_row_run> runs{{"data-0.parquet", 0, 0, 5}};
 
   auto out = filter.apply(std::move(batch), batch_layout{runs}, test_stream(), test_mr());
@@ -233,13 +241,13 @@ TEST_CASE("iceberg equality delete - a NULL key deletes the NULL rows", "[iceber
   cudf::table delete_file{std::move(del)};
 
   auto data = std::make_shared<IcebergDeleteData>();
-  data->equality_delete_groups.push_back(build_group({1}, {0}, {delete_file.view()}));
+  add_group(*data, build_group({1}, {0}, {delete_file.view()}));
 
   std::vector<std::unique_ptr<cudf::column>> batch_cols;
   batch_cols.push_back(int32_column({1, 0, 3}, {false, true, false}));
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, 0, {0}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {0}};
   std::vector<batch_row_run> runs{{"data-0.parquet", 0, 0, 3}};
 
   auto out = filter.apply(std::move(batch), batch_layout{runs}, test_stream(), test_mr());
@@ -256,13 +264,14 @@ TEST_CASE("iceberg equality delete - missing key column throws", "[iceberg][scan
   cudf::table delete_file{std::move(del)};
 
   auto data = std::make_shared<IcebergDeleteData>();
-  data->equality_delete_groups.push_back(build_group({1}, {0}, {delete_file.view()}));
+  add_group(*data, build_group({1}, {0}, {delete_file.view()}));
 
   std::vector<std::unique_ptr<cudf::column>> batch_cols;
   batch_cols.push_back(int32_column({1, 2}));
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, 0, {3}};  // index past the end of the batch
+  equality_delete_filter filter{
+    data, rmm::get_current_cuda_device(), 0, {3}};  // index past the end of the batch
   std::vector<batch_row_run> runs{{"data-0.parquet", 0, 0, 2}};
 
   REQUIRE_THROWS_AS(filter.apply(std::move(batch), batch_layout{runs}, test_stream(), test_mr()),
@@ -280,7 +289,7 @@ TEST_CASE("iceberg equality delete - a composite key matches on every key column
   cudf::table delete_file{std::move(del)};
 
   auto data = std::make_shared<IcebergDeleteData>();
-  data->equality_delete_groups.push_back(build_group({1, 2}, {0, 1}, {delete_file.view()}));
+  add_group(*data, build_group({1, 2}, {0, 1}, {delete_file.view()}));
 
   // The batch holds the keys at positions 2 and 0, with an unrelated column between them: the
   // filter must pair them with the group's key ORDER, not with batch order.
@@ -290,7 +299,7 @@ TEST_CASE("iceberg equality delete - a composite key matches on every key column
   batch_cols.push_back(int32_column({1, 1, 2}));     // first key
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, 0, {2, 0}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {2, 0}};
   auto out = filter.apply(std::move(batch), {}, test_stream(), test_mr());
   REQUIRE(out->num_rows() == 2);
   REQUIRE(to_host(out->get_column(1).view()) == std::vector<int32_t>{7, 9});
@@ -307,14 +316,14 @@ TEST_CASE("iceberg equality delete - a composite key with a NULL member matches 
   cudf::table delete_file{std::move(del)};
 
   auto data = std::make_shared<IcebergDeleteData>();
-  data->equality_delete_groups.push_back(build_group({1, 2}, {0, 1}, {delete_file.view()}));
+  add_group(*data, build_group({1, 2}, {0, 1}, {delete_file.view()}));
 
   std::vector<std::unique_ptr<cudf::column>> batch_cols;
   batch_cols.push_back(int32_column({4, 4, 0}, {false, false, true}));
   batch_cols.push_back(int32_column({0, 5, 0}, {true, false, true}));
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, 0, {0, 1}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {0, 1}};
   auto out = filter.apply(std::move(batch), {}, test_stream(), test_mr());
   REQUIRE(out->num_rows() == 2);
   REQUIRE(out->get_column(0).view().null_count() == 1);
@@ -327,7 +336,7 @@ TEST_CASE("iceberg equality delete - key count and key type mismatches throw", "
   del.push_back(int32_column({1}));
   cudf::table delete_file{std::move(del)};
   auto data = std::make_shared<IcebergDeleteData>();
-  data->equality_delete_groups.push_back(build_group({1}, {0}, {delete_file.view()}));
+  add_group(*data, build_group({1}, {0}, {delete_file.view()}));
 
   auto make_batch = [] {
     std::vector<std::unique_ptr<cudf::column>> cols;
@@ -338,13 +347,20 @@ TEST_CASE("iceberg equality delete - key count and key type mismatches throw", "
   };
 
   // Two batch columns offered for a one-key group.
-  equality_delete_filter too_many{data, 0, {0, 1}};
+  equality_delete_filter too_many{data, rmm::get_current_cuda_device(), 0, {0, 1}};
   REQUIRE_THROWS_AS(too_many.apply(make_batch(), {}, test_stream(), test_mr()),
                     std::invalid_argument);
   // An INT64 batch column against INT32 delete keys: the join would compare raw bytes.
-  equality_delete_filter wrong_type{data, 0, {1}};
+  equality_delete_filter wrong_type{data, rmm::get_current_cuda_device(), 0, {1}};
   REQUIRE_THROWS_AS(wrong_type.apply(make_batch(), {}, test_stream(), test_mr()),
                     std::invalid_argument);
+  // A batch on a device no tables were built on. Another device's tables need not be
+  // addressable from it, and passing the batch through would return the deleted row.
+  rmm::cuda_device_id const other{rmm::get_current_cuda_device().value() + 1};
+  equality_delete_filter other_device{data, other, 0, {0}};
+  REQUIRE_THROWS_WITH(
+    other_device.apply(make_batch(), {}, test_stream(), test_mr()),
+    Catch::Matchers::ContainsSubstring("no equality-delete tables were built on GPU"));
   // A group needs keys and matching tables.
   REQUIRE_THROWS_AS(build_group({1, 2}, {0, 1}, {delete_file.view()}), std::invalid_argument);
 }
@@ -397,13 +413,12 @@ TEST_CASE("iceberg equality delete - probing a batch stays within the row-group 
 
   auto deleted = cudf::sequence(1, *absent, *one);
   auto data    = std::make_shared<IcebergDeleteData>();
-  data->equality_delete_groups.push_back(
-    build_group({1}, {0}, {cudf::table_view{{deleted->view()}}}));
+  add_group(*data, build_group({1}, {0}, {cudf::table_view{{deleted->view()}}}));
 
   rmm::mr::statistics_resource_adaptor stats{
     cuda::mr::any_resource<cuda::mr::device_accessible>{cudf::get_current_device_resource_ref()}};
   scoped_device_resource restore{stats};
-  equality_delete_filter filter{data, 0, {0}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {0}};
   auto out =
     filter.apply(std::move(batch), {}, test_stream(), rmm::device_async_resource_ref{stats});
   REQUIRE(out->num_rows() == rows);
@@ -463,7 +478,8 @@ TEST_CASE("iceberg equality delete - a delete file must match its manifest and k
                        int32_t field_id,
                        duckdb::LogicalTypeId bound,
                        int64_t rows,
-                       int64_t size) {
+                       int64_t size,
+                       std::size_t devices = 1) {
     iceberg_delete_discovery discovery;
     discovery.equality_delete_entries.emplace_back();
     auto& plan = discovery.equality_plan.emplace();
@@ -475,7 +491,9 @@ TEST_CASE("iceberg equality delete - a delete file must match its manifest and k
       "table",
       sirius::test::make_test_local_ioctx(),
       discovery,
-      equality_build_resources{test_stream(), rmm::device_async_resource_ref{handed}});
+      std::vector<equality_build_resources>(
+        devices,
+        {rmm::get_current_cuda_device(), test_stream(), rmm::device_async_resource_ref{handed}}));
   };
   auto load = [&](int32_t field_id, duckdb::LogicalTypeId bound, int64_t rows, int64_t size) {
     return load_from(path, field_id, bound, rows, size);
@@ -507,11 +525,30 @@ TEST_CASE("iceberg equality delete - a delete file must match its manifest and k
   CHECK_THROWS_WITH(
     load_from("s3://bucket/delete.parquet", 1, duckdb::LogicalTypeId::INTEGER, 1, bytes),
     Catch::Matchers::ContainsSubstring("no S3 backend is available to read equality-delete file"));
+  // Deletes that apply to no data file build nothing on any device: the payload is empty, and a
+  // scan is not refused for groups that no data file maps to.
+  CHECK(load_delete_payload(
+          *con.context,
+          "table",
+          sirius::test::make_test_local_ioctx(),
+          unbuilt,
+          {equality_build_resources{
+            rmm::get_current_cuda_device(), test_stream(), rmm::device_async_resource_ref{handed}}})
+          ->empty());
   // INT32 stored for a BIGINT key is the one accepted difference.
-  auto const data = load(1, duckdb::LogicalTypeId::BIGINT, 1, bytes);
-  REQUIRE(data->equality_delete_groups.size() == 1);
-  CHECK(data->equality_delete_groups[0].delete_table->view().column(0).type().id() ==
-        cudf::type_id::INT64);
+  auto const data    = load(1, duckdb::LogicalTypeId::BIGINT, 1, bytes);
+  auto const& groups = data->equality_groups_on(rmm::get_current_cuda_device());
+  REQUIRE(groups.size() == 1);
+  CHECK(groups[0].delete_table->view().column(0).type().id() == cudf::type_id::INT64);
+  // The second device indexes a copy of the first one's keys. Both entries name this device,
+  // since the machine may have no other: what is covered is the copy and the index over it.
+  auto const twice = load_from(path, 1, duckdb::LogicalTypeId::BIGINT, 1, bytes, 2);
+  REQUIRE(twice->equality_replicas.size() == 2);
+  for (auto const& replica : twice->equality_replicas) {
+    REQUIRE(replica.groups.size() == 1);
+    CHECK(replica.groups[0].delete_table->num_rows() == 1);
+    CHECK(replica.groups[0].delete_table->view().column(0).type().id() == cudf::type_id::INT64);
+  }
 }
 
 TEST_CASE("Iceberg per-file positional filters preserve multi-file row positions",

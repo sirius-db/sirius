@@ -210,7 +210,6 @@ enum class verdict_reason : uint16_t {
   iceberg_equality_plan_unproven,    // applicability cannot be proven from the manifests
   iceberg_equality_key_unsupported,  // key is dropped, nested, or of an unsupported type
   iceberg_equality_budget,           // delete set above the plan-time budget
-  iceberg_equality_multi_gpu,        // delete tables are built on one device only
   iceberg_equality_remote,           // a remote delete file has no backend that reads it
   iceberg_equality_file_format,      // a delete file is not Parquet
   provider_admission_refused
@@ -281,8 +280,6 @@ struct physical_check_counters {
   std::shared_ptr<scan_manager::reservation_provider> preparation_provider_for_testing;
   std::optional<uint64_t> statement_dv_limit_for_testing;
   std::optional<int64_t> statement_equality_limit_for_testing;
-  // Stands in for the number of configured GPUs at the equality-delete plan gate.
-  std::optional<std::size_t> equality_gpu_count_for_testing;
   std::optional<std::size_t> equality_files_per_data_file_limit_for_testing;
   std::optional<std::size_t> idle_rest_context_limit_for_testing;
   std::function<void(scan_manager::scan_envelope&)> preparation_envelope_for_testing;
