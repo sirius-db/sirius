@@ -328,8 +328,9 @@ the finished sidecars at wrap time rather than through a propagation case:
   [dictionary carrier](optimizations.md#dictionary-carrier) key is the exception: the partial
   aggregate groups on its codes and emits STRING keys, so its PARTITION and MERGE_GROUP_BY never
   see a dictionary.
-- A dictionary carrier is a hint: a batch may carry it as STRING, so any PARTITION decodes a
-  carrier key before hashing, and a carrier payload whose keys every partition would copy.
+- A dictionary carrier is a hint: a batch may carry it as STRING. Any PARTITION decodes a carrier
+  key before hashing, and decodes a carrier payload when its keys bytes times the partition count
+  exceed an eighth of the batch's bytes, since every partition would copy the keys.
 - Distinct- and sort-side exchanges are native because their inputs are restored at the
   boundary.
 

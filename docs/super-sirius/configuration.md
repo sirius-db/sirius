@@ -1024,6 +1024,7 @@ Evaluators retain their own policy values rather than reading mutable global def
 | `parquet_footer_statistics` | true | Give DuckDB's optimizer the merged footer statistics of every file of an eligible multi-file Parquet scan; a scan over one of the two read limits below is planned without them. |
 | `parquet_footer_statistics_max_remote_reads` | NULL | The most footers of remote files the pass reads for one scan: `-1` no limit, `0` cached statistics only. `NULL` takes `sirius.operator_params.parquet_footer_statistics_max_remote_reads`. |
 | `parquet_footer_statistics_max_local_reads` | NULL | The same for local files; `NULL` takes `sirius.operator_params.parquet_footer_statistics_max_local_reads`. |
+
 DuckDB reads column statistics for a scan of several Parquet files only with `union_by_name`.
 Without them its optimizer estimates every scan filter at a fixed 20%, even an `IS NOT NULL` on a
 column without NULLs, which can pick the wrong join order and build side. With
