@@ -600,58 +600,88 @@ TEST_CASE("A delayed HOST reclaim does not hold up ready requests and is cancele
   CHECK(delayed.get() != nullptr);
 }
 
-TEST_CASE("An eligible HOST retry runs ahead of newer ready requests",
+TEST_CASE("The HOST retry timer enqueues due requests and restarts after pause",
           "[downgrade_executor][fs_cache][downgrade_lifecycle]")
 {
   reclaim_fixture fixture;
   fixture.start();
-  std::promise<void> entered;
-  auto processing = entered.get_future();
-  std::promise<void> release;
-  auto released         = release.get_future().share();
-  absl::Cleanup unblock = [&] { release.set_value(); };
-  fixture.executor->request_free_memory(
-    0,
-    [] { return true; },
-    [entered = std::move(entered), released](std::size_t, std::exception_ptr) mutable noexcept {
-      entered.set_value();
-      released.wait_for(10s);
-    });
-  REQUIRE(processing.wait_for(2s) == std::future_status::ready);
-
-  auto next_completion = std::make_shared<std::atomic<std::size_t>>(0);
-  auto enqueue         = [&](std::chrono::milliseconds delay) {
-    std::promise<std::size_t> done;
+  auto submit = [&](std::chrono::milliseconds delay) {
+    std::promise<std::exception_ptr> done;
     auto result = done.get_future();
     fixture.executor->request_free_memory(
       0,
       [] { return true; },
-      [done = std::move(done), next_completion](std::size_t,
-                                                std::exception_ptr error) mutable noexcept {
-        if (error) {
-          done.set_exception(error);
-        } else {
-          done.set_value(next_completion->fetch_add(1, std::memory_order_relaxed));
-        }
+      [done = std::move(done)](std::size_t, std::exception_ptr error) mutable noexcept {
+        done.set_value(error);
       },
       delay);
     return result;
   };
 
-  auto later = enqueue(1min);
-  auto retry = enqueue(10ms);
-  std::this_thread::sleep_for(10ms);
-  auto ready = enqueue(0ms);
-  std::move(unblock).Invoke();
-
+  auto later = submit(1min);
+  auto retry = submit(10ms);
   REQUIRE(retry.wait_for(2s) == std::future_status::ready);
-  CHECK(retry.get() == 0);
-  REQUIRE(ready.wait_for(2s) == std::future_status::ready);
-  CHECK(ready.get() == 1);
+  CHECK(retry.get() == nullptr);
   CHECK(later.wait_for(0ms) == std::future_status::timeout);
+
   fixture.executor->pause();
   REQUIRE(later.wait_for(0ms) == std::future_status::ready);
-  CHECK_THROWS(later.get());
+  CHECK(later.get() != nullptr);
+  fixture.executor->resume();
+  auto after_resume = submit(10ms);
+  REQUIRE(after_resume.wait_for(2s) == std::future_status::ready);
+  CHECK(after_resume.get() == nullptr);
+}
+
+TEST_CASE("HOST requests accepted by concurrent producers settle on pause",
+          "[downgrade_executor][fs_cache][downgrade_lifecycle]")
+{
+  reclaim_fixture fixture;
+  fixture.start();
+  constexpr std::size_t producer_count = 4;
+  std::atomic<std::size_t> entered{0};
+  auto completions = std::make_shared<std::atomic<std::size_t>>(0);
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  std::vector<std::future<std::size_t>> producers;
+  absl::Cleanup unblock = [&] { release.set_value(); };
+  for (std::size_t i = 0; i < producer_count; ++i) {
+    producers.push_back(std::async(std::launch::async, [&, completions, released] {
+      auto submit = [&](std::chrono::milliseconds delay) {
+        fixture.executor->request_free_memory(
+          0,
+          [] { return true; },
+          [completions](std::size_t, std::exception_ptr) noexcept {
+            completions->fetch_add(1, std::memory_order_relaxed);
+          },
+          delay);
+      };
+      submit(1min);
+      entered.fetch_add(1, std::memory_order_release);
+      std::size_t accepted = 1;
+      if (released.wait_for(5s) != std::future_status::ready) { return accepted; }
+      for (std::size_t attempt = 0; attempt < 32; ++attempt) {
+        try {
+          submit(attempt % 2 == 0 ? 0ms : 1min);
+          ++accepted;
+        } catch (const std::runtime_error&) {
+          break;
+        }
+      }
+      return accepted;
+    }));
+  }
+
+  REQUIRE(wait_until([&] { return entered.load(std::memory_order_acquire) == producer_count; }));
+  std::move(unblock).Invoke();
+  fixture.executor->pause();
+  std::size_t accepted = 0;
+  for (auto& producer : producers) {
+    REQUIRE(producer.wait_for(2s) == std::future_status::ready);
+    accepted += producer.get();
+  }
+  CHECK(accepted >= producer_count);
+  CHECK(completions->load(std::memory_order_relaxed) == accepted);
 }
 
 namespace {

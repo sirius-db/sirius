@@ -249,7 +249,7 @@ void downgrade_executor::set_fs_cache(cucascade::io::cache::fs_cache* cache)
 void downgrade_executor::processing_loop()
 {
   while (_running.load()) {
-    auto request = take_ready_request();
+    auto request = _request_queue.pop();
     if (!request) break;  // interrupted
 
     auto& req = request;
@@ -913,80 +913,128 @@ void downgrade_executor::monitor_loop()
 
 void downgrade_executor::set_request_queue_open(bool open)
 {
-  {
-    std::lock_guard lock(_request_mutex);
-    _request_queue_open = open;
+  if (open) {
+    _request_queue.reactivate();
+    {
+      std::lock_guard lock(_request_timer_mutex);
+      _request_timer_open = true;
+    }
+    _request_submissions.store(0, std::memory_order_release);
+    return;
   }
-  _request_ready.notify_one();
+
+  // The lifecycle mutex excludes reopen. Producers already past the gate finish enqueuing
+  // before the old queue is interrupted or drained.
+  auto state = _request_submissions.fetch_or(request_submission_closed, std::memory_order_acq_rel) |
+               request_submission_closed;
+  while (state != request_submission_closed) {
+    _request_submissions.wait(state, std::memory_order_acquire);
+    state = _request_submissions.load(std::memory_order_acquire);
+  }
+  _request_queue.interrupt();
+  {
+    std::lock_guard lock(_request_timer_mutex);
+    _request_timer_open = false;
+  }
+  _request_timer_changed.notify_one();
+  if (_request_timer_thread.joinable()) { _request_timer_thread.join(); }
+}
+
+bool downgrade_executor::begin_request_submission()
+{
+  auto state = _request_submissions.load(std::memory_order_relaxed);
+  while ((state & request_submission_closed) == 0) {
+    if (_request_submissions.compare_exchange_weak(
+          state, state + 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void downgrade_executor::end_request_submission()
+{
+  const auto prior = _request_submissions.fetch_sub(1, std::memory_order_acq_rel);
+  if (prior == (request_submission_closed | 1)) { _request_submissions.notify_one(); }
 }
 
 bool downgrade_executor::enqueue_request(std::unique_ptr<downgrade_request>& request,
                                          std::chrono::milliseconds delay)
 {
-  {
-    std::lock_guard lock(_request_mutex);
-    if (!_request_queue_open) { return false; }
-    // Allocate the queue entry before taking ownership. A failed insertion leaves
-    // the request and its callback with the submitting call.
-    const auto ready_at = std::chrono::steady_clock::now() + delay;
-    const auto order    = _next_request_order++;
-    if (delay == std::chrono::milliseconds::zero()) {
-      _ready_requests.emplace_back(ready_at, order, nullptr);
-      _ready_requests.back().request = std::move(request);
-    } else {
-      _delayed_requests.emplace_back(ready_at, order, nullptr);
-      _delayed_requests.back().request = std::move(request);
-      std::push_heap(_delayed_requests.begin(), _delayed_requests.end(), std::greater<>{});
-    }
+  if (!begin_request_submission()) { return false; }
+  absl::Cleanup submission = [this] { end_request_submission(); };
+
+  if (delay == std::chrono::milliseconds::zero()) {
+    if (!_request_queue.try_push(request)) { throw std::bad_alloc{}; }
+    return true;
   }
-  _request_ready.notify_one();
+
+  {
+    std::lock_guard lock(_request_timer_mutex);
+    if (!_request_timer_thread.joinable()) {
+      _request_timer_thread = std::thread(&downgrade_executor::request_timer_loop, this);
+    }
+    // Start the timer and allocate its entry before taking ownership of the request.
+    _delayed_requests.emplace_back(
+      std::chrono::steady_clock::now() + delay, _next_delayed_order++, nullptr);
+    _delayed_requests.back().request = std::move(request);
+    std::push_heap(_delayed_requests.begin(), _delayed_requests.end(), std::greater<>{});
+  }
+  _request_timer_changed.notify_one();
   return true;
 }
 
-std::unique_ptr<downgrade_request> downgrade_executor::pop_next_request_locked()
+static void fail_pending_request(downgrade_request& request, const std::exception_ptr& error)
 {
-  // Compare both queues so a now-eligible retry can run even while immediate requests arrive.
-  if (!_delayed_requests.empty() &&
-      (_ready_requests.empty() || _ready_requests.front() > _delayed_requests.front())) {
-    std::pop_heap(_delayed_requests.begin(), _delayed_requests.end(), std::greater<>{});
-    auto request = std::move(_delayed_requests.back().request);
-    _delayed_requests.pop_back();
-    return request;
+  if (request.on_complete) {
+    request.on_complete(0, error);
+  } else {
+    try {
+      request.result.set_exception(error);
+    } catch (const std::future_error&) {
+      // The promise may already be settled.
+    }
   }
-  if (_ready_requests.empty()) { return nullptr; }
-  auto request = std::move(_ready_requests.front().request);
-  _ready_requests.pop_front();
-  return request;
 }
 
-std::unique_ptr<downgrade_request> downgrade_executor::take_ready_request()
+void downgrade_executor::request_timer_loop()
 {
-  std::unique_lock lock(_request_mutex);
-  while (_request_queue_open) {
-    if (!_ready_requests.empty()) { return pop_next_request_locked(); }
+  std::unique_lock lock(_request_timer_mutex);
+  while (_request_timer_open) {
     if (_delayed_requests.empty()) {
-      _request_ready.wait(lock);
+      _request_timer_changed.wait(lock);
       continue;
     }
     const auto ready_at = _delayed_requests.front().ready_at;
-    if (ready_at <= std::chrono::steady_clock::now()) { return pop_next_request_locked(); }
-    _request_ready.wait_until(lock, ready_at);
+    if (ready_at > std::chrono::steady_clock::now()) {
+      _request_timer_changed.wait_until(lock, ready_at);
+      continue;
+    }
+
+    std::exception_ptr error;
+    try {
+      // A concurrent close owns cancellation of all timers that have not enqueued.
+      if (!enqueue_request(_delayed_requests.front().request)) { return; }
+    } catch (...) {
+      error = std::current_exception();
+    }
+
+    std::pop_heap(_delayed_requests.begin(), _delayed_requests.end(), std::greater<>{});
+    auto failed = std::move(_delayed_requests.back().request);
+    _delayed_requests.pop_back();
+    if (failed) {
+      lock.unlock();
+      fail_pending_request(*failed, error);
+      lock.lock();
+    }
   }
-  return nullptr;
 }
 
 void downgrade_executor::cancel_pending_requests()
 {
-  // The queue is closed and the consumer is joined. Drain in eligibility order and invoke
-  // completions outside the request mutex.
+  // The submission gate is closed and the processing and timer threads are joined.
   std::exception_ptr cancellation;
-  for (;;) {
-    std::unique_ptr<downgrade_request> req;
-    {
-      std::lock_guard lock(_request_mutex);
-      req = pop_next_request_locked();
-    }
-    if (!req) { break; }
+  auto cancel = [&](downgrade_request& request) {
     if (!cancellation) {
       try {
         throw std::runtime_error("downgrade executor shutting down");
@@ -996,18 +1044,16 @@ void downgrade_executor::cancel_pending_requests()
         cancellation = std::current_exception();
       }
     }
-    if (req->on_complete) {
-      req->on_complete(0, cancellation);
-    } else {
-      try {
-        req->result.set_exception(cancellation);
-      } catch (const std::future_error&) {
-        // The promise may already be settled.
-      }
-    }
+    fail_pending_request(request, cancellation);
+  };
+  while (auto request = _request_queue.try_pop()) {
+    cancel(*request);
   }
-  // All producers/consumers are joined by callers. A cancelled queued monitor request must not
-  // leave the monitor permanently believing that a request is still in flight after resume().
+  for (auto& timer : _delayed_requests) {
+    cancel(*timer.request);
+  }
+  _delayed_requests.clear();
+  // A cancelled queued monitor request must not leave the monitor gate closed after resume().
   _monitor_request_enqueued.store(false, std::memory_order_relaxed);
 }
 

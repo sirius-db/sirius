@@ -144,8 +144,9 @@ One `downgrade_executor` per memory space monitors pressure and moves data to lo
 
 ### Thread Model
 
-- The **processing thread** dequeues `downgrade_request` objects in eligibility order. The queue
-  supplies retry delays and can service ready requests while delayed requests are pending.
+- The **processing thread** dequeues eligible `downgrade_request` objects from a concurrent queue.
+- A separate **retry timer** starts on the first delayed request and submits delayed requests when
+  their backoff expires. Pause and stop close submissions before draining the queue and the timer.
 - **Monitor thread** (if `monitor_period > 0`): each cycle, if the memory space reports `should_downgrade_memory()`, it applies a **stateless viability gate** (`has_viable_downgrade_target()`) before enqueuing. A request is only fired when a lower tier could plausibly accept the data:
   - A configured DISK tier is always a viable target.
   - Without DISK, only a GPU source has a lower tier (HOST). Viability is confirmed by probing each HOST space with a chunk-sized `make_reservation_or_null` (released immediately) — the ground truth for whether downgraded data can actually land, since HOST capacity reflects both live reservations and already-stored downgraded data.

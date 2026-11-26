@@ -434,8 +434,8 @@ The executor creates a replacement task through `create_rescheduled_task()` and 
 the scheduler. GPU execution retries use a bounded retry count (100 by default) and a worker
 backoff (50 ms by default). For a HOST retry, admission probes compatible HOST pools before
 dispatch. If they cannot grant a reservation, the executor releases the GPU reservation and worker
-slot and submits a byte-targeted HOST reclamation request. The downgrade queue handles backoff
-between sweeps of eligible pools.
+slot and submits a byte-targeted HOST reclamation request. A separate timer handles backoff between
+sweeps of eligible pools and submits each delayed request to the downgrade queue when it is ready.
 The completion callback requeues the replacement through normal query admission. The replacement
 resumes at collection with the computed batches on their original device. The collector publishes
 the task's rows and position together after staging succeeds.

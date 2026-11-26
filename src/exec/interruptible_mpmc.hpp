@@ -92,6 +92,19 @@ class interruptible_mpmc {
   }
 
   /**
+   * @brief Enqueue an item, retaining the caller's ownership if the enqueue fails.
+   *
+   * Callers that require submission to be atomic with interrupt() must synchronize those
+   * operations. The queue's active flag alone does not serialize them.
+   */
+  [[nodiscard]] bool try_push(pointer_type& item)
+  {
+    assert(item != nullptr);
+    if (!_is_active.load(std::memory_order_relaxed)) { return false; }
+    return queue.enqueue(std::move(item));
+  }
+
+  /**
    * \brief Blocks waiting for an item.
    * \return Returns std::nullopt if the queue is interrupted (shutdown).
    */

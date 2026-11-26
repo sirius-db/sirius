@@ -19,6 +19,7 @@
 #include "data/data_repository_manager_registry.hpp"
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
+#include "exec/interruptible_mpmc.hpp"
 #include "exec/invocable.hpp"
 #include "exec/multi_index_priority_queue.hpp"
 #include "exec/query_lifecycle_registry.hpp"
@@ -35,7 +36,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <exception>
 #include <functional>
 #include <future>
@@ -252,8 +252,9 @@ class downgrade_executor {
   void set_request_queue_open(bool open);
   bool enqueue_request(std::unique_ptr<downgrade_request>& request,
                        std::chrono::milliseconds delay = {});
-  std::unique_ptr<downgrade_request> pop_next_request_locked();
-  std::unique_ptr<downgrade_request> take_ready_request();
+  bool begin_request_submission();
+  void end_request_submission();
+  void request_timer_loop();
   void cancel_pending_requests();
 
   // Processing thread only: reclaim and credit only bytes that relieve this HOST space. The
@@ -271,12 +272,12 @@ class downgrade_executor {
   bool has_viable_downgrade_target() const;
 
  private:
-  struct queued_request {
+  struct delayed_request {
     std::chrono::steady_clock::time_point ready_at;
     std::uint64_t order;
     std::unique_ptr<downgrade_request> request;
 
-    bool operator>(const queued_request& other) const noexcept
+    bool operator>(const delayed_request& other) const noexcept
     {
       if (ready_at != other.ready_at) { return ready_at > other.ready_at; }
       return order > other.order;
@@ -285,14 +286,17 @@ class downgrade_executor {
 
   exec::downgrade_executor_config _config;
   std::unique_ptr<exec::bounded_thread_pool> _pool;
-  std::mutex _request_mutex;
-  std::condition_variable _request_ready;
-  // Queue state is guarded by _request_mutex. Immediate submissions form a FIFO, and requests
-  // with a delay form a min-heap by eligibility time and submission order.
-  bool _request_queue_open{false};
-  std::uint64_t _next_request_order{0};
-  std::deque<queued_request> _ready_requests;
-  std::vector<queued_request> _delayed_requests;
+  exec::interruptible_mpmc<std::unique_ptr<downgrade_request>> _request_queue;
+  // The high bit closes submission. The remaining bits count producers that may still enqueue.
+  static constexpr std::uint64_t request_submission_closed = std::uint64_t{1} << 63;
+  std::atomic<std::uint64_t> _request_submissions{request_submission_closed};
+  // Timer state is guarded by _request_timer_mutex. Only eligible work enters the MPMC queue.
+  std::mutex _request_timer_mutex;
+  std::condition_variable _request_timer_changed;
+  bool _request_timer_open{false};
+  std::uint64_t _next_delayed_order{0};
+  std::vector<delayed_request> _delayed_requests;
+  std::thread _request_timer_thread;
   std::thread _processing_thread;
   std::thread _monitor_thread;
   std::atomic<bool> _monitor_request_enqueued{false};
