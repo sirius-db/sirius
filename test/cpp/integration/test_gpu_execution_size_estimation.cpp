@@ -73,7 +73,7 @@ constexpr const char* kGroupByOverJoinQuery =
   "SELECT d.label, COUNT(*) AS n, SUM(f.v) AS total "
   "FROM facts f JOIN dims d ON f.k = d.k GROUP BY d.label";
 
-// Its delim-join partition also sits below MERGE_GROUP_BY but must not enable estimation.
+// A grouped aggregate with a COUNT(DISTINCT).
 constexpr const char* kDistinctAggregateQuery =
   "SELECT g, COUNT(DISTINCT k) AS ks, SUM(v) AS total FROM facts GROUP BY g";
 

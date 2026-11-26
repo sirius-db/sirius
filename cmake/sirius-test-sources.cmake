@@ -87,6 +87,7 @@ set(TEST_SOURCES
     test/cpp/object_store_scope/test_scope.cpp
     test/cpp/object_store_scope/test_validation.cpp
     test/cpp/object_store_scope/test_c_object_store_config.cpp
+    test/cpp/object_store_scope/test_c_object_store_registry.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_cuda_event_completion_poll.cpp
     test/cpp/exec/test_stream_session.cpp
@@ -323,11 +324,14 @@ set(TEST_SOURCES
     test/cpp/planner/test_build_filter_evidence.cpp
     test/cpp/planner/test_copy_logical_plan.cpp
     test/cpp/planner/test_decimal_sum_input_bounds.cpp
+    test/cpp/planner/test_duckdb_host_reference_symbols.cpp
+    test/cpp/planner/test_duckdb_host_static_symbol.cpp
     test/cpp/planner/test_scan_column_origin.cpp
     test/cpp/planner/test_join_implied_filters.cpp
     test/cpp/planner/test_join_key_nullability.cpp
     test/cpp/planner/test_scan_filter_projection.cpp
     test/cpp/planner/test_scan_returned_types.cpp
+    test/cpp/planner/test_scan_source_names.cpp
     test/cpp/planner/test_dynamic_filter_discovery_parity.cpp
     test/cpp/planner/test_dynamic_filter_key_admission.cpp
     test/cpp/planner/test_dynamic_filter_target_discovery.cpp

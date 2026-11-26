@@ -135,19 +135,17 @@ constexpr bool DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE = true;
 /// table into one scan and a per-key MIN/MAX aggregate.
 constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
 
-/// Aggregate below an inner join that only adds variable-width columns the aggregate groups by,
-/// and combine the partial results above it.
+/// Aggregate below a join that only adds variable-width columns the aggregate groups by, and
+/// combine the partial results above it. The join is an inner join, or an outer join that keeps
+/// every row of the aggregated side.
 constexpr bool DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN = true;
 
 /// Restrict every table a delim subquery ties to its correlation column by an equality, before
-/// DuckDB orders the joins. Off for now: the rewrite is not tested on multiple GPUs, and a query
-/// that falls back to the CPU after the pre-optimize hook runs the rewritten plan.
-constexpr bool DEFAULT_ENABLE_SUBQUERY_KEY_CARRY = false;
+/// DuckDB orders the joins.
+constexpr bool DEFAULT_ENABLE_SUBQUERY_KEY_CARRY = true;
 
-/// Answer a correlated `EXISTS` from a scalar aggregate subquery over the same rows. Off for now,
-/// for the same reasons, and because a scan without a row estimate reports one row and so passes
-/// the rewrite's size guard.
-constexpr bool DEFAULT_ENABLE_EXISTS_FROM_AGGREGATE = false;
+/// Answer a correlated `EXISTS` from a scalar aggregate subquery over the same rows.
+constexpr bool DEFAULT_ENABLE_EXISTS_FROM_AGGREGATE = true;
 
 /// 0 = auto: a share of GPU tier capacity, mirroring max_sort_partition_bytes. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
@@ -349,7 +347,7 @@ struct operator_params {
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
-  /// Compute a decorrelated subquery's MIN/MAX/AVG per key from the outer rows its delim join
+  /// Compute a decorrelated subquery's MIN/MAX/AVG per key from the outer rows its delim CTE
   /// materializes rather than by rescanning the subquery's tables, when those rows are provably the
   /// same. See `reuse_delim_rows_for_subquery_aggregates`.
   bool enable_delim_aggregate_reuse = config::DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE;
@@ -359,9 +357,10 @@ struct operator_params {
   /// `rewrite_correlated_inequality_exists`.
   bool enable_exists_minmax_rewrite = config::DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE;
 
-  /// Compute `SUM`/`MIN`/`MAX` per join key below an inner join whose other side only adds
+  /// Compute `SUM`/`MIN`/`MAX` per join key below a join whose other side only adds
   /// variable-width group-by columns, so the join repeats them once per key instead of once per
-  /// row. See `push_partial_aggregates_below_joins`.
+  /// row. The join is an inner join, or an outer join that keeps every row of the aggregated
+  /// side. See `push_partial_aggregates_below_joins`.
   bool enable_partial_aggregate_below_join = config::DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN;
 
   /// Under `delim_join_as_cte`, a subquery restricted to the outer rows' keys on one column also
@@ -390,6 +389,11 @@ struct operator_params {
   /// Bytes assumed per variable-width column (VARCHAR, LIST, etc.) when computing
   /// per-row byte estimates for admission. Only used when admission_bytes_per_gpu > 0.
   uint64_t avg_variable_column_bytes = 32;
+
+  /// Most uncached footers the footer-statistics pass reads for one scan, remote and local files
+  /// apart: -1 no limit, 0 cached only. Explicit analysis and pin warming are exempt.
+  std::int64_t parquet_footer_statistics_max_remote_reads = 1024;
+  std::int64_t parquet_footer_statistics_max_local_reads  = 16384;
 };
 
 struct telemetry_config {
@@ -576,6 +580,17 @@ struct sirius_config {
   void set_object_store_config(cucascade::io::object_store_config config) noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
+
+  /// Rank CPU boundary shared by pool startup, metadata placement and lazy I/O/exchange.
+  [[nodiscard]] const std::vector<int>& get_startup_cpus() const noexcept
+  {
+    return _scan_manager_config.startup_cpus;
+  }
+
+  /// Startup CPUs for unconfigured worker/management and exchange threads, excluding
+  /// reserved reactor CPUs when any were reserved. Explicit pool masks remain authoritative
+  /// within the rank boundary.
+  [[nodiscard]] std::vector<int> get_worker_startup_cpus() const;
 
   /// CPUs reserved for the pinned REST reactors and kept out of every Sirius
   /// thread pool's affinity; empty when nothing is reserved.

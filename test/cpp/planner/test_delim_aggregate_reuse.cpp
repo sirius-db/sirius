@@ -14,11 +14,10 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_delim_aggregate_reuse.hpp"
 #include "utils/parquet_fixture_utils.hpp"
-#include "utils/scoped_sirius_setting.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
@@ -94,10 +93,6 @@ std::size_t count(sirius::op::sirius_physical_operator* root, T type)
   std::size_t found = root->type == type ? 1 : 0;
   for (auto& child : root->children) {
     found += count(child.get(), type);
-  }
-  // A delim join keeps its inner join and distinct outside `children`.
-  if (root->type == T::LEFT_DELIM_JOIN || root->type == T::RIGHT_DELIM_JOIN) {
-    found += count(root->Cast<sirius::op::sirius_physical_delim_join>().join.get(), type);
   }
   return found;
 }
@@ -199,69 +194,57 @@ TEST_CASE_METHOD(delim_reuse_fixture,
                  "delim reuse computes q17- and q2-shaped aggregates from the outer rows",
                  "[delim_reuse][plan]")
 {
-  for (bool const as_cte : {false, true}) {
-    CAPTURE(as_cte);
-    sirius::test::scoped_sirius_setting representation{*con, "delim_join_as_cte", as_cte};
-    CHECK(rewrites(q17_shape()) == 1);
-    CHECK(rewrites(q2_shape()) == 1);
-    // The subquery's second scan of lineitem, and of partsupp, go. DuckDB already shares
-    // supplier, nation and region between the two sides as a CTE.
-    CHECK(scans(q17_shape()) == std::pair<std::size_t, std::size_t>{2, 3});
-    CHECK(scans(q2_shape()) == std::pair<std::size_t, std::size_t>{5, 6});
-  }
+  CHECK(rewrites(q17_shape()) == 1);
+  CHECK(rewrites(q2_shape()) == 1);
+  // The subquery's second scan of lineitem, and of partsupp, go. DuckDB already shares
+  // supplier, nation and region between the two sides as a CTE.
+  CHECK(scans(q17_shape()) == std::pair<std::size_t, std::size_t>{2, 3});
+  CHECK(scans(q2_shape()) == std::pair<std::size_t, std::size_t>{5, 6});
 }
 
 TEST_CASE_METHOD(delim_reuse_fixture,
                  "delim reuse covers MIN and MAX, and outer rows keyed by the subquery's column",
                  "[delim_reuse][plan]")
 {
-  for (bool const as_cte : {false, true}) {
-    CAPTURE(as_cte);
-    sirius::test::scoped_sirius_setting representation{*con, "delim_join_as_cte", as_cte};
-    CHECK(rewrites(q17_shape("", "max(l_quantity) - min(l_quantity)")) == 1);
-    // Keyed by the lineitems' own, nullable, column, each repeated once per region.
-    CHECK(rewrites("SELECT l_partkey, r_name, l_quantity, (SELECT avg(l2.l_quantity) FROM "
-                   "lineitem l2 WHERE l2.l_partkey = l1.l_partkey) FROM lineitem l1, region "
-                   "WHERE r_regionkey < 2") == 1);
-    // The outer rows do not keep the aggregated column.
-    CHECK(rewrites("SELECT l_partkey, r_name, (SELECT avg(l2.l_quantity) FROM lineitem l2 "
-                   "WHERE l2.l_partkey = l1.l_partkey) FROM lineitem l1, region "
-                   "WHERE r_regionkey < 2") == 0);
-    // DuckDB already joins this one with an aggregate over all of lineitem, without a delim join.
-    CHECK(rewrites("SELECT l_partkey, l_quantity FROM lineitem l1 WHERE l_quantity > "
-                   "(SELECT avg(l_quantity) FROM lineitem l2 WHERE l2.l_partkey = l1.l_partkey)") ==
-          0);
-  }
+  CHECK(rewrites(q17_shape("", "max(l_quantity) - min(l_quantity)")) == 1);
+  // Keyed by the lineitems' own, nullable, column, each repeated once per region.
+  CHECK(rewrites("SELECT l_partkey, r_name, l_quantity, (SELECT avg(l2.l_quantity) FROM "
+                 "lineitem l2 WHERE l2.l_partkey = l1.l_partkey) FROM lineitem l1, region "
+                 "WHERE r_regionkey < 2") == 1);
+  // The outer rows do not keep the aggregated column.
+  CHECK(rewrites("SELECT l_partkey, r_name, (SELECT avg(l2.l_quantity) FROM lineitem l2 "
+                 "WHERE l2.l_partkey = l1.l_partkey) FROM lineitem l1, region "
+                 "WHERE r_regionkey < 2") == 0);
+  // DuckDB decorrelates this one itself, into a join with an aggregate over all of lineitem.
+  CHECK(rewrites("SELECT l_partkey, l_quantity FROM lineitem l1 WHERE l_quantity > "
+                 "(SELECT avg(l_quantity) FROM lineitem l2 WHERE l2.l_partkey = l1.l_partkey)") ==
+        0);
 }
 
 TEST_CASE_METHOD(delim_reuse_fixture,
                  "delim reuse leaves subqueries whose rows differ from the outer rows alone",
                  "[delim_reuse][plan]")
 {
-  for (bool const as_cte : {false, true}) {
-    CAPTURE(as_cte);
-    sirius::test::scoped_sirius_setting representation{*con, "delim_join_as_cte", as_cte};
-    // The outer rows drop lineitems the subquery counts.
-    CHECK(rewrites(q17_shape("AND l_shipmode = 'AIR'")) == 0);
-    // The subquery keeps fewer lineitems than the outer rows.
-    CHECK(rewrites(q17_shape(
-            "", "0.2 * avg(l_quantity)", "l_partkey = p_partkey AND l_shipmode = 'AIR'")) == 0);
-    // Correlated on another column than the join key.
-    CHECK(rewrites(q17_shape("", "0.2 * avg(l_quantity)", "l_suppkey = p_partkey")) == 0);
-    // Aggregates that count repeated rows, and an AVG whose sum depends on the order.
-    CHECK(rewrites(q17_shape("", "0.01 * sum(l_quantity)")) == 0);
-    CHECK(rewrites(q17_shape("", "0.01 * count(*)")) == 0);
-    CHECK(rewrites(q17_shape("", "avg(l_discount)")) == 0);
-    // A subquery over another table.
-    CHECK(rewrites("SELECT sum(l_extendedprice) FROM lineitem, part WHERE p_partkey = l_partkey "
-                   "AND p_brand = 'Brand#3' AND l_quantity < "
-                   "(SELECT min(ps_supplycost) FROM partsupp WHERE ps_partkey = p_partkey)") == 0);
-    // Another region, or every supplier rather than the outer rows' region.
-    CHECK(rewrites(q2_shape("partsupp, supplier, nation, region",
-                            "s_suppkey = ps_suppkey AND s_nationkey = n_nationkey AND "
-                            "n_regionkey = r_regionkey AND r_name = 'ASIA'")) == 0);
-    CHECK(rewrites(q2_shape("partsupp, supplier", "s_suppkey = ps_suppkey")) == 0);
-  }
+  // The outer rows drop lineitems the subquery counts.
+  CHECK(rewrites(q17_shape("AND l_shipmode = 'AIR'")) == 0);
+  // The subquery keeps fewer lineitems than the outer rows.
+  CHECK(rewrites(q17_shape(
+          "", "0.2 * avg(l_quantity)", "l_partkey = p_partkey AND l_shipmode = 'AIR'")) == 0);
+  // Correlated on another column than the join key.
+  CHECK(rewrites(q17_shape("", "0.2 * avg(l_quantity)", "l_suppkey = p_partkey")) == 0);
+  // Aggregates that count repeated rows, and an AVG whose sum depends on the order.
+  CHECK(rewrites(q17_shape("", "0.01 * sum(l_quantity)")) == 0);
+  CHECK(rewrites(q17_shape("", "0.01 * count(*)")) == 0);
+  CHECK(rewrites(q17_shape("", "avg(l_discount)")) == 0);
+  // A subquery over another table.
+  CHECK(rewrites("SELECT sum(l_extendedprice) FROM lineitem, part WHERE p_partkey = l_partkey "
+                 "AND p_brand = 'Brand#3' AND l_quantity < "
+                 "(SELECT min(ps_supplycost) FROM partsupp WHERE ps_partkey = p_partkey)") == 0);
+  // Another region, or every supplier rather than the outer rows' region.
+  CHECK(rewrites(q2_shape("partsupp, supplier, nation, region",
+                          "s_suppkey = ps_suppkey AND s_nationkey = n_nationkey AND "
+                          "n_regionkey = r_regionkey AND r_name = 'ASIA'")) == 0);
+  CHECK(rewrites(q2_shape("partsupp, supplier", "s_suppkey = ps_suppkey")) == 0);
 }
 
 TEST_CASE_METHOD(delim_reuse_fixture,
@@ -273,19 +256,15 @@ TEST_CASE_METHOD(delim_reuse_fixture,
     return "SELECT a.k, a." + column + ", r_name, (SELECT avg(b." + column +
            ") FROM widths b WHERE b.k = a.k) FROM widths a, region WHERE r_regionkey < 2";
   };
-  for (bool const as_cte : {false, true}) {
-    CAPTURE(as_cte);
-    sirius::test::scoped_sirius_setting representation{*con, "delim_join_as_cte", as_cte};
-    for (char const* column : {"i", "b", "d9", "d18"}) {
-      CAPTURE(column);
-      CHECK(rewrites(repeated_avg(column)) == 1);
-    }
-    for (char const* column : {"s", "d4", "h", "d38"}) {
-      CAPTURE(column);
-      CHECK(rewrites(repeated_avg(column)) == 0);
-    }
-    // MIN and MAX do not sum, so any width is reused.
-    CHECK(rewrites("SELECT a.k, a.d38, r_name, (SELECT max(b.d38) FROM widths b WHERE b.k = a.k) "
-                   "FROM widths a, region WHERE r_regionkey < 2") == 1);
+  for (char const* column : {"i", "b", "d9", "d18"}) {
+    CAPTURE(column);
+    CHECK(rewrites(repeated_avg(column)) == 1);
   }
+  for (char const* column : {"s", "d4", "h", "d38"}) {
+    CAPTURE(column);
+    CHECK(rewrites(repeated_avg(column)) == 0);
+  }
+  // MIN and MAX do not sum, so any width is reused.
+  CHECK(rewrites("SELECT a.k, a.d38, r_name, (SELECT max(b.d38) FROM widths b WHERE b.k = a.k) "
+                 "FROM widths a, region WHERE r_regionkey < 2") == 1);
 }

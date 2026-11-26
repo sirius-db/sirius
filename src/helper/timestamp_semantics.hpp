@@ -19,6 +19,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/transform.hpp>
+#include <cudf/types.hpp>
 
 #include <rmm/resource_ref.hpp>
 
@@ -46,16 +47,26 @@ namespace sirius::temporal {
                                                         rmm::device_async_resource_ref mr);
 
 /**
- * Converts second, millisecond, or nanosecond timestamps to microseconds.
- * Preserves infinity and NULL; rounds nanoseconds to nearest with ties away from the epoch; throws
- * sirius::invalid_input_exception on finite overflow or unsupported input type.
+ * True for the timestamp precision casts cast_timestamp_checked() implements: every cast to a
+ * finer precision (S to MS, US or NS; MS to US or NS; US to NS) and nanoseconds to microseconds.
+ */
+[[nodiscard]] bool has_checked_timestamp_cast(cudf::data_type source, cudf::data_type target);
+
+/**
+ * Converts timestamps to @p target, for the casts has_checked_timestamp_cast() accepts.
+ * Preserves infinity and NULL; rounds nanoseconds to the nearest microsecond with ties away from
+ * the epoch; throws sirius::invalid_input_exception on finite overflow or an unsupported cast.
  * The overflow check synchronizes the supplied stream to read its result.
  */
-[[nodiscard]] std::unique_ptr<cudf::column> cast_to_microseconds_checked(
-  cudf::column_view const& input, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr);
+[[nodiscard]] std::unique_ptr<cudf::column> cast_timestamp_checked(
+  cudf::column_view const& input,
+  cudf::data_type target,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr);
 
 // Applies a bound DATE/day signature. Offsets preserve NULL and infinity and
-// throw invalid_input_exception on finite overflow. Differences subtract raw day
+// throw invalid_input_exception on finite overflow, on an infinity-sentinel result,
+// and on an input or result day count below -infinity. Differences subtract raw day
 // counts in INT64. Column inputs must have row_count rows; scalar inputs broadcast
 // their single row. The caller retains input ownership; overflow checks synchronize
 // the supplied stream.

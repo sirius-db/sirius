@@ -20,10 +20,10 @@ extern "C" {
  * Non-NULL pointers must refer to live handles or accessible storage of the stated size.
  * Optional diagnostics follow sirius_error's ownership contract. No exceptions cross the ABI.
  *
- * The initial subset supports one local Parquet scan followed by filters. Each node retains
- * its input. Nodes are never fused or reordered. Operator-specific properties and additional
- * operators can be introduced separately. Node chains and expression trees are limited to
- * 256 levels to bound traversal and destruction stack use.
+ * The initial subset supports one Parquet scan of a local file or an S3 object followed by
+ * filters. Each node retains its input. Nodes are never fused or reordered. Operator-specific
+ * properties and additional operators can be introduced separately. Node chains and expression
+ * trees are limited to 256 levels to bound traversal and destruction stack use.
  *
  * @par Thread safety
  * Handles may be transferred between threads. Concurrent reads and construction are safe.
@@ -53,20 +53,39 @@ enum {
   SIRIUS_COMPARISON_GREATER       = 4,
   SIRIUS_COMPARISON_GREATER_EQUAL = 5
 };
-/** Describe one local Parquet file with an explicit schema. path is a nonempty native-byte
- * path without NUL or a URI scheme. The path is literal: glob characters are never expanded.
- * A scheme-shaped prefix such as data:1.parquet is rejected; use ./data:1.parquet
- * to identify that literal POSIX filename.
- * Relative paths use the working directory at future preparation time.
- * No file is opened or schema inferred; preparation must bind the source
+/** Describe one Parquet source, a local file or an S3 object, with an explicit schema.
+ * `location` is a nonempty range of `location_size` bytes without NUL. It is stored as given:
+ * never decoded, trimmed, case-folded or normalized, and glob characters are never expanded.
+ *
+ * A name without a URI scheme is a native-byte local path. A name with a scheme-shaped
+ * prefix, such as data:1.parquet, is not a local path; use ./data:1.parquet to identify that
+ * literal POSIX filename. Relative paths use the working directory at future preparation time.
+ * A leading space or quote is part of the name. A name without a leading URI scheme remains a
+ * local path even if it looks like an S3 URI, and its escaped path appears in plan
+ * descriptions. Only a location accepted as S3 is displayed as `s3://<redacted>`.
+ *
+ * The only accepted URI form is `s3://bucket/key`, with the scheme in either ASCII case. The
+ * bucket is one or more ASCII letters, digits, `.`, `_` or `-`, other than `.` or `..`.
+ * User-info and a port cannot be written, and a host name there is a bucket name, not an
+ * endpoint. The key is nonempty and names one literal object: `@`, `:` and `%` are ordinary
+ * bytes and percent sequences are not decoded. `?` and `#` are rejected anywhere in the URI,
+ * so a key that contains one cannot be expressed. A name with a leading URI scheme that does
+ * not meet the S3 rules returns `SIRIUS_INVALID_ARGUMENT`; it is not treated as a local path.
+ * A diagnostic for an invalid location describes the rule without copying the supplied
+ * location into the message. A scan takes no credentials or configuration reference, and
+ * construction does not select a store. Future preparation can refuse an S3 location that
+ * construction accepts: the current object-store prefix matcher cannot serve a key containing
+ * `%`, an empty segment, a `.` or `..` segment, or a trailing slash.
+ *
+ * No source is opened or schema inferred; preparation must bind the source
  * and check its schema and engine support. schema and out_node must not be NULL.
  * @code{.c}
  * sirius_plan_node *scan = NULL;
  * sirius_status status = sirius_plan_scan_parquet("data.parquet", 12, schema, &scan, NULL);
  * @endcode
  */
-SIRIUS_EXPORT sirius_status sirius_plan_scan_parquet(const char* path,
-                                                     size_t path_size,
+SIRIUS_EXPORT sirius_status sirius_plan_scan_parquet(const char* location,
+                                                     size_t location_size,
                                                      const sirius_schema* schema,
                                                      sirius_plan_node** out_node,
                                                      sirius_error** out_error) SIRIUS_C_NOEXCEPT;
@@ -181,8 +200,10 @@ SIRIUS_EXPORT sirius_status sirius_plan_from_root(const sirius_plan_node* root,
  */
 SIRIUS_EXPORT sirius_plan_node* sirius_plan_root(const sirius_plan* plan) SIRIUS_C_NOEXCEPT;
 /** Borrow a NUL-terminated, human-readable description until plan is released.
- * Returns an empty string for NULL. Names and paths are escaped. Formatting is diagnostic,
- * not a serialization format or stable machine-readable interface.
+ * Returns an empty string for NULL. Names and local paths are escaped. Only a scan location
+ * accepted as S3 is shown as `s3://<redacted>` instead of its bucket or key; a local path that
+ * resembles an S3 URI is still displayed as a path. Formatting is diagnostic, not a
+ * serialization format or stable machine-readable interface.
  * @code{.c}
  * const char *description = sirius_plan_describe(plan);
  * @endcode

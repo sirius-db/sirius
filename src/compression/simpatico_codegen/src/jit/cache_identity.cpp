@@ -77,6 +77,15 @@ Digest environment_identity(const EnvironmentView& environment)
   return hash.finish();
 }
 
+Digest framed_identity(std::string_view domain, std::span<const std::string_view> fields)
+{
+  Encoder hash(domain);
+  hash.number(fields.size());
+  for (const auto field : fields)
+    hash.field(field);
+  return hash.finish();
+}
+
 Digest content_identity(std::string_view content)
 {
   return canonical_digest(XXH3_128bits(content.data(), content.size()));

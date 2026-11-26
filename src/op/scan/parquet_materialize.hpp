@@ -88,14 +88,14 @@ class column_chunk_range_cache {
 ///
 /// Takes one of two routes, picked from what the backend says it wants:
 ///
-///   bulk    - when every source's backend reports @c prefers_bulk_io().  Each
-///             source's column chunks are read in a single vectored device
-///             request straight into their own device buffers, and the table is
-///             decoded from those buffers by the hybrid scan reader —
-///             @c hybrid_scan_reader for one source, @c hybrid_scan_multifile
-///             for several.  One round trip per file for the whole split
-///             instead of one per chunk, which is what makes this worth doing
-///             against an object store.
+///   bulk    - when every source's backend reports @c prefers_bulk_io().  One
+///             logical vectored read per source, straight into that source's
+///             own device buffers; the backend may serve it from cache or split
+///             it into physical reads.  The table is decoded from those buffers
+///             by the hybrid scan reader — @c hybrid_scan_reader for one
+///             source, @c hybrid_scan_multifile for several.  Handing over a
+///             source's ranges together is what lets an object-store backend
+///             fuse them and keep its connections busy.
 ///
 ///   general - otherwise.  cudf::io::read_parquet over the datasources and
 ///             their pre-parsed footers, which reads as it decodes.

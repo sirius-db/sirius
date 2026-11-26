@@ -8,6 +8,7 @@ import sys
 import shutil
 
 import fastavro
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 repo = Path(__file__).resolve().parents[4]
@@ -27,7 +28,9 @@ def write(path, schema, metadata, rows):
         fastavro.writer(f, schema, rows, metadata=metadata)
 
 
-for mode in ("empty", "equality_bad_dv"):
+# equality_dv: a later commit kept the deletion vector and added an equality delete of `cherry`,
+# so both delete kinds apply to the one data file.
+for mode in ("empty", "equality_bad_dv", "equality_dv"):
     dest = out / mode
     (dest / "metadata").mkdir(parents=True, exist_ok=True)
     meta = json.loads((source / "metadata/v1.metadata.json").read_text())
@@ -36,6 +39,18 @@ for mode in ("empty", "equality_bad_dv"):
         snapshot["manifest-list"] = str(
             dest / "metadata" / Path(snapshot["manifest-list"]).name
         )
+        if mode == "equality_dv":
+            snapshot["sequence-number"] = 2
+    if mode == "equality_dv":
+        meta["last-sequence-number"] = 2
+        (dest / "data").mkdir(exist_ok=True)
+        cherry = pa.table(
+            [pa.array(["cherry"], pa.string())],
+            schema=pa.schema(
+                [pa.field("fruit", pa.string(), metadata={"PARQUET:field_id": "1"})]
+            ),
+        )
+        pq.write_table(cherry, dest / "data/delete-eq-cherry.parquet")
     (dest / "metadata/v1.metadata.json").write_text(json.dumps(meta, indent=2))
     (dest / "metadata/version-hint.text").write_text("1")
     for path in (source / "metadata").glob("*.avro"):
@@ -50,26 +65,46 @@ for mode in ("empty", "equality_bad_dv"):
                     row["deleted_files_count"] = 1
                     row["deleted_rows_count"] = row["added_rows_count"]
                     row["added_rows_count"] = row["existing_rows_count"] = 0
+                elif mode == "equality_dv" and row["content"] == 1:
+                    row["sequence_number"] = 2
+                    row["existing_files_count"] = row["added_files_count"]
                 elif row["content"] == 1:
                     row["added_files_count"] = 2
         else:
             for row in rows:
                 if mode == "empty":
                     row["status"] = 2
+                elif mode == "equality_dv" and row["data_file"]["content"] == 1:
+                    row["status"] = 0
                 elif row["data_file"]["content"] == 1:
                     row["data_file"]["content_offset"] = -1
                     row["data_file"]["content_size_in_bytes"] = -1
             if mode != "empty" and rows[0]["data_file"]["content"] == 1:
                 eq = copy.deepcopy(rows[0])
-                eq["data_file"].update(
-                    content=2,
-                    file_format="PARQUET",
-                    equality_ids=[1, 2],
-                    file_path=str(
-                        repo
-                        / "test/cpp/integration/data/iceberg_v2_equality_delete/data/delete-eq-00000-0-c3d4e5f6-0003-0003-0003-000000000002-00001.parquet"
-                    ),
-                )
+                if mode == "equality_dv":
+                    delete = dest / "data/delete-eq-cherry.parquet"
+                    eq.update(status=1, sequence_number=2, file_sequence_number=2)
+                    eq["data_file"].update(
+                        content=2,
+                        file_format="PARQUET",
+                        equality_ids=[1],
+                        file_path=str(delete),
+                        record_count=1,
+                        file_size_in_bytes=delete.stat().st_size,
+                        content_offset=None,
+                        content_size_in_bytes=None,
+                        referenced_data_file=None,
+                    )
+                else:
+                    eq["data_file"].update(
+                        content=2,
+                        file_format="PARQUET",
+                        equality_ids=[1, 2],
+                        file_path=str(
+                            repo
+                            / "test/cpp/integration/data/iceberg_v2_equality_delete/data/delete-eq-00000-0-c3d4e5f6-0003-0003-0003-000000000002-00001.parquet"
+                        ),
+                    )
                 rows.append(eq)
         write(dest / "metadata" / path.name, schema, metadata, rows)
     for path in (dest / "metadata").glob("snap-*.avro"):
@@ -145,6 +180,8 @@ for variant, names in (
     ("dv_unsupported_uri", ("a",)),
     ("dv_supported_s3_uri", ("a",)),
     ("dv_unused_unsupported_uri", ("a",)),
+    ("dv_unused_s3_uri", ("a",)),
+    ("dv_lowercase_format", ("a",)),
 ):
     dest = out / variant
     (dest / "metadata").mkdir(parents=True, exist_ok=True)
@@ -189,7 +226,7 @@ for variant, names in (
                         df["file_path"] = str(data)
                         df["file_size_in_bytes"] = data.stat().st_size
                     else:
-                        if variant == "dv_unused_unsupported_uri":
+                        if variant in ("dv_unused_unsupported_uri", "dv_unused_s3_uri"):
                             unused = copy.deepcopy(row)
                         sidecar = dest / "data" / (name + ".puffin")
                         footer = copy.deepcopy(source_footer)
@@ -214,6 +251,9 @@ for variant, names in (
                         df["file_path"] = str(sidecar)
                         df["referenced_data_file"] = str(data)
                         df["file_size_in_bytes"] = sidecar.stat().st_size
+                        if variant == "dv_lowercase_format":
+                            # DuckDB's Iceberg writer records the format in lower case.
+                            df["file_format"] = "puffin"
                         if variant == "dv_unsupported_uri":
                             # Keep metadata, manifests, and data local while making only the
                             # Puffin sidecar a remote URI with no registered Sirius backend.
@@ -228,9 +268,13 @@ for variant, names in (
                     expanded.append(row)
             rows = expanded
             if unused is not None:
-                unused["data_file"][
-                    "file_path"
-                ] = "http://unsupported-puffin.invalid/unused-sidecar.puffin"
+                # For a data file the scan does not select: under a scheme no backend reads,
+                # or under s3://, where opening it would need a credential.
+                unused["data_file"]["file_path"] = (
+                    "s3://sirius-unused-puffin/unused-sidecar.puffin"
+                    if variant == "dv_unused_s3_uri"
+                    else "http://unsupported-puffin.invalid/unused-sidecar.puffin"
+                )
                 unused["data_file"]["referenced_data_file"] = str(
                     dest / "data" / "unselected.parquet"
                 )

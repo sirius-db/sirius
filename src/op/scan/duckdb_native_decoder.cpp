@@ -44,6 +44,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/query_context.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/database.hpp>
@@ -214,7 +215,7 @@ pinned_segment_bytes decode_roaring_validity(duckdb::DatabaseInstance& db,
   std::size_t const words = (row_count + 63) / 64;
   out.owned_bytes.assign(words * sizeof(uint64_t), 0xff);
 
-  duckdb::roaring::RoaringScanState rs(*seg);
+  duckdb::roaring::RoaringScanState rs(duckdb::QueryContext(), *seg);
   duckdb::ValidityMask vm(CHUNK);
 
   for (duckdb::idx_t scanned = 0; scanned < row_count; scanned += CHUNK) {

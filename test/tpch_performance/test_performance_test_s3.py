@@ -9,6 +9,7 @@
 import csv
 import os
 import tempfile
+import traceback
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -171,6 +172,82 @@ class PerformanceTestS3Tests(unittest.TestCase):
         self.assertTrue(events[0].startswith("LOAD "))
         self.assertEqual(events[1], ("secret", con, True))
         self.assertTrue(events[2].startswith("CREATE OR REPLACE VIEW customer"))
+
+    def test_runs_catalog_setup_before_loading_sirius(self):
+        events = []
+        con = Mock()
+        # The setup file is split by DuckDB, not at every ';'.
+        con.extract_statements.side_effect = (
+            benchmark.duckdb.connect().extract_statements
+        )
+        con.execute.side_effect = (
+            lambda sql: events.append(getattr(sql, "query", sql).strip()) or con
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".sql") as setup:
+            setup.write(
+                "CREATE SECRET c (TYPE ICEBERG, TOKEN 'synthetic;token'); -- one; two\n"
+                "ATTACH '' AS lake (TYPE ICEBERG, SECRET c);\n"
+            )
+            setup.flush()
+            with patch.object(
+                benchmark.duckdb, "connect", return_value=con
+            ), patch.object(benchmark, "CATALOG_SETUP_PATH", setup.name), patch.object(
+                benchmark, "EXTENSION_PATH", "/build/sirius.duckdb_extension"
+            ), patch.dict(
+                os.environ, {"SIRIUS_PRE_SQL": ""}
+            ):
+                benchmark.open_connection(
+                    "lake.tpch", gpu_execution=True, data_source="iceberg"
+                )
+
+        # Sirius logs statement text, so the setup file must be done before it loads.
+        sirius = events.index("LOAD '/build/sirius.duckdb_extension'")
+        # DuckDB keeps the comment before a statement in its text.
+        self.assertTrue(events[sirius - 1].splitlines()[-1].startswith("ATTACH "))
+        self.assertIn("TOKEN 'synthetic;token')", events[sirius - 2])
+        self.assertTrue(
+            all(
+                sql.startswith("CREATE OR REPLACE VIEW ")
+                for sql in events[sirius + 1 :]
+            )
+        )
+
+    def test_failing_catalog_setup_does_not_quote_the_file(self):
+        # A real connection, so the errors are the ones DuckDB raises: a parser
+        # error and a binder error each quote the line they stopped on,
+        # credential and all.
+        token = "synthetic-token-7f3a"
+        cases = {
+            "does not parse": f"CREATE SECRETT c (TYPE ICEBERG, TOKEN '{token}');\n",
+            "statement 2 of 2 failed": (
+                f"SELECT 1;\nSELECT '{token}' || no_such_column;\n"
+            ),
+        }
+        for expected, text in cases.items():
+            with self.subTest(expected), tempfile.NamedTemporaryFile(
+                "w", suffix=".sql"
+            ) as setup:
+                setup.write(text)
+                setup.flush()
+                con = benchmark.duckdb.connect()
+                with patch.object(benchmark, "CATALOG_SETUP_PATH", setup.name):
+                    with self.assertRaises(RuntimeError) as raised:
+                        benchmark._run_catalog_setup(con)
+                # What a caller prints: the message and the whole traceback chain.
+                printed = "".join(
+                    traceback.format_exception(
+                        type(raised.exception),
+                        raised.exception,
+                        raised.exception.__traceback__,
+                    )
+                )
+                self.assertIn(expected, printed)
+                self.assertNotIn(token, printed)
+                # The control: DuckDB's own error for this file does quote it.
+                with self.assertRaises(benchmark.duckdb.Error) as quoted:
+                    for statement in con.extract_statements(text):
+                        con.execute(statement)
+                self.assertIn(token, str(quoted.exception))
 
     def test_s3_profiler_child_writes_timings_but_no_secret_sql(self):
         source = Mock()

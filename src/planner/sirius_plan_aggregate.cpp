@@ -542,8 +542,7 @@ static std::pair<std::size_t, std::size_t> resolve_join_output_column(
 // Whether a subtree contains a producer with separate consumer-side output.
 static bool contains_bespoke_producer(duckdb::LogicalOperator const& node)
 {
-  return node.type == duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN ||
-         node.type == duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
+  return node.type == duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
          std::ranges::any_of(node.children,
                              [](auto const& child) { return contains_bespoke_producer(*child); });
 }
@@ -551,15 +550,14 @@ static bool contains_bespoke_producer(duckdb::LogicalOperator const& node)
 // Whether a join input can feed a DENSE_COUNT_JOIN port. Two rules apply to the input's logical
 // subtree.
 //
-// Root rule: a DELIM_JOIN or MATERIALIZED_CTE root streams its consumer-side output into the
-// enclosing pipeline, and a DELIM_GET or CTE_REF root is a routing-only scan fed by a producer
-// outside the join input, so none of them delivers the input through a child-owned pipeline.
-// Identity projections are elided during planning, so the root is found by looking through
-// projections.
+// Root rule: a MATERIALIZED_CTE root streams its consumer-side output into the enclosing
+// pipeline, and a CTE_REF root is a routing-only scan fed by a producer outside the join input,
+// so neither delivers the input through a child-owned pipeline. Identity projections are elided
+// during planning, so the root is found by looking through projections.
 //
-// Depth rule: a DELIM_JOIN or MATERIALIZED_CTE is excluded anywhere in the subtree.
+// Depth rule: a MATERIALIZED_CTE is excluded anywhere in the subtree.
 // sirius_physical_dense_count_join::get_next_task_hint directs the task creator into the source
-// operator of an unfinished producer pipeline, which can happen before the delim subtree's sizing
+// operator of an unfinished producer pipeline, which can happen before that subtree's sizing
 // partitions have negotiated a join mode, and a MARK hash join polled before sizing throws in
 // sirius_physical_hash_join::refresh_cross_schedule instead of deferring.
 static bool can_feed_dense_count_join(duckdb::LogicalOperator const& input)
@@ -570,7 +568,6 @@ static bool can_feed_dense_count_join(duckdb::LogicalOperator const& input)
     root = root->children[0].get();
   }
   switch (root->type) {
-    case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
     case duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
     case duckdb::LogicalOperatorType::LOGICAL_CTE_REF: return false;
     default: return true;

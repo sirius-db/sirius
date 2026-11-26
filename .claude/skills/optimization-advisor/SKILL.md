@@ -117,7 +117,6 @@ All Sirius physical operators follow a deterministic naming pattern:
 
 Special cases:
 - `sirius_physical_materialized_collector` -> `src/op/sirius_physical_result_collector.cpp`
-- `sirius_physical_left_delim_join` / `sirius_physical_right_delim_join` -> `src/op/sirius_physical_delim_join.cpp`
 - `sirius_physical_streaming_limit` -> `src/op/sirius_physical_limit.cpp`
 
 ### Execution Model

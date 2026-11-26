@@ -14,17 +14,11 @@
  * limitations under the License.
  */
 
-#include "operator/partition_test_utils.hpp"
 #include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
-#include <helper/logical_type.hpp>
-#include <op/sirius_physical_column_data_scan.hpp>
-#include <op/sirius_physical_delim_join.hpp>
 #include <op/sirius_physical_operator.hpp>
-#include <op/sirius_physical_operator_type.hpp>
-#include <op/sirius_physical_partition.hpp>
 #include <pipeline/repository_wiring.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 
@@ -33,9 +27,6 @@
 
 using sirius::op::MemoryBarrierType;
 using sirius::op::sirius_physical_operator;
-using sirius::op::sirius_physical_partition;
-using sirius::op::sirius_physical_right_delim_join;
-using sirius::op::SiriusPhysicalOperatorType;
 using sirius::pipeline::materialize_repository_wiring;
 using sirius::pipeline::repository_wiring;
 using sirius::pipeline::sirius_pipeline;
@@ -166,9 +157,8 @@ TEST_CASE("materialize: explicit source op (5-arg-style) records fanout on the s
   wiring_test_env env;
   cucascade::shared_data_repository_manager mgr;
 
-  // Pipeline whose sink is a delim-join-style composite — the actual emitter is a
-  // sub-operator, not the pipeline's sink. The descriptor carries the explicit
-  // source_op, so add_next_port_after_sink should land on it instead of on the sink.
+  // The descriptor names a source_op other than the pipeline's sink, so
+  // add_next_port_after_sink should land on it instead of on the sink.
   sirius::op::test_physical_operator pipeline_sink;
   sirius::op::test_physical_operator sub_emitter;
   auto src_pipeline = build_pipeline(env, &pipeline_sink, {}, /*pipeline_id=*/0);
@@ -239,61 +229,4 @@ TEST_CASE("materialize: multiple wirings to the same destination attach distinct
   CHECK(default_port->src_pipeline == probe_pipeline);
   CHECK(build_port->src_pipeline == build_pipeline_handle);
   CHECK(default_port->repo != build_port->repo);  // Each port has its own repo.
-}
-
-TEST_CASE("materialize: delim join destinations use the generic path with no sibling side effects",
-          "[repository_wiring][materializer]")
-{
-  // A delim join is a fan-out source, not a wiring destination; the materializer does not
-  // special-case RIGHT/LEFT delim joins: no extra port is grafted onto a partition_join sibling,
-  // and a LEFT delim join does not throw. If a delim join ever appears as a destination's first
-  // operator, it is wired exactly like any other operator.
-  wiring_test_env env;
-  cucascade::shared_data_repository_manager mgr;
-  duckdb::vector<sirius::logical_type> empty_types;
-
-  sirius::op::test_physical_operator source_sink;
-  auto src_pipeline = build_pipeline(env, &source_sink, {}, /*pipeline_id=*/0);
-
-  auto dummy_join =
-    duckdb::make_uniq<sirius::op::test_physical_operator>(SiriusPhysicalOperatorType::INVALID,
-                                                          empty_types,
-                                                          /*estimated_cardinality=*/0);
-  dummy_join->children.push_back(duckdb::make_uniq<sirius::op::test_physical_operator>(
-    SiriusPhysicalOperatorType::INVALID, empty_types, 0));
-  dummy_join->children.push_back(duckdb::make_uniq<sirius::op::test_physical_operator>(
-    SiriusPhysicalOperatorType::INVALID, empty_types, 0));
-
-  auto right_delim = duckdb::make_uniq<sirius_physical_right_delim_join>(
-    empty_types,
-    std::move(dummy_join),
-    duckdb::vector<duckdb::const_reference<sirius_physical_operator>>{},
-    /*estimated_cardinality=*/0,
-    duckdb::optional_idx());
-
-  // The fanout target needs only a single-destination routing specification.
-  auto partition_join = duckdb::make_uniq<sirius_physical_partition>(
-    empty_types, 0, sirius::test::operator_utils::single_partition_spec());
-  right_delim->partition_join = partition_join.get();
-
-  sirius::op::test_physical_operator unused_sink;
-  auto dest_pipeline = build_pipeline(env, &unused_sink, {right_delim.get()}, /*pipeline_id=*/1);
-
-  std::vector<repository_wiring> wirings = {{std::string_view{"build"},
-                                             MemoryBarrierType::FULL,
-                                             &source_sink,
-                                             src_pipeline,
-                                             dest_pipeline}};
-
-  // Must not throw (the LEFT-delim "should never be a source" invariant is gone), and the port
-  // lands only on the destination's operators[0].
-  env.assign_ids();
-  REQUIRE_NOTHROW(materialize_repository_wiring(wirings, mgr));
-
-  auto* delim_port = right_delim->get_port("build");
-  REQUIRE(delim_port != nullptr);
-  CHECK(delim_port->repo != nullptr);
-
-  // No sibling port is grafted onto partition_join.
-  CHECK(partition_join->get_port_ids().empty());
 }

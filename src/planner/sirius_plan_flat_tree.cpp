@@ -24,7 +24,6 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
-#include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
@@ -182,7 +181,7 @@ bool grouped_by_its_group(duckdb::LogicalAggregate const& aggregate)
 namespace {
 
 /// The distinct values of one CTE column, `[PROJECTION] <- AGGREGATE(GROUP BY ref.c) <- CTE_REF`,
-/// as DuckDB builds a delim join's duplicate-eliminated keys under `delim_join_as_cte`.
+/// as DuckDB builds a correlated subquery's distinct outer keys from its delim CTE.
 struct distinct_cte_column {
   TableIndex cte;
   duckdb::idx_t column;
@@ -300,15 +299,6 @@ bool flatten(LogicalOperator& op, flat_tree& tree, key_source* keys)
       if (join.join_type != duckdb::JoinType::INNER) { return add_opaque(op, tree); }
       return flatten(*op.children[0], tree, keys) && flatten(*op.children[1], tree, keys) &&
              add_conditions(join, tree);
-    }
-    case LogicalOperatorType::LOGICAL_DELIM_GET: {
-      auto const& delim_get = op.Cast<duckdb::LogicalDelimGet>();
-      if (!keys || !keys->delim_get) { return add_opaque(op, tree); }
-      if (keys->leaf || delim_get.chunk_types.size() != 1) { return false; }
-      auto const id = add_keys(tree, *keys, op);
-      tree.columns[ColumnBinding(delim_get.table_index, ProjectionIndex(0))] =
-        column(delim_get.chunk_types[0], canonical(id, 0));
-      return true;
     }
     default: return add_opaque(op, tree);
   }

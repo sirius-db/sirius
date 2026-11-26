@@ -4,6 +4,7 @@ target_sources(
           c_api/context.cpp
           c_api/error.cpp
           c_api/object_store_config.cpp
+          c_api/object_store_registry.cpp
           c_api/plan.cpp
           c_api/version.cpp
           config.cpp

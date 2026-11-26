@@ -1,5 +1,6 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include "c_api/error_internal.hpp"
+#include "c_api/handle_internal.hpp"
 #include "c_api/object_store_config_internal.hpp"
 #include "object_store_scope/validation.hpp"
 
@@ -13,6 +14,9 @@
 namespace {
 namespace scope = sirius::object_store_scope;
 using sirius::c_api::fail;
+using sirius::c_api::invoke_redacted;
+using sirius::c_api::release;
+using sirius::c_api::retain;
 
 // A selector is stored as given, so the public constants must be the core's.
 static_assert(SIRIUS_OBJECT_STORE_TRANSPORT_AUTO == scope::transport_auto);
@@ -20,32 +24,6 @@ static_assert(SIRIUS_OBJECT_STORE_TRANSPORT_HTTP == scope::transport_http);
 static_assert(SIRIUS_OBJECT_STORE_TRANSPORT_RDMA == scope::transport_rdma);
 static_assert(SIRIUS_OBJECT_STORE_SIGNING_PRESIGNED == scope::signing_presigned);
 static_assert(SIRIUS_OBJECT_STORE_SIGNING_HEADER == scope::signing_header);
-
-template <typename T>
-void retain(T* value) noexcept
-{
-  if (value) { value->references.fetch_add(1, std::memory_order_relaxed); }
-}
-template <typename T>
-void release(T* value) noexcept
-{
-  if (value && value->references.fetch_sub(1, std::memory_order_acq_rel) == 1) { delete value; }
-}
-
-// Unlike sirius::c_api::invoke, an exception's text never reaches the diagnostic, so a diagnostic
-// of this unit cannot carry a field's bytes.
-template <typename F>
-sirius_status guarded(sirius_error** error, F&& operation) noexcept
-{
-  if (error) { *error = nullptr; }
-  try {
-    return operation();
-  } catch (const std::bad_alloc&) {
-    return fail(SIRIUS_ALLOCATION_FAILURE, "Allocation failed", error);
-  } catch (...) {
-    return fail(SIRIUS_INTERNAL_ERROR, "Unexpected failure", error);
-  }
-}
 
 // A copy of `builder` with one field changed by `change`. `refusal` runs once the output slots
 // are cleared and before anything is copied; a text it returns refuses the argument.
@@ -57,7 +35,7 @@ sirius_status derive(const sirius_object_store_config_builder* builder,
                      Change&& change) noexcept
 {
   if (out) { *out = nullptr; }
-  return guarded(error, [&] {
+  return invoke_redacted(error, [&] {
     if (!builder || !out) {
       return fail(SIRIUS_INVALID_ARGUMENT, "Builder or output pointer is NULL", error);
     }
@@ -116,6 +94,7 @@ bool refuses_build(scope::reason why) noexcept
     case reason::prefix_shape:
     case reason::prefix_no_trailing_slash:
     case reason::prefix_query_or_fragment:
+    case reason::prefix_bucket:
     case reason::prefix_unmatchable_segment:
     case reason::transport_unavailable: return false;
   }
@@ -145,7 +124,7 @@ sirius_status sirius_object_store_config_builder_create(sirius_object_store_conf
                                                         sirius_error** error) noexcept
 {
   if (out) { *out = nullptr; }
-  return guarded(error, [&] {
+  return invoke_redacted(error, [&] {
     if (!out) { return fail(SIRIUS_INVALID_ARGUMENT, "out_builder is NULL", error); }
     *out = new sirius_object_store_config_builder{};
     return sirius_status{SIRIUS_SUCCESS};
@@ -251,7 +230,7 @@ sirius_status sirius_object_store_config_builder_build(
   sirius_error** error) noexcept
 {
   if (out) { *out = nullptr; }
-  return guarded(error, [&] {
+  return invoke_redacted(error, [&] {
     if (!builder || !out) {
       return fail(SIRIUS_INVALID_ARGUMENT, "Builder or output pointer is NULL", error);
     }

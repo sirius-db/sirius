@@ -249,6 +249,56 @@ TEST_CASE("scan column roles are resolved from the planner projection boundary",
     auto const shared = build({duckdb::ColumnIndex(0)}, {0, 0}, 1);
     CHECK((shared.columns.data_roles == std::vector<role>{role::OUTPUT}));
   }
+  SECTION("delete keys are read, never emitted, and are not filter-only")
+  {
+    auto const with_keys = [&](duckdb::vector<duckdb::ColumnIndex> ids,
+                               duckdb::vector<duckdb::idx_t> projections,
+                               std::size_t output_count,
+                               std::vector<std::size_t> keys) {
+      return scan::build_scan_plan(
+        ids, projections, names, types, output_count, {}, {}, false, keys);
+    };
+    // One output, one filter column, one key appended behind them.
+    auto const plan = with_keys(
+      {duckdb::ColumnIndex(0), duckdb::ColumnIndex(2), duckdb::ColumnIndex(3)}, {0, 1, 2}, 1, {3});
+    CHECK((plan.columns.data_roles ==
+           std::vector<role>{role::OUTPUT, role::FILTER_ONLY, role::DELETE_KEY}));
+    CHECK((plan.filter_only_batch_positions() == std::unordered_set<std::size_t>{1}));
+    CHECK((plan.delete_key_batch_positions() == std::unordered_set<std::size_t>{2}));
+    CHECK((plan.non_output_batch_positions() == std::unordered_set<std::size_t>{1, 2}));
+    CHECK((plan.columns.output_data_positions == std::vector<std::size_t>{0}));
+    CHECK(plan.output_layout.size() == 1);
+    CHECK(scan::needs_output_assembly(plan));
+
+    // A key that is also filtered on keeps its values: DELETE_KEY wins over FILTER_ONLY.
+    auto const filtered_key =
+      with_keys({duckdb::ColumnIndex(0), duckdb::ColumnIndex(2)}, {0, 1}, 1, {2});
+    CHECK((filtered_key.columns.data_roles == std::vector<role>{role::OUTPUT, role::DELETE_KEY}));
+    CHECK(filtered_key.filter_only_batch_positions().empty());
+
+    // A key the query outputs is an ordinary output.
+    auto const output_key =
+      with_keys({duckdb::ColumnIndex(0), duckdb::ColumnIndex(2)}, {0, 1}, 2, {2});
+    CHECK((output_key.columns.data_roles == std::vector<role>{role::OUTPUT, role::OUTPUT}));
+    CHECK(output_key.delete_key_batch_positions().empty());
+
+    // count(*): no output column, the key is the only data column and no carrier is added.
+    auto const counted =
+      with_keys({duckdb::ColumnIndex(duckdb::COLUMN_IDENTIFIER_ROW_ID), duckdb::ColumnIndex(2)},
+                {0, 1},
+                1,
+                {2});
+    CHECK((counted.columns.data_roles == std::vector<role>{role::DELETE_KEY}));
+    CHECK(counted.output_layout.empty());
+    CHECK_FALSE(counted.carrier_batch_index);
+    CHECK_FALSE(scan::needs_output_assembly(counted));
+
+    // Without keys the same inputs give the roles they always gave.
+    auto const unchanged = with_keys(
+      {duckdb::ColumnIndex(0), duckdb::ColumnIndex(2), duckdb::ColumnIndex(3)}, {0, 1, 2}, 1, {});
+    CHECK((unchanged.columns.data_roles ==
+           std::vector<role>{role::OUTPUT, role::FILTER_ONLY, role::FILTER_ONLY}));
+  }
   SECTION("duplicate outputs share a slot")
   {
     auto const plan = build({duckdb::ColumnIndex(0)}, {0, 0}, 2);

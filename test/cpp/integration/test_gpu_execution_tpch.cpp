@@ -4405,7 +4405,7 @@ TPCH_TEST_CASES(compare_gpu_vs_cpu_for_without_warnings,
                 "gpu_execution - TPC-H Query 20 parquet",
                 "[integration][gpu_execution][parquet][TPC-H][Q20]",
                 sirius::test::kTpchQ20,
-                {"RIGHT_DELIM_JOIN", "output batch"})
+                {"output batch"})
 
 TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
                 GPUExecutionDuckDBFixture,

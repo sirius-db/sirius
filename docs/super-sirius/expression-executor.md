@@ -122,7 +122,7 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 | `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, `concat`, etc.) and arithmetic (`a + b`, `-x`) — `sirius::function_id` enum |
 | `aggregate` | `sirius::ast::aggregate` | Aggregate function (`SUM`, `COUNT`, etc.) — `sirius::aggregate_id` enum |
 
-**Translation boundary:** `sirius::ast::from_duckdb(expr)` produces a `sirius::ast::node` from a `duckdb::Expression`. This happens once at plan time in the plan builders (and at the scan boundary for pushdown filters); the resulting node is owned by the operator and never re-translated.
+**Translation boundary:** `sirius::ast::from_duckdb(expr)` produces a `sirius::ast::node` from a `duckdb::Expression`. This happens once at plan time in the plan builders (and at the scan boundary for pushdown filters); the resulting node is owned by the operator and never re-translated. A cast between equal DuckDB types that DuckDB bound to a no-op, and that no other rule declines, translates to its child: DuckDB can wrap a literal argument in one (for example a `LIKE` pattern), which the evaluator must still see as a constant.
 
 **Key files:**
 
@@ -329,17 +329,22 @@ The current contract matches DuckDB: signed epoch ticks reserve exactly `+MAX` a
 normalize their temporal values to this representation before using these helpers;
 the helpers do not depend on DuckDB types or a frontend identity.
 
-`cast_to_microseconds_checked()` converts second, millisecond, and nanosecond
-columns to microseconds. It checks finite values before multiplying, preserves
-infinity, and truncates nanoseconds toward zero. Overflow raises
-`sirius::invalid_input_exception`; reading the overflow result synchronizes the
-supplied stream. The cast evaluator dispatches to this helper for semantic casts.
+`cast_timestamp_checked()` converts a timestamp column to every finer precision
+(seconds to milliseconds, microseconds, or nanoseconds; milliseconds to
+microseconds or nanoseconds; microseconds to nanoseconds) and nanoseconds to
+microseconds. It checks finite values before multiplying, preserves infinity, and
+rounds nanoseconds to the nearest microsecond with ties away from the epoch.
+Overflow raises `sirius::invalid_input_exception`; reading the overflow result
+synchronizes the supplied stream. `has_checked_timestamp_cast()` names the casts it
+implements, and the cast evaluator dispatches to this helper for semantic casts
+among them. The other casts to a coarser precision use `cudf::cast`, which
+neither applies DuckDB's rounding nor preserves infinity.
 
 `finite_mask()` returns a nullable boolean column for DATE or any timestamp
 precision. Both checked conversion and millisecond/microsecond extraction use it,
 so sentinel handling has one implementation. The evaluator boundary regressions
-are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
-tagged `[timestamp_extraction]`.
+are tagged `[timestamp_bounds]`; SQL comparisons against DuckDB are tagged
+`[timestamp_extraction]` for extraction and `[timestamp_cast]` for precision casts.
 
 ### HUGEINT
 
@@ -359,8 +364,9 @@ The helper uses a libcudf JIT transform with public CCCL overflow helpers and er
 collection; DATE inputs are bitcast to day counts without copying. Scalar operands
 use one-row columns broadcast by `cudf::scalar_column_view`, with the output row
 count passed explicitly so scalar-only and empty inputs retain the input shape.
-Offsets preserve NULLs and infinity and reject finite overflow or infinity-sentinel
-collisions. Date differences widen both day counts before subtraction and return
+Offsets preserve NULLs and infinity and reject finite overflow, infinity-sentinel
+collisions, and day counts below -infinity (`INT32_MIN`) as input or result, like
+DuckDB. Date differences widen both day counts before subtraction and return
 BIGINT. These operations materialize under every evaluator strategy; standalone
 cuDF AST translation declines them because it cannot implement the checks.
 The existing reference evaluator restores compressed operands before execution.
@@ -374,10 +380,12 @@ Tests are tagged `[decimal_integer_cast]`.
 
 ### Division and modulo
 
-`//` and `%` check valid operand pairs for zero divisors and signed-minimum/-1 overflow before
-calling cuDF. Both operators raise for the latter pair in the pinned DuckDB version. NULLs in
-either operand suppress the check for that row. A detected exceptional pair triggers CPU replay,
-which preserves DuckDB's `error_on_division_by_zero` setting. A guarded
+`//` and `%` check valid operand pairs for zero divisors and signed-minimum/-1 pairs before
+calling cuDF. NULLs in either operand suppress the check for that row. A zero divisor triggers CPU
+replay, which preserves DuckDB's `error_on_division_by_zero` setting. So does a signed-minimum/-1
+pair under `//`, whose quotient overflows and raises in DuckDB. Its remainder is 0, so `%` stays on
+the GPU and matches DuckDB: when such a pair occurs without a zero divisor, the kernel divides by 1
+wherever the divisor is -1, which leaves every remainder unchanged. A guarded
 `CASE WHEN b = 0 THEN NULL ELSE a // b END` stays on the GPU: the division is retried on the rows
 that ELSE selects (see [Conditional evaluation](#conditional-evaluation-and-row-dependent-errors)).
 With fallback disabled, the GPU reports the unsupported exceptional pair without executing it.
@@ -412,8 +420,13 @@ from the operand's, stay on the CPU. `negate` is an AST breaker. Tests are tagge
 `round_floating_point` (`src/cuda/sirius_round_floating_point.cu`), one elementwise kernel that
 reproduces DuckDB's `RoundOperatorPrecision`: the value is rounded in double precision as
 `round(x * 10^n) / 10^n`, or `round(x / 10^-n) * 10^-n` for negative `n`, with ties away from
-zero. A non-finite result yields the input for `n >= 0` and 0 for `n < 0`. The output is bit
-identical to DuckDB. The precision must be a constant INTEGER.
+zero. For `n` from 1 to 22 the product `x * 10^n` can round onto a midpoint that `x` itself is not
+on: `2.675 * 100` is `267.5` while the stored `2.675` is just below it. The kernel then takes the
+product's rounding error from `fma(x, 10^n, -product)` and rounds to the side the exact product
+lies on, so `round(2.675::DOUBLE, 2)` is `2.67`; a zero error is a true tie and rounds away from
+zero. The product is computed with `__dmul_rn` so that nvcc cannot contract it into a fused
+multiply-add. A non-finite result yields the input; a negative `n` whose `10^-n` overflows rounds
+finite values to 0. The output is bit identical to DuckDB. The precision must be a constant INTEGER.
 DECIMAL and integer inputs and a column precision fall back to the CPU at plan time.
 
 ### Absolute value

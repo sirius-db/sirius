@@ -5,7 +5,9 @@ here until it can move to `sirius-db/sirius-duckdb`. Its Makefile uses DuckDB's
 normal extension build infrastructure.
 
 Use matching DuckDB revisions and compatible C++ toolchains for Sirius and the
-wrapper. The engine and wrapper gitlinks record the supported revision.
+wrapper. The engine and wrapper gitlinks record the supported revision. The
+wrapper refuses a Sirius package built from another DuckDB commit; static builds
+compile Sirius against the wrapper's checkout, `sirius-duckdb/duckdb`.
 
 ## Shared development build
 
@@ -52,7 +54,7 @@ Hosts that statically link their C++ runtime must export its exception-handling
 symbols. The supplied DuckDB build enables this with `EXPORT_DYNAMIC_SYMBOLS=ON`.
 
 ```sh
-git submodule update --init duckdb substrait cucascade sirius-duckdb/vcpkg sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
+git submodule update --init substrait cucascade sirius-duckdb/vcpkg sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run -e vcpkg make -C sirius-duckdb release \
   SIRIUS_DUCKDB_LINKAGE=static \
   VCPKG_TOOLCHAIN_PATH="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake"
@@ -70,7 +72,7 @@ The static port hashes source contents and filenames, including the engine's
 submodules and untracked, nonignored source files, so source edits invalidate
 Sirius's package without invalidating third-party dependency caches.
 Distribution CI uses the same port, with
-`configure_ci` initializing the engine's submodules.
+`configure_ci` initializing the engine's other submodules.
 
 For shared builds, first build/install Sirius with the root Makefile or CMake,
 then pass its prefix as `SIRIUS_INSTALL_DIR` (or use CMake's normal package search
@@ -85,9 +87,10 @@ Run the wrapper's SQL tests from the root:
 pixi run make -C sirius-duckdb test_release
 ```
 
-## CUDA-selecting core extensions
+## CUDA-selecting loader
 
-The core-extension layout has three artifacts:
+Sirius ships as three artifacts: the core `sirius` loader and two community
+backends.
 
 - `sirius`: a CUDA-free loader built from `loader/`, with no Sirius package or CUDA toolkit dependency.
 - `sirius_cuda12`: the backend built with CUDA 12.
@@ -135,10 +138,13 @@ into a silent CPU fallback.
 | `gpu_execution` | Transparent GPU execution is active for this session; `false` under `SIRIUS_DISABLE` |
 | `fallback_reason` | Why GPU execution is unavailable; `NULL` once the backend loaded |
 
-This layout is for DuckDB core distribution: the loader follows DuckDB's
-autoload policy, trusting core signatures and using DuckDB's configured
-auto-install repository, not the repository it came from. Community signatures
-are not supported.
+The loader `sirius` is a core extension; the backends `sirius_cuda12` and
+`sirius_cuda13` are community extensions. The loader installs a backend from
+DuckDB's configured auto-install repository, not the repository the loader came
+from. If that is DuckDB's default core repository, the loader uses the community
+repository instead; other repositories, such as mirrors and local test
+repositories, are used as configured. Loading a community backend requires
+`allow_community_extensions`, which is on by default.
 
 These are Linux glibc amd64/arm64 SBSA builds; Jetson/Tegra is not supported.
 The loader does not detect or reject unsupported GPU architectures.
@@ -223,7 +229,7 @@ cp sirius-duckdb/build/release/src/libduckdb_static.a \
   sirius-duckdb/build/release/src/main/extension/libduckdb_loadable_extensions.a \
   sirius-duckdb/build/release/src/main/http/libduckdb_httplib.a "$prebuilt/"
 pixi run cmake -S sirius-duckdb/duckdb -B build/loader -G Ninja \
-  -DDUCKDB_EXPLICIT_VERSION=v2.0.0 \
+  -DDUCKDB_EXPLICIT_VERSION=v2.0.1 \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=ON -DBUILD_SHELL=OFF \
   -DEXTENSION_STATIC_BUILD=ON -DDUCKDB_LINKER=bfd \
   -DPREBUILT_BINARY="$prebuilt/libduckdb_static.a" \
@@ -239,7 +245,7 @@ pixi run python sirius-duckdb/loader/test/test_loader.py \
 They expect no driver; on a GPU machine, hide it with the test fixture:
 
 ```sh
-repository="$PWD/build/loader/repository/v2.0.0/$(cat build/loader/duckdb_platform_out)"
+repository="$PWD/build/loader/repository/v2.0.1/$(cat build/loader/duckdb_platform_out)"
 mkdir -p "$repository"
 cp build/loader/extension/sirius/sirius.duckdb_extension "$repository/"
 LOCAL_EXTENSION_REPO="$PWD/build/loader/repository" \

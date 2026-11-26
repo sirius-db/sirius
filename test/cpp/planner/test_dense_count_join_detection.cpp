@@ -784,74 +784,31 @@ TEST_CASE_METHOD(dense_count_join_fixture,
                  "dense_count_join declines bespoke-wired input roots",
                  "[dense_count_join][plan]")
 {
-  // Keep the correlated join whose input wiring this test exercises.
-  sirius::test::scoped_sirius_setting retain_delim{*con, "delim_join_as_cte", false};
   using T = sirius::op::SiriusPhysicalOperatorType;
 
-  SECTION("materialized CTE reference")
-  {
-    auto const query =
-      "WITH t AS MATERIALIZED (SELECT o_cust, o_id FROM ord) "
-      "SELECT c_id, count(t.o_id) FROM cust LEFT JOIN t ON c_id = t.o_cust GROUP BY c_id";
-    CHECK_FALSE(has_dense_count_join(query));
-    auto plan = generate_sirius_plan(*con, query);
-    REQUIRE(plan);
-    CHECK(collect(plan.get(), T::CTE).size() == 1);
-  }
-
-  // Correlated subqueries whose delim join survives the optimizer's deliminator (the correlated
-  // column reaches a non-equality predicate or an aggregate argument) and roots the join input.
-  auto const require_delim_root_declined = [&](std::string const& query) {
-    CHECK_FALSE(has_dense_count_join(query));
-    auto plan = generate_sirius_plan(*con, query);
-    REQUIRE(plan);
-    CHECK(collect(plan.get(), T::LEFT_DELIM_JOIN).size() +
-            collect(plan.get(), T::RIGHT_DELIM_JOIN).size() ==
-          1);
-  };
-
-  SECTION("semi delim join from a correlated EXISTS")
-  {
-    require_delim_root_declined(
-      "SELECT c_id, count(t.o_id) FROM cust LEFT JOIN ("
-      "  SELECT o_id, o_cust FROM ord o"
-      "  WHERE EXISTS (SELECT 1 FROM ord o2 WHERE o2.o_cust = o.o_cust AND o2.o_id > o.o_id)"
-      ") t ON c_id = t.o_cust GROUP BY c_id");
-  }
-
-  SECTION("single delim join from a correlated scalar subquery")
-  {
-    require_delim_root_declined(
-      "SELECT c_id, count(t.a) FROM cust LEFT JOIN ("
-      "  SELECT o_cust, (SELECT sum(o2.o_id - o.o_id) FROM ord o2 WHERE o2.o_cust = o.o_cust) AS a"
-      "  FROM ord o"
-      ") t ON c_id = t.o_cust GROUP BY c_id");
-  }
+  // A materialized CTE reference.
+  auto const query =
+    "WITH t AS MATERIALIZED (SELECT o_cust, o_id FROM ord) "
+    "SELECT c_id, count(t.o_id) FROM cust LEFT JOIN t ON c_id = t.o_cust GROUP BY c_id";
+  CHECK_FALSE(has_dense_count_join(query));
+  auto plan = generate_sirius_plan(*con, query);
+  REQUIRE(plan);
+  CHECK(collect(plan.get(), T::CTE).size() == 1);
 }
 
 TEST_CASE_METHOD(dense_count_join_fixture,
                  "dense_count_join declines correlated producers at any depth of an input",
                  "[dense_count_join][plan]")
 {
-  // Keep the correlated join whose input wiring this test exercises.
-  auto const as_cte = GENERATE(false, true);
-  CAPTURE(as_cte);
-  sirius::test::scoped_sirius_setting representation{*con, "delim_join_as_cte", as_cte};
   using T = sirius::op::SiriusPhysicalOperatorType;
 
-  // A correlated EXISTS compared as a value keeps a MARK delim join below the input's root. These
-  // plans contain hash joins, so the fused operator's absence is checked directly.
+  // A correlated EXISTS compared as a value keeps a MARK join and its delim CTE below the input's
+  // root. These plans contain hash joins, so the fused operator's absence is checked directly.
   auto const require_declined = [&](std::string const& query) {
     auto plan = generate_sirius_plan(*con, query);
     REQUIRE(plan);
     CHECK(collect(plan.get(), T::DENSE_COUNT_JOIN).empty());
-    if (as_cte) {
-      CHECK_FALSE(collect(plan.get(), T::CTE).empty());
-    } else {
-      CHECK(collect(plan.get(), T::LEFT_DELIM_JOIN).size() +
-              collect(plan.get(), T::RIGHT_DELIM_JOIN).size() ==
-            1);
-    }
+    CHECK_FALSE(collect(plan.get(), T::CTE).empty());
   };
 
   SECTION("below a FILTER root")

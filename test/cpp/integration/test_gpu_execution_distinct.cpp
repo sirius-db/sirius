@@ -521,9 +521,9 @@ TEST_CASE_METHOD(DistinctFixture,
       "s");
   }
 
-  // A second correlated predicate keeps the delim join, so the DISTINCT reads a join against the
-  // DELIM_GET.
-  SECTION("delim join")
+  // A second correlated predicate that is not an equality: the subquery cannot be computed for
+  // every key, so the DISTINCT reads a join against the outer rows' keys.
+  SECTION("two correlated predicates")
   {
     compare_gpu_vs_cpu(
       "SELECT r.a, r.x, s.b FROM dist_r r, "

@@ -18,8 +18,7 @@
  * @file test_plan_tree_shape.cpp
  * @brief Invariants of the physical plan tree after `create_plan` runs
  *        `insert_gpu_pipeline_operators` + `set_parent_ops`: scan leaves are replaced by
- *        GPU_SCAN, joins/aggregates/sorts carry their CONCAT/PARTITION/MERGE wrap chains,
- *        DELIM JOIN internal subtrees (`join`/`distinct_root`) are rewritten and tagged, and
+ *        GPU_SCAN, joins/aggregates/sorts carry their CONCAT/PARTITION/MERGE wrap chains, and
  *        every operator's `_parent_op` matches its position in the final tree.
  */
 
@@ -40,7 +39,6 @@
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -159,8 +157,8 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
 
   auto original_disabled = DBConfig::GetConfig(context).options.disabled_optimizers;
   auto& disabled         = DBConfig::GetConfig(context).options.disabled_optimizers;
-  // Keep STATISTICS_PROPAGATION disabled only for this shape-sensitive suite:
-  // disabling it lets the deliminator retain the DELIM_JOINs asserted below.
+  // STATISTICS_PROPAGATION is disabled only for this shape-sensitive suite: on these toy tables it
+  // changes plans asserted below (the SIP and shared-CTE cases lose their dynamic-filter wiring).
   disabled.insert(OptimizerType::IN_CLAUSE);
   disabled.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
   disabled.insert(OptimizerType::STATISTICS_PROPAGATION);
@@ -218,8 +216,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
   return result;
 }
 
-/// Visit every operator in the tree, including DELIM JOIN internal `join`/`distinct_root`
-/// subtrees (owned outside `children[]`).
+/// Visit every operator in the tree.
 template <typename Fn>
 void for_each_operator(sirius_physical_operator* root, const Fn& fn)
 {
@@ -227,12 +224,6 @@ void for_each_operator(sirius_physical_operator* root, const Fn& fn)
   fn(root);
   for (auto& child : root->children) {
     for_each_operator(child.get(), fn);
-  }
-  if (root->type == SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-      root->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto& delim = root->Cast<sirius::op::sirius_physical_delim_join>();
-    for_each_operator(delim.join.get(), fn);
-    for_each_operator(delim.distinct_root.get(), fn);
   }
 }
 
@@ -262,7 +253,7 @@ bool contains(sirius_physical_operator* root, const sirius_physical_operator* ta
   return found;
 }
 
-/// Render the tree (including delim-join internals) for failure diagnostics.
+/// Render the tree for failure diagnostics.
 void tree_to_string(sirius_physical_operator* root, int depth, std::ostringstream& out)
 {
   if (!root) { return; }
@@ -270,14 +261,6 @@ void tree_to_string(sirius_physical_operator* root, int depth, std::ostringstrea
       << sirius::op::SiriusPhysicalOperatorToString(root->type) << "\n";
   for (auto& child : root->children) {
     tree_to_string(child.get(), depth + 1, out);
-  }
-  if (root->type == SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-      root->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto& delim = root->Cast<sirius::op::sirius_physical_delim_join>();
-    out << std::string(static_cast<size_t>(depth + 1) * 2, ' ') << "(join)\n";
-    tree_to_string(delim.join.get(), depth + 2, out);
-    out << std::string(static_cast<size_t>(depth + 1) * 2, ' ') << "(distinct_root)\n";
-    tree_to_string(delim.distinct_root.get(), depth + 2, out);
   }
 }
 
@@ -302,8 +285,7 @@ duckdb::unique_ptr<duckdb::Expression> untranslatable_table_filter_expression()
   return expression;
 }
 
-/// Every operator's `_parent_op` must equal its position in the final tree; delim joins
-/// stamp their internal `join`/`distinct_root` subtrees with themselves as parent. A CTE's consumer
+/// Every operator's `_parent_op` must equal its position in the final tree. A CTE's consumer
 /// child (`children[1]`) inherits the CTE's parent because that child produces the CTE's output.
 void require_parent_links(sirius_physical_operator* op, sirius_physical_operator* expected_parent)
 {
@@ -318,12 +300,6 @@ void require_parent_links(sirius_physical_operator* op, sirius_physical_operator
   }
   for (auto& child : op->children) {
     require_parent_links(child.get(), op);
-  }
-  if (op->type == SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-      op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto& delim = op->Cast<sirius::op::sirius_physical_delim_join>();
-    if (delim.join) { require_parent_links(delim.join.get(), op); }
-    if (delim.distinct_root) { require_parent_links(delim.distinct_root.get(), op); }
   }
 }
 
@@ -346,36 +322,6 @@ sirius_physical_operator* require_join_child_wrap(sirius_physical_operator* op,
 
   REQUIRE(partition->children.size() == 1);
   return partition->children[0].get();
-}
-
-/// Assert the delim-join invariants shared by both variants: the distinct chain is
-/// `MERGE_GROUP_BY -> PARTITION -> HASH_GROUP_BY` with the chain top tagged as owned by the
-/// delim join and `distinct` borrowing the chain bottom, and the internal join carries the
-/// standard CONCAT/PARTITION wrap on both children.
-void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
-{
-  REQUIRE(delim.distinct_root);
-  auto* merge = delim.distinct_root.get();
-  REQUIRE(merge->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
-  CHECK(merge->owning_delim_join() == &delim);
-
-  REQUIRE(merge->children.size() == 1);
-  auto* partition = merge->children[0].get();
-  REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-  CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
-
-  REQUIRE(partition->children.size() == 1);
-  auto* hgb = partition->children[0].get();
-  REQUIRE(hgb->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
-
-  // `distinct` always borrows the subtree bottom (the bare DISTINCT).
-  REQUIRE(delim.distinct != nullptr);
-  CHECK(static_cast<sirius_physical_operator*>(delim.distinct) == hgb);
-
-  REQUIRE(delim.join);
-  REQUIRE(delim.join->children.size() == 2);
-  require_join_child_wrap(delim.join->children[0].get(), delim.join.get(), /*is_build=*/false);
-  require_join_child_wrap(delim.join->children[1].get(), delim.join.get(), /*is_build=*/true);
 }
 
 /// The chain every DISTINCT shape without a carried column shares: one HASH_GROUP_BY with an empty
@@ -436,8 +382,6 @@ struct plan_tree_shape_fixture {
                "minimal.yaml";
     db  = sirius::test::open_sirius_db(_db_path.path().c_str(), cfg);
     con = std::make_unique<Connection>(*db);
-    // This suite checks the explicit DELIM_JOIN operator's wiring.
-    REQUIRE_FALSE(con->Query("SET delim_join_as_cte=false")->HasError());
 
     // big_left is larger so the optimizer keeps small_right as the build side.
     con->Query("CREATE TABLE big_left (id INTEGER, val INTEGER)");
@@ -453,11 +397,9 @@ struct plan_tree_shape_fixture {
     con->Query("CREATE TABLE small_c (ckey INTEGER, cother INTEGER)");
     con->Query("INSERT INTO small_c VALUES (0, 0), (1, 1)");
 
-    // parts/items reproduce TPC-H q17's RIGHT_DELIM_JOIN: the filter on the correlated
-    // table keeps the deliminator from rewriting the correlated aggregate into a plain
-    // join + group-by, and the items-side fan-out (20 rows per fk) plus the cardinality
-    // skew make the physical planner pick the RIGHT variant (tiny symmetric tables get
-    // a LEFT_DELIM_JOIN instead).
+    // parts/items carry TPC-H q17's shape: a correlated aggregate over the fact side of a
+    // filtered join, with 20 items per part. The filter on the outer rows keeps DuckDB's delim
+    // CTE in the plan.
     con->Query("CREATE TABLE parts (pk INTEGER, pname VARCHAR)");
     con->Query("INSERT INTO parts SELECT range, concat('p', range % 3) FROM range(500)");
     con->Query("CREATE TABLE items (fk INTEGER, qty INTEGER)");
@@ -988,68 +930,12 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
   }
-
-  // This reproduces q17's delim shape: the correlated side builds from a DELIM_GET and wires only
-  // through opaque-build evidence, while the flat side wires an ordinary scan-route endpoint.
-  const std::string delim_query =
-    "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
-    "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)";
-
-  SECTION("delim-scan build, filter on: the scan route binds inside the delim internals")
-  {
-    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
-    auto plan = generate_sirius_plan(*con, delim_query);
-    INFO(tree_to_string(plan.get()));
-
-    auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
-    REQUIRE(node != nullptr);
-    auto& delim = node->Cast<sirius::op::sirius_physical_right_delim_join>();
-
-    auto endpoints = collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
-    REQUIRE(endpoints.size() == 2);
-    auto const inside =
-      std::count_if(endpoints.begin(), endpoints.end(), [&](sirius_physical_operator* endpoint) {
-        return contains(delim.join.get(), endpoint);
-      });
-    CHECK(inside == 1);
-    for (auto* endpoint : endpoints) {
-      REQUIRE(endpoint->children.size() == 1);
-      CHECK(endpoint->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
-    }
-
-    std::vector<sirius::op::sirius_physical_hash_join*> armed_internal_joins;
-    for (auto* join_node : collect(delim.join.get(), SiriusPhysicalOperatorType::HASH_JOIN)) {
-      auto& internal_join = join_node->Cast<sirius::op::sirius_physical_hash_join>();
-      if (!internal_join.dynamic_filter_plan().probe_targets().empty()) {
-        armed_internal_joins.push_back(&internal_join);
-      }
-    }
-    REQUIRE(armed_internal_joins.size() == 1);
-    auto const& internal_targets =
-      armed_internal_joins.front()->dynamic_filter_plan().probe_targets();
-    REQUIRE(internal_targets.size() == 1);
-    CHECK(internal_targets[0].route_class == sirius::op::dynamic_filter_route_class::scan);
-    CHECK(internal_targets[0].accepts_zone_map_filters);
-
-    require_parent_links(plan.get(), /*expected_parent=*/nullptr);
-  }
-
-  SECTION("delim-scan build, filter off: no endpoint anywhere")
-  {
-    dynamic_filter_switch_guard switch_off(*con, /*enabled=*/false);
-    auto plan = generate_sirius_plan(*con, delim_query);
-    INFO(tree_to_string(plan.get()));
-
-    REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) != nullptr);
-    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
-  }
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - native CTE deduplication preserves build-filter evidence",
                  "[plan_tree_shape][isolated_context][dynamic_filter][cte_dedup]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   bool const enable_filter = GENERATE(false, true);
   // A per-connection SET: plans read the connection's operator-options snapshot, so writing the
   // shared config (dynamic_filter_switch_guard) no longer turns the filter off.
@@ -1061,8 +947,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   INFO(tree_to_string(plan.get()));
 
   REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
-  REQUIRE(collect(plan.get(), SiriusPhysicalOperatorType::LEFT_DELIM_JOIN).empty());
-  REQUIRE(collect(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN).empty());
 
   auto skip_projections = [](sirius_physical_operator* op) {
     while (op->type == SiriusPhysicalOperatorType::PROJECTION) {
@@ -1113,7 +997,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - an IN subquery under a delim CTE plans as a SEMI join",
                  "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   // TPC-H Q20 shape: an IN predicate inside the body of a correlated subquery's delim CTE.
   std::string logical_plan;
   auto plan = generate_sirius_plan(
@@ -1140,7 +1023,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - a NOT EXISTS subquery under a delim CTE plans as an ANTI join",
                  "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   // A NOT EXISTS predicate (null-safe keys) inside the body of a correlated subquery's delim CTE.
   std::string logical_plan;
   auto plan = generate_sirius_plan(
@@ -1172,7 +1054,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - an EXISTS under a delim CTE builds on its small outer side",
                  "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   bool const enable_filter = GENERATE(true, false);
   INFO("dynamic filters: " << enable_filter);
   sirius::test::scoped_sirius_setting filter_switch(*con, "enable_dynamic_filter", enable_filter);
@@ -1228,7 +1109,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - a join above a proven delim CTE filters the scans in its body",
                  "[plan_tree_shape][isolated_context][dynamic_filter][cte_body]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
   auto const with_proofs = GENERATE(true, false);
   INFO("with proofs: " << with_proofs);
@@ -1295,7 +1175,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - MARK joins DuckDB keeps are not converted under a delim CTE",
                  "[plan_tree_shape][isolated_context][mark_conversion]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   // Each query has a MARK join whose mark is not a bare filter: it is projected, sits inside an
   // OR, or is negated over keys that are not null-safe (NOT IN, <> ALL).
   auto const sql =
@@ -1408,7 +1287,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "mark conversion - a positional consumer of the mark filter keeps the join MARK",
                  "[plan_tree_shape][isolated_context][mark_conversion]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   auto const shape = GENERATE(as<std::string>{},
                               "projection above",
                               "identity projection map",
@@ -1456,7 +1334,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "mark conversion - a converted join builds on a small filtered outer side",
                  "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   auto const shape = GENERATE(as<std::string>{},
                               "SEMI",
                               "ANTI",
@@ -1703,7 +1580,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "delim CTE proof - on native tables it matches DuckDB's own filter dependency",
                  "[plan_tree_shape][isolated_context][delim_cte_proof]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   create_domain_filter_tables(*con);
   auto const sql = GENERATE(from_range(native_delim_cte_queries()));
   INFO(sql);
@@ -1732,7 +1608,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "delim CTE proof - Parquet scans are proven although DuckDB records nothing",
                  "[plan_tree_shape][isolated_context][delim_cte_proof]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   scoped_file_removal const parquet{_db_path.path() + ".items.parquet"};
   REQUIRE_FALSE(con->Query("COPY items TO '" + parquet.path + "' (FORMAT parquet)")->HasError());
   auto plan = bind_unoptimized(*con,
@@ -1769,7 +1644,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "delim CTE proof - user CTEs named like DuckDB's delim CTEs are not proven",
                  "[plan_tree_shape][isolated_context][delim_cte_proof]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   REQUIRE_FALSE(con
                   ->Query("CREATE TABLE t1 AS SELECT (i % 1000)::INTEGER AS b, i::INTEGER AS x "
                           "FROM range(20000) t(i)")
@@ -1799,7 +1673,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "delim CTE proof - a delim CTE named off its own table index is not proven",
                  "[plan_tree_shape][isolated_context][delim_cte_proof]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   create_domain_filter_tables(*con);
   bool const rename_dedup = GENERATE(false, true);
   INFO((rename_dedup ? "dedup CTE renamed" : "delim CTE renamed"));
@@ -1819,7 +1692,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "delim CTE proof - DuckDB gets back exactly its own filter dependency",
                  "[plan_tree_shape][isolated_context][delim_cte_proof]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   create_domain_filter_tables(*con);
   auto const sql = GENERATE(from_range(native_delim_cte_queries()));
   INFO(sql);
@@ -1862,7 +1734,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "delim CTE proof - DuckDB's pushes into delim CTEs survive loading Sirius",
                  "[plan_tree_shape][isolated_context][delim_cte_proof]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   create_domain_filter_tables(*con);
   auto const gpu_execution = GENERATE(true, false);
   INFO("gpu_execution: " << gpu_execution);
@@ -1887,7 +1758,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "delim CTE proof - a subquery DuckDB cannot restrict is not proven",
                  "[plan_tree_shape][isolated_context][delim_cte_proof]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   auto const sql = GENERATE(
     // A volatile expression in the subquery.
     std::string("SELECT p.pk FROM parts p WHERE p.pk IN (SELECT i.fk FROM items i WHERE i.qty > "
@@ -1916,7 +1786,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "delim CTE proof - the optimizer hooks' proofs mark the delim CTE's two reads",
                  "[plan_tree_shape][isolated_context][delim_cte_proof]")
 {
-  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   auto const with_proofs = GENERATE(true, false);
   INFO("with proofs: " << with_proofs);
   auto plan = generate_sirius_plan(
@@ -3432,78 +3301,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(probe == MemoryBarrierType::FULL);
     CHECK(build == MemoryBarrierType::FULL);
   }
-
-  SECTION("RIGHT_DELIM_JOIN: the inner join is sized from its build side")
-  {
-    auto plan = generate_sirius_plan(
-      *con,
-      "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
-      "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
-    INFO(tree_to_string(plan.get()));
-    auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
-    REQUIRE(node != nullptr);
-    auto& delim = node->Cast<sirius::op::sirius_physical_right_delim_join>();
-    REQUIRE(delim.join);
-    auto const [probe, build] = barriers(delim.join.get());
-    CHECK(probe == MemoryBarrierType::PARTIAL);
-    CHECK(build == MemoryBarrierType::FULL);
-  }
-}
-
-TEST_CASE_METHOD(plan_tree_shape_fixture,
-                 "plan tree shape - delim join internal subtrees are rewritten and tagged",
-                 "[plan_tree_shape][isolated_context]")
-{
-  SECTION("RIGHT_DELIM_JOIN: partition_join points at the build-side PARTITION")
-  {
-    // TPC-H q17 shape: correlated aggregate whose outer is a filtered join.
-    auto plan = generate_sirius_plan(
-      *con,
-      "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
-      "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
-    INFO(tree_to_string(plan.get()));
-
-    auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
-    REQUIRE(node != nullptr);
-    auto& delim = node->Cast<sirius::op::sirius_physical_right_delim_join>();
-    require_delim_join_common(delim);
-
-    // partition_join is the build-side PARTITION freshly planted by wrap_join.
-    auto* build_concat = delim.join->children[1].get();
-    REQUIRE(build_concat->type == SiriusPhysicalOperatorType::CONCAT);
-    REQUIRE(!build_concat->children.empty());
-    auto* build_partition = build_concat->children[0].get();
-    REQUIRE(build_partition->type == SiriusPhysicalOperatorType::PARTITION);
-    CHECK(static_cast<sirius_physical_operator*>(delim.partition_join) == build_partition);
-
-    // The build-side placeholder DUMMY_SCAN carries no runtime data and stays un-wrapped.
-    auto* dummy = find_first(delim.join.get(), SiriusPhysicalOperatorType::DUMMY_SCAN);
-    REQUIRE(dummy != nullptr);
-    CHECK(dummy->children.empty());
-  }
-
-  SECTION("LEFT_DELIM_JOIN: the cached chunk scan sits under the probe-side wrap")
-  {
-    // TPC-H q21 shape: the mixed-comparison EXISTS keeps the deliminator away and its
-    // semi-join decorrelation is a join type the GPU wrap chain supports (a `<` scalar
-    // correlation would decorrelate to a SINGLE join, which sirius_physical_concat
-    // rejects and production falls back to CPU for).
-    auto plan = generate_sirius_plan(
-      *con,
-      "SELECT l.id FROM big_left l "
-      "WHERE EXISTS (SELECT 1 FROM small_right r WHERE r.rid = l.id AND r.other < l.val)");
-    INFO(tree_to_string(plan.get()));
-
-    auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::LEFT_DELIM_JOIN);
-    REQUIRE(node != nullptr);
-    auto& delim = node->Cast<sirius::op::sirius_physical_left_delim_join>();
-    require_delim_join_common(delim);
-
-    // The cached chunk scan (filled at runtime by the delim join's fan-out) is buried under
-    // the internal join's probe-side CONCAT/PARTITION chain.
-    REQUIRE(delim.column_data_scan != nullptr);
-    CHECK(contains(delim.join->children[0].get(), delim.column_data_scan));
-  }
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
@@ -3513,12 +3310,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   const std::string queries[] = {
     "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid",
     "SELECT val, count(*) FROM big_left GROUP BY val ORDER BY val",
-    // RIGHT and LEFT delim joins: parent stamping must descend into the internal
-    // `join`/`distinct_root` subtrees.
-    "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
-    "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)",
-    "SELECT l.id FROM big_left l "
-    "WHERE EXISTS (SELECT 1 FROM small_right r WHERE r.rid = l.id AND r.other < l.val)",
   };
 
   for (const auto& query : queries) {
@@ -3527,8 +3318,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       auto plan = generate_sirius_plan(*con, query);
       INFO(tree_to_string(plan.get()));
 
-      // Root has no parent; every other operator's parent is its tree position, including
-      // the delim-join internal subtrees.
+      // Root has no parent; every other operator's parent is its tree position.
       require_parent_links(plan.get(), /*expected_parent=*/nullptr);
 
       // The sink contract PARTITION's build_pipelines relies on: its tree child terminates
@@ -3769,37 +3559,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
     CHECK(!partition->has_physical_overrides());
   }
-
-  SECTION("delim-distinct partitions stay sidecar-free")
-  {
-    // The propagation delim case restores `distinct_root` in place, so the distinct chain never
-    // carries a sidecar; the wrap must not invent one.
-    auto delim = duckdb::make_uniq<sirius::op::test_delim_join>(
-      SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
-      wrap_integer_types(1),
-      make_projection_leaf(1),
-      duckdb::vector<duckdb::const_reference<sirius_physical_operator>>{},
-      /*estimated_cardinality=*/1,
-      duckdb::optional_idx());
-    delim->distinct_root = make_wrap_grouped_aggregate(make_projection_leaf(2));
-    delim->children.push_back(make_projection_leaf(1));
-    duckdb::unique_ptr<sirius_physical_operator> plan = std::move(delim);
-
-    gen.insert_gpu_pipeline_operators(plan);
-
-    auto& delim_ref = plan->Cast<sirius::op::sirius_physical_delim_join>();
-    CHECK_FALSE(delim_ref.declared_output_schema_is_runtime_schema());
-    REQUIRE(delim_ref.distinct_root);
-    auto* merge = delim_ref.distinct_root.get();
-    REQUIRE(merge->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
-    CHECK(!merge->has_physical_overrides());
-    REQUIRE(merge->children.size() == 1);
-    auto* partition = merge->children[0].get();
-    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-    CHECK(!partition->has_physical_overrides());
-    REQUIRE(partition->children.size() == 1);
-    CHECK(partition->children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
-  }
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
@@ -3904,42 +3663,13 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
-                 "plan tree shape - admission scan walk reaches delim join subtrees",
-                 "[plan_tree_shape][gpu_admission][isolated_context]")
-{
-  // GPU admission sizes a query from its scans' estimated_cardinality, so a scan it cannot
-  // see is a scan whose bytes are not counted — under-estimating the query and admitting it
-  // onto too few GPUs. DELIM JOIN owns `join`/`distinct_root` outside `children[]`, so a walk
-  // over `children` alone misses everything inside them.
-  //
-  // Cross-check planner::collect_gpu_scans against this suite's independently written
-  // for_each_operator: the two descend the tree separately and must agree.
-  auto plan = generate_sirius_plan(
-    *con,
-    "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
-    "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
-  INFO(tree_to_string(plan.get()));
-
-  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) != nullptr);
-
-  auto const expected = collect(plan.get(), SiriusPhysicalOperatorType::GPU_SCAN);
-  REQUIRE_FALSE(expected.empty());
-
-  std::vector<const sirius_physical_operator*> found;
-  sirius::planner::collect_gpu_scans(*plan, found);
-
-  CHECK(found.size() == expected.size());
-  for (auto const* op : expected) {
-    CHECK(std::find(found.begin(), found.end(), op) != found.end());
-  }
-}
-
-TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - admission scan walk agrees on a plain join",
                  "[plan_tree_shape][gpu_admission][isolated_context]")
 {
-  // Baseline: with no operator holding subtrees outside children[], both walks agree
-  // trivially. Guards against a descent that double-counts.
+  // GPU admission sizes a query from its scans' estimated_cardinality. Cross-check
+  // planner::collect_gpu_scans against this suite's independently written for_each_operator:
+  // the two descend the tree separately and must agree. Guards against a descent that
+  // double-counts.
   auto plan =
     generate_sirius_plan(*con, "SELECT b.val FROM big_left b, small_right s WHERE b.id = s.rid");
   INFO(tree_to_string(plan.get()));

@@ -29,7 +29,9 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <variant>
 
@@ -55,6 +57,23 @@ constexpr ErrorCode overflow_error_code()
 #pragma pop_macro("OVERFLOW")
 
 constexpr auto overflow_error = overflow_error_code<cudf::errc>();
+
+struct timestamp_precision {
+  int64_t ticks_per_second;
+  std::string_view label;
+};
+
+// DATE and non-temporal types have no sub-day precision.
+constexpr std::optional<timestamp_precision> sub_day_precision(cudf::type_id id)
+{
+  switch (id) {
+    case cudf::type_id::TIMESTAMP_SECONDS: return timestamp_precision{1, "S"};
+    case cudf::type_id::TIMESTAMP_MILLISECONDS: return timestamp_precision{1000, "MS"};
+    case cudf::type_id::TIMESTAMP_MICROSECONDS: return timestamp_precision{1000000, "US"};
+    case cudf::type_id::TIMESTAMP_NANOSECONDS: return timestamp_precision{1000000000, "NS"};
+    default: return std::nullopt;
+  }
+}
 
 }  // namespace
 
@@ -85,28 +104,39 @@ std::unique_ptr<cudf::column> finite_mask(cudf::column_view const& input,
                                 mr);
 }
 
-std::unique_ptr<cudf::column> cast_to_microseconds_checked(cudf::column_view const& input,
-                                                           ::cuda::stream_ref stream,
-                                                           rmm::device_async_resource_ref mr)
+bool has_checked_timestamp_cast(cudf::data_type source, cudf::data_type target)
 {
-  auto const source_type = input.type().id();
-  if (source_type != cudf::type_id::TIMESTAMP_SECONDS &&
-      source_type != cudf::type_id::TIMESTAMP_MILLISECONDS &&
-      source_type != cudf::type_id::TIMESTAMP_NANOSECONDS) {
+  auto const from = sub_day_precision(source.id());
+  auto const to   = sub_day_precision(target.id());
+  if (!from || !to) { return false; }
+  return from->ticks_per_second < to->ticks_per_second ||
+         (source.id() == cudf::type_id::TIMESTAMP_NANOSECONDS &&
+          target.id() == cudf::type_id::TIMESTAMP_MICROSECONDS);
+}
+
+std::unique_ptr<cudf::column> cast_timestamp_checked(cudf::column_view const& input,
+                                                     cudf::data_type target,
+                                                     ::cuda::stream_ref stream,
+                                                     rmm::device_async_resource_ref mr)
+{
+  if (!has_checked_timestamp_cast(input.type(), target)) {
     throw invalid_input_exception(
-      "Checked microsecond conversion requires second, millisecond, or nanosecond timestamps");
+      "Checked timestamp conversion requires a finer target precision, or nanoseconds to "
+      "microseconds");
   }
-  auto const return_type = cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS};
-  auto const int_type    = cudf::data_type{cudf::type_id::INT64};
-  auto const bool_type   = cudf::data_type{cudf::type_id::BOOL8};
-  auto ticks             = cudf::bit_cast(input, int_type);
-  auto const nanos       = source_type == cudf::type_id::TIMESTAMP_NANOSECONDS;
-  auto finite            = finite_mask(input, stream, mr);
+  auto const from      = *sub_day_precision(input.type().id());
+  auto const to        = *sub_day_precision(target.id());
+  auto const narrowing = from.ticks_per_second > to.ticks_per_second;
+  auto const int_type  = cudf::data_type{cudf::type_id::INT64};
+  auto const bool_type = cudf::data_type{cudf::type_id::BOOL8};
+  auto ticks           = cudf::bit_cast(input, int_type);
+  auto finite          = finite_mask(input, stream, mr);
   // Do not multiply infinity sentinels, even in rows overwritten below.
   cudf::numeric_scalar<int64_t> zero(0, true, stream, mr);
   auto finite_ticks   = cudf::copy_if_else(ticks, zero, finite->view(), stream, mr);
-  int64_t const scale = source_type == cudf::type_id::TIMESTAMP_SECONDS ? 1000000 : 1000;
-  if (!nanos) {
+  int64_t const scale = narrowing ? from.ticks_per_second / to.ticks_per_second
+                                  : to.ticks_per_second / from.ticks_per_second;
+  if (!narrowing) {
     // Integer division truncates toward zero, giving inclusive safe bounds.
     cudf::numeric_scalar<int64_t> lower(
       std::numeric_limits<int64_t>::min() / scale, true, stream, mr);
@@ -125,34 +155,34 @@ std::unique_ptr<cudf::column> cast_to_microseconds_checked(cudf::column_view con
                                      mr);
     auto const& invalid = static_cast<cudf::numeric_scalar<bool> const&>(*any_overflow);
     if (invalid.is_valid(stream) && invalid.value(stream)) {
-      throw invalid_input_exception("Could not convert Timestamp({}) to Timestamp(US)",
-                                    source_type == cudf::type_id::TIMESTAMP_SECONDS ? "S" : "MS");
+      throw invalid_input_exception(
+        "Could not convert Timestamp({}) to Timestamp({})", from.label, to.label);
     }
   }
-  cudf::numeric_scalar<int64_t> factor(nanos ? scale / 2 : scale, true, stream, mr);
-  auto micros =
+  cudf::numeric_scalar<int64_t> factor(narrowing ? scale / 2 : scale, true, stream, mr);
+  auto converted =
     cudf::binary_operation(finite_ticks->view(),
                            factor,
-                           nanos ? cudf::binary_operator::DIV : cudf::binary_operator::MUL,
+                           narrowing ? cudf::binary_operator::DIV : cudf::binary_operator::MUL,
                            int_type,
                            stream,
                            mr);
-  if (nanos) {
-    // Round to the nearest microsecond, with ties away from the epoch. Scale
+  if (narrowing) {
+    // Round to the nearest target tick, with ties away from the epoch. Scale
     // before adding the half-unit so the full finite int64 domain stays safe.
     auto negative = cudf::binary_operation(
-      micros->view(), zero, cudf::binary_operator::LESS, bool_type, stream, mr);
+      converted->view(), zero, cudf::binary_operator::LESS, bool_type, stream, mr);
     cudf::numeric_scalar<int64_t> plus_one(1, true, stream, mr);
     cudf::numeric_scalar<int64_t> minus_one(-1, true, stream, mr);
     auto increment = cudf::copy_if_else(minus_one, plus_one, negative->view(), stream, mr);
     auto rounded   = cudf::binary_operation(
-      micros->view(), increment->view(), cudf::binary_operator::ADD, int_type, stream, mr);
+      converted->view(), increment->view(), cudf::binary_operator::ADD, int_type, stream, mr);
     cudf::numeric_scalar<int64_t> two(2, true, stream, mr);
-    micros = cudf::binary_operation(
+    converted = cudf::binary_operation(
       rounded->view(), two, cudf::binary_operator::DIV, int_type, stream, mr);
   }
-  return cudf::copy_if_else(cudf::bit_cast(micros->view(), return_type),
-                            cudf::bit_cast(ticks, return_type),
+  return cudf::copy_if_else(cudf::bit_cast(converted->view(), target),
+                            cudf::bit_cast(ticks, target),
                             finite->view(),
                             stream,
                             mr);
@@ -191,6 +221,7 @@ std::unique_ptr<cudf::column> date_arithmetic_checked(cudf::transform_input cons
   auto days_ticks = day_counts(reversed ? left : right, difference ? date_type : int32_type);
   // transform skips rows with either input NULL and propagates their
   // validity. Infinity must be handled before invoking checked arithmetic.
+  // Day counts below -infinity are out of range, as input and as result.
   static std::string const offset_prefix = R"(
 #include <cuda/numeric>
 
@@ -203,7 +234,8 @@ __device__ cudf::errc date_offset(int32_t* out, int32_t date, int32_t days)
   }
   auto result = cuda::)";
   static std::string const offset_suffix = std::string{R"((date, days);
-  if (result.overflow || result.value == infinity || result.value == -infinity) {
+  if (date < -infinity || result.overflow || result.value <= -infinity ||
+      result.value >= infinity) {
     return cudf::errc::)"} + cudf::to_string(overflow_error) +
                                            R"(;
   }
