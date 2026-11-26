@@ -27,3 +27,5 @@ target_sources(
           vss/cudf_raft_interop.cu
           vss/brute_force_search.cu
           vss/ivf_flat_index.cu)
+
+add_subdirectory(agg_table)
