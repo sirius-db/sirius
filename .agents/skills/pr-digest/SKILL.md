@@ -122,21 +122,46 @@ containing those blobs at their old paths, then verify the whole patch again. Re
 PR diff-base commit separately from the base tip. If none can be verified, report the limitation
 and omit unverified old-side source links rather than substituting the compare diff.
 
-Inspect the exact recorded commits to resolve source context and line numbers. Use locally available
-Git objects (`git show <head-oid>:<path>` and `git show <diff-base-oid>:<path>`). If needed,
-fetch the PR head from the base repository's URL using `refs/pull/<n>/head` (not an assumed
-`origin` or fork):
+If the pinned PR head is missing locally, fetch it from the base repository's URL using
+`refs/pull/<n>/head`:
 
 ```sh
 git fetch --no-tags --no-write-fetch-head https://github.com/<owner>/<repo>.git refs/pull/<n>/head
 ```
 
-Fetch the base branch or required objects from the same repository if needed. Verify the recorded head, base, and diff-base objects exist as
-commits; a moving ref may fetch a different head, so do not substitute it for the recorded SHA.
-If a checkout is useful, create a separate detached temporary worktree at the pinned head, and
-remove it when finished. Do not checkout, stash, commit,
-or alter tracked or untracked files in the user's checkout. If the pinned commits cannot be
-obtained, report the limitation instead of substituting moving branch tips.
+Fetch the base branch or other required objects from the same repository as needed. Verify that the
+recorded head, base, and verified diff-base object IDs identify commits before using them. A moving
+ref may fetch a different head, so keep using the pinned object IDs. Report any pinned commits you
+cannot obtain.
+
+From the repository root, check the pinned head's filter attributes before
+creating a worktree:
+
+```sh
+git ls-tree -r -z --name-only <head-oid> |
+  git check-attr --source=<head-oid> -z --stdin filter
+```
+
+Check assigned drivers against the configured `filter.*.smudge` and
+`filter.*.process` commands. Use pinned Git object reads if a filter would run
+repository code or fetch data, or if you cannot check the filters. Otherwise,
+create a private temporary parent with `mktemp -d` and add the checkout inside
+it with checkout hooks and FSMonitor disabled:
+
+```sh
+git -c core.hooksPath=/dev/null -c core.fsmonitor=false worktree add --detach <temporary-path> <head-oid>
+```
+
+Use `git -c core.fsmonitor=false grep -n` to navigate the worktree. If filters
+can alter the search or a worktree is unavailable, search the pinned commit with
+`git --literal-pathspecs grep -n -e <pattern> <head-oid> -- <path>`. Use
+`git show <head-oid>:<path> | cat -n` for exact source and line numbers.
+A symlink blob records its target path. For a submodule, record the commit
+from its gitlink and report any unavailable context. Use
+`git show <diff-base-oid>:<path>` for old-side source from the verified diff base.
+When finished, run
+`git -c core.fsmonitor=false worktree remove <temporary-path>` from the original repository and remove
+the empty temporary parent. Preserve the user's original checkout and its files.
 
 ## Step 5 — Identify the key changes, ranked by conceptual centrality
 
