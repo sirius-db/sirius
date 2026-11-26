@@ -4,14 +4,8 @@
 
 ## Building
 
-Clone the Sirius repository:
-```
-git clone --recurse-submodules https://github.com/sirius-db/sirius.git
-cd sirius
-```
-
-Follow the [build instructions](building.md) to build Sirius and the separate
-DuckDB wrapper using Pixi.
+Follow the [source quick start](README.md#quick-start) to build Sirius and the
+DuckDB extension using Pixi.
 
 ## Configuration
 

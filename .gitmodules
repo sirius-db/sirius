@@ -19,10 +19,10 @@
 [submodule "sirius-duckdb/vcpkg"]
 	path = sirius-duckdb/vcpkg
 	url = https://github.com/Microsoft/vcpkg.git
-[submodule "starrocks/starrocks"]
+[submodule "experimental/starrocks/starrocks"]
 	path = experimental/starrocks/starrocks
 	url = https://github.com/starrocks/starrocks
-[submodule "starrocks/brpc"]
+[submodule "experimental/starrocks/brpc"]
 	path = experimental/starrocks/brpc
 	url = https://github.com/apache/brpc
 [submodule "experimental/doris/doris"]

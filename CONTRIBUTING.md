@@ -8,27 +8,22 @@ Keep the workspace `requires-pixi` minimums, the nightly launcher's Pixi depende
 and CI's `pixi-version` pins in sync when upgrading Pixi. Older Pixi versions can
 reject lockfiles written by newer releases even when dependency versions are unchanged.
 
-```bash
-git clone --recurse-submodules <repo>
-cd sirius
-pixi shell                              # activate environment
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
-```
+Follow the [source quick start](docs/README.md#quick-start) to clone Sirius and
+initialize the build submodules. Run the same submodule command in new worktrees.
 
-If you create a new git worktree, initialize submodules manually:
 ```bash
-git submodule update --init --recursive
+pixi run make
 ```
 
 ## Running tests
 
 ```bash
 # C++ unit tests
-make test
+pixi run make test
 
 # Run a specific tag or test name
-build/release/test/cpp/sirius_unittest "[path_utils]"
-build/release/test/cpp/sirius_unittest "strip_file_scheme folds dot, dot-dot and empty segments"
+pixi run build/release/test/cpp/sirius_unittest "[path_utils]"
+pixi run build/release/test/cpp/sirius_unittest "strip_file_scheme folds dot, dot-dot and empty segments"
 ```
 
 `make test` builds the release build and runs `scripts/run_unit_tests.py`, which CI also runs.
@@ -49,13 +44,13 @@ Harness unit tests use `pixi run fuzz-test` and do not require a GPU.
 Sirius uses pre-commit hooks for formatting and linting. Install them once after cloning:
 
 ```bash
-pre-commit install
+pixi run pre-commit install
 ```
 
 To run all checks manually:
 
 ```bash
-pre-commit run -a
+pixi run pre-commit run -a
 ```
 
 Tools enforced: `clang-format` (C++/CUDA), `black` (Python), `cmake-format`, `codespell`, and
