@@ -122,7 +122,7 @@ BUILT: probe_size>0 → READY
 
 ### HASH_JOIN (STANDARD mode)
 
-Overrides both task-driver methods. The CONCAT inputs are PARTIAL barriers; newly arrived batch IDs extend the per-partition pair schedule in `join_cross_schedule`. Each build/probe pair is issued once, and a batch is retired after its opposite producer finishes and all its pairings have been issued.
+Overrides both task-driver methods. The CONCAT inputs are PARTIAL barriers; newly arrived batch IDs extend the per-partition pair schedule in `join_cross_schedule`. Each build/probe pair is issued once, and a batch is retired once the opposite side of its partition is complete (the opposite producer finished, or its CONCAT pushed its last batch for that partition) and all its pairings have been issued.
 
 ### NESTED_LOOP_JOIN
 

@@ -142,6 +142,8 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
     for (auto const batch_id : *plan) {
       input_batch.push_back(port_ptr->repo->pop_data_batch_by_id(batch_id, i));
     }
+    if (_unsunk_groups.size() <= i) { _unsunk_groups.resize(i + 1, 0); }
+    ++_unsunk_groups[i];
     // Preserve the existing partition placement for the downstream consumer.
     return std::make_unique<partitioned_operator_data>(std::move(input_batch), i, *placement);
   }
@@ -217,6 +219,38 @@ void sirius_physical_concat::sink(const operator_data& output_data, ::cuda::stre
         next_port_info.next_operator_port_name, batch, partition_idx);
     }
   }
+  // Consumers poll partition_output_complete under their own mutex, so pushing under `lock`
+  // could deadlock. Retire the claim only after every push has landed.
+  std::lock_guard<std::mutex> lg(lock);
+  if (partition_idx < _unsunk_groups.size() && _unsunk_groups[partition_idx] > 0) {
+    --_unsunk_groups[partition_idx];
+  }
+}
+
+bool sirius_physical_concat::partition_output_complete(std::size_t partition_idx)
+{
+  std::unique_lock<std::mutex> lg(lock, std::try_to_lock);
+  if (!lg.owns_lock() || ports.size() != 1) { return false; }
+  auto const port_ptr = ports.begin()->second;
+  // Check the source first: once it has finished, nothing new reaches the input repository.
+  if (!is_source_pipeline_finished() || port_ptr->repo == nullptr) { return false; }
+  if (partition_idx >= port_ptr->repo->num_partitions() ||
+      port_ptr->repo->size(partition_idx) != 0) {
+    return false;
+  }
+  return partition_idx >= _unsunk_groups.size() || _unsunk_groups[partition_idx] == 0;
+}
+
+bool concat_partition_output_complete(sirius_physical_operator::port const& port,
+                                      std::size_t partition_idx)
+{
+  if (!port.src_pipeline) { return false; }
+  auto* const producer = port.src_pipeline->get_sink().get();
+  if (producer == nullptr || producer->type != SiriusPhysicalOperatorType::CONCAT ||
+      port.src_pipeline->get_source().get() != producer) {
+    return false;
+  }
+  return producer->Cast<sirius_physical_concat>().partition_output_complete(partition_idx);
 }
 
 std::string sirius_physical_concat::get_name() const { return "CONCAT"; }

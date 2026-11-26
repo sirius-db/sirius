@@ -35,6 +35,12 @@ namespace sirius::op {
 // batch IDs discovered on each side and which (probe,build) pairs have already been scheduled, so
 // scheduling tolerates the ID lists growing across calls and each batch is freed once it can no
 // longer be needed. probe = "default"/left, build = "build"/right.
+//
+// A side of a partition is complete once its producer will deliver no further batch to that
+// partition; the whole producer finishing completes every partition. A batch is freed once the
+// opposite side of its partition is complete and the batch has been paired with every batch of
+// that side, so a partition whose sides are done stops holding memory while other partitions
+// still stream.
 //===----------------------------------------------------------------------===//
 struct partition_cross_schedule {
   std::vector<uint64_t> probe_ids;               ///< probe batch IDs, first-seen order
@@ -46,6 +52,11 @@ struct partition_cross_schedule {
   std::vector<uint32_t> build_paired_count;      ///< parallel to build_ids: #probe batches paired
   std::unordered_set<uint64_t> probe_popped;     ///< probe IDs already freed from the repo
   std::unordered_set<uint64_t> build_popped;     ///< build IDs already freed from the repo
+  /// The probe producer will deliver no further batch to this partition. Set it only from a
+  /// completion signal read before the probe IDs were last merged, so `probe_ids` is final.
+  bool probe_complete = false;
+  /// Build counterpart of `probe_complete`.
+  bool build_complete = false;
 };
 
 /// Merge newly discovered IDs into a partition, preserving first-seen order and existing pairing
@@ -78,9 +89,10 @@ struct cross_schedule_pair {
   return (static_cast<uint64_t>(probe_idx) << 32) | static_cast<uint64_t>(build_idx);
 }
 
-/// Collect (and mark popped) every batch that is now fully consumed: a probe batch once the build
-/// producer is finished and the batch has been paired with every known build batch (build side has
-/// >= 1 batch), and symmetrically for build batches. Idempotent.
+/// Collect (and mark popped) every batch that is now fully consumed: a probe batch once its
+/// partition's build side is complete (`build_complete`, or the whole build producer finished) and
+/// the batch has been paired with every known build batch (build side has >= 1 batch), and
+/// symmetrically for build batches. Idempotent.
 [[nodiscard]] std::vector<cross_schedule_discard> collect_cross_schedule_discards(
   std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished);
 

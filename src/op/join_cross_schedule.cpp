@@ -44,10 +44,10 @@ std::vector<cross_schedule_discard> collect_cross_schedule_discards(
   std::vector<cross_schedule_discard> discards;
   for (std::size_t p = 0; p < cross.size(); ++p) {
     auto& c = cross[p];
-    // A probe batch is done once no more build batches can arrive (build finished) AND it has been
-    // paired with every known build batch. Requires >= 1 build batch: the empty-opposite case is
-    // skipped, matching the legacy grid (which likewise never popped a batch it could not pair).
-    if (build_finished && !c.build_ids.empty()) {
+    // A probe batch is done once no more build batches can arrive for its partition AND it has
+    // been paired with every known build batch. Requires >= 1 build batch: the empty-opposite case
+    // is skipped, matching the legacy grid (which likewise never popped a batch it could not pair).
+    if ((build_finished || c.build_complete) && !c.build_ids.empty()) {
       for (std::size_t i = 0; i < c.probe_ids.size(); ++i) {
         uint64_t const id = c.probe_ids[i];
         if (c.probe_popped.count(id)) { continue; }
@@ -57,7 +57,7 @@ std::vector<cross_schedule_discard> collect_cross_schedule_discards(
         }
       }
     }
-    if (probe_finished && !c.probe_ids.empty()) {
+    if ((probe_finished || c.probe_complete) && !c.probe_ids.empty()) {
       for (std::size_t j = 0; j < c.build_ids.size(); ++j) {
         uint64_t const id = c.build_ids[j];
         if (c.build_popped.count(id)) { continue; }

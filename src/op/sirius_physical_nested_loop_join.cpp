@@ -321,6 +321,10 @@ std::pair<bool, bool> sirius_physical_nested_loop_join::refresh_cross_schedule()
   bool const build_finished = build->src_pipeline->is_pipeline_finished();
   if (cross_schedule.empty()) { cross_schedule.resize(1); }
   auto& c = cross_schedule.front();
+  // Read completion before polling the repositories so a complete side's IDs are final. The
+  // CONCAT can be done pushing before its pipeline is marked finished.
+  c.probe_complete = c.probe_complete || concat_partition_output_complete(*probe, 0);
+  c.build_complete = c.build_complete || concat_partition_output_complete(*build, 0);
   merge_cross_schedule_batch_ids(c, probe->repo->get_batch_ids(0), build->repo->get_batch_ids(0));
 
   // CONCAT must fold the opposite side before we can decide unmatched / existential rows.

@@ -362,11 +362,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// operator stays nonempty until every slot has issued its emit task.
   [[nodiscard]] bool all_ports_empty() override;
 
-  /// STANDARD / MIXED_JOIN only. Re-poll both input ports for newly-arrived batch IDs, extend
-  /// `_cross`, enforce the non-INNER whole-side invariant (the must-be-whole side stays a single
-  /// concat-folded batch), and free every fully-consumed batch from its repository. Must be called
-  /// with op_state_mutex held. Returns the (probe_finished, build_finished) producer state so the
-  /// caller can reuse it without re-querying.
+  /// STANDARD / MIXED_JOIN only. Re-poll both input ports for newly-arrived batch IDs and each
+  /// side's per-partition completion, extend `_cross`, enforce the non-INNER whole-side invariant
+  /// (the must-be-whole side stays a single concat-folded batch), and free every fully-consumed
+  /// batch from its repository. Must be called with op_state_mutex held. Returns the
+  /// (probe_finished, build_finished) producer state so the caller can reuse it without
+  /// re-querying.
   std::pair<bool, bool> refresh_cross_schedule();
 
   /// Snapshot each partition's build state and per-partition data availability for the BUILD_PROBE
