@@ -2635,7 +2635,7 @@ def _main(args, workload=None):
         log("Preparing scale_bench inputs outside query timing")
         workload.prepare(benchmark_dir)
     os.environ["SIRIUS_LOG_DIR"] = log_dir
-    # Sirius writes the configuration it resolved here instead of ~/.sirius at startup.
+    # Have Sirius write the configuration it resolved at startup.
     os.environ["SIRIUS_WRITE_EFFECTIVE_CONFIG"] = os.path.join(
         benchmark_dir, "resolved_config.yaml"
     )

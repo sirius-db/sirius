@@ -883,7 +883,7 @@ std::string effective_config_text(const sirius_config& resolved,
   add_missing(document, user.write(false));
   auto root = config::node::mapping();
   root.set(std::string(config::user_config_root), std::move(document));
-  return "# The configuration Sirius runs with on this machine, rewritten at every start: the\n"
+  return "# The configuration Sirius ran with on this machine, written when it started: the\n"
          "# values the config file named, and every other setting's default or the value derived\n"
          "# from this machine's hardware. To use it, copy it to ~/.sirius/sirius.yaml.\n" +
          config::emit_yaml(root);

@@ -49,24 +49,25 @@ Sirius searches for a config file in this order:
 If no config file is found, Sirius uses built-in capacity budgets of 95% of GPU memory and 90% of each backing NUMA node's RAM for pinned host memory.
 Initial host pools target 10% of that node's RAM, capped by the host budget and rounded down to whole pools.
 
-### Effective configuration (`~/.sirius/effective_config.yaml`)
+### Effective configuration (`SIRIUS_WRITE_EFFECTIVE_CONFIG`)
 
-At every start, Sirius writes the configuration it runs with to
-`~/.sirius/effective_config.yaml` (replaced on every start, readable by the owner only). It holds
-every value the config file named, and spells out every production setting (below) the file left
-out: its default, or what was derived from this machine — thread and reactor counts, REST limits,
-operator batch sizes, initial host pools. Derived values are this machine's, so the file may not
-suit another. The file is a record and is not on the search path above; copy it to
-`~/.sirius/sirius.yaml` to make those values your configuration.
+When asked, Sirius writes the configuration it runs with when it starts. Set
+`SIRIUS_WRITE_EFFECTIVE_CONFIG` to a path to write it there, or to `1`, `true`, `on` or `yes` to
+write `~/.sirius/effective_config.yaml`; unset, empty, `0`, `false`, `off` or `no` writes nothing.
+The TPC-H benchmark runner writes it into each benchmark directory as `resolved_config.yaml`. The
+file is replaced on every start and is readable by the owner only. It holds every value the config
+file named, and spells out every production setting (below) the file left out: its default, or what
+was derived from this machine — thread and reactor counts, REST limits, operator batch sizes,
+initial host pools. Derived values are this machine's, so the file may not suit another. The file is
+a record and is not on the search path above; copy it to `~/.sirius/sirius.yaml` to make those
+values your configuration.
 
 Every other setting is developer-only. All settings are read in every build, but only a build with
 **developer mode** on writes the developer-only ones the config file did not name: configure with
 `-DSIRIUS_DEVELOPER_MODE=ON` (`pixi run cmake -DSIRIUS_DEVELOPER_MODE=ON build/release`, then
 `pixi run make`; the setting stays in the CMake cache). Resolving the file again on the same
 machine runs with the same values; developer-only settings it leaves out resolve as they did the
-first time. Set `SIRIUS_WRITE_EFFECTIVE_CONFIG` to `0`, `false`, `off` or `no` to skip writing the
-file (`sirius_unittest` does), or to a path to write it there instead (the TPC-H benchmark runner
-writes it into each benchmark directory as `resolved_config.yaml`).
+first time.
 
 Production settings (a setting with two spellings, such as `usage_limit_fraction` and
 `usage_limit_bytes`, is one setting):
