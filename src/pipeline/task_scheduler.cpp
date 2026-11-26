@@ -96,6 +96,8 @@ task_scheduler::task_scheduler(
     return nullptr;
   };
 
+  // TODO: Prefer the producing GPU's NUMA-local HOST pool for both initial result staging and
+  // collection retries. Try other compatible pools when the local pool cannot admit the request.
   auto host_spaces =
     cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}.get_candidates(
       mem_mgr);
