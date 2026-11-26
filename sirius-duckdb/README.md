@@ -229,7 +229,7 @@ cp sirius-duckdb/build/release/src/libduckdb_static.a \
   sirius-duckdb/build/release/src/main/extension/libduckdb_loadable_extensions.a \
   sirius-duckdb/build/release/src/main/http/libduckdb_httplib.a "$prebuilt/"
 pixi run cmake -S sirius-duckdb/duckdb -B build/loader -G Ninja \
-  -DDUCKDB_EXPLICIT_VERSION=v2.0.0 \
+  -DDUCKDB_EXPLICIT_VERSION=v2.0.1 \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=ON -DBUILD_SHELL=OFF \
   -DEXTENSION_STATIC_BUILD=ON -DDUCKDB_LINKER=bfd \
   -DPREBUILT_BINARY="$prebuilt/libduckdb_static.a" \
@@ -245,7 +245,7 @@ pixi run python sirius-duckdb/loader/test/test_loader.py \
 They expect no driver; on a GPU machine, hide it with the test fixture:
 
 ```sh
-repository="$PWD/build/loader/repository/v2.0.0/$(cat build/loader/duckdb_platform_out)"
+repository="$PWD/build/loader/repository/v2.0.1/$(cat build/loader/duckdb_platform_out)"
 mkdir -p "$repository"
 cp build/loader/extension/sirius/sirius.duckdb_extension "$repository/"
 LOCAL_EXTENSION_REPO="$PWD/build/loader/repository" \

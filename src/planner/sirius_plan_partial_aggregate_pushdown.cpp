@@ -254,9 +254,9 @@ bool is_arithmetic(duckdb::BoundFunctionExpression const& function)
 
 /// Whether @p expression is safe to evaluate on rows a join above would have removed: it cannot
 /// throw, or what can throw in it is only `+`, `-` and `*`, under CASE, AND, OR and functions that
-/// cannot fail themselves, such as comparisons. Arithmetic can still overflow on a row the
-/// unrewritten plan never evaluates it on; DuckDB's own partial aggregate pushdown accepts the
-/// same.
+/// cannot fail themselves, such as comparisons. Accepting that arithmetic is Sirius's own rule:
+/// it can still overflow on a row the unrewritten plan never evaluates it on, and DuckDB's partial
+/// aggregate pushdown declines it unless column statistics rule the overflow out.
 bool fails_only_through_arithmetic(Expression const& expression)
 {
   if (!expression.CanThrow()) { return true; }
@@ -456,9 +456,9 @@ std::optional<double> most_distinct_values(duckdb::ClientContext& context,
       // nothing about how often a value repeats.
       auto const scan  = duckdb::RelationStatisticsHelper::ExtractGetStats(get, context);
       auto const found = scan.GetColumnStats(behind->binding);
-      if (found && found->distinct_count.distinct_count > 0 &&
-          found->distinct_count.source != duckdb::DistinctCountSource::CARDINALITY) {
-        most = static_cast<double>(found->distinct_count.distinct_count);
+      if (found && found->total_domain.distinct_count > 0 &&
+          found->total_domain.source != duckdb::DistinctCountSource::CARDINALITY) {
+        most = static_cast<double>(found->total_domain.distinct_count);
       }
     } else if (auto const span =
                  transparent::parquet_scan_value_span(get, column.GetPrimaryIndex())) {

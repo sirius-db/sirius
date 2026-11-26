@@ -202,7 +202,8 @@ class PerformanceTestS3Tests(unittest.TestCase):
 
         # Sirius logs statement text, so the setup file must be done before it loads.
         sirius = events.index("LOAD '/build/sirius.duckdb_extension'")
-        self.assertTrue(events[sirius - 1].startswith("ATTACH "))
+        # DuckDB keeps the comment before a statement in its text.
+        self.assertTrue(events[sirius - 1].splitlines()[-1].startswith("ATTACH "))
         self.assertIn("TOKEN 'synthetic;token')", events[sirius - 2])
         self.assertTrue(
             all(

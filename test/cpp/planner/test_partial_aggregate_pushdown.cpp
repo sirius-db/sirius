@@ -313,6 +313,9 @@ TEST_CASE_METHOD(pushdown_fixture,
   // Two aggregates share an expression, which DuckDB computes in a projection under them.
   CHECK(pushed(per_customer("sum(o_totalprice * (1 - o_totalprice)), "
                             "min(o_totalprice * (1 - o_totalprice))")) == 1);
+  // Under the default settings a floating-point division by zero yields inf or NaN, so it
+  // cannot fail.
+  CHECK(pushed(per_customer("min(o_units / o_shippriority)")) == 1);
 }
 
 TEST_CASE_METHOD(pushdown_fixture,
@@ -424,11 +427,11 @@ TEST_CASE_METHOD(pushdown_fixture,
 
   // Arguments: one that reads both sides, and ones that can fail other than through arithmetic.
   CHECK(why(per_customer("sum(o_totalprice * c_acctbal)")) == reasons{"arguments:both-sides"});
-  CHECK(
-    why(per_customer("sum(CASE WHEN o_units / o_shippriority > 1 THEN o_totalprice ELSE 0 END)")) ==
-    reasons{"argument:fallible"});
+  CHECK(why(per_customer(
+          "sum(CASE WHEN o_units // o_shippriority > 1 THEN o_totalprice ELSE 0 END)")) ==
+        reasons{"argument:fallible"});
   CHECK(why(per_customer("max(CAST(o_clerk AS INTEGER))")) == reasons{"argument:fallible"});
-  CHECK(why(per_customer("min(o_units / o_shippriority)")) == reasons{"argument:fallible"});
+  CHECK(why(per_customer("min(o_units // o_shippriority)")) == reasons{"argument:fallible"});
 
   // Joins and keys.
   CHECK(why(per_customer("sum(o_totalprice)", "", "c_custkey, c_nationkey")) ==
