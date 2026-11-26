@@ -18,7 +18,10 @@
 #include "planner/gpu_admission.hpp"
 #include "sirius_config.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
+#include "utils/parquet_fixture_utils.hpp"
 
+#include <duckdb.hpp>  // IWYU pragma: keep
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/storage/statistics/node_statistics.hpp>
 #include <parquet_types.h>
 
@@ -40,7 +43,18 @@ using sirius::planner::total_scan_bytes;
 
 namespace {
 constexpr uint64_t k_avg_var = 32;
+
+duckdb::LogicalGet* find_admission_get(duckdb::LogicalOperator& node)
+{
+  if (node.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    return &node.Cast<duckdb::LogicalGet>();
+  }
+  for (auto& child : node.children) {
+    if (auto* found = find_admission_get(*child)) { return found; }
+  }
+  return nullptr;
 }
+}  // namespace
 
 TEST_CASE("apply_gpu_cap with no cap admits every GPU", "[gpu_admission]")
 {
@@ -406,6 +420,41 @@ duckdb_parquet::RowGroup admission_string_group(int64_t rows,
   return group;
 }
 }  // namespace
+
+TEST_CASE("admission reads a DuckDB table's longest string from its statistics", "[gpu_admission]")
+{
+  using sirius::planner::detail::table_function_max_string_bytes;
+  // Plain DuckDB with Sirius disabled: the width is a property of the table function.
+  sirius::test::scoped_sirius_disable disable;
+  duckdb::DuckDB db{nullptr};
+  duckdb::Connection con{db};
+  // `note` is 40 to 42 bytes long, wider than the 32-byte default for a string column.
+  REQUIRE_FALSE(con
+                  .Query("CREATE TABLE admission_native AS SELECT i::INTEGER AS id, "
+                         "repeat('x', 40 + i % 3) AS note FROM range(1000) r(i)")
+                  ->HasError());
+  // The statistics callbacks need a transaction.
+  REQUIRE_FALSE(con.Query("BEGIN TRANSACTION")->HasError());
+  auto plan = con.ExtractPlan("SELECT id, note FROM admission_native");
+  REQUIRE(plan);
+  auto* get = find_admission_get(*plan);
+  REQUIRE(get != nullptr);
+  auto& context         = *con.context;
+  auto const* bind_data = get->bind_data.get();
+
+  // DuckDB's table scan registers `statistics_extended` and not `statistics`, so a lookup that
+  // asks only the latter finds nothing here.
+  CHECK(table_function_max_string_bytes(context, get->function, bind_data, 1) ==
+        std::optional<uint64_t>{42});
+  // An INTEGER column has numeric statistics, which state no string length.
+  CHECK_FALSE(table_function_max_string_bytes(context, get->function, bind_data, 0).has_value());
+  CHECK_FALSE(table_function_max_string_bytes(context, get->function, nullptr, 1).has_value());
+  auto no_statistics                = get->function;
+  no_statistics.statistics          = nullptr;
+  no_statistics.statistics_extended = nullptr;
+  CHECK_FALSE(table_function_max_string_bytes(context, no_statistics, bind_data, 1).has_value());
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+}
 
 TEST_CASE("Parquet admission requires decoded sizes for the entire scan", "[gpu_admission]")
 {

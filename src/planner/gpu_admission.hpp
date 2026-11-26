@@ -20,6 +20,7 @@
 #include "op/scan/scan_admission_hint.hpp"
 
 #include <absl/functional/function_ref.h>
+#include <duckdb/function/table_function.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -216,6 +217,15 @@ inline int gpu_count_for_bytes(uint64_t total_bytes, uint64_t bytes_per_gpu, int
 namespace detail {
 // Metadata-only helpers shared with admission regression tests.
 std::optional<uint64_t> reported_row_count(const duckdb::NodeStatistics& stats);
+
+/// The longest string, in bytes, that the statistics of @p function report for table column
+/// @p column; nullopt when the function has no statistics callback, the column's statistics are
+/// not string statistics or state no maximum length, or the callback throws. Asks
+/// `statistics_extended` first: DuckDB tables (`seq_scan`) register only that one.
+std::optional<uint64_t> table_function_max_string_bytes(duckdb::ClientContext& context,
+                                                        const duckdb::BoundTableFunction& function,
+                                                        const duckdb::FunctionData* bind_data,
+                                                        duckdb::column_t column);
 }  // namespace detail
 
 /**
@@ -227,8 +237,9 @@ std::optional<uint64_t> reported_row_count(const duckdb::NodeStatistics& stats);
  * scan); otherwise the table function's `cardinality` callback (`TableScanCardinality` for
  * DuckDB tables). Widths, for variable-width columns only: for a Parquet scan, the decoded
  * byte-array size statistics of its footers when they cover every row group of every file
- * (`transparent::parquet_scan_string_widths`), plus the 4-byte offset word; otherwise the table
- * statistics' maximum string length plus the offset. Unknown widths retain the configured
+ * (`transparent::parquet_scan_string_widths`), plus the 4-byte offset word; otherwise the maximum
+ * string length in the table function's statistics (`statistics_extended`, or `statistics` where
+ * that is the only callback) plus the offset. Unknown widths retain the configured
  * average. The columns the scan reads only for pushed-down filters are listed with their widths.
  */
 op::scan::scan_admission_hint derive_scan_admission_hint(

@@ -23,6 +23,7 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 
+#include <duckdb/common/column_index.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/node_statistics.hpp>
@@ -124,6 +125,38 @@ std::optional<uint64_t> reported_row_count(const duckdb::NodeStatistics& stats)
   return rows;
 }
 
+std::optional<uint64_t> table_function_max_string_bytes(duckdb::ClientContext& context,
+                                                        const duckdb::BoundTableFunction& function,
+                                                        const duckdb::FunctionData* bind_data,
+                                                        duckdb::column_t column)
+{
+  if (bind_data == nullptr) { return std::nullopt; }
+  if (function.statistics_extended == nullptr && function.statistics == nullptr) {
+    return std::nullopt;
+  }
+  try {
+    duckdb::unique_ptr<duckdb::BaseStatistics> stats;
+    if (function.statistics_extended != nullptr) {
+      duckdb::TableFunctionGetStatisticsInput input(bind_data, duckdb::ColumnIndex(column));
+      stats = function.statistics_extended(context, input);
+    } else {
+      stats = function.statistics(context, bind_data, column);
+    }
+    // The string accessors read the statistics' string payload unchecked, so the kind is checked
+    // here: a column of another type has numeric or nested statistics.
+    if (stats && stats->GetStatsType() == duckdb::StatisticsType::STRING_STATS &&
+        duckdb::StringStats::HasMaxStringLength(*stats)) {
+      return static_cast<uint64_t>(duckdb::StringStats::MaxStringLength(*stats));
+    }
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_DEBUG("gpu_admission: statistics callback of {} threw for column {}: {}",
+                     function.GetName().GetIdentifierName(),
+                     column,
+                     e.what());
+  }
+  return std::nullopt;
+}
+
 }  // namespace detail
 
 op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& context,
@@ -150,22 +183,11 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
     if (column < leaf_widths.size() && leaf_widths[column].has_value()) {
       return leaf_widths[column];
     }
-    if (scan.function.statistics == nullptr || scan.bind_data == nullptr || !type.is_varchar()) {
-      return std::nullopt;
-    }
-    try {
-      auto stats = scan.function.statistics(context, scan.bind_data.get(), column);
-      if (stats && duckdb::StringStats::HasMaxStringLength(*stats)) {
-        // Upper bound: every string fits, plus cuDF's 4-byte offset per row.
-        return static_cast<uint64_t>(duckdb::StringStats::MaxStringLength(*stats)) + 4;
-      }
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_DEBUG("gpu_admission: statistics callback of {} threw for column {}: {}",
-                       scan.function.GetName().GetIdentifierName(),
-                       column,
-                       e.what());
-    }
-    return std::nullopt;
+    if (!type.is_varchar()) { return std::nullopt; }
+    // Upper bound: every string fits, plus cuDF's 4-byte offset per row.
+    auto const longest =
+      detail::table_function_max_string_bytes(context, scan.function, scan.bind_data.get(), column);
+    return longest.has_value() ? std::optional<uint64_t>{*longest + 4} : std::nullopt;
   };
   for (std::size_t i = 0; i < scan.types.size(); ++i) {
     if (auto const column = table_column_of_output(scan, i)) {
