@@ -1174,10 +1174,15 @@ bool parquet_scan_core::has_processed_all_metadata() const
   return _next_file_idx.load(std::memory_order_relaxed) >= _selected_file_indices.size();
 }
 
-std::size_t parquet_scan_core::pick_position(std::size_t claim, io::ioctx_resolver const& resolve)
+parquet_scan_core::file_pick parquet_scan_core::pick_position(std::size_t claim,
+                                                              io::ioctx_resolver const& resolve)
 {
   auto const n = _selected_file_indices.size();
-  if (n < 2 || _file_order_off.load(std::memory_order_relaxed)) { return claim; }
+  if (n < 2) { return {claim, nullptr}; }
+  // Each claim is distinct, so the unlocked path moves out of a slot no other claim touches.
+  if (_file_order_off.load(std::memory_order_acquire)) {
+    return {claim, std::move(_file_ctxs[claim])};
+  }
   std::lock_guard lock(_claim_mtx);
   if (_claimed.empty()) {
     _claimed.assign(n, false);
@@ -1210,8 +1215,8 @@ std::size_t parquet_scan_core::pick_position(std::size_t claim, io::ioctx_resolv
     if (_order.empty() && _claims_since_rank == 0 &&
         std::none_of(
           by_cached.begin(), by_cached.end(), [](auto const& e) { return e.first > 0; })) {
-      _file_order_off.store(true, std::memory_order_relaxed);
-      return claim;
+      _file_order_off.store(true, std::memory_order_release);
+      return {claim, std::move(_file_ctxs[claim])};
     }
     // Coarse buckets, ties in file order: files cached about equally (all or nothing, the
     // common cases) are read in file order.
@@ -1231,7 +1236,7 @@ std::size_t parquet_scan_core::pick_position(std::size_t claim, io::ioctx_resolv
   auto const pick = _order_pos < _order.size() ? _order[_order_pos++] : claim;
   _claimed[pick]  = true;
   ++_claims_since_rank;
-  return pick;
+  return {pick, std::move(_file_ctxs[pick])};
 }
 
 parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
@@ -1240,8 +1245,8 @@ parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
   if (!resolve) { throw std::runtime_error("parquet_scan_core: no scan_manager is wired."); }
   auto const claim = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
   if (claim >= _selected_file_indices.size()) { return nullptr; }
-  auto const position = pick_position(claim, resolve);
-  auto const idx      = _selected_file_indices[position];
+  auto [position, resolved] = pick_position(claim, resolve);
+  auto const idx            = _selected_file_indices[position];
 
   // Route each file to its own backend (s3:// -> rest, local -> uring) so a
   // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task
@@ -1249,11 +1254,11 @@ parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
   // parquet_batch_coalescer.
   auto const& file_path = _file_paths[idx];
   // The resolver returns a valid ioctx or throws if no backend supports the path.
-  return [this, file_path, idx, resolve = std::move(resolve)](
+  return [this, file_path, idx, resolved = std::move(resolved), resolve = std::move(resolve)](
            scan_manager::preparation_stop_token stop) -> std::unique_ptr<scan_info> {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-    auto io_ctx = resolve(file_path);
+    auto io_ctx = resolved ? resolved : resolve(file_path);
     try {
       return build_file_scan_info(file_path, idx, io_ctx, stop.token());
     } catch (unsupported_physical_input const&) {

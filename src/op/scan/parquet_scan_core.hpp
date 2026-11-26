@@ -209,11 +209,17 @@ class parquet_scan_core {
   // per claim; the coalescer downstream batches files and chunks row groups.
   std::atomic<std::size_t> _next_file_idx{0};
 
+  struct file_pick {
+    std::size_t position;
+    /// The file's ioctx when ranking already resolved it, so its task does not resolve again.
+    std::shared_ptr<cucascade::io::ioctx> ctx;
+  };
+
   /// Position in @c _selected_file_indices for the @p claim-th call: the unclaimed file the
   /// prefetching cache holds the largest share of, so a scan re-reading a table (the previous
   /// iteration, or a second scan of lineitem in one query) reaches its cached files before
   /// the uncached ones' chunks evict them.  File order when nothing is cached.
-  std::size_t pick_position(std::size_t claim, io::ioctx_resolver const& resolve);
+  file_pick pick_position(std::size_t claim, io::ioctx_resolver const& resolve);
 
   std::mutex _claim_mtx;
   std::atomic<bool> _file_order_off{false};
