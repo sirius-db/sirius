@@ -164,6 +164,12 @@ struct build_probe_decision {
 /// A kept-build join (@p kept_build_streaming) streams its probe, which only BUILD_PROBE does, so
 /// it always takes BUILD_PROBE, never broadcast (a replica would see only its GPU's probe rows),
 /// and uses the natural partition count when the build exceeds either BUILD_PROBE budget.
+///
+/// A correlated MARK slot (@p correlated_mark, see sirius_physical_hash_join::mark_is_correlated)
+/// can hold three tables over its build rows: the primary filter, the filter over the groups with
+/// a NULL IN key, and the filter over every group that the first probe with a NULL IN key builds.
+/// It also copies the correlation keys of the NULL-IN-key rows, at most the whole build. The
+/// BUILD_PROBE bounds charge three tables per row and the build twice.
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
   uint64_t total_bytes,
   std::optional<uint64_t> total_rows,
@@ -179,7 +185,8 @@ struct build_probe_decision {
   HASH_JOIN_MODE join_mode,
   double estimated_probe_to_build_ratio,
   std::optional<uint64_t> resident_bytes = std::nullopt,
-  bool kept_build_streaming              = false);
+  bool kept_build_streaming              = false,
+  bool correlated_mark                   = false);
 
 /**
  * @brief Select never-probed build slots that can be reclaimed after the probe producer closes.

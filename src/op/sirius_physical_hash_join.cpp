@@ -788,7 +788,8 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                                         HASH_JOIN_MODE join_mode,
                                                         double estimated_probe_to_build_ratio,
                                                         std::optional<uint64_t> resident_bytes,
-                                                        bool kept_build_streaming)
+                                                        bool kept_build_streaming,
+                                                        bool correlated_mark)
 {
   // Without a GPU list (engine-free tests) plan as a single GPU and leave partitions unpinned.
   int const num_gpus = std::max(1, static_cast<int>(active_gpu_ids.size()));
@@ -859,10 +860,16 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
     auto const partitions = static_cast<uint64_t>(build_probe_partitions);
     return broadcast_candidate ? total : total / partitions + (total % partitions != 0);
   };
-  uint64_t const per_gpu_build_bytes = per_gpu(resident_bytes.value_or(total_bytes));
+  // A correlated MARK slot holds up to three tables over its rows and a copy of up to its whole
+  // build (see the declaration).
+  uint64_t const tables_per_row = correlated_mark ? 3 : 1;
+  uint64_t const build_copies   = correlated_mark ? 2 : 1;
+  uint64_t const per_gpu_build_bytes =
+    memory::saturating_mul(per_gpu(resident_bytes.value_or(total_bytes)), build_copies);
   uint64_t const per_gpu_table_bytes_est =
     total_rows
-      ? memory::saturating_mul(per_gpu(*total_rows), config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW)
+      ? memory::saturating_mul(memory::saturating_mul(per_gpu(*total_rows), tables_per_row),
+                               config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW)
       : std::numeric_limits<uint64_t>::max();
   // Bounding the full row count prevents an oversized concat even when every key hashes to one
   // partition. Unknown counts cannot establish either the hash-table estimate or this limit.
@@ -939,7 +946,8 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                                                              _join_mode,
                                                              estimated_probe_to_build_ratio,
                                                              in.resident_bytes,
-                                                             kept_build_streaming());
+                                                             kept_build_streaming(),
+                                                             mark_is_correlated());
 
   // A hash-partitioned MARK build: marks use the join-wide build observation.
   if (join_type == duckdb::JoinType::MARK && in.is_build_side) {
@@ -2328,15 +2336,19 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         }
         slot.built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
         slot.build_table              = build_batch_ro;
+        // A MARK/SEMI/ANTI build has more than one allocation. Build into locals and publish them
+        // after the sync, so a throw (an OOM retry) leaves no half-built table in the slot.
+        std::unique_ptr<cudf::filtered_join> filtered_table;
+        std::unique_ptr<correlated_mark_build> correlated_mark;
         if (join_type == duckdb::JoinType::MARK || join_type == duckdb::JoinType::SEMI ||
             join_type == duckdb::JoinType::ANTI) {
           // MARK/SEMI/ANTI: build a reusable filtered_join on the right (filter) keys; each probe
           // batch's semi_join/anti_join returns left-row match indices (scattered into a BOOL8 mark
           // for MARK, gathered as the output rows for SEMI/ANTI).
-          slot.filtered_table = make_right_filtered_join_ptr(build_keys, compare_nulls(), stream);
+          filtered_table = make_right_filtered_join_ptr(build_keys, compare_nulls(), stream);
           if (mark_is_correlated()) {
             // The slot keeps the key columns these per-group facts view alive.
-            slot.correlated_mark = make_correlated_mark_build(
+            correlated_mark = make_correlated_mark_build(
               correlated_mark_group_keys(build_keys), correlated_mark_in_key(build_keys), stream);
           } else if (mark_propagates_build_nulls() &&
                      !_mark_build_partitioned.load(std::memory_order_acquire)) {
@@ -2364,6 +2376,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         }
         stream.sync();  // Ensure the hash table is fully built before we allow any probe
                         // batches to proceed.
+        if (filtered_table) {
+          slot.filtered_table  = std::move(filtered_table);
+          slot.correlated_mark = std::move(correlated_mark);
+        }
         slot.build_state.store(BUILD_HASH_TABLE_STATE::BUILT, std::memory_order_release);
       }
     }
@@ -2493,38 +2509,53 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     }
 
     if (join_type == duckdb::JoinType::MARK) {
-      auto semi_indices = cudf::mixed_left_semi_join(
-        left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), stream);
       if (mark_is_correlated()) {
         // The hash keys are the correlation keys; the IN key is the predicate's two operands.
-        auto const& in_key = conditions.back();
-        auto const column  = [](cudf::table_view const& table, sirius::ast::node const& operand) {
-          return table.column(
-            static_cast<cudf::size_type>(operand.get<sirius::ast::reference>().column_index));
-        };
-        auto const build =
-          make_correlated_mark_build(right_eq, column(right_full, *in_key.right), stream);
+        // Only those two columns are the conditional tables: cuDF's build-side dedup in
+        // mixed_left_semi_join compares every conditional column, so an unrelated payload column
+        // of a type it cannot compare (a LIST) would make the join fail.
+        auto const& in_key    = conditions.back();
+        auto const& left_ref  = in_key.left->get<sirius::ast::reference>();
+        auto const& right_ref = in_key.right->get<sirius::ast::reference>();
+        auto const left_in_key =
+          left_full.column(static_cast<cudf::size_type>(left_ref.column_index));
+        auto const right_in_key =
+          right_full.column(static_cast<cudf::size_type>(right_ref.column_index));
+        // The same comparison over column 0 of each one-column conditional table.
+        duckdb::vector<sirius::join_condition> in_key_condition;
+        in_key_condition.push_back(
+          {std::make_unique<sirius::ast::node>(sirius::ast::reference{0U, left_ref.return_type()}),
+           std::make_unique<sirius::ast::node>(sirius::ast::reference{0U, right_ref.return_type()}),
+           in_key.comparison});
+        auto in_key_pred = translator.translate_join_conditions(in_key_condition, 0, 1);
+        if (!in_key_pred) {
+          throw std::runtime_error(
+            "In sirius_physical_hash_join: failed to translate the correlated MARK join's IN key "
+            "comparison to a cuDF AST predicate");
+        }
+        auto semi_indices = cudf::mixed_left_semi_join(left_eq,
+                                                       right_eq,
+                                                       cudf::table_view({left_in_key}),
+                                                       cudf::table_view({right_in_key}),
+                                                       in_key_pred->back(),
+                                                       compare_nulls(),
+                                                       stream);
+        auto const build  = make_correlated_mark_build(right_eq, right_in_key, stream);
         return resolve_correlated_mark_join_result(*semi_indices,
                                                    *build,
                                                    left_eq,
-                                                   column(left_full, *in_key.left),
+                                                   left_in_key,
                                                    left_full,
                                                    lhs_output_columns.col_idxs,
                                                    input_batches[0],
                                                    stream,
                                                    batch_telemetry());
       }
-      auto const nulls =
-        resolve_mark_null_state(table_has_any_null(right_eq), right_eq.num_rows() == 0);
-      return resolve_mark_join_result(*semi_indices,
-                                      left_full,
-                                      lhs_output_columns.col_idxs,
-                                      left_eq,
-                                      nulls.build_has_null,
-                                      nulls.marks_are_definite,
-                                      input_batches[0],
-                                      stream,
-                                      batch_telemetry());
+      // The constructor rejects any other MARK join with an inequality condition.
+      throw std::logic_error(
+        "sirius_physical_hash_join: only a correlated MARK join runs as a mixed join, in "
+        "operator " +
+        std::to_string(this->get_operator_id()));
     } else if (join_type == duckdb::JoinType::INNER) {
       auto result = cudf::mixed_inner_join(
         left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), {}, stream);

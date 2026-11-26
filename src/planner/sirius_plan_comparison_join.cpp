@@ -539,10 +539,32 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       }
     }
     mark_mixes_null_safe_keys = has_null_safe && !all_null_safe;
-    if (mark_mixes_null_safe_keys && !is_correlated_any_mark(op)) {
+    bool const is_correlated  = is_correlated_any_mark(op);
+    if (mark_mixes_null_safe_keys && !is_correlated) {
       throw duckdb::NotImplementedException(
         "MARK join mixing a null-safe (IS NOT DISTINCT FROM) key with a plain key not supported "
         "in GPU");
+    }
+    // DuckDB's hash join applies the per-group rule to any MARK with one condition more than
+    // `mark_types` (PhysicalHashJoin::InitializeHashTable), whatever the comparisons are. A shape
+    // is_correlated_mark does not accept, such as an explicit MARK whose keys are all
+    // IS NOT DISTINCT FROM, would get the join-wide rule here and differ from DuckDB.
+    if (!op.mark_types.empty() && op.mark_types.size() + 1 == op.conditions.size() &&
+        !is_correlated) {
+      throw duckdb::NotImplementedException(
+        "MARK join with a per-group NULL rule that is not a correlated IN / ANY / ALL not "
+        "supported in GPU");
+    }
+    // cuDF's AST has no comparison on nested values, and the per-group NULL rule is not built for
+    // them.
+    if (is_correlated) {
+      auto const& in_key = op.conditions.back();
+      if (in_key.GetLHS().GetReturnType().IsNested() ||
+          in_key.GetRHS().GetReturnType().IsNested()) {
+        throw duckdb::NotImplementedException(
+          "Correlated IN / ANY / ALL on a nested (STRUCT, LIST, MAP or ARRAY) value not supported "
+          "in GPU");
+      }
     }
   }
 
@@ -659,10 +681,12 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   bool is_supported_by_hash_join = sirius::op::sirius_physical_hash_join::are_conditions_supported(
     conditions, op.join_type, op.mark_types.size());
-  // The hash join declines an inequality IN key that shares a column with a correlation key.
+  // Only the hash join has the per-group rule, so a correlated MARK it declines falls back to the
+  // CPU. One such case is an inequality IN key that shares a column with a correlation key.
   if (mark_mixes_null_safe_keys && !is_supported_by_hash_join) {
     throw duckdb::NotImplementedException(
-      "Correlated ANY / ALL comparing a correlation key column not supported in GPU");
+      "Correlated IN / ANY / ALL whose conditions the GPU hash join cannot run not supported in "
+      "GPU");
   }
   if (is_supported_by_hash_join && !prefer_range_joins) {
     auto options               = duckdb::query_operator_options(context);

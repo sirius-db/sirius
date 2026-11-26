@@ -344,6 +344,20 @@ TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
     "SELECT mnl.id, mnl.a <> ANY (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS m FROM mnl");
 }
 
+TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
+                 "gpu_execution correlated IN / ANY on a fixed-size ARRAY falls back",
+                 "[integration][gpu_execution][join][nulls][mark]")
+{
+  // The cuDF AST has no comparison on nested values, and the per-group NULL rule is not built for
+  // them.
+  expect_plan_fallback_matches_cpu(
+    "SELECT mnl.id, array_value(mnl.b, mnl.id) <> ANY (SELECT array_value(mnr.b, mnr.id) FROM mnr "
+    "WHERE mnr.a = mnl.a) AS m FROM mnl");
+  expect_plan_fallback_matches_cpu(
+    "SELECT mnl.id, array_value(mnl.b, mnl.id) IN (SELECT array_value(mnr.b, mnr.id) FROM mnr "
+    "WHERE mnr.a = mnl.a) AS m FROM mnl");
+}
+
 // DuckDB plans an ordered ANY / ALL (`<`, `<=`, `>`, `>=`) as a min/max aggregate under a SINGLE
 // join, so no MARK join is involved, whichever column is compared.
 TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
