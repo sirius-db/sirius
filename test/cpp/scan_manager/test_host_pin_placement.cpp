@@ -114,6 +114,67 @@ TEST_CASE("NUMA affinity supports uneven and unknown domains independently",
   REQUIRE(affinity.next_gpu(4, known) == 2);
 }
 
+TEST_CASE("host data is routed only to the query's admitted GPUs",
+          "[host_pin_placement][numa_affinity]")
+{
+  using sirius::memory::admitted_local_gpus;
+  std::array<int, 4> const local{0, 1, 2, 3};
+  std::array<int, 3> const admitted{0, 1, 2};
+
+  // No subset: every local GPU, in the topology's order.
+  REQUIRE(admitted_local_gpus(local, {}) == std::vector<int>{0, 1, 2, 3});
+  REQUIRE(admitted_local_gpus(local, local) == std::vector<int>{0, 1, 2, 3});
+  REQUIRE(admitted_local_gpus({}, {}).empty());
+
+  // A subset keeps the local order and drops the excluded GPU.
+  REQUIRE(admitted_local_gpus(local, admitted) == std::vector<int>{0, 1, 2});
+  std::array<int, 4> const reordered{3, 2, 1, 0};
+  REQUIRE(admitted_local_gpus(reordered, admitted) == std::vector<int>{2, 1, 0});
+
+  // No admitted GPU on the data's NUMA node, or no GPU on it at all: locality names no GPU, and
+  // the walk over an empty list leaves the task without a preference.
+  std::array<int, 2> const other_node{4, 5};
+  REQUIRE(admitted_local_gpus(other_node, admitted).empty());
+  REQUIRE(admitted_local_gpus({}, admitted).empty());
+  sirius::memory::numa_affinity no_local;
+  REQUIRE_FALSE(no_local.next_gpu(0, admitted_local_gpus(other_node, admitted)).has_value());
+
+  // Three chunks of one scan on three admitted GPUs land on three different GPUs, wherever the
+  // walk happens to start. Walking all four GPUs would name GPU 3 for one chunk in every four.
+  sirius::memory::numa_affinity affinity;
+  for (int start = 0; start < 4; ++start) {
+    auto const gpus = admitted_local_gpus(local, admitted);
+    std::vector<int> chunks;
+    for (int i = 0; i < 3; ++i) {
+      chunks.push_back(affinity.next_gpu(0, gpus).value());
+    }
+    std::sort(chunks.begin(), chunks.end());
+    REQUIRE(chunks == std::vector<int>{0, 1, 2});
+    (void)affinity.next_gpu(0, gpus);  // shift the starting point for the next round
+  }
+}
+
+TEST_CASE("queries admitted to different subsets rotate independently on one NUMA node",
+          "[host_pin_placement][numa_affinity]")
+{
+  // Two queries alternate on node 0, one admitted to {0, 1} and one to {0, 1, 2}. On a counter
+  // shared by both lists the first query would only see even values and get GPU 0 every time.
+  sirius::memory::numa_affinity affinity;
+  std::array<int, 2> const two{0, 1};
+  std::array<int, 3> const three{0, 1, 2};
+  std::vector<int> first, second;
+  for (int i = 0; i < 6; ++i) {
+    first.push_back(affinity.next_gpu(0, two).value());
+    second.push_back(affinity.next_gpu(0, three).value());
+  }
+  REQUIRE(first == std::vector<int>{0, 1, 0, 1, 0, 1});
+  REQUIRE(second == std::vector<int>{0, 1, 2, 0, 1, 2});
+
+  // The same list on another node is a separate walk.
+  REQUIRE(affinity.next_gpu(1, two) == 0);
+  REQUIRE(affinity.next_gpu(0, two) == 0);
+}
+
 TEST_CASE("concurrent placement retains balanced host and GPU counters",
           "[host_pin_placement][numa_affinity]")
 {
