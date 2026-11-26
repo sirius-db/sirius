@@ -1040,7 +1040,7 @@ The first job on the native worker plans the retained snapshot and opens one
 cursor. It can also read its first batch. Each later job reads at most one batch
 from that cursor, including when moving across splits. The native path forces
 `read.preparation-window=1` so the SDK prepares one file reader at a time within
-a split. CPU decode feeds GPU import serially through the cursor. The stop token
+an append/raw split. CPU decode feeds GPU import serially through the cursor. The stop token
 is checked around SDK calls. An active stock SDK call must complete before it
 can be drained. The reader uses SDK I/O independently of Sirius's Parquet caches.
 
