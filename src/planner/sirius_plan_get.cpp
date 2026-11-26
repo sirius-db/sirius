@@ -158,8 +158,8 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
   } catch (op::scan::equality_plan_error const& e) {
     return iceberg_decline(scan_reason::iceberg_equality_plan_unproven, e.what());
   }
-  // The plan keeps the delete files that apply to a data file, and only those are opened. A
-  // live delete that applies to none is never read, so its format does not matter, like its URI.
+  // The plan keeps the delete files on a data file's list, and only those are opened. A live
+  // delete on none is never read, so its format does not matter, like its URI.
   //
   // The spec also allows Avro and ORC delete files. The format is in the inventory, so no
   // delete file is opened to find out.
