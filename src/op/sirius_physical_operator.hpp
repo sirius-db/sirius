@@ -631,10 +631,16 @@ class sirius_physical_operator {
     return _alternate_physical_types;
   }
 
-  //! Whether @p type is the alternate carrier recorded for output column @p column.
+  //! Whether @p type is the alternate carrier recorded for output column @p column. STRING is the
+  //! alternate of every DICTIONARY32 carrier without a record: a dictionary carrier is a hint.
   [[nodiscard]] bool is_alternate_physical_type(std::size_t column,
                                                 cudf::data_type type) const noexcept
   {
+    if (column < _physical_types.size() &&
+        _physical_types[column].id() == cudf::type_id::DICTIONARY32 &&
+        type.id() == cudf::type_id::STRING) {
+      return true;
+    }
     return column < _alternate_physical_types.size() && _alternate_physical_types[column] == type;
   }
 

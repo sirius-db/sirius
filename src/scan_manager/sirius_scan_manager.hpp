@@ -407,6 +407,14 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 [[nodiscard]] bool pinned_column_nulls_restorable(pinned_entry const& entry,
                                                   std::size_t column_position);
 
+/// True when some chunk of @p entry is Simpatico-compressed and stores the cached column at
+/// @p entry_position with a string `dictionary` value root whose keys take at most
+/// @p max_keys_bytes, so that chunk can decode it straight to a DICTIONARY32 carrier. The other
+/// chunks decode it to STRING, which a carrier's consumers accept. Either tier qualifies.
+[[nodiscard]] bool pinned_column_dictionary_carriable(pinned_entry const& entry,
+                                                      std::size_t entry_position,
+                                                      std::size_t max_keys_bytes);
+
 /// True when every column of @p column_ids that @p entry carries still maps, in
 /// every chunk, to the pin-time native cuDF type @p returned_types declares. A
 /// column the entry lacks is skipped (coverage is checked separately) and an

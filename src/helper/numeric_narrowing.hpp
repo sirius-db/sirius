@@ -21,6 +21,8 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -28,9 +30,11 @@
 
 #include <cuda/stream>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace sirius {
 
@@ -216,6 +220,61 @@ enum class narrow_domain : uint8_t { NONE, SIGNED_INTEGER, UNSIGNED_INTEGER, DEC
  * @return `true` if @p source and @p target share a carrier family and @p target is strictly larger
  */
 [[nodiscard]] bool can_restore_to(cudf::data_type source, cudf::data_type target);
+
+/**
+ * @brief Checks whether @p carrier is the DICTIONARY32 carrier of a @p native STRING column
+ *
+ * A dictionary carrier holds the same values as keys plus codes, so `cast_through_rep` restores it
+ * with a decode and narrows to it with an encode. It shares no family with the numeric carriers,
+ * so `can_narrow_to` and `can_restore_to` reject the pair.
+ *
+ * Unlike a numeric carrier, a planned dictionary carrier is a hint: any batch may carry the column
+ * as its native STRING instead, so a consumer planned for the carrier accepts either form.
+ */
+[[nodiscard]] bool is_dictionary_carrier_of(cudf::data_type carrier,
+                                            cudf::data_type native) noexcept;
+
+/**
+ * @brief Most bytes (offsets plus chars) the keys of one batch's dictionary carrier may take
+ *
+ * Every gather, mask, and split of a batch copies its dictionary's keys whole, so a batch whose
+ * keys exceed this carries the column as STRING instead. Whatever makes a carrier enforces this:
+ * the decode that returns one and every concatenation that merges keys, so a consumer may rely on
+ * it without measuring.
+ */
+inline constexpr std::size_t dictionary_carrier_max_keys_bytes = std::size_t{512} * 1024;
+
+/**
+ * @brief Returns the bytes allocated to the STRING keys of DICTIONARY32 @p column
+ *
+ * The sizes of an owned column's buffers are known on the host, so this does not wait on a stream.
+ * A column without a keys child, as a zero-row dictionary may be, has none.
+ */
+[[nodiscard]] std::size_t dictionary_keys_bytes(cudf::column const& column);
+
+/**
+ * @brief Decodes DICTIONARY32 @p column of STRING keys to STRING
+ *
+ * Unlike `cudf::dictionary::decode`, a zero-row column decodes to an empty STRING column rather
+ * than an EMPTY one, whether or not it has a keys child.
+ */
+[[nodiscard]] std::unique_ptr<cudf::column> decode_dictionary_carrier(
+  cudf::column_view const& column,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Concatenates @p tables whose columns may carry a dictionary carrier in some tables and
+ * its STRING values in others
+ *
+ * `cudf::concatenate` rejects such a mix, so a column that mixes the two forms is decoded to
+ * STRING in every table; a column every table carries as a dictionary stays one unless its merged
+ * keys exceed `dictionary_carrier_max_keys_bytes`.
+ */
+[[nodiscard]] std::unique_ptr<cudf::table> concatenate_carriers(
+  std::vector<cudf::table_view> tables,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Checks whether exact bounds are representable by a numeric carrier

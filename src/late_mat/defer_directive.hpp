@@ -145,7 +145,8 @@ struct port_materialize_directive {
   [[nodiscard]] bool empty() const noexcept { return output_positions.empty(); }
   [[nodiscard]] std::size_t rowid_position() const { return rowid_at; }
 
-  /// Whether `schema` is the batch this directive was installed for.
+  /// Whether `schema` is the batch this directive was installed for. A column expected as a
+  /// DICTIONARY32 carrier may arrive as STRING.
   [[nodiscard]] bool matches(std::vector<cudf::data_type> const& schema) const;
 
   /// Self-consistency: the parallel vectors agree, the positions are ascending

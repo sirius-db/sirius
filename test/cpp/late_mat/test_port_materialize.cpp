@@ -27,10 +27,13 @@
 // produces a column that names what it actually read.
 
 #include "operator/operator_test_utils.hpp"
+#include "operator/operator_type_traits.hpp"
 #include "operator/partition_test_utils.hpp"
+#include "utils/data_utils.hpp"
 #include "utils/test_physical_operator.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/dictionary/encode.hpp>
 #include <cudf/table/table.hpp>
 
 #include <rmm/mr/per_device_resource.hpp>
@@ -203,6 +206,40 @@ TEST_CASE("a rowid becomes its columns again, in the batch's own order", "[late_
   REQUIRE(read_back<std::int32_t>(restored->get_column(2).view()) == expect);
   // The column that was never deferred is the one it always was.
   REQUIRE(read_back<std::int32_t>(restored->get_column(0).view()) == payload);
+}
+
+TEST_CASE("a carrier passing the port may arrive as strings in some batches",
+          "[late_mat][port][dictionary_carrier]")
+{
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  fake_entry pin({300, 150, 200}, stream);
+
+  auto schema     = riding_schema();
+  schema[0]       = cudf::data_type{cudf::type_id::DICTIONARY32};
+  auto const pair = make_defer_pair(schema, {1, 2}, schema, {1, 2}, {pin.origin(0), pin.origin(1)});
+  REQUIRE(pair.valid());
+
+  std::vector<std::uint64_t> const rowids{420, 7, 300, 0};
+  auto const strings = sirius::test::vector_to_cudf_column<
+    sirius::test::operator_utils::gpu_type_traits<sirius::test::operator_utils::string_tag>>(
+    std::vector<std::string>{"a", "b", "a", "c"});
+  auto const dictionary =
+    cudf::dictionary::encode(strings->view(), cudf::data_type{cudf::type_id::INT32});
+
+  for (auto const* carried : {dictionary.get(), strings.get()}) {
+    auto batch   = riding_batch(rowids, std::vector<std::int32_t>(rowids.size(), 0), stream);
+    auto columns = batch->release();
+    columns[0]   = std::make_unique<cudf::column>(carried->view(), stream, mr);
+    cudf::table const riding(std::move(columns));
+    REQUIRE(port_directive_matches(pair.port, riding.view()));
+
+    auto const restored = materialize_at_port(pair.port, riding.view(), stream, mr);
+    cudaStreamSynchronize(stream.get());
+    CHECK(restored->get_column(0).type() == carried->type());
+    std::vector<std::int32_t> expect(rowids.begin(), rowids.end());
+    CHECK(read_back<std::int32_t>(restored->get_column(1).view()) == expect);
+  }
 }
 
 TEST_CASE("a batch of another shape is declined, not materialized", "[late_mat][port]")

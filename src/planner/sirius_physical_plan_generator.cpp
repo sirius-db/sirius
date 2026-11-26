@@ -2029,13 +2029,16 @@ void insert_gpu_pipeline_operators_recursive(
   }
 }
 
-/// Whether this plan should carry narrow carriers: the connection's setting says so and the
-/// Sirius runtime that holds the plan sidecar is registered on the context.
-bool compressed_materialization_active(duckdb::ClientContext& context)
+/// Whether scans of this plan may install physical sidecars, which the compressed-schema passes
+/// then propagate: a setting that installs them (compressed materialization for numeric carriers,
+/// the dictionary carrier for strings) is on, and the Sirius runtime that holds the plan sidecar is
+/// registered on the context.
+bool physical_sidecars_enabled(duckdb::ClientContext& context)
 {
   if (!context.registered_state) { return false; }
   auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return state != nullptr && duckdb::compressed_materialization_enabled(context);
+  return state != nullptr && (duckdb::compressed_materialization_enabled(context) ||
+                              duckdb::dictionary_carrier_enabled(context));
 }
 
 }  // namespace
@@ -2479,7 +2482,7 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   }
 
   plan = fold_adjacent_projections(std::move(plan));
-  if (compressed_materialization_active(context)) {
+  if (physical_sidecars_enabled(context)) {
     auto const retracted = apply_compressed_schema_passes(plan);
     if (retracted > 0) {
       auto sirius_ctx = context.registered_state
