@@ -64,7 +64,15 @@ bool deferred_scan_output::defers(std::size_t position) const noexcept
 
 bool port_materialize_directive::matches(std::vector<cudf::data_type> const& schema) const
 {
-  return !empty() && schema == expected_schema;
+  if (empty() || schema.size() != expected_schema.size()) { return false; }
+  // A dictionary carrier is a hint: a batch may bring a carried column as its STRING values.
+  return std::equal(schema.begin(),
+                    schema.end(),
+                    expected_schema.begin(),
+                    [](auto const& actual, auto const& want) {
+                      return actual == want || (want.id() == cudf::type_id::DICTIONARY32 &&
+                                                actual.id() == cudf::type_id::STRING);
+                    });
 }
 
 bool port_materialize_directive::valid() const

@@ -29,6 +29,7 @@
 #include <catch.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/planner/logical_operator.hpp>
+#include <late_mat/defer_directive.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <planner/sirius_physical_plan_generator.hpp>
 #include <unistd.h>
@@ -92,7 +93,12 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
   ~DictionaryCarrierFixture()
   {
     if (pinned) { con->Query("CALL unpin_table('t');"); }
+    if (pinned_mixed) { con->Query("CALL unpin_table('mixed');"); }
     for (auto const* setting : {"enable_dictionary_carrier",
+                                "enable_duckdb_fallback",
+                                "late_materialization_min_boundaries",
+                                "late_materialization_min_value_x_boundaries",
+                                "scan_task_batch_size",
                                 "pin_table_compression",
                                 "pin_table_compression_min_batch_size_bytes",
                                 "pin_table_compression_max_compressed_fraction",
@@ -131,6 +137,35 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
     run_ok("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';");
     run_ok("CALL pin_table(format='duckdb', name='t', tier='" + tier + "');");
     pinned = true;
+  }
+
+  // Pin `mixed` Simpatico-compressed on @p tier. Its first chunk's `m` keys fit the carrier cap,
+  // later chunks' do not, so those chunks decode `m` to strings.
+  void pin_mixed(std::string const& tier)
+  {
+    run_ok(
+      "CREATE TABLE mixed AS SELECT range AS x, CASE WHEN range < 200000 THEN 'm' || (range % 10) "
+      "ELSE 'x' || range || repeat('_', 40) END AS m, 'p' || range || repeat('_', 40) AS p FROM "
+      "range(300000);");
+    run_ok("CREATE TABLE probe AS SELECT 'm' || range AS key FROM range(5);");
+    run_ok("CHECKPOINT;");
+    auto const plan_dir = dir / "mixed_plans";
+    fs::create_directories(plan_dir);
+    {
+      std::ofstream plan(plan_dir / "mixed.txt");
+      plan << "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+              "---\n"
+              "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+              "---\n"
+              "input -> identity\n";
+    }
+    run_ok("SET pin_table_compression = true;");
+    run_ok("SET pin_table_compression_min_batch_size_bytes = 0;");
+    run_ok("SET pin_table_compression_max_compressed_fraction = 2.0;");
+    run_ok("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';");
+    run_ok("SET scan_task_batch_size = 4194304;");
+    run_ok("CALL pin_table(format='duckdb', name='mixed', tier='" + tier + "');");
+    pinned_mixed = true;
   }
 
   // The number of scan outputs the planner carries as DICTIONARY32.
@@ -179,7 +214,8 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
   }
 
   fs::path dir;
-  bool pinned = false;
+  bool pinned       = false;
+  bool pinned_mixed = false;
 };
 
 }  // namespace
@@ -205,4 +241,45 @@ TEST_CASE_METHOD(
   compare_gpu_vs_cpu("SELECT low, count(*) FROM t GROUP BY low");
   auto const after = sirius::test::get_compressed_materialization_stats(*con);
   CHECK(after.scan_dictionary_carriers > before.scan_dictionary_carriers);
+}
+
+TEST_CASE_METHOD(DictionaryCarrierFixture,
+                 "dictionary carrier - deferred columns keep a carrier on either tier",
+                 "[integration][gpu_execution][dictionary_carrier][late_mat]")
+{
+  auto const tier = GENERATE(as<std::string>{}, "gpu", "host");
+  CAPTURE(tier);
+  pin_compressed(tier);
+  run_ok("SET enable_duckdb_fallback = false;");
+  run_ok("SET late_materialization_min_boundaries = 0;");
+  run_ok("SET late_materialization_min_value_x_boundaries = 0;");
+  auto const before = sirius::late_mat::deferrals_installed();
+  for (auto const* query : {
+         "SELECT low, count(*) FROM t GROUP BY low",
+         "SELECT low, distinct_values FROM t JOIN dim ON low = key WHERE x % 1000 = 0",
+         "SELECT low, wide, distinct_values FROM t JOIN dim ON low = key WHERE x % 997 = 0",
+         "SELECT \"group\", nullable, min(distinct_values) FROM t JOIN dim ON low = key GROUP BY "
+         "ALL",
+       }) {
+    compare_gpu_vs_cpu(query);
+  }
+  // The host-tier pin installs no deferral for these queries.
+  if (tier == "gpu") { CHECK(sirius::late_mat::deferrals_installed() > before); }
+}
+
+TEST_CASE_METHOD(DictionaryCarrierFixture,
+                 "dictionary carrier - a column carried in some chunks and strings in others",
+                 "[integration][gpu_execution][dictionary_carrier]")
+{
+  auto const tier = GENERATE(as<std::string>{}, "gpu", "host");
+  CAPTURE(tier);
+  pin_mixed(tier);
+  REQUIRE(carried_dictionaries("SELECT m, count(*) FROM mixed GROUP BY m") == 1);
+  run_ok("SET enable_duckdb_fallback = false;");
+  run_ok("SET late_materialization_min_boundaries = 0;");
+  run_ok("SET late_materialization_min_value_x_boundaries = 0;");
+  compare_gpu_vs_cpu("SELECT m, count(*) FROM mixed GROUP BY m");
+  compare_gpu_vs_cpu("SELECT m, p FROM mixed JOIN probe ON m = key");
+  compare_gpu_vs_cpu("SELECT m, count(*), max(p) FROM mixed JOIN probe ON m = key GROUP BY m");
+  compare_gpu_vs_cpu("SELECT DISTINCT m FROM mixed");
 }
