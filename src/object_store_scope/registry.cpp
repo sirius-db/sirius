@@ -8,25 +8,6 @@
 
 namespace sirius::object_store_scope {
 
-namespace {
-
-// A sorted copy of `current` with the entry of `key` replaced by `replacement` (or removed when
-// null).
-std::shared_ptr<const scope_set> with_key(const scope_set& current,
-                                          std::string_view key,
-                                          std::shared_ptr<const entry> replacement)
-{
-  auto next = std::make_shared<scope_set>(current);
-  std::erase_if(*next, [&](const auto& e) { return e->value->uri_prefix == key; });
-  if (replacement) { next->push_back(std::move(replacement)); }
-  std::stable_sort(next->begin(), next->end(), [](const auto& a, const auto& b) {
-    return a->value->uri_prefix.size() > b->value->uri_prefix.size();
-  });
-  return next;
-}
-
-}  // namespace
-
 registry::registry() : _set(std::make_shared<const scope_set>()) {}
 
 std::shared_ptr<const scope_set> registry::capture() const
@@ -52,7 +33,7 @@ registry::outcome registry::publish(std::shared_ptr<const settings> value,
   std::shared_ptr<const scope_set> published;
   {
     std::lock_guard update(_update_mutex);
-    auto next = with_key(*capture(), candidate->value->uri_prefix, candidate);
+    auto next = with_entry(*capture(), candidate);
     published = next;
     std::lock_guard lock(_mutex);
     retired = std::exchange(_set, std::move(next));
@@ -74,7 +55,7 @@ registry::outcome registry::drop(std::string_view uri_prefix)
       return e->value->uri_prefix == uri_prefix;
     });
     if (!present) { return {}; }
-    auto next = with_key(*current, uri_prefix, nullptr);
+    auto next = without_entry(*current, uri_prefix);
     published = next;
     std::lock_guard lock(_mutex);
     retired = std::exchange(_set, std::move(next));

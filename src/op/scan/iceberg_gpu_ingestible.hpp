@@ -68,7 +68,10 @@ class iceberg_ingestible_table_info : public parquet_ingestible_table_info {
  * 2. @ref materialize_metadata_to_table applies each bound delete set using reader positions or
  *    intervals, preserves predicate facts, and releases hidden indices after their last use.
  *
- * Equality deletes are declined by the planner: they need their key columns force-projected.
+ * 3. Equality deletes run right after the positional ones, on the same decoded batch. Their key
+ *    columns are read as DELETE_KEY columns the lowering appended to the scan and are dropped by
+ *    the output projection. Which groups apply to a data file comes from the scan's equality
+ *    plan; files with different answers never share a batch.
  */
 class iceberg_gpu_ingestible : public gpu_ingestible {
  public:
@@ -142,6 +145,10 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
   [[nodiscard]] std::string const& delete_key_for(std::string const& scan_path) const;
 
   std::shared_ptr<iceberg_delete_sets const> _delete_sets;
+  /// Owner of the equality-delete groups; null when the table has no equality deletes.
+  std::shared_ptr<const IcebergDeleteData> _equality_data;
+  /// Per equality-delete group: decoded-batch positions of its key columns, in key order.
+  std::vector<std::vector<cudf::size_type>> _equality_key_positions;
   std::shared_ptr<iceberg_dv_preparation> _deferred;
   std::shared_ptr<iceberg_dv_attempt> _attempt;
   std::string _table_path;

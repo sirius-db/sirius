@@ -33,6 +33,7 @@
 #include "scan_manager/insert_delta_job.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/memory_prefetcher.hpp"
+#include "scan_manager/metadata_placement.hpp"
 #include "scan_manager/mvcc_mask_cache.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
@@ -396,6 +397,14 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
  */
 [[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(
   pinned_entry const& entry, std::size_t entry_position, cudf::data_type native_type);
+
+/// Whether late materialization can restore the nulls of the pinned column at
+/// @p column_position: its gather shape carries validity through, or the pin
+/// proves the column holds none. A compressed chunk carrying no blob answers
+/// neither, so a pin with one is refused. Deferral admission asks this of every
+/// column a primary bundle or a rider defers.
+[[nodiscard]] bool pinned_column_nulls_restorable(pinned_entry const& entry,
+                                                  std::size_t column_position);
 
 /// True when every column of @p column_ids that @p entry carries still maps, in
 /// every chunk, to the pin-time native cuDF type @p returned_types declares. A
@@ -1167,6 +1176,8 @@ class sirius_scan_manager {
   /// the GPU id set fed to the round-robin scan-balancing strategy.
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
+  metadata_placement _metadata_placement;
+  std::atomic<size_t> _next_metadata_domain{0};
   exec::static_thread_pool _thread_pool;
   std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
     std::make_shared<shared_scan_budget>();

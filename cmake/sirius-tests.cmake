@@ -574,3 +574,32 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# Construction uses only host-side libraries; exercise the production sources on
+# CPU CI.
+find_package(Threads REQUIRED)
+add_executable(sirius_plan_unittest test/cpp/plan/test_c_api_plan.cpp
+                                    src/c_api/plan.cpp src/c_api/error.cpp)
+target_include_directories(sirius_plan_unittest PRIVATE include src)
+target_link_libraries(
+  sirius_plan_unittest PRIVATE Catch2::Catch2WithMain Threads::Threads
+                               absl::strings utf8proc::utf8proc)
+set_target_properties(
+  sirius_plan_unittest
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CXX_SCAN_FOR_MODULES OFF
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
+
+# Export cleanup/ordering tests need neither a CUDA driver nor a DuckDB runtime.
+add_executable(
+  sirius_parquet_session_test src/output/parquet_session.cpp
+                              test/cpp/output/test_parquet_session.cpp)
+target_compile_features(sirius_parquet_session_test PRIVATE cxx_std_20)
+set_target_properties(sirius_parquet_session_test
+                      PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+target_include_directories(
+  sirius_parquet_session_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                      ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp)
+target_link_libraries(sirius_parquet_session_test PRIVATE Catch2::Catch2WithMain
+                                                          pthread)

@@ -14,6 +14,12 @@ Tune Sirius configuration parameters for optimal TPC-H performance at various sc
 
 **Reference:** See `.claude/skills/_shared/build-and-query.md` for shared infrastructure (build modes, query execution).
 
+This tuning workflow and its profiling examples remain TPC-H-specific. For a
+scale_bench comparison, use the [benchmark skill's scale_bench workflow](../benchmark/SKILL.md#workflow-s-a-scale_bench)
+and its supported serial runner; do not apply TPC-H query numbers, scale factors,
+pinning or profiling wrappers to the named workloads. Match result format and
+prepared-table policy between configurations.
+
 ## Configuration Parameters
 
 | Parameter | Range | Description |

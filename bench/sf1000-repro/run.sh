@@ -8,7 +8,6 @@ REPO="$(cd "$HERE/../.." && pwd)"
 
 DATA="${DATA:-$HOME/tpch_parquet_sf1000}"          # SF1000 parquet, one dir per table
 CUDF_SO="${CUDF_SO:-}"                             # leave unset to use pixi-provided libcudf
-PLANS="${PLANS:-$HERE/plans}"
 CFG="${CFG:-$HERE/sirius-sf1000.yaml}"
 NAME="${NAME:-sf1000_repro}"
 
@@ -27,16 +26,15 @@ if [ -n "$CUDF_SO" ]; then
   export LD_PRELOAD="$CUDF_SO"
 fi
 
-# Two settings do the work here:
-#   pin_table_input_compression_plan_dir -> simpatico plans; l_shipinstruct MUST stay `dictionary`
-#     or the decode-time predicate pushdown has no dictionary to answer from and silently no-ops.
+# Settings that do the work here:
+#   pin_table_compression=true -> Simpatico plans selected automatically per pinned table; GPU pins
+#     small next to GPU memory stay uncompressed (pin_table_compression_min_table_device_fraction).
 #   expression_evaluator_strategy=ast_jit -> cuDF's JIT expression evaluator instead of the
 #     interpreted AST walker. Worth -4.17% suite on its own. Default is ast_interpret.
 #   parquet_metadata_cache=true -> DuckDB keeps the parsed Parquet footers instead of re-parsing
 #     them at every bind (2-4 ms per query on the short queries). Inputs that are not Parquet
 #     ignore it.
 export SIRIUS_PRE_SQL="SET pin_table_compression = true; \
-SET pin_table_input_compression_plan_dir = '$PLANS'; \
 SET expression_evaluator_strategy = 'ast_jit'; \
 SET parquet_metadata_cache = true"
 
@@ -51,7 +49,6 @@ done
 # per-iteration timings are unaffected either way because we report best-of-3.
 echo "data      : $DATA"
 echo "libcudf   : ${CUDF_SO:-<pixi-provided>}"
-echo "plans     : $PLANS"
 echo "config    : $CFG"
 echo
 

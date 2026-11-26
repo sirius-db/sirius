@@ -38,60 +38,40 @@ equality_delete_filter::equality_delete_filter(std::shared_ptr<const IcebergDele
 }
 
 std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf::table> tbl,
-                                                           batch_layout layout,
+                                                           batch_layout,
                                                            ::cuda::stream_ref stream,
                                                            rmm::device_async_resource_ref mr)
 {
   auto const n_rows = tbl->num_rows();
   if (n_rows == 0) { return tbl; }
 
-  // Per spec, equality deletes apply only to data files with a strictly lower sequence number.
-  // That is a per-file answer, but the mask below is per batch, so a batch mixing files that
-  // disagree is refused: keeping them apart is the caller's job.
-  auto const& group = _delete_data->equality_delete_groups[_group_index];
-
-  // An unknown file is refused rather than assumed deletable: answering "applies" would delete
-  // rows from a data file that may post-date the delete.
-  auto applies_to = [&](std::string const& path) {
-    if (group.sequence_number <= 0) { return true; }
-    auto seq_it = _delete_data->data_file_manifest_sequence_numbers.find(path);
-    if (seq_it == _delete_data->data_file_manifest_sequence_numbers.end()) {
-      throw std::invalid_argument(
-        "[equality_delete_filter] no sequence number recorded for data file '" + path +
-        "'; equality deletes apply only to data files strictly older than the delete, so this "
-        "cannot be decided (the manifest-to-scan path translation did not cover this file)");
-    }
-    if (seq_it->second <= 0) { return true; }
-    return seq_it->second < group.sequence_number;
-  };
-
-  bool const first_applies = layout.empty() || applies_to(layout.front().data_file_path);
-  for (auto const& run : layout) {
-    if (applies_to(run.data_file_path) != first_applies) {
-      throw std::invalid_argument(
-        "[equality_delete_filter] batch mixes data files that disagree on whether delete group "
-        "sequence " +
-        std::to_string(group.sequence_number) +
-        " applies; equality deletes need one sequence number per batch");
-    }
-  }
-
-  if (!first_applies) {
-    SIRIUS_LOG_DEBUG(
-      "[equality_delete_filter] Skipping group (delete_seq={}) — batch's data "
-      "file(s) are at or above it",
-      group.sequence_number);
-    return tbl;
+  auto const& group = _delete_data->equality_delete_groups.at(_group_index);
+  auto const keys   = group.delete_table->view();
+  if (_data_key_indices.size() != static_cast<std::size_t>(keys.num_columns())) {
+    throw std::invalid_argument("[equality_delete_filter] " +
+                                std::to_string(_data_key_indices.size()) +
+                                " batch key column(s) supplied for a delete group keyed on " +
+                                std::to_string(keys.num_columns()));
   }
 
   // Missing key column means projection widening never reached the scan. Returning the batch
   // unchanged would drop this group's deletes and hand back deleted rows.
-  for (auto idx : _data_key_indices) {
-    if (idx >= static_cast<cudf::size_type>(tbl->num_columns())) {
+  for (std::size_t k = 0; k < _data_key_indices.size(); ++k) {
+    auto const idx = _data_key_indices[k];
+    if (idx < 0 || idx >= static_cast<cudf::size_type>(tbl->num_columns())) {
       throw std::invalid_argument("[equality_delete_filter] equality-delete key column index " +
                                   std::to_string(idx) + " is absent from the decoded batch (" +
                                   std::to_string(tbl->num_columns()) +
                                   " columns); the key columns must be appended to the projection");
+    }
+    // The hash join compares raw values; a type mismatch would be a wrong answer or a crash.
+    auto const batch_type  = tbl->get_column(idx).type();
+    auto const delete_type = keys.column(static_cast<cudf::size_type>(k)).type();
+    if (batch_type != delete_type) {
+      throw std::invalid_argument(
+        "[equality_delete_filter] key column " + std::to_string(k) + " is cuDF type " +
+        std::to_string(static_cast<int>(batch_type.id())) + " in the batch but " +
+        std::to_string(static_cast<int>(delete_type.id())) + " in the delete group");
     }
   }
 

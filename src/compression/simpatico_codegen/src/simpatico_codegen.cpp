@@ -1098,12 +1098,36 @@ std::unique_ptr<cudf::column> decode_complete_column(PlanTree const& plan,
 
 }  // namespace
 
+validity_sidecar const* column_validity(const compressed_table& table, std::size_t column_index)
+{
+  auto const* tree = column_plan(table, column_index, nullptr, "column_validity");
+  return tree == nullptr ? nullptr : &tree->validity;
+}
+
+std::optional<std::int64_t> column_null_count(const compressed_table& table,
+                                              std::size_t column_index)
+{
+  auto const* v = column_validity(table, column_index);
+  if (v == nullptr) { return std::nullopt; }
+  switch (v->kind) {
+    case validity_kind::all_valid: return std::int64_t{0};
+    case validity_kind::all_null:
+    case validity_kind::mask:
+      // A negative count is a record the writer never produces; reading it as
+      // "no nulls" would admit a column on a corrupted header.
+      if (v->null_count < 0) { return std::nullopt; }
+      return v->null_count;
+  }
+  return std::nullopt;
+}
+
 std::unique_ptr<cudf::column> decompress_column_rows(const compressed_table& table,
                                                      std::size_t column_index,
                                                      sirius::codegen::chunk_row_set const& rows,
                                                      ::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr,
-                                                     std::string* error_out)
+                                                     std::string* error_out,
+                                                     validity_sidecar const** stripped_validity)
 {
   auto const* tree = column_plan(table, column_index, error_out, "decompress_column_rows");
   if (tree == nullptr) { return nullptr; }
@@ -1122,12 +1146,15 @@ std::unique_ptr<cudf::column> decompress_column_rows(const compressed_table& tab
   }
 
   decode_selection sel;
-  sel.rows           = &rows;
-  sel.survivor_count = rows.num_survivors;
-  sel.route          = sirius::codegen::decode_route::bitpack_mask;
+  sel.rows                       = &rows;
+  sel.survivor_count             = rows.num_survivors;
+  sel.route                      = sirius::codegen::decode_route::bitpack_mask;
+  sel.caller_reattaches_validity = stripped_validity != nullptr;
 
-  return decode_complete_column(
-    *tree, table.columns[column_index].dtype, stream, mr, &sel, error_out);
+  auto col =
+    decode_complete_column(*tree, table.columns[column_index].dtype, stream, mr, &sel, error_out);
+  if (col && stripped_validity != nullptr) { *stripped_validity = &tree->validity; }
+  return col;
 }
 
 std::unique_ptr<cudf::column> decompress_column_compacted(
@@ -1136,7 +1163,8 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   sirius::codegen::selection_mask const& mask,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
-  std::string* error_out)
+  std::string* error_out,
+  validity_sidecar const** stripped_validity)
 {
   auto const* tree = column_plan(table, column_index, error_out, "decompress_column_compacted");
   if (tree == nullptr) { return nullptr; }
@@ -1153,12 +1181,15 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   }
 
   decode_selection sel;
-  sel.mask           = &mask;
-  sel.survivor_count = mask.survivor_count;
-  sel.route          = route;
+  sel.mask                       = &mask;
+  sel.survivor_count             = mask.survivor_count;
+  sel.route                      = route;
+  sel.caller_reattaches_validity = stripped_validity != nullptr;
 
-  return decode_complete_column(
-    *tree, table.columns[column_index].dtype, stream, mr, &sel, error_out);
+  auto col =
+    decode_complete_column(*tree, table.columns[column_index].dtype, stream, mr, &sel, error_out);
+  if (col && stripped_validity != nullptr) { *stripped_validity = &tree->validity; }
+  return col;
 }
 
 std::unique_ptr<cudf::column> decompress_column_full(const compressed_table& table,

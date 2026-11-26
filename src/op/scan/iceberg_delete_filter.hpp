@@ -41,7 +41,7 @@ namespace sirius::op::scan {
 using batch_layout = std::span<batch_row_run const>;
 
 /// One delete filter stage: V2 positional deletes (which V3 deletion vectors merge into) or V2
-/// equality deletes. Applied per decoded batch by @ref iceberg_delete_pipeline.
+/// equality deletes. Applied per decoded batch by @ref iceberg_gpu_ingestible.
 class iceberg_delete_filter {
  public:
   virtual ~iceberg_delete_filter() = default;
@@ -77,11 +77,12 @@ class positional_delete_filter : public iceberg_delete_filter {
   iceberg_delete_sets _delete_sets;
 };
 
-/// Applies V2 equality deletes: probes the group's prebuilt hash join with the batch's key
-/// columns and applies an anti-join mask. Entirely on device.
+/// Applies one equality-delete group: probes its prebuilt hash join with the batch's key columns
+/// and applies an anti-join mask. The caller decides which groups apply; the layout is ignored.
 class equality_delete_filter : public iceberg_delete_filter {
  public:
-  /// @param data_key_indices Batch column indices of the group's equality key columns.
+  /// @param data_key_indices Batch column indices of the group's key columns, in the group's
+  ///                         key order.
   equality_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data,
                          size_t group_index,
                          std::vector<cudf::size_type> data_key_indices);
@@ -95,44 +96,6 @@ class equality_delete_filter : public iceberg_delete_filter {
   std::shared_ptr<const IcebergDeleteData> _delete_data;
   size_t _group_index;
   std::vector<cudf::size_type> _data_key_indices;
-};
-
-/**
- * @brief Applies an ordered list of delete filters to a batch, then strips extra columns.
- *
- * Equality-delete key columns may not be in the query's projection, so the scan is widened to
- * append them; once every filter has run they are stripped again. Order matters — they are
- * appended at the tail, and stripping cuts from the tail.
- */
-class iceberg_delete_pipeline {
- public:
-  /// Applied in insertion order.
-  void add_filter(std::shared_ptr<iceberg_delete_filter> filter);
-
-  /// Extra columns appended for delete-key projection, stripped after all filters run.
-  void set_extra_column_count(size_t n) { _extra_column_count = n; }
-
-  [[nodiscard]] size_t extra_column_count() const { return _extra_column_count; }
-
-  /// True if no filters have been added.
-  [[nodiscard]] bool empty() const { return _filters.empty(); }
-
-  /**
-   * @brief Run every filter in insertion order, then strip any trailing extra columns.
-   *
-   * @param tbl     Decoded batch, consumed.
-   * @param layout  Row provenance of @p tbl (see @ref batch_row_run).
-   * @param stream  CUDA stream for GPU operations.
-   * @param mr      Allocator for filter results.
-   */
-  [[nodiscard]] std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
-                                                   batch_layout layout,
-                                                   ::cuda::stream_ref stream,
-                                                   rmm::device_async_resource_ref mr) const;
-
- private:
-  std::vector<std::shared_ptr<iceberg_delete_filter>> _filters;
-  size_t _extra_column_count = 0;
 };
 
 }  // namespace sirius::op::scan

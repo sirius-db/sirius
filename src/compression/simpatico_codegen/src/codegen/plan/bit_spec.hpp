@@ -81,7 +81,7 @@ cudf::data_type parse_packed_type_token(std::string_view tok);
 /// `bitextract_3hi_5lo` and `bitextract_i16_3hi_5lo` share the namespace
 /// `bitextract_3hi_5lo.<field>`. That decouples the auto-injected type prefix
 /// (stored in `step.compressor` for type reconstruction) from the path layout
-/// (used by the leaves map).
+/// (used by the leaves map). `bitpack_gcd` likewise shares `bitpack`'s namespace.
 std::string bitextract_canonical_name(std::string const& compressor);
 
 /// Canonicalize a path token by applying `bitextract_canonical_name` to the

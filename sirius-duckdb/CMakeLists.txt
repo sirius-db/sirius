@@ -28,6 +28,19 @@ else()
   message(FATAL_ERROR "SIRIUS_DUCKDB_LINKAGE must be static or shared")
 endif()
 
+# DuckDB's C++ ABI differs between revisions, and the metadata footer DuckDB
+# checks on load only names the tree this extension is configured in.
+if(COMMAND sirius_require_duckdb_revision)
+  sirius_require_duckdb_revision(
+    "${sirius_DUCKDB_REVISION}" "${DuckDB_SOURCE_DIR}"
+    "${SIRIUS_DUCKDB_LINKAGE}")
+elseif(SIRIUS_DUCKDB_LINKAGE STREQUAL "static")
+  message(
+    FATAL_ERROR
+      "Cannot verify that Sirius and this extension use one DuckDB revision: the Sirius package predates the check"
+  )
+endif()
+
 include(cmake/third-party-notices.cmake)
 set(notice_components "${CMAKE_CURRENT_BINARY_DIR}/third_party_components")
 file(REMOVE_RECURSE "${notice_components}")

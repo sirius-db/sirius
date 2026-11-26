@@ -17,7 +17,7 @@ get_filename_component(sirius_source "${CMAKE_CURRENT_LIST_DIR}/../../.."
                        ABSOLUTE)
 find_program(sirius_git NAMES git REQUIRED)
 set(sirius_files)
-foreach(repository . duckdb cucascade substrait)
+foreach(repository . sirius-duckdb/duckdb cucascade substrait)
   if(NOT EXISTS "${sirius_source}/${repository}/CMakeLists.txt")
     message(
       FATAL_ERROR "Initialize the Sirius engine submodules before building")
@@ -35,6 +35,7 @@ foreach(repository . duckdb cucascade substrait)
   endif()
   execute_process(
     COMMAND
+      "${CMAKE_COMMAND}" -E env --unset=GIT_DIR --unset=GIT_WORK_TREE
       "${sirius_git}" -c core.quotePath=false -C
       "${sirius_source}/${repository}" ls-files --cached --others
       --exclude-standard -- ${paths}
@@ -68,5 +69,10 @@ foreach(path IN LISTS sirius_files)
   file(SHA256 "${path}" hash)
   string(APPEND sirius_hashes "${hash}  ${name}\n")
 endforeach()
+# The package records the DuckDB commit, which can change without its files.
+include("${sirius_source}/cmake/sirius-duckdb-revision.cmake")
+sirius_duckdb_revision("${sirius_source}/sirius-duckdb/duckdb"
+                       sirius_duckdb_commit)
+string(APPEND sirius_hashes "${sirius_duckdb_commit}  sirius-duckdb/duckdb\n")
 file(WRITE "${sirius_inventory}" "${sirius_hashes}")
 list(APPEND VCPKG_HASH_ADDITIONAL_FILES "${sirius_inventory}")

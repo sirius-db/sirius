@@ -91,6 +91,8 @@ class sirius_httpfs : public duckdb::FileSystem {
   /// reads it once per caching handle as the validation token; an empty tag
   /// keeps the safe (uncached) bypass.
   std::string GetVersionTag(duckdb::FileHandle& handle) override;
+  /// Forbids byte-cache reuse when this handle's captured policy disabled it.
+  duckdb::optional<duckdb::timestamp_t> GetCacheValidUntil(duckdb::FileHandle& handle) override;
 
   /// Exact key: returns @c {path} when @ref CanHandleFile. A glob pattern
   /// expands via one paginated S3 LIST (see @ref expand_glob) under four

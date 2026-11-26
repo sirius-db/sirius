@@ -70,7 +70,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> all_gather(
   stream_id stream,
   std::shared_ptr<cucascade::data_batch> mine,
   cucascade::memory::memory_space& gpu,
-  rmm::cuda_stream_view cuda_stream,
+  ::cuda::stream_ref cuda_stream,
   std::chrono::milliseconds timeout)
 {
   auto const world = service.world_size();

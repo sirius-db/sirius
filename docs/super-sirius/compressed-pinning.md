@@ -20,14 +20,30 @@ CALL pin_table('/data/lineitem/*.parquet',
                compression => true);
 ```
 
-When no readable, nonempty matching plan is found, each materialized chunk uses the same policy as
-[spill compression](memory-management.md#spill-compression). It samples up to 65,536 values:
-integer-valued columns choose bitpacking, delta-bitpacking, or delta-RLE-bitpacking, with
-more elaborate plans requiring over 10% estimated size savings. Strings with at least
-4,096 rows use a dictionary with bitpacked indices when at most 10% of the sample is
-distinct; otherwise they use ANS characters and delta-bitpacked offsets. Other eligible
-fixed-width columns use bitpacking; short strings and unsupported types are stored as is.
-Selection runs after carrier narrowing and in pinned-column order.
+When no readable, nonempty matching plan is found, a GPU-tier pin smaller than
+`pin_table_compression_min_table_device_fraction` (default 0.05) of the memory of the GPUs it
+pins to is stored uncompressed. Such a pin frees little GPU memory, and its scans would still
+pay for decoding. The size is the pin's uncompressed bytes: the first materialized chunk's
+bytes per row, after narrowing, times the table's row count. If the row count can't be read,
+the pin is not gated. Host-tier pins are never gated, because every scan copies them over the
+host-to-device link and fewer bytes always shorten that copy. On SF1000 with GB300, the default
+compresses the `lineitem` and `orders` pins of most queries and leaves `part`, `partsupp`,
+`customer` and `supplier` raw. Compressing those as well slowed q2, q11, q14, q16, q19 and q20
+by 4 to 27 ms each on the GPU tier. On the host tier, compressing every table is 0.26 s faster
+over the suite than keeping the small ones raw.
+
+Otherwise each materialized chunk selects its plans automatically. The policy is close to
+[spill compression](memory-management.md#spill-compression)'s, but it favors plans a filtered
+scan can decode in place. It samples up to 65,536 values. Integer-valued columns choose
+between bitpacking and delta-bitpacking, and delta-bitpacking needs over 10% estimated size
+savings. Delta-RLE-bitpacking, which every scan decodes in full, is chosen only when it saves
+at least a quarter of the column's uncompressed size more than the better of those two. A
+sorted key whose differences already pack to almost nothing does not qualify. Strings with
+at least 4,096 rows use a dictionary with bitpacked indices when at most 10% of the sample is
+distinct. Otherwise they keep their characters as is beside delta-bitpacked offsets, which a
+filtered scan gathers for surviving rows only. Other eligible fixed-width columns use
+bitpacking; short strings and unsupported types are stored as is. Selection runs after
+carrier narrowing and in pinned-column order.
 
 Each explicit plan file carries one `---`-separated DSL
 block per full-table column in schema order; a pin of a column subset selects the matching
@@ -209,6 +225,21 @@ The decision trace shows what happened: the plan per column (route, bounds, what
 and why), then per batch the sources in the order they ran, the enumeration chosen, the
 survivor count and whether the batch came back needing no further filtering. Enable
 `fused_scan_diagnostics` to emit these decisions at INFO level.
+
+### Reporting the rows the decode kept
+
+A decode that compacts can hand back the positions it kept, as an ascending INT32 index list over
+the pre-filter batch (`pushdown_outcome::survivor_rows`). It is produced only when the request
+asks (`pushdown_request::report_survivors`, set through
+`decompression_pushdown_scan::with_survivor_reporting()`), which only a scan carrying a
+late-materialization deferral does — that rowid addresses the pinned chunk by position, and a
+compacted batch no longer holds the chunk's rows in order.
+
+The answer is not re-derived: the tier-B route already materialized the index list to gather by,
+and every other route left the counted mask it balloted, so this either copies a buffer that
+exists or expands one (`mask_to_row_indices`). `pushdown_outcome::compacted` reports that rows
+were dropped at all — separately from `row_filtered`, which additionally claims the whole filter
+was carried — so a consumer can tell "no positions asked for" apart from "no rows dropped".
 
 ## Interaction with the downgrade executor
 

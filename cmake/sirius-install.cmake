@@ -15,6 +15,7 @@ install(
 install(
   FILES "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
+        "${CMAKE_CURRENT_LIST_DIR}/sirius-duckdb-revision.cmake"
   DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
   COMPONENT sirius_library)
 

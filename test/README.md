@@ -29,11 +29,27 @@ It respects `CUDA_VISIBLE_DEVICES` and shards over the GPUs it lists. Each proce
 
 Multi-GPU tests of direct peer copies skip when a GPU's memory pool does not grant the other GPUs access, as on some PCIe topologies. On a machine whose GPUs must support those copies, set `SIRIUS_TEST_REQUIRE_POOL_PEER_ACCESS=1` so these tests fail instead of skipping.
 
+Iceberg tests load the installed `iceberg` extension. Set `SIRIUS_TEST_ICEBERG_EXTENSION` to the path of another build to load that one instead. With it set, `iceberg table replacement at the same location` fails unless that build's `iceberg_metadata()` accepts `expected_table_uuid` ([duckdb/duckdb-iceberg#1729](https://github.com/duckdb/duckdb-iceberg/pull/1729)), so the run covers the verified delete lookup and not the known limitation:
+```bash
+SIRIUS_TEST_ICEBERG_EXTENSION=/path/to/iceberg.duckdb_extension \
+  pixi run build/release/test/cpp/sirius_unittest "[iceberg_table_replacement]"
+```
+
 To run specific tests, call the test binary directly with a Catch2 tag or test name:
 ```bash
 pixi run build/release/test/cpp/sirius_unittest "[path_utils]"
 pixi run build/release/test/cpp/sirius_unittest "strip_file_scheme folds dot, dot-dot and empty segments"
 ```
+
+## Performance benchmarks
+
+The [Python performance runner](tpch_performance/performance_test.py) supports
+TPC-H (the default) and `--benchmark scale_bench`. See the
+[scale_bench guide](tpch_performance/README.md#scale_bench) for named queries,
+existing Parquet input layout, `--temp-dir` preparation/cleanup, and fingerprint,
+row or Parquet result modes. The [run guide](tpch_performance/run.md) also covers
+the TPC-H-specific legacy shell and profiling workflows. TPC-DS retains its
+[separate benchmark script](tpcds_performance/benchmark_and_validate.sh).
 
 ## TPC-Havoc queries
 

@@ -23,6 +23,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/version_config.hpp>
 
 #include <rmm/aligned.hpp>
 #include <rmm/error.hpp>
@@ -67,25 +68,54 @@ void add_block_copies(
   }
 }
 
+using gpu_buffer  = incoming_batch::gpu_buffer;
+using mask_buffer = incoming_batch::mask_buffer;
+
+mask_buffer make_mask(std::size_t bytes,
+                      ::cuda::stream_ref stream,
+                      rmm::device_async_resource_ref mr)
+{
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+  return mask_buffer{
+    stream,
+    mr,
+    (bytes / sizeof(mask_buffer::value_type)) + (bytes % sizeof(mask_buffer::value_type) != 0),
+    ::cuda::no_init};
+#else
+  return mask_buffer{bytes, stream, mr};
+#endif
+}
+
+void buffer_kinds(column_metadata const& c, std::vector<bool>& masks)
+{
+  if (c.has_null_mask && c.null_mask_size > 0) { masks.push_back(true); }
+  if (c.has_data && c.data_size > 0) { masks.push_back(false); }
+  for (auto const& child : c.children) {
+    buffer_kinds(child, masks);
+  }
+}
+
 /// Rebuilds one column from its buffers, consumed in walk order from @p next.
 std::unique_ptr<cudf::column> rebuild(column_metadata const& c,
-                                      std::vector<rmm::device_buffer>::iterator& next)
+                                      std::vector<gpu_buffer>::iterator& next,
+                                      ::cuda::stream_ref stream,
+                                      rmm::device_async_resource_ref mr)
 {
-  auto const id   = static_cast<cudf::type_id>(c.type_id);
-  auto const rows = static_cast<cudf::size_type>(c.num_rows);
-  rmm::device_buffer mask =
-    c.has_null_mask && c.null_mask_size > 0 ? std::move(*next++) : rmm::device_buffer{};
+  auto const id    = static_cast<cudf::type_id>(c.type_id);
+  auto const rows  = static_cast<cudf::size_type>(c.num_rows);
+  mask_buffer mask = c.has_null_mask && c.null_mask_size > 0 ? std::move(*((next++)->mask))
+                                                             : make_mask(0, stream, mr);
   rmm::device_buffer data =
-    c.has_data && c.data_size > 0 ? std::move(*next++) : rmm::device_buffer{};
+    c.has_data && c.data_size > 0 ? std::move(*((next++)->data)) : rmm::device_buffer{};
   if (id == cudf::type_id::STRING) {
     auto const& o = c.children.front();
     rmm::device_buffer offsets_data =
-      o.has_data && o.data_size > 0 ? std::move(*next++) : rmm::device_buffer{};
+      o.has_data && o.data_size > 0 ? std::move(*((next++)->data)) : rmm::device_buffer{};
     auto offsets =
       std::make_unique<cudf::column>(cudf::data_type{static_cast<cudf::type_id>(o.type_id)},
                                      rows + 1,
                                      std::move(offsets_data),
-                                     rmm::device_buffer{},
+                                     make_mask(0, stream, mr),
                                      0);
     return cudf::make_strings_column(
       rows, std::move(offsets), std::move(data), c.null_count, std::move(mask));
@@ -106,7 +136,7 @@ outgoing_batch::outgoing_batch(std::shared_ptr<cucascade::data_batch> batch,
 }
 
 std::optional<outgoing_batch> outgoing_batch::make(std::shared_ptr<cucascade::data_batch> batch,
-                                                   rmm::cuda_stream_view stream)
+                                                   ::cuda::stream_ref stream)
 {
   auto read_only = batch->to_read_only();
   if (read_only.get_current_tier() != Tier::GPU) {
@@ -142,7 +172,7 @@ std::optional<outgoing_batch> outgoing_batch::make(std::shared_ptr<cucascade::da
 void outgoing_batch::copy_range(std::size_t begin,
                                 std::size_t end,
                                 void* dst,
-                                rmm::cuda_stream_view stream) const
+                                ::cuda::stream_ref stream) const
 {
   if (begin > end || end > _header.stream_bytes) {
     throw sirius::invalid_input_exception(
@@ -168,7 +198,7 @@ incoming_batch::incoming_batch(batch_header header, cucascade::memory::memory_sp
 std::unique_ptr<incoming_batch> incoming_batch::land(batch_header header,
                                                      cucascade::memory::memory_space& gpu,
                                                      cucascade::memory::memory_space* host,
-                                                     rmm::cuda_stream_view stream)
+                                                     ::cuda::stream_ref stream)
 {
   std::unique_ptr<incoming_batch> out{new incoming_batch(std::move(header), gpu)};
 
@@ -201,8 +231,24 @@ std::unique_ptr<incoming_batch> incoming_batch::land(batch_header header,
       absl::Cleanup detach = [&] { tracker->reset_stream_reservation(stream); };
       try {
         out->_gpu_buffers.reserve(out->_buffers.size());
-        for (auto const& b : out->_buffers) {
-          out->_gpu_buffers.emplace_back(b.size, stream, gpu.get_default_allocator());
+        std::vector<bool> masks;
+        for (auto const& c : out->_header.columns) {
+          buffer_kinds(c, masks);
+        }
+        if (masks.size() != out->_buffers.size()) {
+          throw sirius::internal_exception("exchange: inconsistent buffer layout");
+        }
+        for (std::size_t i = 0; i < out->_buffers.size(); ++i) {
+          auto const& b = out->_buffers[i];
+          gpu_buffer buffer;
+          if (masks[i]) {
+            buffer.mask =
+              std::make_unique<mask_buffer>(make_mask(b.size, stream, gpu.get_default_allocator()));
+          } else {
+            buffer.data =
+              std::make_unique<rmm::device_buffer>(b.size, stream, gpu.get_default_allocator());
+          }
+          out->_gpu_buffers.push_back(std::move(buffer));
         }
         return out;
       } catch (rmm::out_of_memory const&) {
@@ -230,7 +276,7 @@ std::unique_ptr<incoming_batch> incoming_batch::land(batch_header header,
 void incoming_batch::copy_in(std::size_t begin,
                              void const* src,
                              std::size_t size,
-                             rmm::cuda_stream_view stream)
+                             ::cuda::stream_ref stream)
 {
   if (begin > _header.stream_bytes || size > _header.stream_bytes - begin) {
     throw sirius::invalid_input_exception(
@@ -240,10 +286,13 @@ void incoming_batch::copy_in(std::size_t begin,
   sirius::cuda::device_copy_batch copies;
   if (_tier == Tier::GPU) {
     for (auto const& piece : pieces_in(_buffers, begin, begin + size)) {
-      copies.add(
-        static_cast<std::uint8_t*>(_gpu_buffers[piece.buffer].data()) + piece.buffer_offset,
-        in + piece.range_offset,
-        piece.size);
+      copies.add(static_cast<std::uint8_t*>(
+                   _gpu_buffers[piece.buffer].data
+                     ? _gpu_buffers[piece.buffer].data->data()
+                     : static_cast<void*>(_gpu_buffers[piece.buffer].mask->data())) +
+                   piece.buffer_offset,
+                 in + piece.range_offset,
+                 piece.size);
     }
   } else {
     add_block_copies(copies, *_host_blocks, begin, in, size);
@@ -251,7 +300,7 @@ void incoming_batch::copy_in(std::size_t begin,
   RMM_CUDA_TRY(copies.enqueue(stream));
 }
 
-std::shared_ptr<cucascade::data_batch> incoming_batch::seal(rmm::cuda_stream_view stream)
+std::shared_ptr<cucascade::data_batch> incoming_batch::seal(::cuda::stream_ref stream)
 {
   if (_tier == Tier::HOST) {
     auto const batch_id = sirius::get_next_batch_id();
@@ -266,13 +315,14 @@ std::shared_ptr<cucascade::data_batch> incoming_batch::seal(rmm::cuda_stream_vie
   // Freed later on one of the space's streams; the copies are ordered before the batch's writer
   // event, recorded on @p stream.
   for (auto& buffer : _gpu_buffers) {
-    buffer.set_stream(_space->acquire_stream());
+    if (buffer.data) { buffer.data->set_stream(_space->acquire_stream()); }
+    if (buffer.mask) { buffer.mask->set_stream(_space->acquire_stream()); }
   }
   auto next = _gpu_buffers.begin();
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(_header.columns.size());
   for (auto const& c : _header.columns) {
-    columns.push_back(rebuild(c, next));
+    columns.push_back(rebuild(c, next, stream, _space->get_default_allocator()));
   }
   _gpu_buffers.clear();
   return sirius::make_data_batch(

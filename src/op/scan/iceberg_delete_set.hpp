@@ -69,6 +69,13 @@ struct iceberg_delete_set : prepared_visibility {
   std::string_view data_file;
   std::span<int64_t const> positions;
   uint64_t source_dv_count = 0;
+  /// Equality-delete groups that apply to this data file, or null when none do. Files with the
+  /// same applicability share one list, so the pointer is also the batch-compatibility class.
+  std::shared_ptr<std::vector<uint32_t> const> equality_groups;
+  [[nodiscard]] bool deletes_rows() const
+  {
+    return !positions.empty() || (equality_groups && !equality_groups->empty());
+  }
   // Eager V2 inputs preserve signed, out-of-file legacy positions. Deferred
   // inputs retain strict bounds validation even when the consumer clips ranges.
   void validate_file_bounds(int64_t rows) const

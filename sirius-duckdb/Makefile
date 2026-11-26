@@ -46,4 +46,4 @@ sirius-release: ${EXTENSION_CONFIG_STEP}
 .PHONY: configure_sirius_submodules
 configure_ci: configure_sirius_submodules
 configure_sirius_submodules:
-	git -C '$(PROJ_DIR)..' submodule update --init --recursive -- duckdb cucascade substrait
+	git -C '$(PROJ_DIR)..' submodule update --init --recursive -- cucascade substrait
