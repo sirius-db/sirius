@@ -160,6 +160,10 @@ pixi run python example.py
 
 For an example using TPC-H data from Parquet files or a DuckDB database, see the
 [Python benchmark script](../test/tpch_performance/performance_test.py).
+The same runner supports `--benchmark scale_bench` for named workloads over
+existing local Parquet datasets. See the
+[scale_bench guide](../test/tpch_performance/README.md#scale_bench) for examples,
+the prepared table-C path and cleanup, result formats, and validation limits.
 
 The Python benchmark and power/throughput runners require a Python DuckDB client
 built from the pinned v2 revision, as described above. The CLI-based scripts use
