@@ -115,6 +115,7 @@ bool is_declared_signing_mode(std::uint32_t value) noexcept
 // same rule admits a scope key to publication (put/set) and to removal (drop). A prefix no key
 // can match byte-for-byte (an empty, "." or ".." segment, or a raw `%` byte) is refused
 // with the same rule that refuses such keys at resolution, so a published scope is never dead.
+// The bucket follows the rule for scan locations (`check_bucket`).
 std::optional<violation> check_uri_prefix(std::string_view uri_prefix)
 {
   constexpr std::string_view field   = "uri_prefix";
@@ -128,16 +129,47 @@ std::optional<violation> check_uri_prefix(std::string_view uri_prefix)
   if (uri_prefix.find_first_of("?#") != std::string_view::npos) {
     return refuse(field, reason::prefix_query_or_fragment);
   }
+  auto const bucket_end = uri_prefix.find('/', kScheme.size());
+  if (sirius::io::s3::check_bucket(uri_prefix.substr(
+        kScheme.size(), bucket_end - kScheme.size())) != sirius::io::s3::bucket_defect::none) {
+    return refuse(field, reason::prefix_bucket);
+  }
   // Re-check the key part as a key: drop the mandatory trailing slash and let the shared rule
   // classify the remaining segments ("s3://bucket/" has no key and is always fine).
-  auto const bucket_end = uri_prefix.find('/', kScheme.size());
   if (bucket_end != std::string_view::npos && bucket_end + 1 < uri_prefix.size()) {
-    std::string const as_key{uri_prefix.substr(0, uri_prefix.size() - 1)};
+    auto const as_key = uri_prefix.substr(0, uri_prefix.size() - 1);
     if (sirius::io::s3::key_defeats_prefix_match(as_key)) {
       return refuse(field, reason::prefix_unmatchable_segment);
     }
   }
   return std::nullopt;
+}
+
+bool is_prefix_reason(reason why) noexcept
+{
+  switch (why) {
+    case reason::prefix_shape:
+    case reason::prefix_no_trailing_slash:
+    case reason::prefix_query_or_fragment:
+    case reason::prefix_bucket:
+    case reason::prefix_unmatchable_segment: return true;
+    case reason::required:
+    case reason::endpoint_missing_scheme:
+    case reason::endpoint_bad_scheme:
+    case reason::endpoint_control_bytes:
+    case reason::endpoint_missing_host:
+    case reason::endpoint_has_path:
+    case reason::endpoint_has_user_info:
+    case reason::endpoint_unterminated_ipv6:
+    case reason::endpoint_malformed:
+    case reason::endpoint_bad_port:
+    case reason::transport_unknown:
+    case reason::signing_mode_unknown:
+    case reason::ca_bundle_not_regular_file:
+    case reason::ca_bundle_unreadable:
+    case reason::transport_unavailable: return false;
+  }
+  return false;
 }
 
 std::optional<violation> check_settings(const settings& value, const capabilities& backend)
@@ -185,6 +217,9 @@ std::string describe(const violation& refused)
     case reason::prefix_shape: return "must be s3://bucket/ or s3://bucket/prefix/";
     case reason::prefix_no_trailing_slash: return "must end with '/'";
     case reason::prefix_query_or_fragment: return "must not contain a query or fragment";
+    case reason::prefix_bucket:
+      return "bucket must use only ASCII letters, digits, '.', '_' or '-' and must not be '.' or "
+             "'..'";
     case reason::prefix_unmatchable_segment:
       return "contains a segment no key can match byte-for-byte (empty, '.', '..' or "
              "percent-encoded)";

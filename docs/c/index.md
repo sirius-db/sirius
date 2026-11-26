@@ -8,6 +8,7 @@ The public C API provides a C ABI for embedding Sirius. Include the headers unde
 - `<sirius-c/export.h>` defines visibility and C/C++ declaration helpers.
 - `<sirius-c/context/config_builder.h>` builds immutable context configurations.
 - `<sirius-c/object_store/config_builder.h>` builds immutable object-store configurations.
+- `<sirius-c/object_store/registry.h>` maps URI prefixes to object-store configurations.
 - `<sirius-c/context/context.h>` creates and owns an engine context.
 - `<sirius-c/schema.h>` constructs and inspects immutable typed schemas.
 - `<sirius-c/plan/plan.h>` constructs and inspects immutable physical plans.
@@ -96,7 +97,33 @@ diagnostic for SIRIUS_INVALID_CONFIGURATION names the field and the reason. No f
 returns a field. See the
 [complete C example](https://github.com/sirius-db/sirius/blob/main/test/cmake/installed_consumer/object_store.c).
 
-Nothing in the engine consumes these configurations yet.
+## Object-store registry
+
+A registry lists the stores a caller may read from: each store is a URI prefix and the
+configuration that serves the URIs under it. Registries are immutable.
+sirius_object_store_registry_with_store() returns a new registry with one store added, or
+replaced when the prefix is already present; release the input once the result replaces it.
+One configuration can serve several prefixes.
+
+Register an empty prefix for the S3 fallback, or a prefix such as `s3://bucket/` or
+`s3://bucket/data/`. Write the scheme in lowercase. The bucket may contain ASCII letters,
+digits, `.`, `_` and `-`; it must not be empty, `.` or `..`. End each prefix component with `/`;
+components after the bucket must not be empty, equal `.` or `..`, or contain `%`. A prefix
+cannot contain `?` or `#`.
+
+Matching compares the lookup scheme without regard to ASCII case and compares bucket and key
+bytes exactly. A nonempty registry refuses an empty key after the bucket/key separator, an
+empty, `.` or `..` key segment, a trailing slash, or a literal `%` in the key before selecting
+any store, even if only the fallback is registered. For example, plan construction keeps `%2F`
+as written; the matcher refuses that key rather than treating it as `/`. Otherwise the longest
+matching prefix wins. If no nonempty prefix matches, the fallback can serve only a URI beginning
+with `s3://` in either ASCII case.
+
+A NULL prefix pointer with a nonzero size or a NUL byte in the supplied range gives
+`SIRIUS_INVALID_ARGUMENT`. A prefix that fails the grammar checks gives
+`SIRIUS_INVALID_CONFIGURATION`; an available diagnostic names `uri_prefix` and the reason, not
+the supplied value. Building a registry reads no file and consults no I/O backend. No engine API
+consumes a registry yet.
 
 ## Engine context
 

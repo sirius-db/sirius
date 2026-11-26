@@ -77,9 +77,6 @@ documented in the doc comments of cuCascade's headers under `cucascade/include/c
 All new work targets Super Sirius. Memory spilling / CPU fallback is handled by the downgrade executor
 (`src/downgrade/`, `src/creator/`); see `docs/super-sirius/memory-management.md`.
 
-Before implementing operators / memory / expression / I/O work, run `/module-context <task>` to
-load accurate cudf/rmm/duckdb/cucascade API docs.
-
 ## Usage
 
 Load the extension and run normal SQL — Sirius intercepts it transparently and runs supported

@@ -160,6 +160,10 @@ pixi run python example.py
 
 For an example using TPC-H data from Parquet files or a DuckDB database, see the
 [Python benchmark script](../test/tpch_performance/performance_test.py).
+The same runner supports `--benchmark scale_bench` for named workloads over
+existing local Parquet datasets. See the
+[scale_bench guide](../test/tpch_performance/README.md#scale_bench) for examples,
+the prepared table-C path and cleanup, result formats, and validation limits.
 
 The Python benchmark and power/throughput runners require a Python DuckDB client
 built from the pinned v2 revision, as described above. The CLI-based scripts use
@@ -243,6 +247,20 @@ below for merge requirements and explicit-plan staging limits.
 From Python, execute the same SQL with `con.execute(...)` after loading the extension and before
 querying. See the [compressed pinning guide](super-sirius/compressed-pinning.md) for plan selection
 and tuning.
+
+## Footer Statistics for Large Parquet Tables
+
+During planning, Sirius reads and caches statistics from the Parquet footers of a multi-file scan
+and passes them to DuckDB's optimizer, but only for scans with at most 1,024 uncached `s3://` files
+(or 16,384 local). For a table consisting of more files than that, you can still read all the
+footers ahead of the queries explicitly by running:
+
+```sql
+SELECT files FROM sirius_analyze_parquet('s3://my-bucket/my-table/*.parquet');
+```
+
+Later scans of the same glob in that process find them cached. See the
+[scan settings](super-sirius/configuration.md#scan) to change or remove the limits.
 
 ## Configuration
 

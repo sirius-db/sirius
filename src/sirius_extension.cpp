@@ -73,6 +73,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_partial_aggregate_pushdown.hpp"
 #include "planner/unsupported_optimizers.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 #include "transparent/plan_source_policy.hpp"
@@ -3162,6 +3163,30 @@ static void SetEnablePartialAggregateBelowJoin(ClientContext& context,
                    params->enable_partial_aggregate_below_join);
 }
 
+static void SetPartialAggregateMinKeptShare(ClientContext& /*context*/,
+                                            SetScope /*scope*/,
+                                            Value& parameter)
+{
+  // DuckDB stores this setting in the client context.
+  auto const share = DoubleValue::Get(parameter);
+  if (!(share >= 0.0) || share > 1.0) {
+    throw InvalidInputException("partial_aggregate_min_kept_share must be in [0.0, 1.0], got %f",
+                                share);
+  }
+}
+
+static void SetPartialAggregateMinRowsPerKey(ClientContext& /*context*/,
+                                             SetScope /*scope*/,
+                                             Value& parameter)
+{
+  // DuckDB stores this setting in the client context.
+  auto const rows = DoubleValue::Get(parameter);
+  if (!(rows >= 0.0)) {
+    throw InvalidInputException("partial_aggregate_min_rows_per_key must be 0 or more, got %f",
+                                rows);
+  }
+}
+
 static void SetEnableSubqueryKeyCarry(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                      = get_operator_params(context, scope);
@@ -3790,10 +3815,33 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_partial_aggregate_below_join",
-                    "aggregate below an inner join that only adds group-by payload",
+                    "aggregate below a join that only adds group-by payload",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_partial_aggregate_below_join),
                     SetEnablePartialAggregateBelowJoin);
+  sirius::planner::partial_aggregate_pushdown_options const pushdown_defaults;
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "partial_aggregate_min_kept_share",
+                    "share of its rows a joined scan must keep for an aggregate to go below the "
+                    "join; 0 accepts any",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(pushdown_defaults.min_kept_share),
+                    SetPartialAggregateMinKeptShare);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "partial_aggregate_max_extra_keys",
+                    "columns an aggregate below a join may group by beyond the join's keys",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(pushdown_defaults.max_extra_keys));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "partial_aggregate_min_rows_per_key",
+                    "rows per group an aggregate below a join must be estimated to combine where "
+                    "the query does not group by its keys; 0 never trusts the estimate",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(pushdown_defaults.min_rows_per_key),
+                    SetPartialAggregateMinRowsPerKey);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_subquery_key_carry",
