@@ -44,7 +44,8 @@ Build with debug symbols (`relwithdebinfo` or `clang-debug`). Compute Sanitizer
 hazards. Choose the tool suited to the evidence, and run the supplied query or test:
 
 ```bash
-pixi run compute-sanitizer --tool racecheck sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';" <database_path> <<'EOF'
+wrapper_build_dir="${wrapper_build_dir:-sirius-duckdb/build/debug}"
+pixi run compute-sanitizer --tool racecheck "$wrapper_build_dir/duckdb" -unsigned -cmd "LOAD '${wrapper_build_dir//\'/\'\'}/extension/sirius/sirius.duckdb_extension';" <database_path> <<'EOF'
 <QUERY>
 EOF
 ```

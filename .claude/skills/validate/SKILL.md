@@ -12,7 +12,8 @@ GPU: transparent execution can fall back to CPU. Compare results as multisets un
 specifies ordering; preserve duplicates and account for types and floating-point tolerances.
 Use the matching built wrapper as described in `sirius-duckdb/README.md`.
 
-For example, substitute the reproduction's database and SQL, and retain the printed directory:
+This example uses the default release wrapper. Substitute the reproduction's
+database and SQL, and retain the printed directory:
 
 ```bash
 result_dir=$(mktemp -d)
@@ -41,17 +42,35 @@ for deterministic failures. Remove temporary instrumentation after the investiga
 Intermittent or garbage data can result from stream synchronization: synchronizing the caller's
 stream does not synchronize a different stream used by an operation. `utils/stream_check/`
 intercepts `cudf::get_default_stream()` on monitored threads and writes call stacks to
-`default_stream_traces.log`; Sirius pipeline executor threads enable monitoring through
-`src/util/stream_check_wrapper.cpp`. Record the prior `ENABLE_STREAM_CHECK` cache value
-and restore it after the investigation. In an already configured build tree:
+`default_stream_traces.log`. Sirius builds in the hook that enables monitoring on
+pipeline executor threads. `LD_PRELOAD` installs the interposer for a shared cuDF
+build, and `SIRIUS_STREAM_CHECK_LIB` gives the hook the path to the helper library.
+Preload an existing compatible `libstream_check.so` without rebuilding Sirius.
+
+Set `build_dir` and `wrapper_build_dir` to the actual build directories. If
+you need to build the helper, record the previous `ENABLE_STREAM_CHECK` cache
+value and restore it afterward. Use a helper path without spaces or colons in
+`LD_PRELOAD`. A relative path from the launch directory works even when the
+checkout path contains spaces. When needed, point `stream_check_lib` to a
+symlink at a separator-free path in a private temporary directory.
 
 ```bash
-pixi run cmake -S . -B build/release -DENABLE_STREAM_CHECK=ON
-pixi run cmake --build build/release --target stream_check
-pixi run env LD_PRELOAD=<absolute-path-to-libstream_check.so> sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';" <db_path> -c "SELECT ...;"
+build_dir="${build_dir:-build/release}"
+wrapper_build_dir="${wrapper_build_dir:-sirius-duckdb/build/release}"
+database=/path/to/reproduction.duckdb
+
+# Run these two commands if the helper needs to be built.
+pixi run cmake -S . -B "$build_dir" -DENABLE_STREAM_CHECK=ON
+pixi run cmake --build "$build_dir" --target stream_check
+
+stream_check_lib="$build_dir/utils/stream_check/libstream_check.so"
+pixi run env LD_PRELOAD="$stream_check_lib" SIRIUS_STREAM_CHECK_LIB="$stream_check_lib" \
+  "$wrapper_build_dir/duckdb" -unsigned \
+  -cmd "LOAD '${wrapper_build_dir//\'/\'\'}/extension/sirius/sirius.duckdb_extension';" "$database" -c "SELECT ...;"
 ```
 
-The library is normally `build/release/utils/stream_check/libstream_check.so`. A default stream
-trace is a lead, not proof of a defect. Temporarily inserting `cudaDeviceSynchronize()` can test a
-synchronization or timing hypothesis, but a changed result does not prove the cause; remove the
-diagnostic synchronization before finishing.
+`default_stream_traces.log` is append-only. When running serially, record its
+size before starting the query and inspect the appended bytes. Treat a default
+stream trace as a diagnostic lead. Temporarily inserting
+`cudaDeviceSynchronize()` can test a synchronization or timing hypothesis. A changed result alone
+cannot establish the cause. Remove the diagnostic synchronization before finishing.

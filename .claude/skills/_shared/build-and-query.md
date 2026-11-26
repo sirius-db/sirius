@@ -2,7 +2,7 @@
 
 ## Builds and sanitizers
 
-Run builds through `pixi run make <preset>`. The `release` preset is optimized;
+Run builds through `pixi run make <target>`. The `release` preset is optimized;
 `relwithdebinfo` and `clang-relwithdebinfo` include host debug symbols;
 `debug` and `clang-debug` include device line information. Root presets build Sirius and its
 C++ tests. `pixi run make` also installs the release library and builds the wrapper;
@@ -36,10 +36,13 @@ line information. Compute Sanitizer and cuda-gdb may not be installed or on
 Use the supplied query, database, Parquet paths, and setup statements when available.
 Ask only for information needed to reproduce the issue that cannot be inferred.
 Avoid rerunning mutating SQL against user data without authorization. Run normal
-SQL after loading the extension; Sirius transparently intercepts supported queries:
+SQL after loading the extension; Sirius intercepts supported queries. Set
+`wrapper_build_dir` to the actual wrapper output directory for these commands. This
+example uses the default release wrapper:
 
 ```bash
-pixi run sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';" <database_path>
+wrapper_build_dir="${wrapper_build_dir:-sirius-duckdb/build/release}"
+pixi run "$wrapper_build_dir/duckdb" -unsigned -cmd "LOAD '${wrapper_build_dir//\'/\'\'}/extension/sirius/sirius.duckdb_extension';" <database_path>
 ```
 
 For CPU comparison, use `SET gpu_execution = false` or start the process with
@@ -57,9 +60,11 @@ builds and repeated runs alongside the user's resource constraints.
 
 For file logging, set `SIRIUS_LOG_BACKEND=spdlog`, `SIRIUS_LOG_LEVEL=trace`, and a
 per-run `SIRIUS_LOG_DIR` as appropriate. The owning sink writes date-stamped
-`sirius*.log` files with daily rotation and periodic best-effort flushing; trace level does not guarantee
-all entries reach disk before a crash. See `src/log/spdlog_owning_sink.cpp` and
-`src/log/logging.hpp`. Test logs live under `build/<preset>/test/cpp/log/`.
+`sirius*.log` files with daily rotation. The `sirius_log_flush_seconds` SQL setting
+controls the spdlog flush interval (default three seconds). A crash or abrupt exit can
+leave entries since the last flush buffered. See `src/log/spdlog_owning_sink.cpp` and
+`src/log/logging.hpp`. Test logs live under `<build-dir>/test/cpp/log/`, where
+`<build-dir>` is the directory passed to `scripts/run_unit_tests.py --build-dir` (default `build/release`).
 Temporary trace statements can use a `[SIRIUS_DIAG]` tag to make them easy to find.
 
 The active engine includes code in both `namespace sirius` and `namespace duckdb`.

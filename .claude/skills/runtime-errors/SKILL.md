@@ -14,6 +14,9 @@ Diagnose runtime errors (crashes, segfaults, exceptions, hangs, fallback trigger
 
 **Reference:** See `.claude/skills/_shared/build-and-query.md` for shared infrastructure (build modes, query execution, changes and logs).
 
+Examples with a literal `sirius-duckdb/build/release` path use the default
+release wrapper. Set `wrapper_build_dir` to the intended wrapper for debugger commands.
+
 ## Triage
 
 1. **Gather context:**
@@ -84,10 +87,11 @@ If Phase 1 narrows the hang to a code region but not the exact cause:
 For deadlocks and thread-level hangs where log analysis is insufficient:
 
 1. Install a `relwithdebinfo` or `clang-debug` library and rebuild the SQL wrapper
-   as described in the shared build guide. Use its actual output directory below
-   (`debug` for the shared guide example). Run the query **without** timeout:
+   as described in the shared build guide. Set `wrapper_build_dir` to its actual
+   output directory, such as `sirius-duckdb/build/debug`. Run the query **without** timeout:
    ```bash
-   pixi run sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';" <db_path> <<'EOF' &
+   wrapper_build_dir="${wrapper_build_dir:-sirius-duckdb/build/debug}"
+   pixi run "$wrapper_build_dir/duckdb" -unsigned -cmd "LOAD '${wrapper_build_dir//\'/\'\'}/extension/sirius/sirius.duckdb_extension';" <db_path> <<'EOF' &
    <QUERY>
    EOF
    HANG_PID=$!
@@ -208,7 +212,8 @@ the library and rebuild the wrapper as described in the shared reference. Use th
 actual wrapper directory. See `docs/super-sirius/debugging.md` for pooled-allocation
 limitations:
 ```bash
-pixi run compute-sanitizer --tool memcheck sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';" <db_path> <<'EOF'
+wrapper_build_dir="${wrapper_build_dir:-sirius-duckdb/build/debug}"
+pixi run compute-sanitizer --tool memcheck "$wrapper_build_dir/duckdb" -unsigned -cmd "LOAD '${wrapper_build_dir//\'/\'\'}/extension/sirius/sirius.duckdb_extension';" <db_path> <<'EOF'
 <QUERY>
 EOF
 ```
@@ -225,7 +230,8 @@ Fallback when ASan and Compute Sanitizer don't find the issue, or when you need 
   reference. Use its actual build directory below and put the supplied SQL in
   an absolute-path query file:
   ```bash
-  pixi run cuda-gdb --batch -ex run -ex bt -ex quit --args sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';" <db_path> < /absolute/path/query.sql
+  wrapper_build_dir="${wrapper_build_dir:-sirius-duckdb/build/debug}"
+  pixi run cuda-gdb --batch -ex run -ex bt -ex quit --args "$wrapper_build_dir/duckdb" -unsigned -cmd "LOAD '${wrapper_build_dir//\'/\'\'}/extension/sirius/sirius.duckdb_extension';" <db_path> < /absolute/path/query.sql
   ```
 - Parse the backtrace to identify the exact file, line, and call stack
 - For GPU-side crashes, cuda-gdb can inspect device threads and shared memory
@@ -315,12 +321,13 @@ For errors that are hard to reproduce or where the exception obscures the true o
   reference. Use its actual build directory and an absolute-path query file to
   catch the exception at throw time:
   ```bash
+  wrapper_build_dir="${wrapper_build_dir:-sirius-duckdb/build/debug}"
   pixi run cuda-gdb --batch \
     -ex "catch throw" \
     -ex run \
     -ex bt \
     -ex quit \
-    --args sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';" <db_path> < /absolute/path/query.sql
+    --args "$wrapper_build_dir/duckdb" -unsigned -cmd "LOAD '${wrapper_build_dir//\'/\'\'}/extension/sirius/sirius.duckdb_extension';" <db_path> < /absolute/path/query.sql
   ```
   This catches C++ exceptions at the throw site, before unwinding obscures the call stack.
 
