@@ -89,19 +89,15 @@ sirius::planner::partial_aggregate_pushdown_options partial_aggregate_pushdown_t
   duckdb::ClientContext& context)
 {
   sirius::planner::partial_aggregate_pushdown_options options;
-  duckdb::Value setting;
-  if (context.TryGetCurrentSetting("partial_aggregate_min_kept_share", setting) &&
-      !setting.IsNull()) {
-    options.min_kept_share = setting.GetValue<double>();
-  }
-  if (context.TryGetCurrentSetting("partial_aggregate_max_extra_keys", setting) &&
-      !setting.IsNull()) {
-    options.max_extra_keys = setting.GetValue<std::uint64_t>();
-  }
-  if (context.TryGetCurrentSetting("partial_aggregate_min_rows_per_key", setting) &&
-      !setting.IsNull()) {
-    options.min_rows_per_key = setting.GetValue<double>();
-  }
+  auto const read = [&]<typename T>(char const* name, T& threshold) {
+    duckdb::Value setting;
+    if (context.TryGetCurrentSetting(name, setting) && !setting.IsNull()) {
+      threshold = setting.GetValue<T>();
+    }
+  };
+  read("partial_aggregate_min_kept_share", options.min_kept_share);
+  read("partial_aggregate_max_extra_keys", options.max_extra_keys);
+  read("partial_aggregate_min_rows_per_key", options.min_rows_per_key);
   return options;
 }
 

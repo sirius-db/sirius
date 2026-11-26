@@ -190,11 +190,10 @@ struct pushdown_fixture {
   }
 
   /// Why the rule left the aggregates of @p query alone: one entry per aggregate over a join.
-  reasons why(std::string const& query,
-              pushdown_options const& options = by_grouping,
-              join_order order                = join_order::optimized)
+  reasons why(std::string const& query, pushdown_options const& options = by_grouping)
   {
-    return with_resolved_plan(*con, query, order, true, options, [](ClientContext&, auto&) {})
+    return with_resolved_plan(
+             *con, query, join_order::optimized, true, options, [](ClientContext&, auto&) {})
       .declined;
   }
 
@@ -242,6 +241,16 @@ std::string per_customer(std::string const& aggregates,
 {
   return "SELECT " + groups + ", " + aggregates +
          " FROM orders, customer WHERE o_custkey = c_custkey " + filter + " GROUP BY " + groups;
+}
+
+/// The orders' total per group, with the customers joined first and, above them, lineitem, whose
+/// join reads the order key.
+std::string through_lineitem(std::string const& groups)
+{
+  return "SELECT " + groups +
+         ", sum(o_totalprice) FROM (orders JOIN customer ON o_custkey = c_custkey) "
+         "JOIN lineitem ON o_orderkey = l_orderkey GROUP BY " +
+         groups;
 }
 
 }  // namespace
@@ -320,11 +329,9 @@ TEST_CASE_METHOD(pushdown_fixture,
     "FROM orders JOIN customer ON o_custkey = c_custkey GROUP BY c_custkey, c_name";
   CHECK(shape(joined, false) == "AGG[2](JOIN(orders,customer))");
   CHECK(shape(joined, true) == "AGG[2](JOIN(AGG[1](orders),customer))");
-  // A sum of 128-bit values stays above the join. The GPU refuses one when a batch's row count
-  // times its largest value could overflow, and below the join the batch holds rows the join
-  // would have removed.
-  CHECK(pushed(per_customer("sum(CAST(o_units AS HUGEINT))")) == 0);
-  CHECK(pushed(per_customer("sum(o_wide)")) == 0);
+  // A sum of 128-bit values stays above the join, and keeps the sums beside it there. The GPU
+  // refuses one when a batch's row count times its largest value could overflow, and below the
+  // join the batch holds rows the join would have removed.
   CHECK(pushed(per_customer("sum(o_units), sum(o_wide)")) == 0);
   // MIN and MAX of such values add nothing up.
   CHECK(pushed(per_customer("min(o_wide), max(CAST(o_units AS HUGEINT))")) == 1);
@@ -360,57 +367,20 @@ TEST_CASE_METHOD(pushdown_fixture,
     "SELECT c_custkey, c_name, sum(CASE WHEN o_units - o_shippriority <= 3 THEN 1 ELSE 0 END) "
     "FROM orders JOIN customer ON o_custkey = c_custkey GROUP BY c_custkey, c_name";
   CHECK(shape(branching, true) == "AGG[2](JOIN(AGG[1](orders),customer))");
-  // A division or a cast that can fail still stands in the way, wherever it sits.
-  CHECK(pushed(per_customer(
-          "sum(CASE WHEN o_units / o_shippriority > 1 THEN o_totalprice ELSE 0 END)")) == 0);
+  // A cast that can fail still stands in the way, wherever it sits.
   CHECK(pushed(per_customer(
           "sum(CASE WHEN CAST(o_clerk AS INTEGER) > 1 THEN o_totalprice ELSE 0 END)")) == 0);
 }
 
-TEST_CASE_METHOD(pushdown_fixture,
-                 "partial aggregate pushdown declines aggregates it cannot combine exactly",
-                 "[partial_agg_pushdown][plan]")
-{
-  CHECK(pushed(per_customer("count(*)")) == 0);
-  CHECK(pushed(per_customer("count(o_totalprice), sum(o_totalprice)")) == 0);
-  CHECK(pushed(per_customer("avg(o_totalprice)")) == 0);
-  CHECK(pushed(per_customer("sum(DISTINCT o_totalprice)")) == 0);
-  CHECK(pushed(per_customer("sum(o_totalprice) FILTER (WHERE o_shippriority = 1)")) == 0);
-  // An argument that reads both sides, and ones that can fail on a row the join would drop.
-  CHECK(pushed(per_customer("sum(o_totalprice * c_acctbal)")) == 0);
-  CHECK(pushed(per_customer("max(CAST(o_clerk AS INTEGER))")) == 0);
-  CHECK(pushed(per_customer("min(o_units / o_shippriority)")) == 0);
-}
-
+// What the rule leaves alone, with its reason, is in "reports why it leaves an aggregate alone".
 TEST_CASE_METHOD(pushdown_fixture,
                  "partial aggregate pushdown declines joins where it would not pay off",
                  "[partial_agg_pushdown][plan]")
 {
-  // No strings to carry.
-  CHECK(pushed(per_customer("sum(o_totalprice)", "", "c_custkey, c_nationkey")) == 0);
-  // The customers are filtered, so the join discards orders that would have been aggregated.
-  CHECK(pushed(per_customer("sum(o_totalprice)", "AND c_acctbal > 400")) == 0);
-  // It would group by as many columns as the aggregate above it, or by a string.
-  CHECK(pushed(per_customer("sum(o_totalprice)", "", "c_name")) == 0);
-  CHECK(pushed("SELECT c_clerk, c_address, sum(o_totalprice) FROM orders, customer "
-               "WHERE o_clerk = c_clerk GROUP BY c_clerk, c_address") == 0);
-  // The strings alone are grouped by, not the join key: the aggregate above may group far more
-  // coarsely than a group per key.
-  CHECK(pushed(per_customer("sum(o_totalprice)", "", "c_name, c_address")) == 0);
   // A column a join further up reads is a key too. Below the customers' join the orders would be
   // grouped by their own key, one group per order, which pays only when the aggregate above keeps
   // the orders apart as well.
-  auto const through_lineitem = [](std::string const& groups) {
-    return "SELECT " + groups +
-           ", sum(o_totalprice) FROM (orders JOIN customer "
-           "ON o_custkey = c_custkey) JOIN lineitem ON o_orderkey = l_orderkey GROUP BY " +
-           groups;
-  };
   CHECK(pushed(through_lineitem("c_custkey, c_name, l_orderkey, l_returnflag")) == 1);
-  CHECK(pushed(through_lineitem("c_custkey, c_name, l_returnflag")) == 0);
-  // Too many columns of the aggregated side are grouped by.
-  CHECK(pushed(per_customer(
-          "sum(o_totalprice)", "", "c_custkey, c_name, o_shippriority, o_orderdate")) == 0);
   // The aggregated side is already grouped.
   CHECK(pushed("SELECT c_custkey, c_name, min(spent) FROM customer, "
                "(SELECT o_custkey, min(o_totalprice) AS spent FROM orders GROUP BY o_custkey) "
@@ -423,12 +393,7 @@ TEST_CASE_METHOD(pushdown_fixture,
   };
   CHECK(pushed(joined_on("o_weight = c_weight", "c_weight")) == 1);
   CHECK(pushed(joined_on("o_custkey + 1 = c_custkey", "o_custkey")) == 1);
-  CHECK(pushed(joined_on("1.0 / o_weight = c_weight", "o_weight")) == 0);
   CHECK(pushed(joined_on("CAST(o_weight AS VARCHAR) = c_clerk", "o_weight")) == 0);
-  // An outer join pads the aggregated side, and an ungrouped aggregate has nothing to carry.
-  CHECK(pushed("SELECT c_custkey, c_name, sum(o_totalprice) FROM customer LEFT JOIN orders "
-               "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == 0);
-  CHECK(pushed("SELECT sum(o_totalprice) FROM orders, customer WHERE o_custkey = c_custkey") == 0);
 }
 
 TEST_CASE_METHOD(pushdown_fixture,
@@ -480,9 +445,7 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(why(per_customer("sum(o_totalprice)", "", "c_name, c_address")) ==
         reasons{"keys:not-grouped"});
   // The join to lineitem reads the order key, which no group stands for.
-  CHECK(why("SELECT c_custkey, c_name, l_returnflag, sum(o_totalprice) FROM (orders JOIN customer "
-            "ON o_custkey = c_custkey) JOIN lineitem ON o_orderkey = l_orderkey "
-            "GROUP BY c_custkey, c_name, l_returnflag") == reasons{"keys:not-grouped"});
+  CHECK(why(through_lineitem("c_custkey, c_name, l_returnflag")) == reasons{"keys:not-grouped"});
   CHECK(why("SELECT c_clerk, c_address, sum(o_totalprice) FROM orders, customer "
             "WHERE o_clerk = c_clerk GROUP BY c_clerk, c_address") ==
         reasons{"keys:variable-width"});
@@ -525,12 +488,6 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(pushed(kept("orders LEFT JOIN customer")) == 1);
   CHECK(pushed(kept("customer RIGHT JOIN orders")) == 1);
   CHECK(shape(kept("orders LEFT JOIN customer"), true) == "AGG[2](JOIN(AGG[1](orders),customer))");
-  // The customers' key does not stand for the orders' here, as it does under an inner join: it is
-  // NULL for every order without a customer.
-  CHECK(pushed("SELECT c_custkey, c_name, sum(o_totalprice) FROM orders LEFT JOIN customer "
-               "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == 0);
-  CHECK(pushed("SELECT c_custkey, c_name, sum(o_totalprice) FROM orders JOIN customer "
-               "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == 1);
   // The join pads the orders instead, or both sides.
   CHECK(pushed(kept("customer LEFT JOIN orders")) == 0);
   CHECK(pushed(kept("orders FULL JOIN customer")) == 0);
@@ -564,7 +521,6 @@ TEST_CASE_METHOD(pushdown_fixture,
   auto const per_account =
     "SELECT c_custkey, c_name, sum(a_balance) FROM accounts, customer "
     "WHERE a_custkey = c_custkey GROUP BY c_custkey, c_name";
-  CHECK(pushed(per_account) == 0);
   CHECK(why(per_account) == reasons{"keys:unique"});
   // A filter on the accounts keeps the proof.
   CHECK(why("SELECT c_custkey, c_name, sum(a_balance) FROM accounts, customer "
@@ -572,8 +528,6 @@ TEST_CASE_METHOD(pushdown_fixture,
         reasons{"keys:unique"});
   // The statistics cannot outvote it: they show one account per key as well.
   CHECK(pushed(per_account, {.min_rows_per_key = 0.5}) == 0);
-  // The orders' customer key repeats, and nothing proves otherwise.
-  CHECK(pushed(per_customer("sum(o_totalprice)")) == 1);
 }
 
 TEST_CASE_METHOD(pushdown_fixture,
@@ -585,10 +539,7 @@ TEST_CASE_METHOD(pushdown_fixture,
   // The count behind that is DuckDB's estimate, so the thresholds here stand well clear of 10.
   auto const by_strings = per_customer("sum(o_totalprice)", "", "c_name, c_address");
   CHECK(pushed(by_strings, {.min_rows_per_key = 2}) == 1);
-  CHECK(pushed(by_strings, {.min_rows_per_key = 40}) == 0);
   CHECK(why(by_strings, {.min_rows_per_key = 40}) == reasons{"keys:not-grouped"});
-  // 0 leaves the decision to the grouping.
-  CHECK(pushed(by_strings, {.min_rows_per_key = 0}) == 0);
   CHECK(shape(by_strings, true, {.min_rows_per_key = 2}) ==
         "AGG[2](JOIN(AGG[1](orders),customer))");
 
@@ -619,15 +570,12 @@ TEST_CASE_METHOD(pushdown_fixture,
             {.min_rows_per_key = 2})
           .size() == 1);
   // Two keys together can form more groups than there are orders, which shows nothing either.
-  CHECK(why("SELECT c_custkey, c_name, l_returnflag, sum(o_totalprice) FROM (orders JOIN customer "
-            "ON o_custkey = c_custkey) JOIN lineitem ON o_orderkey = l_orderkey "
-            "GROUP BY c_custkey, c_name, l_returnflag",
-            {.min_rows_per_key = 2}) == reasons{"keys:not-grouped"});
+  CHECK(why(through_lineitem("c_custkey, c_name, l_returnflag"), {.min_rows_per_key = 2}) ==
+        reasons{"keys:not-grouped"});
 
   // A floating-point sum is left to the grouping, however often its keys repeat: where keys share
   // a group above, each key's sum could overflow where the group's would not.
   auto const floats = per_customer("sum(o_weight)", "", "c_name, c_address");
-  CHECK(pushed(floats, {.min_rows_per_key = 2}) == 0);
   CHECK(why(floats, {.min_rows_per_key = 2}) == reasons{"keys:not-grouped"});
   CHECK(pushed(per_customer("min(o_weight), max(o_weight)", "", "c_name, c_address"),
                {.min_rows_per_key = 2}) == 1);

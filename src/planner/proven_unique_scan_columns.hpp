@@ -21,18 +21,18 @@
 #include <vector>
 
 namespace duckdb {
+class ClientContext;
 class LogicalGet;
-class SiriusContext;
 }  // namespace duckdb
 
 namespace sirius::planner {
 
 /// The output positions of the scan @p get that are each proven to hold no value twice and no
 /// NULL: a column the pinned copy of a Parquet scan's files proved distinct at pin time, which
-/// needs @p sirius_context, or a native table's single-column PRIMARY KEY. Empty when nothing is
-/// proven. A filter or a projection above the scan keeps the fact: a subset of distinct values is
-/// distinct.
-std::vector<duckdb::idx_t> proven_unique_scan_outputs(duckdb::SiriusContext* sirius_context,
+/// counts only with pin_table_prove_unique_keys, or a native table's single-column PRIMARY KEY.
+/// Empty when nothing is proven. A filter or a projection above the scan keeps the fact: a subset
+/// of distinct values is distinct.
+std::vector<duckdb::idx_t> proven_unique_scan_outputs(duckdb::ClientContext& context,
                                                       duckdb::LogicalGet& get);
 
 }  // namespace sirius::planner

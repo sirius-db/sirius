@@ -19,6 +19,7 @@
 #include "duckdb/common/unique_ptr.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -36,7 +37,7 @@ struct partial_aggregate_pushdown_options {
   /// count as keeping the rows of its other side. 0 accepts any other side.
   double min_kept_share = 0.7;
   /// The columns the pushed aggregate may group by beyond those it is joined on.
-  std::size_t max_extra_keys = 1;
+  std::uint64_t max_extra_keys = 1;
   /// The rows each group of the pushed aggregate must be estimated to combine, at least, for it to
   /// be pushed where the aggregate above does not group by the same columns. The estimate is the
   /// input's row estimate over the most groups its keys can form, from the scan statistics. 0 never
@@ -53,7 +54,7 @@ struct partial_aggregate_pushdown_result {
 };
 
 /// Aggregate before a join that only adds group-by payload. For `AGGREGATE <- JOIN ... <- S`,
-/// where every aggregate argument comes from the subtree S and an inner join above S brings in
+/// where every aggregate argument comes from the subtree S and a join above S brings in
 /// variable-width columns the aggregate groups by, insert `AGGREGATE(GROUP BY the S columns used
 /// above S)` directly above S and make the original aggregate combine its results. The join then
 /// repeats the payload once per group of S instead of once per row (TPC-H q10 joins `customer`'s

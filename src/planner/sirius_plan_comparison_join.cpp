@@ -417,11 +417,23 @@ static unique_keys prove_unique_columns(duckdb::SiriusContext* sirius_context,
   }
 }
 
-std::vector<duckdb::idx_t> proven_unique_scan_outputs(duckdb::SiriusContext* sirius_context,
+/// The context whose pin-time uniqueness facts count as proofs, which they do only with
+/// pin_table_prove_unique_keys. Without one, prove_unique_columns considers declared PRIMARY KEYs
+/// alone.
+static duckdb::shared_ptr<duckdb::SiriusContext> pin_facts_of(duckdb::ClientContext& context)
+{
+  auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_context && !duckdb::query_operator_options(context)->prove_unique_keys) {
+    sirius_context.reset();
+  }
+  return sirius_context;
+}
+
+std::vector<duckdb::idx_t> proven_unique_scan_outputs(duckdb::ClientContext& context,
                                                       duckdb::LogicalGet& get)
 {
   std::vector<duckdb::idx_t> outputs;
-  for (auto const& key : prove_unique_columns(sirius_context, get)) {
+  for (auto const& key : prove_unique_columns(pin_facts_of(context).get(), get)) {
     if (key.size() == 1) { outputs.push_back(*key.begin()); }
   }
   return outputs;
@@ -549,13 +561,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                        origin_policy::value_preserving)
                    : std::vector<std::size_t>{};
 
-  // Pin-time uniqueness facts count as proofs only with pin_table_prove_unique_keys; without a
-  // context, prove_unique_columns considers declared PRIMARY KEYs alone.
-  auto* const pin_facts_context =
-    sirius_context && duckdb::query_operator_options(context)->prove_unique_keys
-      ? sirius_context.get()
-      : nullptr;
-  auto build_side_unique_keys  = prove_unique_columns(pin_facts_context, *op.children[1]);
+  auto build_side_unique_keys  = prove_unique_columns(pin_facts_of(context).get(), *op.children[1]);
   auto left                    = create_plan(*op.children[0]);
   auto right                   = create_plan(*op.children[1]);
   left->estimated_cardinality  = lhs_cardinality;

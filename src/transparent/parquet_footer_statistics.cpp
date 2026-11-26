@@ -672,7 +672,14 @@ bool add_statistics(duckdb::ClientContext& context,
   remember_row_count(bind->file_list, total_rows);
   if (single_file) {
     // DuckDB has this file's statistics itself; only its value spans are kept.
-    remember_value_spans(bind->file_list.get(), merged_statistics(*bind, scan.files).value_spans);
+    value_span_list spans(bind->names.size());
+    for (duckdb::idx_t i = 0; i < spans.size(); ++i) {
+      if (auto const column = merged_column(*bind, scan.files, i)) {
+        spans[i] = value_span(*column);
+      }
+    }
+    remember_value_spans(bind->file_list.get(),
+                         std::make_shared<value_span_list const>(std::move(spans)));
     return false;
   }
   auto const scan_key = merge_cache_key(get);

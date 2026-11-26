@@ -3175,13 +3175,6 @@ static void SetPartialAggregateMinKeptShare(ClientContext& /*context*/,
   }
 }
 
-static void SetPartialAggregateMaxExtraKeys(ClientContext& /*context*/,
-                                            SetScope /*scope*/,
-                                            Value& /*parameter*/)
-{
-  // DuckDB stores this setting in the client context.
-}
-
 static void SetPartialAggregateMinRowsPerKey(ClientContext& /*context*/,
                                              SetScope /*scope*/,
                                              Value& parameter)
@@ -3840,8 +3833,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     "partial_aggregate_max_extra_keys",
                     "columns an aggregate below a join may group by beyond the join's keys",
                     LogicalType::UBIGINT,
-                    Value::UBIGINT(pushdown_defaults.max_extra_keys),
-                    SetPartialAggregateMaxExtraKeys);
+                    Value::UBIGINT(pushdown_defaults.max_extra_keys));
   add_sirius_option(config,
                     option_visibility::internal,
                     "partial_aggregate_min_rows_per_key",
