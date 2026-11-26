@@ -48,6 +48,24 @@
 
 namespace {
 
+/// Counts the rows of @p groups_query, one per group, and those matching @p violation, on the GPU
+/// and the CPU alike, and requires @p groups rows with no violation.
+void require_groups_hold(sirius::test::GpuExecutionFixture& fixture,
+                         std::string const& groups_query,
+                         std::string const& violation,
+                         std::int64_t groups)
+{
+  auto const check =
+    "SELECT count(*), count(*) FILTER (WHERE " + violation + ") FROM (" + groups_query + ")";
+  fixture.compare_gpu_vs_cpu(check);
+  INFO(check);
+  auto result = fixture.con->Query(check);
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  CHECK(result->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(groups));
+  CHECK(result->Collection().GetValue(1, 0) == duckdb::Value::BIGINT(0));
+}
+
 /// Duplicate `(a, b)` pairs, NULLs in either key column, two rows sharing the composite key
 /// `(NULL, 1)`, a wholly-NULL column, and a fully-NULL row.
 class DistinctFixture : public sirius::test::GpuExecutionFixture {
@@ -129,6 +147,14 @@ class DistinctBulkFixture : public sirius::test::GpuExecutionFixture {
       "SELECT 'a_long_string_value_' || (i % 20) AS s FROM range(100000) t(i);");
     run_ok("CREATE TABLE dist_dup AS SELECT (i % 10) AS k, i AS payload FROM range(1000000) t(i);");
     run_ok("CHECKPOINT;");
+  }
+
+  /// Compares the per-key rows of @p winners, a query over dist_dup's ten keys, on the GPU and the
+  /// CPU, then requires ten rows with none matching @p mismatch.
+  void compare_winners(std::string const& winners, std::string const& mismatch)
+  {
+    compare_gpu_vs_cpu(winners);
+    require_groups_hold(*this, winners, mismatch, 10);
   }
 };
 
@@ -333,10 +359,13 @@ TEST_CASE_METHOD(DistinctFixture,
   run_ok("CREATE TABLE first_lowcard (k VARCHAR NOT NULL, v BIGINT NOT NULL);");
   run_ok("INSERT INTO first_lowcard VALUES ('A', 10), ('A', 20), ('B', 30), ('B', 40);");
   run_ok("CHECKPOINT;");
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT k, first(v) AS a, first(100 - v) AS b, sum(v) AS s "
-    "FROM first_lowcard GROUP BY k) WHERE a + b <> 100 OR "
-    "(k = 'A' AND s <> 30) OR (k = 'B' AND s <> 70)");
+  require_groups_hold(
+    *this,
+    "SELECT k, first(v) AS a, first(100 - v) AS b, sum(v) AS s FROM first_lowcard "
+    "GROUP BY k",
+    "a + b IS DISTINCT FROM 100 OR s IS DISTINCT FROM CASE k WHEN 'A' THEN 30 "
+    "ELSE 70 END",
+    2);
   compare_gpu_vs_cpu("SELECT k, first(k), sum(v) FROM first_lowcard GROUP BY k");
 }
 
@@ -661,9 +690,10 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   compare_gpu_vs_cpu_on_columns("SELECT DISTINCT ON (k) k, payload FROM dist_dup_null", {0});
   compare_gpu_vs_cpu_on_columns("SELECT DISTINCT ON (d) d, payload FROM dist_dup_fp", {0});
   // The groupby route with the row selector, over the same NULL group.
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT k, first(payload) AS a, count(*) AS c FROM dist_dup_null "
-    "GROUP BY k) WHERE coalesce(k, 0) <> a % 10 OR c <> 100000");
+  require_groups_hold(*this,
+                      "SELECT k, first(payload) AS a, count(*) AS c FROM dist_dup_null GROUP BY k",
+                      "coalesce(k, 0) IS DISTINCT FROM a % 10 OR c IS DISTINCT FROM 100000",
+                      10);
 }
 
 TEST_CASE_METHOD(DistinctBulkFixture,
@@ -1096,13 +1126,10 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   // again; the unordered route keeps the smallest.
   sirius::test::scoped_sirius_setting batch_size{
     *con, "scan_task_batch_size", std::uint64_t{1048576}};
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT DISTINCT ON (k) k, payload FROM dist_dup "
-    "ORDER BY payload DESC) WHERE payload <> 999990 + k");
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT DISTINCT ON (k) k, payload FROM dist_dup ORDER BY payload) "
-    "WHERE payload <> k");
-  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, payload FROM dist_dup ORDER BY payload DESC");
+  compare_winners("SELECT DISTINCT ON (k) k, payload AS w FROM dist_dup ORDER BY payload DESC",
+                  "w IS DISTINCT FROM 999990 + k");
+  compare_winners("SELECT DISTINCT ON (k) k, payload AS w FROM dist_dup ORDER BY payload",
+                  "w IS DISTINCT FROM k");
   // MERGE_SETS puts the merge groupby, and its ranked row selector, on cuDF's sort path.
   compare_gpu_vs_cpu(
     "SELECT k, first(payload ORDER BY payload DESC), count(*), count(DISTINCT payload % 7) "
@@ -1118,16 +1145,18 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   // the merge as well.
   sirius::test::scoped_sirius_setting batch_size{
     *con, "scan_task_batch_size", std::uint64_t{1048576}};
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT k, first(payload ORDER BY CASE WHEN payload >= 500000 THEN NULL "
-    "ELSE payload END DESC) AS w FROM dist_dup GROUP BY k) WHERE w <> 499990 + k");
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT k, first(payload ORDER BY CASE WHEN payload < 500000 THEN NULL "
-    "ELSE payload END NULLS FIRST, payload DESC) AS w FROM dist_dup GROUP BY k) "
-    "WHERE w <> 499990 + k");
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT DISTINCT ON (k) k, payload FROM dist_dup ORDER BY CASE WHEN "
-    "payload >= 500000 THEN NULL ELSE payload END DESC) WHERE payload <> 499990 + k");
+  compare_winners(
+    "SELECT k, first(payload ORDER BY CASE WHEN payload >= 500000 THEN NULL ELSE payload END DESC) "
+    "AS w FROM dist_dup GROUP BY k",
+    "w IS DISTINCT FROM 499990 + k");
+  compare_winners(
+    "SELECT k, first(payload ORDER BY CASE WHEN payload < 500000 THEN NULL ELSE payload END NULLS "
+    "FIRST, payload DESC) AS w FROM dist_dup GROUP BY k",
+    "w IS DISTINCT FROM 499990 + k");
+  compare_winners(
+    "SELECT DISTINCT ON (k) k, payload AS w FROM dist_dup ORDER BY CASE WHEN payload >= 500000 "
+    "THEN NULL ELSE payload END DESC",
+    "w IS DISTINCT FROM 499990 + k");
 }
 
 TEST_CASE_METHOD(DistinctBulkFixture,
@@ -1138,13 +1167,14 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   // again under the reversed order. The second query's key is NULL from 500000 on.
   sirius::test::scoped_sirius_setting batch_size{
     *con, "scan_task_batch_size", std::uint64_t{1048576}};
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT k, last(payload ORDER BY payload) AS a, "
-    "last(payload + 1 ORDER BY payload) AS b FROM dist_dup GROUP BY k) "
-    "WHERE a <> 999990 + k OR b <> a + 1");
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT k, last(payload ORDER BY CASE WHEN payload >= 500000 THEN NULL "
-    "ELSE payload END NULLS FIRST) AS w FROM dist_dup GROUP BY k) WHERE w <> 499990 + k");
+  compare_winners(
+    "SELECT k, last(payload ORDER BY payload) AS a, last(payload + 1 ORDER BY payload) AS b FROM "
+    "dist_dup GROUP BY k",
+    "a IS DISTINCT FROM 999990 + k OR b IS DISTINCT FROM a + 1");
+  compare_winners(
+    "SELECT k, last(payload ORDER BY CASE WHEN payload >= 500000 THEN NULL ELSE payload END NULLS "
+    "FIRST) AS w FROM dist_dup GROUP BY k",
+    "w IS DISTINCT FROM 499990 + k");
 }
 
 TEST_CASE_METHOD(DistinctBulkFixture,
@@ -1155,17 +1185,18 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   sirius::test::scoped_sirius_setting batch_size{
     *con, "scan_task_batch_size", std::uint64_t{1048576}};
   sirius::test::scoped_sirius_setting partitions{*con, "hash_partition_bytes", std::uint64_t{1000}};
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT k, last(payload ORDER BY payload) AS a, "
-    "last(payload + 1 ORDER BY payload) AS b FROM dist_dup GROUP BY k) "
-    "WHERE a <> 999990 + k OR b <> a + 1");
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT k, first(payload ORDER BY CASE WHEN payload < 500000 THEN NULL "
-    "ELSE payload END NULLS FIRST, payload DESC) AS w FROM dist_dup GROUP BY k) "
-    "WHERE w <> 499990 + k");
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT DISTINCT ON (k) k, payload FROM dist_dup ORDER BY CASE WHEN "
-    "payload >= 500000 THEN NULL ELSE payload END DESC) WHERE payload <> 499990 + k");
+  compare_winners(
+    "SELECT k, last(payload ORDER BY payload) AS a, last(payload + 1 ORDER BY payload) AS b FROM "
+    "dist_dup GROUP BY k",
+    "a IS DISTINCT FROM 999990 + k OR b IS DISTINCT FROM a + 1");
+  compare_winners(
+    "SELECT k, first(payload ORDER BY CASE WHEN payload < 500000 THEN NULL ELSE payload END NULLS "
+    "FIRST, payload DESC) AS w FROM dist_dup GROUP BY k",
+    "w IS DISTINCT FROM 499990 + k");
+  compare_winners(
+    "SELECT DISTINCT ON (k) k, payload AS w FROM dist_dup ORDER BY CASE WHEN payload >= 500000 "
+    "THEN NULL ELSE payload END DESC",
+    "w IS DISTINCT FROM 499990 + k");
 }
 
 //===----------------------------------------------------------------------===//
@@ -1394,8 +1425,10 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   // first(v) is any row of its group, so only the key and the sum are compared.
   compare_gpu_vs_cpu_on_columns("SELECT s, first(v), sum(v) FROM dist_str_first GROUP BY s",
                                 {0, 2});
-  // v % 20 equals its row's k, so a FIRST gathered from another group makes the count non-zero.
-  compare_gpu_vs_cpu(
-    "SELECT count(*) FROM (SELECT s, first(v) AS f, min(k) AS mk, sum(v) AS t FROM dist_str_first "
-    "GROUP BY s) WHERE f % 20 <> mk");
+  // v % 20 equals its row's k, so a FIRST gathered from another group is a violation.
+  require_groups_hold(
+    *this,
+    "SELECT s, first(v) AS f, min(k) AS mk, sum(v) AS t FROM dist_str_first GROUP BY s",
+    "f % 20 IS DISTINCT FROM mk",
+    20);
 }
