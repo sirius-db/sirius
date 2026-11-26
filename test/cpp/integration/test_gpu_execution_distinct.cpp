@@ -1199,6 +1199,71 @@ TEST_CASE_METHOD(DistinctBulkFixture,
     "w IS DISTINCT FROM 499990 + k");
 }
 
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution ordered FIRST over a VARCHAR key across batches",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Under string order the smallest `b` of keys 2 to 9 is '10000' || k, in the second scan batch;
+  // numeric order and the unordered route keep payload k.
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  run_ok("CREATE TABLE dist_vkey AS SELECT k, payload, payload::VARCHAR AS b FROM dist_dup;");
+  run_ok("CHECKPOINT;");
+  compare_winners("SELECT k, first(payload ORDER BY b) AS w FROM dist_vkey GROUP BY k",
+                  "w IS DISTINCT FROM CASE WHEN k < 2 THEN k ELSE 100000 + k END");
+  compare_winners("SELECT DISTINCT ON (k) k, payload AS w FROM dist_vkey ORDER BY b",
+                  "w IS DISTINCT FROM CASE WHEN k < 2 THEN k ELSE 100000 + k END");
+}
+
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution ordered FIRST over a DOUBLE key with NaN and signed zeros across "
+                 "batches",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Each key's smallest `d` is a 0.0 in the first scan batch and a -0.0 in the last, or the
+  // reverse; the signs alternate row by row so no run folds them. Tied, `payload DESC` keeps the
+  // last batch's row, where a sign-aware order keeps the -0.0 and fails the even keys. Each key's
+  // NaN or -NaN sits in the last batch and is the largest `d`.
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  run_ok(
+    "CREATE TABLE dist_dkey AS SELECT k, payload, CASE "
+    "WHEN payload < 10 THEN CASE WHEN k % 2 = 0 THEN -(0.0::DOUBLE) ELSE 0.0::DOUBLE END "
+    "WHEN payload >= 999990 THEN CASE WHEN k % 2 = 0 THEN 0.0::DOUBLE ELSE -(0.0::DOUBLE) END "
+    "WHEN payload >= 999980 THEN CASE WHEN k % 2 = 0 THEN 'NaN'::DOUBLE ELSE -('NaN'::DOUBLE) END "
+    "ELSE payload + 1.0 END AS d FROM dist_dup;");
+  run_ok("CHECKPOINT;");
+  compare_winners(
+    "SELECT k, first(payload ORDER BY d, payload DESC) AS w FROM dist_dkey GROUP BY k",
+    "w IS DISTINCT FROM 999990 + k");
+  compare_winners("SELECT k, first(payload ORDER BY d DESC) AS w FROM dist_dkey GROUP BY k",
+                  "w IS DISTINCT FROM 999980 + k");
+  compare_winners("SELECT DISTINCT ON (k) k, payload AS w FROM dist_dkey ORDER BY d DESC",
+                  "w IS DISTINCT FROM 999980 + k");
+}
+
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution DISTINCT ON carries several columns across batches and partitions",
+                 "[integration][gpu_execution][distinct]")
+{
+  // Every carried column is a function of `payload`, so a column gathered from another row than
+  // the winner's breaks its relation to `w`.
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  run_ok(
+    "CREATE TABLE dist_wide AS SELECT k, payload, payload * 2 AS a, payload::VARCHAR AS b, "
+    "payload % 7 AS c, payload / 2 AS d FROM dist_dup;");
+  run_ok("CHECKPOINT;");
+  auto const* const winners =
+    "SELECT DISTINCT ON (k) k, payload AS w, a, b, c, d FROM dist_wide ORDER BY payload DESC";
+  auto const* const mismatch =
+    "w IS DISTINCT FROM 999990 + k OR a IS DISTINCT FROM w * 2 OR b IS DISTINCT FROM w::VARCHAR "
+    "OR c IS DISTINCT FROM w % 7 OR d IS DISTINCT FROM w / 2";
+  compare_winners(winners, mismatch);
+  sirius::test::scoped_sirius_setting partitions{*con, "hash_partition_bytes", std::uint64_t{1000}};
+  compare_winners(winners, mismatch);
+}
+
 //===----------------------------------------------------------------------===//
 // Guarded shapes: plan-time CPU fallback, not a result divergence
 //===----------------------------------------------------------------------===//
