@@ -276,7 +276,7 @@ TEST_CASE("Paimon cursor holds native owners through reader teardown", "[paimon_
   state->owners       = owners;
   state->check_owners = true;
   {
-    paimon_batch_cursor cursor(std::make_unique<reader>(state), owners, 2);
+    paimon_batch_cursor cursor(std::make_unique<reader>(state), owners);
     owners.reset();
     cursor.close();
     REQUIRE(state->destroyed == 1);
