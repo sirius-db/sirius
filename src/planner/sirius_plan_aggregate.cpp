@@ -211,6 +211,29 @@ bool is_first(duckdb::BoundAggregateExpression const& aggregate)
          sirius::aggregate_id::first;
 }
 
+// Whether row order cannot change @p aggregate's result, so its ORDER BY can be dropped. Until
+// #2537 settles floating aggregates, a floating sum or average is not, since its rounding follows
+// the order DuckDB adds in.
+bool ignores_row_order(duckdb::BoundAggregateExpression const& aggregate)
+{
+  auto const id =
+    sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName());
+  if (!id) { return false; }
+  switch (*id) {
+    case sirius::aggregate_id::min:
+    case sirius::aggregate_id::max:
+    case sirius::aggregate_id::count:
+    case sirius::aggregate_id::count_star: return true;
+    case sirius::aggregate_id::sum:
+    case sirius::aggregate_id::sum_no_overflow:
+    case sirius::aggregate_id::avg: {
+      auto const& input = aggregate.GetChildren()[0]->GetReturnType();
+      return input.IsIntegral() || input.id() == duckdb::LogicalTypeId::DECIMAL;
+    }
+    default: return false;
+  }
+}
+
 // Whether @p signature is one of @p builtins' overloads. An overload registered under a built-in's
 // name joins its catalog set, so the name alone does not identify DuckDB's function.
 bool is_builtin_overload(duckdb::FunctionSignature const& signature,
@@ -452,18 +475,20 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
     return index;
   };
 
-  // bind sorted aggregates; a FIRST keeps its ORDER BY, without the terms a group key makes
-  // constant
+  // Only FIRST keeps an ORDER BY, without the terms a group key makes constant. Another aggregate's
+  // ORDER BY must simplify away, have no argument to order, or not change the result.
   for (auto& aggr : aggregates) {
     auto& bound_aggr = aggr->Cast<duckdb::BoundAggregateExpression>();
     auto& order_bys  = bound_aggr.GetOrderBysMutable();
     if (!order_bys) { continue; }
-    if (!is_first(bound_aggr)) {
-      duckdb::FunctionBinder::BindSortedAggregate(context, bound_aggr, groups, grouping_sets);
-      // Binding leaves an ORDER BY only with no keys or on an aggregate without arguments.
+    if (order_bys->Simplify(groups, grouping_sets) || bound_aggr.GetChildren().empty() ||
+        ignores_row_order(bound_aggr)) {
       order_bys.reset();
-    } else if (order_bys->Simplify(groups, grouping_sets)) {
-      order_bys.reset();
+    } else if (!is_first(bound_aggr)) {
+      throw duckdb::NotImplementedException(
+        "An ORDER BY on an aggregate other than first() is not supported on the GPU (falling back "
+        "to CPU): " +
+        bound_aggr.ToString());
     }
   }
   for (auto& group : groups) {

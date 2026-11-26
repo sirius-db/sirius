@@ -1264,6 +1264,14 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   compare_winners(winners, mismatch);
 }
 
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution integer AVG runs on the GPU without its ORDER BY",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  compare_gpu_vs_cpu("SELECT k, avg(v ORDER BY t DESC) FROM dist_ord GROUP BY k");
+  compare_gpu_vs_cpu("SELECT avg(v ORDER BY t) FROM dist_ord");
+}
+
 //===----------------------------------------------------------------------===//
 // Guarded shapes: plan-time CPU fallback, not a result divergence
 //===----------------------------------------------------------------------===//
@@ -1275,6 +1283,14 @@ TEST_CASE_METHOD(DistinctFixture,
   // One carried row per group cannot answer two row orders.
   expect_plan_fallback_matches_cpu(
     "SELECT k, first(v ORDER BY t), first(v ORDER BY s) FROM dist_ord GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution floating AVG with an ORDER BY falls back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // DuckDB adds in the ORDER BY's order, which fixes the rounding the GPU cannot match.
+  expect_plan_fallback_matches_cpu("SELECT k, avg(d ORDER BY t) FROM dist_ord GROUP BY k");
 }
 
 TEST_CASE_METHOD(DistinctFixture,

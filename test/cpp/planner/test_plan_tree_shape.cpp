@@ -2779,6 +2779,28 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     require_rejected(query, "Aggregate EXPORT_STATE is not supported on the GPU");
   }
 
+  // DuckDB keeps the ORDER BY of an aggregate not marked order-insensitive, such as avg.
+  SECTION("an ORDER BY that can change a non-FIRST aggregate's result is refused")
+  {
+    auto const* query =
+      GENERATE("SELECT id, avg(val::DOUBLE ORDER BY val DESC) FROM big_left GROUP BY id",
+               "SELECT avg(val::DOUBLE ORDER BY id) FROM big_left",
+               "SELECT id, stddev_samp(val ORDER BY val DESC) FROM big_left GROUP BY id",
+               "SELECT id, sum(val::DOUBLE ORDER BY val DESC) FROM big_left GROUP BY id");
+    require_rejected(query, "An ORDER BY on an aggregate other than first()");
+  }
+
+  SECTION("an ORDER BY that cannot change a non-FIRST aggregate's result is dropped")
+  {
+    auto const* query =
+      GENERATE("SELECT id, avg(val ORDER BY val DESC) FROM big_left GROUP BY id",
+               "SELECT avg(val ORDER BY id) FROM big_left",
+               "SELECT id, avg(val::DECIMAL(10, 2) ORDER BY val DESC) FROM big_left GROUP BY id",
+               "SELECT id, avg(val::DOUBLE ORDER BY id) FROM big_left GROUP BY id");
+    INFO(query);
+    REQUIRE_NOTHROW(generate_sirius_plan(*con, query));
+  }
+
   SECTION("a collated DISTINCT ON ORDER BY key is refused")
   {
     // The binder wraps the key in its collation, so it is not a plain reference to a child column.
