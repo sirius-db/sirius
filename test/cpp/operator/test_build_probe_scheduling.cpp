@@ -666,6 +666,45 @@ TEST_CASE("compute_hash_join_partition_strategy - MARK respects both BUILD_PROBE
 }
 
 TEST_CASE(
+  "compute_hash_join_partition_strategy - a correlated MARK charges its extra tables and key copy",
+  "[hash_join][build_probe][unit][mark][correlated]")
+{
+  // A 200 MB build of 16-byte rows: one 200 MB table, or one copy of the build, fits a 300 MB
+  // budget; three tables (600 MB) or two copies (400 MB) do not.
+  constexpr uint64_t build_bytes = 2 * k100MB;
+  constexpr uint64_t budget      = 3 * k100MB;
+  constexpr uint64_t unbounded   = 1ull << 40;
+  auto const build_probe         = [&](bool correlated_mark,
+                               uint64_t max_build_hash_table_bytes,
+                               uint64_t max_build_probe_resident_bytes) {
+    return compute_hash_join_partition_strategy(build_bytes,
+                                                build_bytes / 16,
+                                                /*is_build_side=*/true,
+                                                /*build_foldable=*/true,
+                                                gpu_ids(1),
+                                                /*single_partition_rotation=*/0,
+                                                kBigPartitionBytes,
+                                                max_build_hash_table_bytes,
+                                                max_build_probe_resident_bytes,
+                                                kMaxBroadcastBytes,
+                                                duckdb::JoinType::MARK,
+                                                HASH_JOIN_MODE::STANDARD,
+                                                /*estimated_probe_to_build_ratio=*/0.0,
+                                                /*resident_bytes=*/std::nullopt,
+                                                /*kept_build_streaming=*/false,
+                                                correlated_mark)
+      .build_probe;
+  };
+
+  // The table budget.
+  REQUIRE(build_probe(/*correlated_mark=*/false, budget, unbounded));
+  REQUIRE_FALSE(build_probe(/*correlated_mark=*/true, budget, unbounded));
+  // The resident budget.
+  REQUIRE(build_probe(/*correlated_mark=*/false, unbounded, budget));
+  REQUIRE_FALSE(build_probe(/*correlated_mark=*/true, unbounded, budget));
+}
+
+TEST_CASE(
   "compute_hash_join_partition_strategy - a broadcast candidate charges the full build to every "
   "GPU",
   "[hash_join][build_probe][unit][broadcast]")
