@@ -25,8 +25,8 @@ mod ffi {
     }
 
     /// Named fields for building an [`ObjectStoreConfig`] snapshot; see the C++ struct for
-    /// the meaning of each field. `Debug` is implemented by hand and redacts the three
-    /// credential fields.
+    /// the meaning of each field. `Debug` redacts all seven text values; transport and
+    /// signing mode remain visible.
     #[derive(Clone, Default)]
     struct ObjectStoreConfigArgs {
         endpoint: String,
@@ -110,11 +110,13 @@ mod ffi {
         /// is a no-op. Fails on a malformed prefix without changing the published set.
         fn drop_object_store_prefix(ctx: &Context, uri_prefix: &CxxString) -> Result<()>;
 
-        /// The snapshot that would serve `uri`: the longest matching published prefix, then
-        /// the default scope; null when nothing is published or no scope matches. Whenever at
-        /// least one snapshot is published, a key that cannot be matched byte-for-byte (an
-        /// empty, `.` or `..` segment, or a raw `%` byte) fails before any scope is selected,
-        /// default scope included, as an execution would.
+        /// The snapshot that would serve `uri`: the longest matching published prefix. After
+        /// the raw-key check, the default scope matches only URIs beginning with `s3://` in
+        /// either ASCII case. A lookup with no matching scope returns a null snapshot, as does
+        /// a lookup when nothing is published. Whenever at least one snapshot is published, a
+        /// key that cannot be matched byte-for-byte (an empty, `.` or `..` segment, or a raw
+        /// `%` byte) fails before any scope is selected, default scope included, as an
+        /// execution would.
         fn object_store_config_for_uri(
             ctx: &Context,
             uri: &CxxString,
@@ -131,18 +133,20 @@ mod ffi {
     }
 }
 
+// Callers can format these arguments before validation, including an endpoint with user-info
+// or a signed query.
 impl std::fmt::Debug for ffi::ObjectStoreConfigArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObjectStoreConfigArgs")
-            .field("endpoint", &self.endpoint)
-            .field("region", &self.region)
+            .field("endpoint", &"<redacted>")
+            .field("region", &"<redacted>")
             .field("access_key", &"<redacted>")
             .field("secret_key", &"<redacted>")
             .field("session_token", &"<redacted>")
             .field("transport", &self.transport)
             .field("signing_mode", &self.signing_mode)
-            .field("ca_bundle_path", &self.ca_bundle_path)
-            .field("uri_prefix", &self.uri_prefix)
+            .field("ca_bundle_path", &"<redacted>")
+            .field("uri_prefix", &"<redacted>")
             .finish()
     }
 }

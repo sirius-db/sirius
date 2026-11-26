@@ -40,6 +40,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
+#include "scan_manager/late_mat_resolver.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 #include "sirius_config.hpp"
@@ -54,6 +55,7 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
@@ -61,6 +63,7 @@
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/column_metadata.hpp>
+#include <cucascade/memory/cpu_constraints.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/error_data.hpp>
@@ -692,6 +695,22 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
            : late_mat::kRowidType;
 }
 
+/// Nulls one compressed chunk records for a column, or nullopt when the chunk
+/// cannot say.
+///
+/// Compression strips a column's validity into a sidecar the .hpln header
+/// carries, so the count is a header read and no decode happens here. A chunk
+/// carrying no blob at all is a legitimate shape (serving paths that need only
+/// a row count never load one), and it answers nothing.
+[[nodiscard]] std::optional<std::size_t> compressed_chunk_null_count(
+  sirius::compressed_device_representation const& compressed, std::size_t column_position)
+{
+  if (!compressed.has_table()) { return std::nullopt; }
+  auto const count = simpatico::column_null_count(compressed.table(), column_position);
+  if (!count.has_value()) { return std::nullopt; }
+  return static_cast<std::size_t>(*count);
+}
+
 /// Nulls in one pinned column across every chunk, or nullopt when the storage
 /// cannot say without decompressing — which reads as "assume the worst".
 [[nodiscard]] std::optional<std::size_t> pinned_column_null_count(pinned_entry const& entry,
@@ -701,8 +720,14 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   std::size_t nulls = 0;
   if (!entry.device_chunks.empty()) {
     for (auto const& chunk : entry.device_chunks) {
-      if (chunk.compressed || column_position >= chunk.columns.size() ||
-          !chunk.columns[column_position]) {
+      if (chunk.compressed) {
+        auto const compressed_nulls =
+          compressed_chunk_null_count(*chunk.compressed, column_position);
+        if (!compressed_nulls.has_value()) { return std::nullopt; }
+        nulls += *compressed_nulls;
+        continue;
+      }
+      if (column_position >= chunk.columns.size() || !chunk.columns[column_position]) {
         return std::nullopt;
       }
       nulls += static_cast<std::size_t>(chunk.columns[column_position]->null_count());
@@ -719,9 +744,16 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   return nulls;
 }
 
-/// Whether this column's pin is uncompressed — every such gather shape (single-batch,
-/// multi-batch fixed-width, multi-batch variable-width) propagates validity. Must agree with
-/// resolve_pinned_column's own check.
+/// Whether materialization can carry this column's validity through.
+///
+/// Every uncompressed gather shape (single-batch, multi-batch fixed-width,
+/// multi-batch variable-width) propagates validity. A compressed chunk does too,
+/// provided its blob is loaded and records the column's validity sidecar: a full
+/// decode reattaches the mask, and the two compacting routes gather it by the
+/// same rows they selected the values by (materialize.cpp's
+/// attach_selected_validity). A chunk carrying no blob answers nothing and is
+/// unsafe, which is also where resolve_pinned_column refuses — the two checks
+/// must agree.
 [[nodiscard]] bool pinned_column_nulls_are_safe(pinned_entry const& entry,
                                                 std::size_t column_position)
 {
@@ -729,8 +761,10 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   if (!entry.device_chunks.empty()) {
     return std::all_of(
       entry.device_chunks.begin(), entry.device_chunks.end(), [&](auto const& chunk) {
-        return !chunk.compressed && column_position < chunk.columns.size() &&
-               chunk.columns[column_position] != nullptr;
+        if (chunk.compressed) {
+          return compressed_chunk_null_count(*chunk.compressed, column_position).has_value();
+        }
+        return column_position < chunk.columns.size() && chunk.columns[column_position] != nullptr;
       });
   }
   if (column_position >= entry.cache_info.names.size()) { return false; }
@@ -738,6 +772,17 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   return it != entry.data_batches_by_column.end() &&
          std::all_of(
            it->second.begin(), it->second.end(), [](auto const& col) { return col != nullptr; });
+}
+
+/// Whether the port will find every deferred origin, asked of the same resolver
+/// materialize_at_port reads them through. Admission must not accept a shape that
+/// resolver refuses — a column whose chunks were narrowed to different carriers is
+/// one — because by the port the scan has already given the values up.
+[[nodiscard]] bool deferred_origins_resolve(std::span<late_mat::column_origin const> origins)
+{
+  if (origins.empty() || !resolve_pinned_layout(origins.front())) { return false; }
+  return std::ranges::all_of(
+    origins, [](auto const& origin) { return resolve_pinned_column(origin).has_value(); });
 }
 
 /// Whether every chunk of a GPU-tier pin records the memory space it lives in,
@@ -927,16 +972,14 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   }
   if (scan_op.get_ingestible().has_row_filter()) {
     // A filtered batch is no longer the chunk's rows in order, so the rowid has
-    // to come from the survivor positions the filter produced. That only works
-    // where the filter runs where we can see it — post-serve, over a whole
-    // served chunk. A COMPRESSED chunk is filtered inside the fused decode
-    // instead, and those survivors never reach the scan's output path, so a
-    // pin with any compressed chunk is refused rather than guessed at.
-    if (has_compressed_chunk) {
-      return decline(
-        "the scan restricts rows and its pin is compressed, so the surviving rows are decided "
-        "inside the decode");
-    }
+    // to come from the survivor positions the filter produced. A COMPRESSED
+    // chunk may be restricted twice — inside the fused decode and again by
+    // whatever conjuncts the decode could not carry — and both stages report
+    // their survivors: the decode through pushdown_outcome::survivor_rows,
+    // requested per split by late_mat_wants_survivors, and the residual through
+    // post_filter_and_project. The scan composes them
+    // (sirius_gpu_scan_operator's compose_survivors) and throws rather than
+    // guess if a compaction arrives unaccounted for.
     if (!entry.host_chunks.empty()) {
       return decline("the scan restricts rows and its pin is host-tier");
     }
@@ -1078,9 +1121,7 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   // pinned_column_nulls_are_safe).
   for (auto const position : planned.positions) {
     if (position >= selected_columns.size()) { continue; }  // caught again, and reported, below
-    if (pinned_column_nulls_are_safe(entry, selected_columns[position])) { continue; }
-    auto const nulls = pinned_column_null_count(entry, selected_columns[position]);
-    if (!nulls.has_value() || *nulls != 0) {
+    if (!pinned_column_nulls_restorable(entry, selected_columns[position])) {
       return decline(
         "a deferred column's pinned values may contain nulls, which materialization cannot "
         "restore");
@@ -1102,6 +1143,11 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
     origin.column_pos = static_cast<std::uint32_t>(selected_columns[position]);
     origin.generation = entry.late_mat_handle->generation();
     origins.push_back(std::move(origin));
+  }
+  if (!deferred_origins_resolve(origins)) {
+    return decline(
+      "a deferred column would not resolve at the port (its chunks disagree on the carrier, or "
+      "one carries no readable blob)");
   }
 
   // The port sees the batch its INPUT produced, not the scan's output: a join
@@ -1291,16 +1337,10 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
     }
 
     // Same gap and exemption as the primary bundle's install, above.
-    bool rider_null_free = true;
-    for (auto const position : planned.positions) {
-      if (position >= candidate.columns.size()) { continue; }  // caught again below
-      if (pinned_column_nulls_are_safe(entry, candidate.columns[position])) { continue; }
-      auto const nulls = pinned_column_null_count(entry, candidate.columns[position]);
-      if (!nulls.has_value() || *nulls != 0) {
-        rider_null_free = false;
-        break;
-      }
-    }
+    bool const rider_null_free = std::ranges::all_of(planned.positions, [&](std::size_t position) {
+      return position >= candidate.columns.size() ||  // caught again below
+             pinned_column_nulls_restorable(entry, candidate.columns[position]);
+    });
     if (!rider_null_free) {
       decline(
         "a deferred column's pinned values may contain nulls, which materialization cannot "
@@ -1323,6 +1363,12 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
     }
     if (origins.empty()) {
       decline("a deferred output position has no served column");
+      continue;
+    }
+    if (!deferred_origins_resolve(origins)) {
+      decline(
+        "a deferred column would not resolve at the port (its chunks disagree on the carrier, or "
+        "one carries no readable blob)");
       continue;
     }
 
@@ -1359,6 +1405,13 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
 
 }  // namespace
 
+bool pinned_column_nulls_restorable(pinned_entry const& entry, std::size_t column_position)
+{
+  if (pinned_column_nulls_are_safe(entry, column_position)) { return true; }
+  auto const nulls = pinned_column_null_count(entry, column_position);
+  return nulls.has_value() && *nulls == 0;
+}
+
 sirius_scan_manager::sirius_scan_manager(
   sirius::exec::query_lifecycle_registry& lifecycle,
   const scan_manager_config& config,
@@ -1366,20 +1419,55 @@ sirius_scan_manager::sirius_scan_manager(
   std::shared_ptr<const sirius::memory::topology_index> topology_index,
   std::shared_ptr<op::scan::physical_check_counters> physical_counters)
   : _query_lifecycle(lifecycle),
-    _config(validate_scan_manager_config(config)),
+    _config([&] {
+      auto resolved = validate_scan_manager_config(config);
+      if (resolved.startup_cpus.empty())
+        resolved.startup_cpus = cucascade::memory::discover_cpu_constraints().allowed_cpus;
+      auto& pool_cpus = resolved.thread_pool.cpu_affinity_list;
+      pool_cpus       = pool_cpus.empty()
+                          ? resolved.startup_cpus
+                          : cucascade::memory::intersect_cpu_affinity(pool_cpus, resolved.startup_cpus);
+      if (pool_cpus.empty())
+        throw std::invalid_argument("scan workers have no CPUs within the rank boundary");
+      resolved.worker_startup_cpus = resolved.worker_startup_cpus.empty()
+                                       ? resolved.startup_cpus
+                                       : cucascade::memory::intersect_cpu_affinity(
+                                           resolved.worker_startup_cpus, resolved.startup_cpus);
+      if (resolved.worker_startup_cpus.empty())
+        throw std::invalid_argument("scan control workers have no CPUs within the rank boundary");
+      return resolved;
+    }()),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _physical_counters(std::move(physical_counters)),
+    _metadata_placement(
+      _topology_index ? resolve_metadata_placement(*_topology_index, _config.startup_cpus, _config)
+                      : throw std::invalid_argument("scan manager requires topology")),
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
-                 _config.thread_pool.cpu_affinity_list),
+                 {},
+                 nullptr,
+                 _metadata_placement.cpus),
     _native_readers(_config.preparation.resolved_native_workers(),
-                    _config.preparation.resolved_native_readers()),
-    _coordinators(_config.preparation.resolved_coordinator_workers()),
+                    _config.preparation.resolved_native_readers(),
+                    _config.worker_startup_cpus),
+    _coordinators(_config.preparation.resolved_coordinator_workers(), _config.worker_startup_cpus),
     _ioctx_registry(_config.to_io_config(), reservation_manager)
 {
   if (!_topology_index) {
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
+  }
+
+  for (size_t domain = 0; domain < _metadata_placement.cpus.size(); ++domain) {
+    std::string cpus;
+    for (int cpu : _metadata_placement.cpus[domain]) {
+      if (!cpus.empty()) cpus += ",";
+      cpus += std::to_string(cpu);
+    }
+    SIRIUS_LOG_INFO("scan metadata domain={} numa_node={} cpus={}",
+                    domain,
+                    _metadata_placement.nodes[domain],
+                    cpus);
   }
 
   // scan_manager always owns the local io_ctx (uring for backend=native), so
@@ -1388,6 +1476,7 @@ sirius_scan_manager::sirius_scan_manager(
   // staging resource from the reservation manager it was constructed with.  The
   // registry routes s3:// paths independently to the REST backend; there is no
   // catch-all backend for other URL schemes.
+
   //
   // The default ioctx is mandatory, so its failure is thrown rather than logged:
   // the cause is explained once, in the exception.
@@ -1430,6 +1519,8 @@ sirius_scan_manager::sirius_scan_manager(
 
 sirius_scan_manager::~sirius_scan_manager()
 {
+  // A file handle DuckDB still holds may ask for a sweep at any time: from here on it gets none.
+  _idle_rest_sweeper->detach();
   if (_io_ctx && _io_ctx->cache()) {
     try {
       SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
@@ -1453,22 +1544,25 @@ sirius_scan_manager::~sirius_scan_manager()
   }
 }
 
-parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
+parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri,
+                                                          s3_config_snapshot const* planned)
 {
   // Footer-probe only when we will actually read + parse the footer.  On a warm
   // re-bind the metadata_store already holds the parsed footer, so a suffix GET
   // would download footer bytes we won't reuse — a plain HEAD resolves the size.
   auto const cache_key     = normalize_path(uri);
-  auto const io_ctx        = ioctx_for_path(uri);
+  auto const io_ctx        = ioctx_for_path(uri, planned);
   bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
   auto const hint          = footer_cached ? cucascade::io::open_hint::generic
                                            : cucascade::io::open_hint::parquet_footer_probe;
 
-  auto datasource = create_datasource(uri, hint);
-  if (!datasource) {
+  if (!io_ctx) {
     throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
                              uri);
   }
+  // Opened on the context resolved above, so a planned configuration builds at most one.
+  std::shared_ptr<cucascade::io::datasource> datasource =
+    sirius::io::open_datasource(io_ctx, cache_key, hint);
 
   // Reuse a previously parsed footer when present — a prior bind or scan of the
   // same file parks it in the ioctx metadata store, which lives for the ioctx's
@@ -1573,8 +1667,9 @@ void sirius_scan_manager::prepare_for_query(
   state->completion = completion;
   state->active_gpu_ids.assign(allocated_gpu_ids.begin(), allocated_gpu_ids.end());
   // Deliberately NOT divided by the query count: a lone query must still be able to use the
-  // whole pool. Dispatchers yield between tasks; each shared pool selects older queries
-  // first and preserves FIFO order within each query's priority.
+  // whole pool across its eligible domains. Dispatchers yield between tasks; the shared
+  // pool selects older queries first among work eligible for each worker. Within a query,
+  // pending metadata/coalescing classes alternate, with FIFO order within each class.
   auto const priority = sirius::query_priority_bits(query_id);
   state->dispatcher =
     std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads(), priority);
@@ -1588,11 +1683,13 @@ void sirius_scan_manager::prepare_for_query(
   // the shared contexts.
   std::vector<std::shared_ptr<cucascade::io::ioctx>> query_io_ctxs;
   std::unordered_set<cucascade::io::ioctx const*> seen_query_io_ctxs;
+  auto planned_io_ctxs = std::make_shared<planned_s3_io_ctxs>();
   for (auto const& scan_op : query.get_scan_operators()) {
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
-    auto const& op = scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
-    for (auto const& path : op.get_ingestible().table_info().file_paths()) {
-      auto io_ctx = ioctx_for_path(path);
+    auto const& op   = scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
+    auto const& info = op.get_ingestible().table_info();
+    for (auto const& path : info.file_paths()) {
+      auto io_ctx = ioctx_for_scan(info, path, *planned_io_ctxs);
       if (io_ctx && seen_query_io_ctxs.insert(io_ctx.get()).second) {
         query_io_ctxs.push_back(std::move(io_ctx));
       }
@@ -1665,8 +1762,11 @@ void sirius_scan_manager::prepare_for_query(
     // One path per operator, not per file: the backend warms per endpoint and
     // rate-limits itself, so the extra paths would only re-ask the same
     // question. A no-op for local backends, which have nothing to connect.
-    if (auto const paths = op->get_ingestible().table_info().file_paths(); !paths.empty()) {
-      if (auto io_ctx = ioctx_for_path(paths.front())) { io_ctx->warmup(paths.front()); }
+    auto const* info = &op->get_ingestible().table_info();
+    if (auto const paths = info->file_paths(); !paths.empty()) {
+      if (auto io_ctx = ioctx_for_scan(*info, paths.front(), *planned_io_ctxs)) {
+        io_ctx->warmup(paths.front());
+      }
     }
     state->metadata_processor->register_pipeline(op, round_robin, state->readahead);
     // On a pinned-cache hit the coalescer serves this operator from a cached
@@ -1716,15 +1816,15 @@ void sirius_scan_manager::prepare_for_query(
     if (native) { pause_native_with_key_for_testing(); }
     auto provider = std::make_unique<split_provider>(
       op->get_ingestible(),
-      sirius::io::ioctx_resolver{
-        [this](std::string_view file_path) -> std::shared_ptr<cucascade::io::ioctx> {
-          auto io_ctx = ioctx_for_path(file_path);
-          if (!io_ctx) {
-            throw std::runtime_error("scan_manager: no backend supports path: " +
-                                     std::string(file_path));
-          }
-          return io_ctx;
-        }});
+      sirius::io::ioctx_resolver{[this, info, planned_io_ctxs](std::string_view file_path)
+                                   -> std::shared_ptr<cucascade::io::ioctx> {
+        auto io_ctx = ioctx_for_scan(*info, file_path, *planned_io_ctxs);
+        if (!io_ctx) {
+          throw std::runtime_error("scan_manager: no backend supports path: " +
+                                   std::string(file_path));
+        }
+        return io_ctx;
+      }});
     state->scans.push_back({op, query_scan_manager_state::disk_scan{std::move(provider)}});
   }
 
@@ -2101,12 +2201,29 @@ void sirius_scan_manager::prepare_for_query(
 std::unique_ptr<preparation_coordinator> sirius_scan_manager::make_preparation_coordinator(
   query_scan_manager_state& state)
 {
+  std::vector<int> domains;
+  for (int gpu : state.active_gpu_ids) {
+    auto node = _topology_index->numa_node_of(gpu);
+    auto it   = std::find(_metadata_placement.nodes.begin(), _metadata_placement.nodes.end(), node);
+    if (it != _metadata_placement.nodes.end()) {
+      auto domain = static_cast<int>(it - _metadata_placement.nodes.begin());
+      if (std::find(domains.begin(), domains.end(), domain) == domains.end())
+        domains.push_back(domain);
+    }
+  }
+  // CPU restrictions may exclude every GPU-local domain for this query. Use the
+  // first permitted manager domain, even when it is remote from the query's GPUs.
+  if (domains.empty()) domains.push_back(0);
+  rotate_metadata_domains(domains, _next_metadata_domain);
+  auto options                 = state.preparation;
+  options.control_cpu_affinity = _config.worker_startup_cpus;
   return std::make_unique<preparation_coordinator>(
     *state.completion,
     *state.dispatcher,
-    state.preparation,
+    std::move(options),
     &_native_readers,
-    _config.preparation.resolved_coordinator_workers() ? &_coordinators : nullptr);
+    _config.preparation.resolved_coordinator_workers() ? &_coordinators : nullptr,
+    std::move(domains));
 }
 
 void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state,
@@ -2229,10 +2346,10 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
 }
 
 std::shared_ptr<cucascade::io::datasource> sirius_scan_manager::create_datasource(
-  std::string_view path, cucascade::io::open_hint hint)
+  std::string_view path, cucascade::io::open_hint hint, s3_config_snapshot const* planned)
 {
   auto file_path = normalize_path(std::string(path));
-  auto io_ctx    = ioctx_for_path(file_path);
+  auto io_ctx    = ioctx_for_path(file_path, planned);
   if (!io_ctx) { return nullptr; }  // no backend supports the path
   // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
   // only "no backend" is reported as nullptr (callers map it to that message).
@@ -2268,7 +2385,8 @@ void sirius_scan_manager::list_objects_paged(
   std::string const& s3_prefix_uri,
   std::size_t page_size,
   std::function<bool(cucascade::io::rest::s3::list_objects_v2_page const&)> const& sink,
-  std::optional<std::size_t> max_scanned)
+  std::optional<std::size_t> max_scanned,
+  s3_config_snapshot const* planned)
 {
   // Hand-split rather than cucascade::io::parse — a LIST prefix URI legitimately
   // has an EMPTY key part (bucket-root glob: "s3://bucket/"), which parse()
@@ -2288,7 +2406,7 @@ void sirius_scan_manager::list_objects_paged(
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: malformed prefix URI '" +
                              s3_prefix_uri + "'");
   }
-  auto rest = rest_ioctx_for_list(s3_prefix_uri);
+  auto rest = rest_ioctx_for_list(s3_prefix_uri, planned);
   if (!rest) {
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -2296,14 +2414,15 @@ void sirius_scan_manager::list_objects_paged(
   rest->list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
 }
 
-std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
+std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri,
+                                                     s3_config_snapshot const* planned)
 {
   constexpr std::string_view k_scheme = "s3://";
   if (s3_uri.size() <= k_scheme.size() || s3_uri.compare(0, k_scheme.size(), k_scheme) != 0) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: malformed URI '" + s3_uri +
                              "'");
   }
-  auto rest = rest_ioctx_for_list(s3_uri);
+  auto rest = rest_ioctx_for_list(s3_uri, planned);
   if (!rest) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -2311,7 +2430,8 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
   return rest->list_max_matches();
 }
 
-std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
+std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_path(
+  std::string_view path, s3_config_snapshot const* planned, retired_io_ctxs* retired)
 {
   // Normalize here so every caller (incl. the scan resolver, which forwards raw
   // ingestible paths) routes `file://` the same way create_datasource does.
@@ -2323,7 +2443,24 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_path(std::s
   }
   auto type = _ioctx_registry.lookup_path(file_path);
   if (!type) { return nullptr; }
-  return ioctx_for_type(*type, file_path);
+  return ioctx_for_type(*type, file_path, planned, retired);
+}
+
+std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_scan(
+  ingestible_table_info const& info, std::string_view path, planned_s3_io_ctxs& planned)
+{
+  auto const config = info.s3_configs.find(std::string(path));
+  if (config == info.s3_configs.end()) { return ioctx_for_path(path); }
+  // Building the context may drop idle ones of other configurations. Declared before the
+  // lock, so they are destroyed after it is released: a context joins its reactors when
+  // destroyed, and every scan of this query that needs a planned context waits on this lock.
+  retired_io_ctxs retired;
+  // One lookup per config and query: a context this query had to build for itself is built
+  // once and lives as long as its scans.
+  std::lock_guard lk{planned.mtx};
+  auto& io_ctx = planned.by_config[config->second.id];
+  if (!io_ctx) { io_ctx = ioctx_for_path(path, &config->second, &retired); }
+  return io_ctx;
 }
 
 std::optional<cucascade::io::io_context_type> sirius_scan_manager::planning_io_backend(
@@ -2337,13 +2474,18 @@ std::optional<cucascade::io::io_context_type> sirius_scan_manager::planning_io_b
 }
 
 std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
-  cucascade::io::io_context_type type, std::string_view path)
+  cucascade::io::io_context_type type,
+  std::string_view path,
+  s3_config_snapshot const* planned,
+  retired_io_ctxs* retired_by_caller)
 {
   auto const canonical_path = path.empty() ? std::string{} : normalize_path(std::string(path));
   bool const uses_object_store_config = type == cucascade::io::io_context_type::restful;
-  auto const snapshot                 = uses_object_store_config && !canonical_path.empty()
+  bool const uses_planned_config      = uses_object_store_config && planned != nullptr;
+  auto const snapshot                 = uses_planned_config ? std::optional{*planned}
+                                        : uses_object_store_config && !canonical_path.empty()
                                           ? _s3_configs.resolve(canonical_path)
-                                          : std::optional<sirius::io::scoped_object_store_configs::snapshot>{};
+                                          : std::optional<s3_config_snapshot>{};
   auto const config_id                = snapshot ? snapshot->id : 0;
   auto const cache_key                = routed_ioctx_key{type, config_id};
   // The local default `_io_ctx` already serves uring; only an off-default
@@ -2352,27 +2494,39 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
 
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find({type, config_id}); it != _routed_io_ctxs.end()) {
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
+      _routed_io_ctx_last_use[cache_key] = ++_routed_io_ctx_clock;
       return it->second;
     }
   }
+  // Idle REST contexts dropped by this call when it builds one. Declared before the build
+  // and map locks, so it is destroyed after both on a return and on an exception alike: a
+  // context joins its reactors and tears its cache down when it is destroyed. A caller that
+  // holds a lock of its own across this call passes its list instead, and destroys them
+  // after that lock too.
+  retired_io_ctxs retired_here;
+  auto& retired = retired_by_caller != nullptr ? *retired_by_caller : retired_here;
   // Build outside the map mutex: make_ioctx/start spawn reactor threads and
   // initialize_cache allocates, so holding _routed_io_ctxs_mtx across them would
   // park every concurrent lookup behind one long critical section. The build
   // mutex serializes builders instead, so two first-touches of the same type
   // never construct twice (a losing ioctx would need drain/stop teardown).
   std::unique_lock build_lk{_routed_io_ctxs_build_mtx};
-  if (uses_object_store_config && !canonical_path.empty()) {
+  // A context is retired when the last path leaves its config. One cached for a planned config
+  // that no path maps to any more would never be retired, so the caller owns it instead.
+  bool const cached = !uses_planned_config || _s3_configs.contains(config_id);
+  if (!uses_planned_config && uses_object_store_config && !canonical_path.empty()) {
     auto latest          = _s3_configs.resolve(canonical_path);
     auto const latest_id = latest ? latest->id : 0;
     if (latest_id != config_id) {
       build_lk.unlock();
-      return ioctx_for_type(type, canonical_path);
+      return ioctx_for_type(type, canonical_path, nullptr, &retired);
     }
   }
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find({type, config_id}); it != _routed_io_ctxs.end()) {
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
+      _routed_io_ctx_last_use[cache_key] = ++_routed_io_ctx_clock;
       return it->second;
     }
   }
@@ -2397,22 +2551,96 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   // inherit it. First use may come from a pool thread whose mask excludes the CPUs reserved for
   // the reactors (e.g. a deferred Puffin read on a metadata worker), so build from the mask the
   // reservation was planned from.
-  if (type == cucascade::io::io_context_type::restful && !_config.rest_placement_cpus.empty()) {
-    exec::run_with_affinity(_config.rest_placement_cpus, build_and_start);
+  if (type == cucascade::io::io_context_type::restful && !_config.startup_cpus.empty()) {
+    exec::scoped_startup_affinity affinity(_config.startup_cpus);
+    build_and_start();
   } else {
     build_and_start();
   }
   auto& [io_ctx, failure] = build;
   if (!io_ctx) {
-    _failed_io_ctxs.insert_or_assign(cache_key, failure.by_configuration);
+    if (cached) { _failed_io_ctxs.insert_or_assign(cache_key, failure.by_configuration); }
     return nullptr;
   }
   _failed_io_ctxs.erase(cache_key);
   init_cache_for(*io_ctx);
+  if (!cached) { return std::move(io_ctx); }
+  std::shared_ptr<cucascade::io::ioctx> kept;
+  {
+    std::lock_guard lk{_routed_io_ctxs_mtx};
+    kept = _routed_io_ctxs.emplace(cache_key, std::move(io_ctx)).first->second;
+    _routed_io_ctx_last_use[cache_key] = ++_routed_io_ctx_clock;
+    // The contexts grow in number only here.
+    if (type == cucascade::io::io_context_type::restful) { detach_idle_rest_contexts(retired); }
+  }
+  build_lk.unlock();
+  return kept;
+}
+
+void sirius_scan_manager::detach_idle_rest_contexts(retired_io_ctxs& retired) noexcept
+{
+  auto const limit = _physical_counters && _physical_counters->track_units &&
+                         _physical_counters->idle_rest_context_limit_for_testing
+                       ? *_physical_counters->idle_rest_context_limit_for_testing
+                       : kMaxIdleRestContexts;
+  if (_routed_io_ctxs.size() <= limit) { return; }
+  try {
+    std::vector<std::pair<std::uint64_t, routed_ioctx_key>> idle;
+    for (auto const& [key, io_ctx] : _routed_io_ctxs) {
+      if (key.type != cucascade::io::io_context_type::restful || io_ctx.use_count() != 1) {
+        continue;
+      }
+      auto const used = _routed_io_ctx_last_use.find(key);
+      idle.emplace_back(used == _routed_io_ctx_last_use.end() ? 0 : used->second, key);
+    }
+    if (idle.size() <= limit) { return; }
+    std::ranges::sort(idle, {}, [](auto const& entry) { return entry.first; });
+    idle.resize(idle.size() - limit);
+    // The last allocation. Once it succeeds every context to move has a place in the caller's
+    // list, so moving them there cannot fail half way and leave one to be destroyed under a
+    // lock.
+    retired.reserve(retired.size() + idle.size());
+    for (auto const& [last_use, key] : idle) {
+      auto const it = _routed_io_ctxs.find(key);
+      retired.push_back(std::move(it->second));
+      _routed_io_ctxs.erase(it);
+      _routed_io_ctx_last_use.erase(key);
+    }
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] dropped {} idle REST context(s)", idle.size());
+  } catch (...) {
+    // Out of memory. If it was while listing the idle contexts, none has left the map: the
+    // reserve is the last step before the first one moves, and they stay cached until the
+    // next call. If it was the log line, they are all in the caller's list already.
+  }
+}
+
+void sirius_scan_manager::release_idle_rest_contexts() noexcept
+{
+  retired_io_ctxs retired;
   std::lock_guard lk{_routed_io_ctxs_mtx};
-  auto [it, inserted] =
-    _routed_io_ctxs.emplace(routed_ioctx_key{type, config_id}, std::move(io_ctx));
-  return it->second;
+  detach_idle_rest_contexts(retired);
+}
+
+void sirius_scan_manager::idle_rest_context_sweeper::sweep() noexcept
+{
+  // Shared, so that sweeps do not wait for each other; the manager's destructor takes it
+  // exclusively and so waits for every sweep that has started.
+  std::shared_lock lk{_mtx};
+  if (_manager != nullptr) { _manager->release_idle_rest_contexts(); }
+}
+
+void sirius_scan_manager::idle_rest_context_sweeper::detach() noexcept
+{
+  std::unique_lock lk{_mtx};
+  _manager = nullptr;
+}
+
+std::size_t sirius_scan_manager::rest_context_count() const
+{
+  std::lock_guard lk{_routed_io_ctxs_mtx};
+  return static_cast<std::size_t>(std::ranges::count_if(_routed_io_ctxs, [](auto const& entry) {
+    return entry.first.type == cucascade::io::io_context_type::restful;
+  }));
 }
 
 sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
@@ -2492,20 +2720,21 @@ bool sirius_scan_manager::init_cache_for(cucascade::io::ioctx& io_ctx)
 }
 
 std::shared_ptr<cucascade::io::rest::rest_ioctx> sirius_scan_manager::rest_ioctx_for_list(
-  std::string_view path)
+  std::string_view path, s3_config_snapshot const* planned)
 {
-  auto io_ctx = ioctx_for_type(cucascade::io::io_context_type::restful, path);
+  auto io_ctx = ioctx_for_type(cucascade::io::io_context_type::restful, path, planned);
   return std::dynamic_pointer_cast<cucascade::io::rest::rest_ioctx>(io_ctx);
 }
 
-void sirius_scan_manager::install_s3_config(std::string_view path,
-                                            cucascade::io::object_store_config config)
+std::optional<sirius_scan_manager::s3_config_snapshot> sirius_scan_manager::install_s3_config(
+  std::string_view path, cucascade::io::object_store_config config)
 {
   auto scope = normalize_path(std::string(path));
   std::vector<std::shared_ptr<cucascade::io::ioctx>> retired;
   std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
   auto superseded_id = _s3_configs.install(scope, std::move(config));
-  if (!superseded_id) { return; }
+  auto installed     = _s3_configs.resolve(scope);
+  if (!superseded_id) { return installed; }
   std::lock_guard ctx_lk{_routed_io_ctxs_mtx};
   routed_ioctx_key const key{cucascade::io::io_context_type::restful, *superseded_id};
   _failed_io_ctxs.erase(key);
@@ -2513,7 +2742,9 @@ void sirius_scan_manager::install_s3_config(std::string_view path,
   if (it != _routed_io_ctxs.end()) {
     retired.push_back(std::move(it->second));
     _routed_io_ctxs.erase(it);
+    _routed_io_ctx_last_use.erase(key);
   }
+  return installed;
 }
 
 void sirius_scan_manager::query_scan_manager_state::drain() noexcept
@@ -2605,6 +2836,11 @@ void sirius_scan_manager::reset(sirius::query_id_t query_id)
 {
   drain_query(query_id);
   release_checkpoint_keys(query_id);
+  // The scans of a query hold their REST contexts together, so none of them was idle while
+  // the others were built. With the query's state gone they are: give the excess back now,
+  // rather than when the next context is built. After the keys, because tearing a context
+  // down joins its reactors.
+  release_idle_rest_contexts();
 }
 
 void sirius_scan_manager::drain_query(sirius::query_id_t query_id)
@@ -2678,6 +2914,8 @@ void sirius_scan_manager::reset_caches()
       _pinned_parquet_sources.size(),
       names);
     _pinned_parquet_sources.clear();
+    // Those datasources may have been the last readers of their REST contexts.
+    release_idle_rest_contexts();
   }
 
   // Rebuild one context's cache.  shutdown_cache drains the evictor and every
@@ -3524,16 +3762,21 @@ void sirius_scan_manager::insert_pinned_entry_device(
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
-  pin_registry_mutation_scope const registry_mutation{*this};
-  // Safe mid-query by construction: dropping the map slot only removes visibility to new
-  // queries and releases this map's reference. A query serving the exact entry holds its own
-  // shared_ptr, and the entry's weak late-mat handle continues to resolve through that owner.
-  std::lock_guard pin_lk{_pinned_entries_mutex};
-  _pinned_entries.erase(name);
-  // Dropping the datasources releases their prefetching handles, which disposes
-  // each request's consumer and hands the chunks back to the evictor. That is
-  // the whole of unpinning a parquet-tier entry.
-  _pinned_parquet_sources.erase(name);
+  {
+    pin_registry_mutation_scope const registry_mutation{*this};
+    // Safe mid-query by construction: dropping the map slot only removes visibility to new
+    // queries and releases this map's reference. A query serving the exact entry holds its own
+    // shared_ptr, and the entry's weak late-mat handle continues to resolve through that owner.
+    std::lock_guard pin_lk{_pinned_entries_mutex};
+    _pinned_entries.erase(name);
+    // Dropping the datasources releases their prefetching handles, which disposes
+    // each request's consumer and hands the chunks back to the evictor. That is
+    // the whole of unpinning a parquet-tier entry.
+    _pinned_parquet_sources.erase(name);
+  }
+  // Those datasources may have been the last readers of their REST contexts, and nothing need
+  // follow an unpin: drop the idle contexts beyond the bound, outside the registry lock.
+  release_idle_rest_contexts();
 }
 void sirius_scan_manager::publish_pinned_entry(const std::string& name, pinned_entry entry)
 {
@@ -3668,6 +3911,8 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
   // Replace rather than accumulate: a re-pin under the same name should leave
   // one set of handles, not two covering the same chunks.
   _pinned_parquet_sources[name] = std::move(retained);
+  // The handles replaced may have been the last readers of their REST contexts.
+  release_idle_rest_contexts();
   return total_bytes;
 }
 

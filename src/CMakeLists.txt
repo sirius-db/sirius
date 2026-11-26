@@ -3,11 +3,16 @@ target_sources(
   PRIVATE c_api/config.cpp
           c_api/context.cpp
           c_api/error.cpp
+          c_api/object_store_config.cpp
+          c_api/object_store_registry.cpp
+          c_api/plan.cpp
           c_api/version.cpp
           config.cpp
           config_loading.cpp
           debug_utils.cpp
           pin_table.cpp
+          output/parquet_session.cpp
+          output/parquet_writer.cpp
           sirius_config.cpp
           sirius_context.cpp
           sirius_engine.cpp

@@ -20,7 +20,7 @@
  *        trees: the per-column verdict rule (transport keeps, narrow-domain comparisons rescue,
  *        boundary restores veto, evaluator restores retract), the exact eligibility mirrors of
  *        the propagation cases (hash-join keys and payload maps, the grouped-aggregate ladder,
- *        DELIM_JOIN sub-trees, unmodeled boundaries), host-tier invisibility, multi-scan
+ *        unmodeled boundaries), host-tier invisibility, multi-scan
  *        independence, and the pass-pipeline composition over a Q1-shaped tree.
  */
 
@@ -32,7 +32,6 @@
 #include "expression/value.hpp"
 #include "helper/logical_type.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -839,67 +838,17 @@ TEST_CASE("tier_narrowing_policy - pair verdicts track the shared eligibility pr
   }
 }
 
-TEST_CASE("tier_narrowing_policy - unmodeled operators and DELIM_JOIN sub-trees are boundaries",
+TEST_CASE("tier_narrowing_policy - an unmodeled operator above the carrier retracts it",
           "[tier_narrowing_policy]")
 {
-  SECTION("an unmodeled operator above the carrier retracts it")
-  {
-    auto boundary = duckdb::make_uniq<sirius::op::test_physical_operator>(
-      SiriusPhysicalOperatorType::TOP_N, integer_types(1), /*estimated_cardinality=*/1);
-    boundary->children.push_back(make_integer_scan(1, {k_int8}));
-    duckdb::unique_ptr<sirius_physical_operator> plan = std::move(boundary);
+  auto boundary = duckdb::make_uniq<sirius::op::test_physical_operator>(
+    SiriusPhysicalOperatorType::TOP_N, integer_types(1), /*estimated_cardinality=*/1);
+  boundary->children.push_back(make_integer_scan(1, {k_int8}));
+  duckdb::unique_ptr<sirius_physical_operator> plan = std::move(boundary);
 
-    sirius::planner::apply_tier_narrowing_policy(*plan);
+  sirius::planner::apply_tier_narrowing_policy(*plan);
 
-    REQUIRE(!plan->children[0]->has_physical_overrides());
-  }
-
-  SECTION("a hash join as a DELIM_JOIN sub-root awards no payload transport")
-  {
-    // Propagation restores every child of the sub-root in place, so these payloads never cross
-    // the sub-root join narrow; the would-be transport of its output map must not rescue them.
-    auto sub_join = make_hash_join(duckdb::JoinType::INNER,
-                                   make_integer_scan(2, {k_int8, k_int8}),
-                                   make_integer_scan(2, {k_int8, k_int16}),
-                                   duckdb_integer_types(4));
-    auto delim    = duckdb::make_uniq<sirius::op::test_delim_join>(
-      SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
-      integer_types(4),
-      std::move(sub_join),
-      duckdb::vector<duckdb::const_reference<sirius_physical_operator>>{},
-      /*estimated_cardinality=*/1,
-      duckdb::optional_idx());
-    delim->children.push_back(make_integer_scan(1, {k_int8}));
-    duckdb::unique_ptr<sirius_physical_operator> plan = std::move(delim);
-
-    sirius::planner::apply_tier_narrowing_policy(*plan);
-
-    auto const& delim_ref = plan->Cast<sirius::op::sirius_physical_delim_join>();
-    REQUIRE(!delim_ref.join->children[0]->has_physical_overrides());
-    REQUIRE(!delim_ref.join->children[1]->has_physical_overrides());
-    REQUIRE(!plan->children[0]->has_physical_overrides());
-  }
-
-  SECTION("DELIM_JOIN sub-tree survivors retract")
-  {
-    auto delim = duckdb::make_uniq<sirius::op::test_delim_join>(
-      SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
-      integer_types(1),
-      make_integer_scan(1, {k_int8}),
-      duckdb::vector<duckdb::const_reference<sirius_physical_operator>>{},
-      /*estimated_cardinality=*/1,
-      duckdb::optional_idx());
-    delim->distinct_root = make_integer_scan(1, {k_int8});
-    delim->children.push_back(make_integer_scan(1, {k_int8}));
-    duckdb::unique_ptr<sirius_physical_operator> plan = std::move(delim);
-
-    sirius::planner::apply_tier_narrowing_policy(*plan);
-
-    auto const& delim_ref = plan->Cast<sirius::op::sirius_physical_delim_join>();
-    REQUIRE(!delim_ref.join->has_physical_overrides());
-    REQUIRE(!delim_ref.distinct_root->has_physical_overrides());
-    REQUIRE(!plan->children[0]->has_physical_overrides());
-  }
+  REQUIRE(!plan->children[0]->has_physical_overrides());
 }
 
 TEST_CASE("tier_narrowing_policy - verdicts are per scan and per origin", "[tier_narrowing_policy]")

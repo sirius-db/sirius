@@ -47,9 +47,9 @@ If `counts.operator_types` (a dict of `{op_type: count}`) differs between the tw
 
 If the bad run's operator inventory (`counts.operator_types`) doesn't match any other run of the same SQL in the current log, **stop and ask the user before doing anything else**:
 
-> "I found N other runs of this SQL in the log, but none have a matching operator inventory (e.g. the bad run uses LEFT_DELIM_JOIN + GPU_PARQUET_SCAN, the others use RIGHT_DELIM_JOIN + DUCKDB_SCAN). Do you have another log — a successful test run, or a different failure log that happened to also run this query — where the same query executed with the same operators? If so, share the path and I'll parse it and compare."
+> "I found N other runs of this SQL in the log, but none have a matching operator inventory (e.g. the bad run uses DENSE_COUNT_JOIN + GPU_PARQUET_SCAN, the others use HASH_JOIN + DUCKDB_SCAN). Do you have another log — a successful test run, or a different failure log that happened to also run this query — where the same query executed with the same operators? If so, share the path and I'll parse it and compare."
 
-**Do not** silently fall back to comparing across mismatched plans. Trap B (next section) explains why scan-path differences make cross-path diffs untrustworthy. The same logic applies to other plan differences (LEFT vs RIGHT DELIM_JOIN, missing or extra operators) — these are legitimate planner decisions, not bugs, and a row-count divergence across them tells you nothing.
+**Do not** silently fall back to comparing across mismatched plans. Trap B (next section) explains why scan-path differences make cross-path diffs untrustworthy. The same logic applies to other plan differences (HASH_JOIN vs DENSE_COUNT_JOIN, missing or extra operators) — these are legitimate planner decisions, not bugs, and a row-count divergence across them tells you nothing.
 
 The common case where this works: a project usually has many log files (one per test run, one per failure). A workload that runs Q4 on the parquet path with a particular set of operators is likely to have run with the *same* operator set in another log. Parse that other log and pair the runs across the two parser-output directories. The matching rule (full SQL + operator inventory) is the same; only the file paths differ.
 

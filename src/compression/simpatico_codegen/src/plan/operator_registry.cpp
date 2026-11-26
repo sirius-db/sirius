@@ -45,7 +45,7 @@ std::vector<OperatorInfo> const& operator_registry()
   static const std::vector<OperatorInfo> kTable = {
     {OpId::Delta,          "delta",           {"differences"},                                                        true,  false, true,  true},
     {OpId::Rle,            "rle",             {"runs", "values"},                                                     true,  false, true,  true},
-    {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed"},                   true,  false, false, true},
+    {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed", "chunk_divisors"}, true,  false, false, true},
     {OpId::For,            "for",             {"deltas", "references"},                                               true,  false, true,  true},
     {OpId::Zigzag,         "zigzag",          {"zigzag"},                                                             true,  false, true,  true},
     {OpId::Dictionary,     "dictionary",      {},                                                                     true,  false, false, false},
@@ -83,6 +83,8 @@ std::optional<OpId> op_id_from_name(std::string const& name)
   for (auto const& e : operator_registry()) {
     if (name == e.name) return e.id;
   }
+
+  if (name == kBitpackGcdName) return OpId::Bitpack;
 
   // Parameterised suffix families sharing a bare-name entry above.
   if (after_prefix(name, "bitcomp")) return OpId::Bitcomp;

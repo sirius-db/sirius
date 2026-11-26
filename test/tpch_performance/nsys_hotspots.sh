@@ -84,9 +84,6 @@ map_operator_to_source() {
         sirius_physical_materialized_collector)
             echo "src/op/sirius_physical_result_collector.cpp"
             ;;
-        sirius_physical_left_delim_join|sirius_physical_right_delim_join)
-            echo "src/op/sirius_physical_delim_join.cpp"
-            ;;
         sirius_physical_streaming_limit)
             echo "src/op/sirius_physical_limit.cpp"
             ;;

@@ -40,6 +40,7 @@ class sirius_physical_table_scan;
 namespace scan {
 enum class dynamic_filter_apply_mode;
 class gpu_ingestible;
+class parquet_ingestible_table_info;
 }  // namespace scan
 }  // namespace op
 }  // namespace sirius
@@ -75,9 +76,21 @@ struct connector {
                                             op::sirius_physical_table_scan const&,
                                             duckdb::ClientContext&,
                                             scan_contract_provenance&) = nullptr;
-  // On success, lookup delegates the bound candidate's function_info validation to
-  // this hook. The bridge must verify its provider-owned function_info and binding
-  // identity together; verifying only the nested Parquet wrapper is insufficient.
+  // Without this hook, lookup accepts a candidate only when its `function_info` matches the
+  // registered function's: both absent, or multi-file info with the same settings. With the
+  // hook, lookup leaves `function_info` to it, and calls it after the candidate's callbacks
+  // have matched the registered function's, so the hook may call them.
+  //
+  // What a hook returning true guarantees, and all it guarantees:
+  //   - the `function_info` is one this connector's provider attaches, by its type;
+  //   - it sits on a binding of the kind the provider attaches it to.
+  // It does NOT guarantee that the info describes the bound table: DuckDB passes it as an
+  // opaque `TableFunctionInfo`, and its content is private to the provider.
+  //
+  // A connector with this hook must therefore take nothing from `function_info`. The table,
+  // its snapshot and its files come from the bind data, through the verified callbacks, and
+  // the bind data stays authoritative whatever info is attached. Verifying only the nested
+  // Parquet wrapper is insufficient.
   bool (*verify_binding)(duckdb::BaseTableFunction const&,
                          duckdb::FunctionData const*,
                          duckdb::ClientContext&) = nullptr;
@@ -174,6 +187,9 @@ duckdb::unique_ptr<op::sirius_physical_operator> lower_iceberg_scan(
 op::scan::pre_capture_result registered_iceberg_decline_reason(duckdb::LogicalGet&,
                                                                duckdb::ClientContext&,
                                                                scan_contract_provenance&);
+/// Reads every equality-delete key of @p plan into the scan without changing its output.
+void widen_scan_for_equality_keys(op::scan::parquet_ingestible_table_info& info,
+                                  op::scan::iceberg_equality_plan const& plan);
 /// Verify the nested multi-file wrapper against this host's Parquet implementation.
 /// Does not verify the outer provider's function_info or binding identity.
 bool verified_parquet_interface(duckdb::FunctionData const*, duckdb::ClientContext&);

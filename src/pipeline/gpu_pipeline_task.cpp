@@ -261,10 +261,11 @@ void synchronize_after_exception(::cuda::stream_ref stream, const sirius_pipelin
 
 std::unique_ptr<op::operator_data> run_one_operator(
   op::sirius_physical_operator& op,
-  const op::operator_data& operator_input_data,
+  op::operator_data& operator_input_data,
   ::cuda::stream_ref stream,
   const sirius_pipeline* pipeline,
   uint64_t task_id,
+  op::delivery_metadata delivery,
   size_t num_operators,
   cucascade::memory::reservation_aware_resource_adaptor* allocator,
   cucascade::memory::memory_space const* host_staging_space)
@@ -281,8 +282,11 @@ std::unique_ptr<op::operator_data> run_one_operator(
   std::unique_ptr<op::operator_data> operator_output_data;
   try {
     materialized = materialize_deferred_input(op, operator_input_data, stream, host_staging_space);
-    auto const& effective_input = materialized ? *materialized : operator_input_data;
-    operator_output_data        = op.execute(effective_input, stream);
+    auto& effective_input = materialized ? *materialized : operator_input_data;
+    // Stamp after materialization: a replacement payload need not copy metadata
+    // from its source. Never trust metadata inherited from an upstream task.
+    effective_input.set_delivery(delivery);
+    operator_output_data = op.execute(effective_input, stream);
   } catch (const std::exception& ex) {
     // Both the original input and any restored deferred input are still alive here. Quiesce the
     // stream before rethrowing lets their owners unwind only after their last GPU reader finishes.
@@ -438,11 +442,34 @@ gpu_pipeline_task::~gpu_pipeline_task()
   }
   _subscribed_batches.clear();
 
-  if (_global_state == nullptr ||
-      _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
-    return;
+  if (_global_state == nullptr) { return; }
+  auto* pipeline = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+  if (pipeline == nullptr) { return; }
+  try {
+    pipeline->mark_task_completed();
+  } catch (...) {
+    // Completing the last task finalizes the pipeline's operators, which do device work and can
+    // throw. An exception leaving this destructor would terminate the process, so fail the
+    // task's query instead.
+    auto error = std::current_exception();
+    if (auto completion = get_completion_handler()) {
+      completion->report_error(error, transparent::late_failure_cause::gpu_error);
+    }
+    log::log_noexcept([&] {
+      try {
+        std::rethrow_exception(error);
+      } catch (std::exception const& e) {
+        SIRIUS_LOG_ERROR("gpu_pipeline_task: completing task {} of pipeline {} failed: {}",
+                         get_task_id(),
+                         pipeline->get_pipeline_id(),
+                         e.what());
+      } catch (...) {
+        SIRIUS_LOG_ERROR("gpu_pipeline_task: completing task {} of pipeline {} failed",
+                         get_task_id(),
+                         pipeline->get_pipeline_id());
+      }
+    });
   }
-  _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->mark_task_completed();
 }
 
 const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
@@ -456,6 +483,8 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto operator_input_output_data = std::move(local_state._input_data);
   if (not pipeline) { throw std::invalid_argument("task global state has null pipeline"); }
+  op::delivery_metadata const delivery{local_state.original_task_id.value_or(get_task_id()),
+                                       local_state.retry_count};
   auto operators   = pipeline->get_operators();
   auto start_index = local_state._start_operator_index;
 
@@ -526,7 +555,8 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
         *operator_input_output_data,
         stream,
         pipeline,
-        _task_id,
+        get_task_id(),
+        delivery,
         operators.size(),
         _allocator,
         _global_state->cast<gpu_pipeline_task_global_state>().get_host_staging_space());

@@ -376,6 +376,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
     REQUIRE(setting_count(con, "cross_join_task_bytes") == 0);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
+    REQUIRE(setting_count(con, "partial_aggregate_min_kept_share") == 0);
+    REQUIRE(setting_count(con, "partial_aggregate_max_extra_keys") == 0);
+    REQUIRE(setting_count(con, "partial_aggregate_min_rows_per_key") == 0);
+    REQUIRE(con.Query("SET partial_aggregate_min_kept_share = 0.5")->HasError());
+    REQUIRE(con.Query("SET partial_aggregate_max_extra_keys = 2")->HasError());
+    REQUIRE(con.Query("SET partial_aggregate_min_rows_per_key = 4")->HasError());
     REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
     REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
     auto native_option = con.Query("SET sirius_test_sync_native_checkpoint = true");
@@ -444,6 +450,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
     REQUIRE(setting_count(con, "cross_join_task_bytes") == 0);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
+    REQUIRE(setting_count(con, "partial_aggregate_min_kept_share") == 0);
+    REQUIRE(setting_count(con, "partial_aggregate_max_extra_keys") == 0);
+    REQUIRE(setting_count(con, "partial_aggregate_min_rows_per_key") == 0);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
@@ -468,6 +477,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
     REQUIRE(setting_count(con, "cross_join_task_bytes") == 1);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 1);
+    REQUIRE(setting_count(con, "partial_aggregate_min_kept_share") == 1);
+    REQUIRE(setting_count(con, "partial_aggregate_max_extra_keys") == 1);
+    REQUIRE(setting_count(con, "partial_aggregate_min_rows_per_key") == 1);
     duckdb::Value native_enabled;
     auto native_setting =
       con.context->TryGetCurrentSetting("sirius_test_sync_native_checkpoint", native_enabled);
@@ -536,6 +548,34 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result->HasError());
     REQUIRE_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("must be in (0.0, 1.0]"));
     result = con.Query("RESET dense_count_join_memory_fraction");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    // 0 turns the gate off rather than being rejected.
+    result = con.Query("SET partial_aggregate_min_kept_share = 0");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET partial_aggregate_min_kept_share = 1.5");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("must be in [0.0, 1.0]"));
+    result = con.Query("RESET partial_aggregate_min_kept_share");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET partial_aggregate_max_extra_keys = 2");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET partial_aggregate_max_extra_keys");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    // 0 leaves the statistics out rather than being rejected.
+    result = con.Query("SET partial_aggregate_min_rows_per_key = 0");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET partial_aggregate_min_rows_per_key = -1");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("must be 0 or more"));
+    result = con.Query("RESET partial_aggregate_min_rows_per_key");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET concat_batch_bytes = 1048576");
@@ -1019,6 +1059,21 @@ TEST_CASE("Sirius configuration accepts intentional compression retention fracti
 
   require_fraction("valid_compression_fraction_zero.yaml", 0.0);
   require_fraction("valid_compression_fraction_above_one.yaml", 1.5);
+}
+
+TEST_CASE("Sirius configuration loads the pin compression table size gate", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config config;
+  REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_pin_min_table_device_fraction.yaml"));
+  REQUIRE(config.get_compression_config().min_table_device_fraction == Approx(0.05));
+
+  sirius::sirius_config negative;
+  REQUIRE_THROWS_WITH(
+    negative.load_from_file(data_dir / "invalid_pin_min_table_device_fraction.yaml"),
+    Catch::Matchers::ContainsSubstring("min_table_device_fraction"));
 }
 
 TEST_CASE("Sirius configuration loads spill compression settings", "[sirius][config]")

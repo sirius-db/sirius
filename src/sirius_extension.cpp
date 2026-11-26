@@ -73,6 +73,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_partial_aggregate_pushdown.hpp"
 #include "planner/unsupported_optimizers.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 #include "transparent/plan_source_policy.hpp"
@@ -122,6 +123,7 @@ extern "C" int cudaProfilerStop();
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -281,15 +283,21 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
     sirius_ctx->throw_runtime_unavailable();
   }
 
+  std::optional<sirius::scan_manager::sirius_scan_manager::s3_config_snapshot> planned;
   if (sirius::io::s3::is_s3_path(uri)) {
     auto s3_config = sirius::io::s3::resolve_duckdb_s3_secret(
       context, uri, sirius_ctx->get_config().get_scan_manager_config().object_store);
-    sirius_ctx->get_scan_manager().install_s3_config(uri, std::move(s3_config));
+    planned = sirius_ctx->get_scan_manager().install_s3_config(uri, std::move(s3_config));
+  }
+  if (auto const counters = sirius_ctx->physical_counters();
+      counters->track_units && counters->s3_config_installed_for_testing) {
+    counters->s3_config_installed_for_testing(uri);
   }
 
-  auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
-  return_types     = std::move(bind_result.return_types);
-  names            = StringsToIdentifiers(bind_result.names);
+  auto bind_result =
+    sirius_ctx->get_scan_manager().describe_parquet(uri, planned ? &*planned : nullptr);
+  return_types = std::move(bind_result.return_types);
+  names        = StringsToIdentifiers(bind_result.names);
   return make_uniq<SiriusReadParquetBindData>(
     uri, bind_result.total_num_rows, return_types, IdentifiersToStrings(names));
 }
@@ -993,6 +1001,45 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
 
 }  // namespace
 
+// DuckDB stores these settings in the client context; NULL leaves the engine's limit in force.
+static void SetParquetFooterStatisticsReadLimit(ClientContext& /*context*/,
+                                                SetScope /*scope*/,
+                                                Value& parameter)
+{
+  if (!parameter.IsNull() && parameter.GetValue<int64_t>() < -1) {
+    throw InvalidInputException(
+      "A footer-statistics read limit is -1 (no limit), 0 (cached statistics only) or the most "
+      "footers to read for one scan; got %s",
+      parameter.ToString());
+  }
+}
+
+// Session-only: a GLOBAL value could be reset away, and DuckDB then calls the option unrecognized.
+static void add_footer_read_limit_option(DBConfig& config, char const* name, char const* files)
+{
+  ExtensionOption option(
+    StringUtil::Format(
+      "The most footers of %s files parquet_footer_statistics reads for one scan; a scan that "
+      "needs more is planned without them. -1: no limit, 0: cached statistics only, NULL: "
+      "sirius.operator_params.%s",
+      files,
+      name),
+    LogicalType::BIGINT,
+    SetParquetFooterStatisticsReadLimit,
+    Value(LogicalType::BIGINT),
+    SetScope::SESSION,
+    /*is_debug=*/false,
+    /*is_deprecated=*/false);
+  option.supports_global = false;
+  config.AddExtensionOption(name, std::move(option));
+  // DuckDB keeps no value for a NULL default; reading the option then fails. Store the NULL.
+  optional_ptr<const ConfigurationOption> builtin;
+  auto const index = config.TryGetSettingIndex(name, builtin);
+  if (index.IsValid() && !config.user_settings.IsSet(index.GetIndex())) {
+    config.SetOption(index.GetIndex(), Value(LogicalType::BIGINT));
+  }
+}
+
 static bool parquet_footer_statistics_enabled(ClientContext& context)
 {
   Value setting;
@@ -1210,6 +1257,10 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     // duckdb-native has no standalone reader, so both formats go through their
     // gpu_ingestible — one read path.
     std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible;
+    // Rows of the pinned table, which the automatic-plan size check extrapolates the first
+    // chunk to; 0 when unknown. Called only when that check applies, since a parquet pin reads
+    // every file's footer for it.
+    std::function<std::size_t()> count_table_rows = [] { return std::size_t{0}; };
     // Pin-time DuckDB types of the pinned columns, in column_ids (batch-column)
     // order — the zone-map capture keys its type allowlist on these exact types.
     vector<LogicalType> pinned_column_types;
@@ -1221,6 +1272,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     if (data.args.format == "duckdb") {
       auto info = build_duckdb_pin_info(
         context, data.args.name, data.args.schema, data.args.cols, batch_size, pinned_column_types);
+      count_table_rows = [rows = static_cast<std::size_t>(info->storage->GetTotalRows())] {
+        return rows;
+      };
       // After the catalog resolution (so a bad table name fails without side
       // effects) but before make_ingestible snapshots the on-disk row groups.
       suppress_auto_checkpoint_for_pin(context);
@@ -1269,6 +1323,14 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         return strverscmp(lhs.c_str(), rhs.c_str()) < 0;
       });
       warm_parquet_footer_statistics(context, file_paths);
+      count_table_rows = [&context, file_paths, name = data.args.name]() -> std::size_t {
+        try {
+          return sirius::transparent::parquet_files_row_count(context, file_paths);
+        } catch (std::exception const& e) {
+          SIRIUS_LOG_DEBUG("[pin_table] '{}': no row count: {}", name, e.what());
+          return 0;
+        }
+      };
 
       // tier='parquet' pins the undecoded bytes and stops there: there is no
       // decode, no GPU materialisation and no pinned_entry, because the residency
@@ -1403,6 +1465,21 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
           data.args.name,
           data.args.tier,
           pin_comp.column_names.size());
+        if (data.args.tier == "gpu" && comp_cfg.min_table_device_fraction > 0) {
+          std::size_t gpu_capacity = 0;
+          for (auto const* space : gpu_spaces_mut) {
+            gpu_capacity += space->get_max_memory();
+          }
+          // Any finite fraction is accepted; one whose threshold exceeds size_t saturates, which
+          // leaves every pin uncompressed.
+          auto const min_pin_bytes =
+            comp_cfg.min_table_device_fraction * static_cast<double>(gpu_capacity);
+          auto constexpr max_bytes = std::numeric_limits<std::size_t>::max();
+          pin_comp.min_pin_bytes   = min_pin_bytes >= static_cast<double>(max_bytes)
+                                       ? max_bytes
+                                       : static_cast<std::size_t>(min_pin_bytes);
+          pin_comp.table_rows      = count_table_rows();
+        }
       }
     }
 
@@ -3015,6 +3092,24 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
+static void SetPinTableCompressionMinTableDeviceFraction(ClientContext& context,
+                                                         SetScope scope,
+                                                         Value& parameter)
+{
+  if (scope == SetScope::GLOBAL)
+    throw InvalidInputException("Pin compression options are session settings");
+  const double fraction = DoubleValue::Get(parameter);
+  if (!std::isfinite(fraction) || fraction < 0.0) {
+    throw InvalidInputException(
+      "pin_table_compression_min_table_device_fraction must be finite and non-negative, got %f",
+      fraction);
+  }
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  duckdb::session_compression_config(context).min_table_device_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated pin_table_compression_min_table_device_fraction");
+}
+
 static void SetPinTableProveUniqueKeys(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params              = get_operator_params(context, scope);
@@ -3072,6 +3167,30 @@ static void SetEnablePartialAggregateBelowJoin(ClientContext& context,
   params->enable_partial_aggregate_below_join = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN to {}",
                    params->enable_partial_aggregate_below_join);
+}
+
+static void SetPartialAggregateMinKeptShare(ClientContext& /*context*/,
+                                            SetScope /*scope*/,
+                                            Value& parameter)
+{
+  // DuckDB stores this setting in the client context.
+  auto const share = DoubleValue::Get(parameter);
+  if (!(share >= 0.0) || share > 1.0) {
+    throw InvalidInputException("partial_aggregate_min_kept_share must be in [0.0, 1.0], got %f",
+                                share);
+  }
+}
+
+static void SetPartialAggregateMinRowsPerKey(ClientContext& /*context*/,
+                                             SetScope /*scope*/,
+                                             Value& parameter)
+{
+  // DuckDB stores this setting in the client context.
+  auto const rows = DoubleValue::Get(parameter);
+  if (!(rows >= 0.0)) {
+    throw InvalidInputException("partial_aggregate_min_rows_per_key must be 0 or more, got %f",
+                                rows);
+  }
 }
 
 static void SetEnableSubqueryKeyCarry(ClientContext& context, SetScope scope, Value& parameter)
@@ -3401,11 +3520,19 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
     SetExpressionEvaluatorStrategy);
 
+  config.AddExtensionOption(
+    "sirius_s3_header_signing",
+    "Sign S3 requests made with a DuckDB secret in the Authorization header instead of a "
+    "presigned URL",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(false));
+
   add_sirius_option(
     config,
     option_visibility::user,
     "enable_duckdb_fallback",
-    "Whether to enable fallback to duckdb execution after an error is detected",
+    "Allow GPU-candidate statements to fall back to DuckDB on planning or execution failure; "
+    "DuckDB-only statements are unaffected (GPU COPY never replays runtime failures)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true),  // literal default: never seed from a process-global that a
                            // prior connection's SET may have mutated (that leaked the
@@ -3687,7 +3814,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_delim_aggregate_reuse",
-                    "compute decorrelated subquery aggregates from the delim join's outer rows",
+                    "compute decorrelated subquery aggregates from the delim CTE's outer rows",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_delim_aggregate_reuse),
                     SetEnableDelimAggregateReuse);
@@ -3701,10 +3828,33 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_partial_aggregate_below_join",
-                    "aggregate below an inner join that only adds group-by payload",
+                    "aggregate below a join that only adds group-by payload",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_partial_aggregate_below_join),
                     SetEnablePartialAggregateBelowJoin);
+  sirius::planner::partial_aggregate_pushdown_options const pushdown_defaults;
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "partial_aggregate_min_kept_share",
+                    "share of its rows a joined scan must keep for an aggregate to go below the "
+                    "join; 0 accepts any",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(pushdown_defaults.min_kept_share),
+                    SetPartialAggregateMinKeptShare);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "partial_aggregate_max_extra_keys",
+                    "columns an aggregate below a join may group by beyond the join's keys",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(pushdown_defaults.max_extra_keys));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "partial_aggregate_min_rows_per_key",
+                    "rows per group an aggregate below a join must be estimated to combine where "
+                    "the query does not group by its keys; 0 never trusts the estimate",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(pushdown_defaults.min_rows_per_key),
+                    SetPartialAggregateMinRowsPerKey);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_subquery_key_carry",
@@ -3773,6 +3923,9 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "all their footers, which DuckDB itself reads only with union_by_name",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true));
+
+  add_footer_read_limit_option(config, "parquet_footer_statistics_max_remote_reads", "remote");
+  add_footer_read_limit_option(config, "parquet_footer_statistics_max_local_reads", "local");
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
@@ -3926,6 +4079,15 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::DOUBLE,
     Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);
+
+  config.AddExtensionOption(
+    "pin_table_compression_min_table_device_fraction",
+    "Select compression plans automatically for a GPU-tier pin only when its uncompressed size "
+    "is at least this finite, non-negative fraction of its GPUs' memory, and pin a smaller one "
+    "uncompressed; host pins are not gated; 0 disables the gate",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(compression_defaults.min_table_device_fraction),
+    SetPinTableCompressionMinTableDeviceFraction);
 
   config.AddExtensionOption(
     "pin_table_prove_unique_keys",

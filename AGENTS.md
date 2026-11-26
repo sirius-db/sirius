@@ -51,8 +51,8 @@ Logs go to `build/release/test/cpp/log/<process>/`.
 **Python API**: the default Pixi environment includes DuckDB's Python package. Load the built
 Sirius extension from Python as shown in [docs/README.md](docs/README.md#python-api).
 
-**Worktrees**: submodules are not auto-initialized — after creating one, run
-`git submodule update --init --recursive`.
+**Worktrees**: after creating a worktree, run the submodule initialization command in
+the [source quick start](docs/README.md#quick-start).
 
 **Agent-assisted SQL fuzzing**: use the repository's
 [sirius-fuzz skill](.agents/skills/sirius-fuzz/SKILL.md) for requests to run the fuzzer or check
@@ -76,9 +76,6 @@ documented in the doc comments of cuCascade's headers under `cucascade/include/c
 
 All new work targets Super Sirius. Memory spilling / CPU fallback is handled by the downgrade executor
 (`src/downgrade/`, `src/creator/`); see `docs/super-sirius/memory-management.md`.
-
-Before implementing operators / memory / expression / I/O work, run `/module-context <task>` to
-load accurate cudf/rmm/duckdb/cucascade API docs.
 
 ## Usage
 

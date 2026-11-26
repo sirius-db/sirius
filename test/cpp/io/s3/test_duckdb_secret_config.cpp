@@ -52,15 +52,20 @@ void register_test_httpfs_s3_secret(duckdb::SecretManager& manager)
   type.extension        = "test_only";
   manager.RegisterSecretType(type);
 
-  duckdb::CreateSecretFunction function;
-  function.secret_type                  = "s3";
-  function.provider                     = "config";
-  function.function                     = create_test_httpfs_s3_secret;
-  function.named_parameters["key_id"]   = duckdb::LogicalType::VARCHAR;
-  function.named_parameters["secret"]   = duckdb::LogicalType::VARCHAR;
-  function.named_parameters["region"]   = duckdb::LogicalType::VARCHAR;
-  function.named_parameters["endpoint"] = duckdb::LogicalType::VARCHAR;
-  manager.RegisterSecretFunction(std::move(function), duckdb::OnCreateConflict::ERROR_ON_CONFLICT);
+  // "iceberg" stands in for the provider the Iceberg extension stores vended credentials under.
+  for (auto const* provider : {"config", "iceberg", "credential_chain"}) {
+    duckdb::CreateSecretFunction function;
+    function.secret_type                      = "s3";
+    function.provider                         = provider;
+    function.function                         = create_test_httpfs_s3_secret;
+    function.named_parameters["key_id"]       = duckdb::LogicalType::VARCHAR;
+    function.named_parameters["secret"]       = duckdb::LogicalType::VARCHAR;
+    function.named_parameters["region"]       = duckdb::LogicalType::VARCHAR;
+    function.named_parameters["endpoint"]     = duckdb::LogicalType::VARCHAR;
+    function.named_parameters["refresh_info"] = duckdb::LogicalType::VARCHAR;
+    manager.RegisterSecretFunction(std::move(function),
+                                   duckdb::OnCreateConflict::ERROR_ON_CONFLICT);
+  }
 }
 
 }  // namespace
@@ -191,6 +196,51 @@ TEST_CASE("Sirius S3 secret lookup prefers Sirius then httpfs then config", "[s3
                  "KEY_ID 'incomplete-key')");
   CHECK_THROWS(sirius::io::s3::resolve_duckdb_s3_secret(
     *con.context, "s3://bucket/invalid/file.parquet", defaults));
+
+  require_sql_ok(con, "ROLLBACK");
+}
+
+TEST_CASE("Sirius S3 accepts catalog-vended secrets and no other dynamic provider", "[s3][secret]")
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  register_test_httpfs_s3_secret(duckdb::SecretManager::Get(*db.instance));
+  db.instance->config.AddExtensionOption(
+    "sirius_s3_header_signing", "", duckdb::LogicalType::BOOLEAN, duckdb::Value::BOOLEAN(false));
+  require_sql_ok(con, "BEGIN TRANSACTION");
+  cucascade::io::object_store_config defaults;
+  using signing = cucascade::io::object_store_config::signing_mode;
+
+  // The Iceberg extension records how to re-vend; Sirius uses the snapshot and never refreshes.
+  require_sql_ok(con,
+                 "CREATE SECRET vended (TYPE S3, PROVIDER iceberg, SCOPE 's3://bucket/table/', "
+                 "KEY_ID 'vended-key', SECRET 'vended-secret', REGION 'us-east-1', "
+                 "ENDPOINT 'catalog-store:9000', REFRESH_INFO 'table')");
+  auto const vended = sirius::io::s3::resolve_duckdb_s3_secret(
+    *con.context, "s3://bucket/table/data/file.parquet", defaults);
+  CHECK(vended.access_key == "vended-key");
+  CHECK(vended.secret_key == "vended-secret");
+  CHECK(vended.endpoint == "https://catalog-store:9000");
+  CHECK(vended.s3_signing_mode == signing::presigned);
+
+  require_sql_ok(con, "SET sirius_s3_header_signing = true");
+  CHECK(sirius::io::s3::resolve_duckdb_s3_secret(
+          *con.context, "s3://bucket/table/data/file.parquet", defaults)
+          .s3_signing_mode == signing::header);
+
+  // A static secret that asks for refresh, and any other dynamic provider, stay refused.
+  require_sql_ok(con,
+                 "CREATE SECRET refreshing (TYPE S3, PROVIDER config, SCOPE 's3://bucket/static/', "
+                 "KEY_ID 'k', SECRET 's', REFRESH_INFO 'auto')");
+  CHECK_THROWS_AS(sirius::io::s3::resolve_duckdb_s3_secret(
+                    *con.context, "s3://bucket/static/file.parquet", defaults),
+                  duckdb::NotImplementedException);
+  require_sql_ok(con,
+                 "CREATE SECRET chain (TYPE S3, PROVIDER credential_chain, "
+                 "SCOPE 's3://bucket/chain/', KEY_ID 'k', SECRET 's')");
+  CHECK_THROWS_AS(sirius::io::s3::resolve_duckdb_s3_secret(
+                    *con.context, "s3://bucket/chain/file.parquet", defaults),
+                  duckdb::NotImplementedException);
 
   require_sql_ok(con, "ROLLBACK");
 }

@@ -376,8 +376,8 @@ std::vector<prefetch_step> query_index::prefetching_orders(std::size_t concat_ba
   for (pipeline_ptr p : _pipelines) {
     if (dag.out(p).empty()) { visit(p, visit); }
   }
-  // Defensive: a cycle (delim-join distribution edges) can leave a pipeline with no root above
-  // it. Sweep anything still unvisited so no scan is silently dropped.
+  // Defensive: a dependency cycle would leave a pipeline with no root above it. Sweep anything
+  // still unvisited so no scan is silently dropped.
   for (pipeline_ptr p : _pipelines) {
     visit(p, visit);
   }

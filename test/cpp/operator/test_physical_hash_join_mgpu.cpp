@@ -340,7 +340,7 @@ TEST_CASE("physical_hash_join - repeated BUILD_PROBE queries don't wedge on left
 //   1. Simple JOIN + GROUP BY + ORDER BY with cache=none — baseline.
 //   2. Same with cache=table_gpu — isolates cache's contribution.
 //   3. Same shape + HAVING scalar subquery with cache=none — isolates
-//      subquery/DELIM_JOIN contribution.
+//      the subquery's contribution.
 //   4. Full Q11 shape with cache=table_gpu — the failing baseline (already
 //      in the other TEST_CASE; duplicated here without [stress] so the
 //      bisect filter sweeps all four in one invocation).
@@ -529,8 +529,8 @@ TEST_CASE("hash_join bisect 3 - Q11 shape with HAVING subquery, cache=none",
 // → BUILT window stays open long enough for task_creator to issue many probe
 // hint/input_data calls during the race window; (b) cache=table_gpu so the
 // cached-batch lifecycle interacts with repeated BUILD_PROBE cycles;
-// (c) a Q11-like scalar subquery pattern whose DELIM_JOIN encodes as nested
-// HASH_JOINs feeding each other.
+// (c) a Q11-like scalar subquery pattern that plans as nested HASH_JOINs
+// feeding each other.
 //
 // This TEST_CASE tries all three in one shot at the largest size that fits
 // unit-test budgets (~500 MiB per side). It is tagged [stress] so CI can
@@ -595,8 +595,8 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
 
   scoped_mgpu_env env(yaml_path);
 
-  // Q11-shaped query: the inner aggregate feeds a scalar HAVING subquery,
-  // which DuckDB encodes as a DELIM_JOIN over the same three-table join.
+  // Q11-shaped query: the inner aggregate feeds a scalar HAVING subquery
+  // over the same three-table join.
   // The outer and inner joins both land as BUILD_PROBE (supplier fits the
   // build threshold) — on a 2-GPU host this exercises:
   //   - two BUILD_PROBE hash joins in one query

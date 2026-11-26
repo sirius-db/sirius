@@ -31,7 +31,9 @@ class sirius_meta_pipeline;
 
 namespace op {
 
-//! The sirius_physical_column_data_scan scans a ColumnDataCollection
+//! A scan of rows produced elsewhere in the plan. As COLUMN_DATA_SCAN it holds a host
+//! ColumnDataCollection (VALUES), which the plan generator replaces with GPU_VALUES. As CTE_SCAN
+//! it holds nothing: it only marks where the CTE's batches are routed.
 class sirius_physical_column_data_scan : public sirius_physical_operator {
  public:
   [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
@@ -60,8 +62,6 @@ class sirius_physical_column_data_scan : public sirius_physical_operator {
 
   //! For a CTE_SCAN of a delim CTE whose rewrite was proven restrictable: which read this is.
   cte_reader_role reader_role = cte_reader_role::unknown;
-
-  duckdb::optional_idx delim_index;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;

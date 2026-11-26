@@ -22,8 +22,8 @@ builds only Sirius and its C++ tests.
 
 Read the relevant diagnostics and source context, including earlier errors that
 may cause later failures. Consult `error-patterns.md` for known Sirius failures.
-Check submodule state or sccache when the error suggests a problem there. Preserve
-local submodule changes; do not reset them to resolve a mismatch without permission.
+Check submodule state or sccache when the error points to either. For a submodule
+problem, follow the [path-scoped steps](error-patterns.md#submodule-out-of-sync).
 Reduce parallelism on an out-of-memory build, for example:
 
 ```bash

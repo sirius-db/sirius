@@ -35,8 +35,15 @@ pixi run sccache --start-server
 
 **Cause:** Git submodules not at the expected commits.
 
-**Diagnosis:** Inspect `git submodule status` and local changes before updating a
-submodule. Preserve any user changes and confirm before replacing its checkout.
+**Diagnosis:** Run `git submodule status`. Initialize each required checkout
+marked `-` using its path.
+
+```bash
+git submodule update --init -- path/to/submodule
+```
+
+A `+` indicates a different revision. Preserve local work and ask before
+switching that checkout back to the pin.
 
 ## cuDF API Changes
 

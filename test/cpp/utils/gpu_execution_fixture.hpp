@@ -146,6 +146,16 @@ class GpuExecutionFixture {
     REQUIRE_FALSE(result->HasError());
   }
 
+  /// The error @p sql fails with; requires that it fails.
+  std::string query_error(const std::string& sql)
+  {
+    auto result = con->Query(sql);
+    REQUIRE(result);
+    if (!result->HasError()) { UNSCOPED_INFO("expected an error, got: " << result->ToString()); }
+    REQUIRE(result->HasError());
+    return result->GetError();
+  }
+
   /// @copydoc sirius::test::collect_rows
   static std::vector<std::vector<std::string>> collect_rows(duckdb::QueryResult& result,
                                                             bool sort = true)

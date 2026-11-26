@@ -54,20 +54,39 @@ constexpr std::string_view kScheme = "s3://";
 /// @c Read/Seek bookkeeping; the parquet reader uses positional reads.
 class sirius_httpfs_file_handle : public duckdb::FileHandle {
  public:
-  sirius_httpfs_file_handle(duckdb::FileSystem& fs,
-                            std::string path,
-                            duckdb::FileOpenFlags flags,
-                            std::shared_ptr<cucascade::io::datasource> datasource)
+  sirius_httpfs_file_handle(
+    duckdb::FileSystem& fs,
+    std::string path,
+    duckdb::FileOpenFlags flags,
+    std::shared_ptr<cucascade::io::datasource> datasource,
+    bool external_file_cache,
+    std::shared_ptr<sirius::scan_manager::sirius_scan_manager::idle_rest_context_sweeper>
+      idle_rest_sweeper)
     : duckdb::FileHandle(fs, std::move(path), flags),
       datasource_(std::move(datasource)),
-      version_tag_(datasource_->get_io_object().validation_tag())
+      version_tag_(datasource_->get_io_object().validation_tag()),
+      external_file_cache_(external_file_cache),
+      idle_rest_sweeper_(std::move(idle_rest_sweeper))
   {
+  }
+
+  /// The handle may be the last reader of its REST context, and DuckDB closes it when it likes:
+  /// release the datasource, then have the scan manager drop its idle contexts beyond the bound.
+  ~sirius_httpfs_file_handle() override
+  {
+    datasource_.reset();
+    if (idle_rest_sweeper_) { idle_rest_sweeper_->sweep(); }
   }
 
   void Close() override {}
 
   std::shared_ptr<cucascade::io::datasource> datasource_;
   std::string version_tag_;
+  /// scan_manager.httpfs_external_file_cache of the engine that opened the handle.
+  bool external_file_cache_;
+  /// From the scan manager that opened the handle; usable after that manager is gone.
+  std::shared_ptr<sirius::scan_manager::sirius_scan_manager::idle_rest_context_sweeper>
+    idle_rest_sweeper_;
   duckdb::idx_t cursor_{0};
 };
 
@@ -255,16 +274,27 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
   }
   auto s3_config = resolve_duckdb_s3_secret(
     *client, path, sirius_ctx->get_config().get_scan_manager_config().object_store);
-  sirius_ctx->get_scan_manager().install_s3_config(path, std::move(s3_config));
+  auto const planned = sirius_ctx->get_scan_manager().install_s3_config(path, std::move(s3_config));
+  if (auto const counters = sirius_ctx->physical_counters();
+      counters->track_units && counters->s3_config_installed_for_testing) {
+    counters->s3_config_installed_for_testing(path);
+  }
   // Resolve through the scan_manager's datasource factory (the routed seam):
   // the returned datasource performs the HEAD and carries the backend;
   // HEAD failures (missing key / auth / network) propagate as exceptions for
   // DuckDB to surface at bind time.
-  auto datasource = sirius_ctx->get_scan_manager().create_datasource(path);
+  auto datasource = sirius_ctx->get_scan_manager().create_datasource(
+    path, cucascade::io::open_hint::generic, planned ? &*planned : nullptr);
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + path + "'");
   }
-  return duckdb::make_uniq<sirius_httpfs_file_handle>(*this, path, flags, std::move(datasource));
+  return duckdb::make_uniq<sirius_httpfs_file_handle>(
+    *this,
+    path,
+    flags,
+    std::move(datasource),
+    sirius_ctx->get_config().get_scan_manager_config().httpfs_external_file_cache,
+    sirius_ctx->get_scan_manager().idle_rest_sweeper());
 }
 
 duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
@@ -286,17 +316,27 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
   }
   auto s3_config = resolve_duckdb_s3_secret(
     *client, file.path, sirius_ctx->get_config().get_scan_manager_config().object_store);
-  sirius_ctx->get_scan_manager().install_s3_config(file.path, std::move(s3_config));
+  auto const planned =
+    sirius_ctx->get_scan_manager().install_s3_config(file.path, std::move(s3_config));
+  if (auto const counters = sirius_ctx->physical_counters();
+      counters->track_units && counters->s3_config_installed_for_testing) {
+    counters->s3_config_installed_for_testing(file.path);
+  }
   // A parquet_footer_probe open: one suffix-range GET resolves the size (== the
   // LIST size that rode the glob expansion) and stashes the footer, so the
   // binder's footer reads are served locally (no HEAD, no separate footer GETs).
   auto datasource = sirius_ctx->get_scan_manager().create_datasource(
-    file.path, cucascade::io::open_hint::parquet_footer_probe);
+    file.path, cucascade::io::open_hint::parquet_footer_probe, planned ? &*planned : nullptr);
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + file.path + "'");
   }
   return duckdb::make_uniq<sirius_httpfs_file_handle>(
-    *this, file.path, flags, std::move(datasource));
+    *this,
+    file.path,
+    flags,
+    std::move(datasource),
+    sirius_ctx->get_config().get_scan_manager_config().httpfs_external_file_cache,
+    sirius_ctx->get_scan_manager().idle_rest_sweeper());
 }
 
 void sirius_httpfs::Read(duckdb::FileHandle& handle,
@@ -350,6 +390,12 @@ std::string sirius_httpfs::GetVersionTag(duckdb::FileHandle& handle)
   return as_httpfs_handle(handle).version_tag_;
 }
 
+duckdb::optional<duckdb::timestamp_t> sirius_httpfs::GetCacheValidUntil(duckdb::FileHandle& handle)
+{
+  if (as_httpfs_handle(handle).external_file_cache_) { return duckdb::nullopt; }
+  return duckdb::timestamp_t::ninfinity();
+}
+
 duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path,
                                                          duckdb::FileOpener* opener)
 {
@@ -370,8 +416,13 @@ duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path
   }
   auto s3_config = resolve_duckdb_s3_secret(
     *client, path, sirius_ctx->get_config().get_scan_manager_config().object_store);
-  sirius_ctx->get_scan_manager().install_s3_config(path, std::move(s3_config));
-  return expand_glob(path, sirius_ctx->get_scan_manager());
+  auto const planned = sirius_ctx->get_scan_manager().install_s3_config(path, std::move(s3_config));
+  if (auto const counters = sirius_ctx->physical_counters();
+      counters->track_units && counters->s3_config_installed_for_testing) {
+    counters->s3_config_installed_for_testing(path);
+  }
+  return expand_glob(
+    path, sirius_ctx->get_scan_manager(), std::nullopt, planned ? &*planned : nullptr);
 }
 
 namespace {
@@ -400,7 +451,8 @@ bool key_has_literal_question_in_hive_segment(std::string_view key)
 duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   std::string const& pattern,
   sirius::scan_manager::sirius_scan_manager& scan_manager,
-  std::optional<std::size_t> max_matches)
+  std::optional<std::size_t> max_matches,
+  sirius::io::scoped_object_store_configs::snapshot const* planned)
 {
   constexpr std::string_view k_scheme = "s3://";
   if (pattern.size() <= k_scheme.size()) {
@@ -430,8 +482,9 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   split_segments(key_pattern, pattern_segments);
   bool const has_crawl =
     std::find(pattern_segments.begin(), pattern_segments.end(), "**") != pattern_segments.end();
-  std::string const list_uri  = "s3://" + std::string{bucket} + "/" + std::string{prefix};
-  std::size_t const match_cap = max_matches.value_or(scan_manager.s3_list_max_matches(list_uri));
+  std::string const list_uri = "s3://" + std::string{bucket} + "/" + std::string{prefix};
+  std::size_t const match_cap =
+    max_matches.value_or(scan_manager.s3_list_max_matches(list_uri, planned));
 
   // Stream the pages, keeping only matches: peak memory = one page (≤1000
   // entries) + the matched set, regardless of the prefix's population. The
@@ -443,7 +496,9 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   std::vector<std::string_view> key_segments;
   std::vector<std::int8_t> memo;
   scan_manager.list_objects_paged(
-    list_uri, /*page_size=*/1000, [&](cucascade::io::rest::s3::list_objects_v2_page const& page) {
+    list_uri,
+    /*page_size=*/1000,
+    [&](cucascade::io::rest::s3::list_objects_v2_page const& page) {
       for (auto const& entry : page.entries) {
         split_segments(entry.key, key_segments);
         bool matched;
@@ -481,7 +536,9 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
         matches.push_back(std::move(info));
       }
       return true;
-    });
+    },
+    std::nullopt,
+    planned);
 
   std::sort(
     matches.begin(), matches.end(), [](auto const& a, auto const& b) { return a.path < b.path; });

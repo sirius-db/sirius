@@ -24,7 +24,7 @@ MAIN_BUILD_TARGETS ?= sirius_library
 
 BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 
-.PHONY: all sirius-duckdb release debug relwithdebinfo \
+.PHONY: all sirius-duckdb release release-meld debug relwithdebinfo \
 	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
 	test test_release test_debug test_relwithdebinfo clean list-presets \
 	s3-test s3-test-large s3-test-aws \
@@ -51,6 +51,10 @@ $(BUILD_DIR)/%/build.ninja: $(CMAKE_INPUTS)
 
 release: $(BUILD_DIR)/release/build.ninja
 	$(CMAKE) --build "$(BUILD_DIR)/release" --target $(BUILD_TARGETS)
+
+# pixi run make release-meld
+release-meld: $(BUILD_DIR)/release-meld/build.ninja
+	$(CMAKE) --build "$(BUILD_DIR)/release-meld" --target $(BUILD_TARGETS)
 
 debug: $(BUILD_DIR)/debug/build.ninja
 	$(CMAKE) --build "$(BUILD_DIR)/debug" --target $(BUILD_TARGETS)

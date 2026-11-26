@@ -22,10 +22,16 @@
 #include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/cuda_device.hpp>
+#include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
+
 #include <cucascade/io/types.hpp>
 #include <duckdb/main/client_context.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -56,7 +62,6 @@ struct IcebergDeleteFileEntry {
   std::string referenced_data_file;   // data file this DV applies to (V3, empty if absent)
   int64_t content_offset{-1};         // byte offset in Puffin file (V3, -1 if absent)
   int64_t content_size_in_bytes{-1};  // byte length of DV blob (V3, -1 if absent)
-  int64_t sequence_number{0};         // manifest entry sequence number (for eq delete filtering)
   int64_t file_size_in_bytes{-1};
   int64_t record_count{-1};  // deleted positions the manifest claims (V3, -1 if absent)
 
@@ -78,10 +83,11 @@ struct IcebergDeleteFileEntry {
 
 struct iceberg_delete_discovery {
   std::vector<std::string> positional_delete_files;
+  /// Live equality-delete entries of the snapshot. Non-empty selects eager loading.
   std::vector<IcebergDeleteFileEntry> equality_delete_entries;
   std::vector<IcebergDeleteFileEntry> deletion_vector_entries;
-  /// From the data manifests; equality deletes need them to test applicability.
-  std::unordered_map<std::string, int64_t> data_file_manifest_sequence_numbers;
+  /// Present whenever @ref equality_delete_entries is non-empty on an admitted scan.
+  std::optional<iceberg_equality_plan> equality_plan;
 };
 
 void validate_deletion_vector_claims(iceberg_delete_discovery const&);
@@ -91,42 +97,96 @@ struct inventory_result {
   uint64_t equality_count = 0;
 };
 struct inventory_query_error : std::runtime_error {
-  inventory_query_error(std::string const& message, bool missing)
-    : std::runtime_error(message), missing_result(missing)
+  inventory_query_error(std::string const& message, bool missing, bool unconfirmed = false)
+    : std::runtime_error(message), missing_result(missing), unconfirmed_table(unconfirmed)
   {
   }
   bool missing_result;
+  /// The lookup did not confirm that it reads the table the scan bound: it resolved another
+  /// table, or one it could not identify. what() says which.
+  bool unconfirmed_table;
 };
 // Inspect only Avro manifest schemas (LIMIT 0), once per data manifest. Empty
 // partition records prove missing columns cannot be supplied by partition metadata.
 std::unordered_set<std::string> iceberg_files_without_partition_values(
   duckdb::ClientContext&, iceberg_delete_inventory const&);
 
-inventory_result read_delete_inventory(duckdb::ClientContext&,
-                                       std::string const&,
-                                       std::optional<int64_t>,
-                                       std::string_view injection = {});
+/// @p expected_table_uuid is checked by iceberg_metadata() when the loaded extension accepts it.
+/// When it does not and @p unconfirmed_table is set, that runs first on the connection that
+/// reads the inventory, in the same transaction, and says why the table resolved there is not
+/// confirmed to be the bound one (empty when it is the bound one); a reason fails the read.
+inventory_result read_delete_inventory(
+  duckdb::ClientContext&,
+  std::string const&,
+  std::optional<int64_t>,
+  std::string_view injection                                                  = {},
+  std::string_view expected_table_uuid                                        = {},
+  std::function<std::string(duckdb::ClientContext&)> const& unconfirmed_table = {});
+
+/// Ceilings on the equality deletes one statement loads, charged from the manifests' record
+/// counts and file sizes before any delete file is opened; a table above them is declined. The
+/// byte ceiling exists because a row count does not bound variable-width keys.
+inline constexpr int64_t kMaxEqualityDeleteRowsPerFile       = 32LL * 1024 * 1024;
+inline constexpr int64_t kMaxEqualityDeleteRowsPerStatement  = 64LL * 1024 * 1024;
+inline constexpr int64_t kMaxEqualityDeleteBytesPerStatement = 1024LL * 1024 * 1024;
+/// Not a memory bound: every batch is probed once per applicable delete group.
+inline constexpr std::size_t kMaxEqualityDeleteFilesPerDataFile = 64;
+
+/// Running total of the equality deletes a statement has agreed to load.
+struct equality_delete_charge {
+  int64_t rows  = 0;
+  int64_t bytes = 0;
+};
+/// Adds every delete file of @p plan to @p total. False when a file is above the per-file
+/// ceiling or the total would pass a statement ceiling; @p total is then unspecified.
+[[nodiscard]] bool charge_equality_deletes(
+  iceberg_equality_plan const& plan,
+  equality_delete_charge& total,
+  int64_t statement_row_limit = kMaxEqualityDeleteRowsPerStatement);
+
+/// The cuDF type an equality-delete key bound as @p type is compared in, or nullopt for a type
+/// this path does not compare: a data file and a delete file must decode the key identically.
+[[nodiscard]] std::optional<cudf::data_type> equality_key_cudf_type(
+  duckdb::LogicalType const& type);
+
+/// Equality-delete manifests that cannot be read or interpreted, or that contradict the inventory.
+struct equality_plan_error : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+/**
+ * @brief Decide which equality-delete files apply to which data file of @p inventory.
+ *
+ * `equality_ids`, sizes and partitions come from the manifests the inventory names, read with
+ * `read_avro`; the table path is not resolved again. A delete applies to a data file with a
+ * strictly lower data sequence number, in the same partition unless the delete's spec does not
+ * partition. A manifest whose live entries are not the inventory's throws
+ * @ref equality_plan_error. `keys` is left empty; the plan gate resolves them.
+ *
+ * @param max_files_per_data_file A data file's list stops growing one past this.
+ */
+iceberg_equality_plan read_equality_plan(duckdb::ClientContext&,
+                                         iceberg_delete_inventory const& inventory,
+                                         std::size_t max_files_per_data_file);
 iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext&,
                                                  std::string const&,
                                                  iceberg_delete_inventory&&);
 
-/// One group of equality-delete files sharing the same key column schema.
+/// Equality-delete files that share their key columns and apply to exactly the same data files.
 struct EqualityDeleteGroup {
-  /// GPU-resident deduplicated key table.
+  /// GPU-resident deduplicated keys: one column per key, in @ref key_field_ids order, in the
+  /// bound key types.
   std::unique_ptr<cudf::table> delete_table;
-  std::vector<std::string> key_names;
-  /// Populated when the delete file's footer carries them.
-  std::vector<std::optional<int32_t>> key_field_ids;
+  /// Iceberg field IDs of the keys, ascending. From the manifest's `equality_ids`.
+  std::vector<int32_t> key_field_ids;
+  /// Bound-schema (P-space) index of each key, parallel to @ref key_field_ids.
+  std::vector<std::size_t> key_primary_indices;
   /// Build side = delete_table.
   std::unique_ptr<cudf::distinct_hash_join> hash_join;
-  /// Applies only to data files with a STRICTLY lower DATA sequence number.
-  ///
-  /// ⚠️ Holds the MANIFEST's number, which is not that. Per the inheritance rule an entry takes
-  /// its manifest's number only when its own is null AND its status is ADDED, so after a manifest
-  /// rewrite these are inflated and the strict-inequality test flips both ways. This is one of the
-  /// reasons load_delete_payload() refuses live equality entries.
-  int64_t sequence_number{0};
 };
+
+/// Ascending indices into @ref IcebergDeleteData::equality_delete_groups.
+using equality_group_list = std::vector<uint32_t>;
 
 /**
  * @brief Fully materialized Iceberg delete data for one table.
@@ -139,29 +199,49 @@ struct IcebergDeleteData {
   /// V2 positional deletes and V3 deletion vectors merged: data_file_path -> sorted positions.
   std::unordered_map<std::string, std::vector<int64_t>> positional_deletes;
 
-  /// One per unique (key-column schema, sequence number).
+  /// Built on one device; the plan gate declines multi-GPU configurations.
   std::vector<EqualityDeleteGroup> equality_delete_groups;
+  /// The device @ref equality_delete_groups live on. They are released with it current.
+  std::optional<rmm::cuda_device_id> equality_device;
+  ~IcebergDeleteData();
 
-  /// Keyed as the manifest wrote the path. NOT the file's data sequence number -- see above.
-  std::unordered_map<std::string, int64_t> data_file_manifest_sequence_numbers;
+  /// Every data file of the snapshot (keyed as the manifest wrote the path) -> the groups that
+  /// apply to it. Files with the same applicability share one list object. Empty when the table
+  /// has no equality deletes; otherwise a scanned file missing from it must be refused.
+  std::unordered_map<std::string, std::shared_ptr<equality_group_list const>>
+    equality_groups_by_data_file;
 
   [[nodiscard]] bool empty() const
   {
-    return positional_deletes.empty() && equality_delete_groups.empty();
+    return positional_deletes.empty() && equality_delete_groups.empty() &&
+           equality_groups_by_data_file.empty();
   }
 };
 
 /**
- * @brief Concatenate the delete files' rows, deduplicate them, and stand up the GPU hash join the
- *        scan probes. All @p views must share @p key_names.
+ * @brief Concatenate the delete files' key rows, deduplicate them, and stand up the GPU hash join
+ *        the scan probes. Every view holds exactly the key columns, in @p key_field_ids order.
  *
- * Exported only so this and the anti-join mask can be tested directly: the SQL route that reaches
- * them is declined at plan time, so no fixture can, and an inverted mask would stay green until
- * the route is switched on.
+ * Exported so this and the anti-join mask can be tested without a table.
+ *
+ * @param stream A stream of the current device.
+ * @param mr     Allocates everything the group retains.
  */
-EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
-                                         std::vector<std::optional<int32_t>> key_field_ids,
-                                         std::vector<cudf::table_view> const& views);
+EqualityDeleteGroup build_equality_group(std::vector<int32_t> key_field_ids,
+                                         std::vector<std::size_t> key_primary_indices,
+                                         std::vector<cudf::table_view> const& views,
+                                         ::cuda::stream_ref stream,
+                                         rmm::device_async_resource_ref mr);
+
+/// A stream and an allocator of the device equality-delete tables are built on. The caller makes
+/// that device current for the load.
+struct equality_build_resources {
+  ::cuda::stream_ref stream;
+  rmm::device_async_resource_ref mr;
+  /// The context an `s3://` delete file is opened on, with its statement's credentials. Unset
+  /// or returning null, such a file fails the load.
+  std::function<std::shared_ptr<cucascade::io::ioctx>(std::string const& path)> remote_ioctx = {};
+};
 
 /**
  * @brief Load immutable legacy delete payloads from this scan's supplied discovery.
@@ -172,31 +252,20 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
  * table has no deletes" and never "the deletes could not be read" — treating the second as the
  * first drops deletes silently and returns rows the table removed.
  *
- * @param metadata_ioctx Routes the equality-delete parquet and footer reads. Single-GPU is
- *                       sufficient (planning-time reads). Shared because every datasource
+ * @param metadata_ioctx Routes the local equality-delete parquet and footer reads. Single-GPU
+ *                       is sufficient (planning-time reads). Shared because every datasource
  *                       opened on it co-owns it; nullptr throws.
+ * @param equality_resources Required when @p discovery has equality deletes; absent throws.
  * The caller supplies discovery from the scan's snapshot-scoped inventory.
  */
 std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   duckdb::ClientContext& context,
   std::string const& table_path,
   std::shared_ptr<cucascade::io::ioctx> const& metadata_ioctx,
-  iceberg_delete_discovery const& discovery);
+  iceberg_delete_discovery const& discovery,
+  std::optional<equality_build_resources> equality_resources = std::nullopt);
 
 /// Legacy payload builds. Monotonic; retained for the existing scan-local read oracle.
 uint64_t iceberg_delete_data_uncached_read_count();
-
-/**
- * @brief Extract a column_name → field_id map from a parquet FileMetaData.
- *
- * Walks the flattened schema depth-first and collects field IDs for leaf
- * columns (num_children == 0).  Columns without a field_id are omitted.
- *
- * @param file_meta  Parquet file metadata (from read_parquet_footers or
- *                   parquet_scan_task_global_state::_file_metadatas).
- * @return Map of column name to Iceberg field ID.
- */
-std::unordered_map<std::string, int32_t> extract_field_id_map(
-  cudf::io::parquet::FileMetaData const& file_meta);
 
 }  // namespace sirius::op::scan

@@ -4,7 +4,7 @@ This document covers Super Sirius configuration: the `sirius_config` class, oper
 
 ## `sirius_config`
 
-**File:** `src/include/sirius_config.hpp`
+**File:** `src/sirius_config.hpp`
 
 The `sirius_config` class loads configuration from a YAML file or uses built-in defaults. It provides:
 
@@ -34,7 +34,7 @@ the maintenance, error and multi-GPU contracts.
 
 ### `SIRIUS_DISABLE`
 
-Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
+Set `SIRIUS_DISABLE` to any value other than `0` (for example `SIRIUS_DISABLE=1`) to prevent Super Sirius from initializing: it reads no config file and claims no GPU or pinned host memory, but still registers its functions and settings. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
 
 ```bash
 export SIRIUS_DISABLE=1
@@ -188,15 +188,17 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 Simpatico compression is enabled by default when `pin_table` caches input tables on
 the host or GPU. Use `CALL pin_table(..., compression => false)` to opt out for a specific
 pin, or `SET pin_table_compression = false` for the session default. Matching table plans
-in `input_plan_dir` override automatic selection; without one, each chunk uses the same
-type/sample-based plan selection as spill compression, after carrier narrowing. The
-size and actual compressed-footprint gates below still apply.
+in `input_plan_dir` override automatic selection; without one, a large enough table has each
+chunk's plans chosen from type and sample after carrier narrowing, favoring plans a filtered
+scan can decode in place (see [Compressed Pinning](compressed-pinning.md)). The size and actual
+compressed-footprint gates below still apply.
 
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
 | `enable_pin_table_compression` | `pin_table_compression` | bool | true | Default for `pin_table` calls that omit the `compression` argument. |
 | `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
 | `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
+| `min_table_device_fraction` | `pin_table_compression_min_table_device_fraction` | finite double >= 0 | 0.05 | Select plans automatically for a GPU-tier pin only when its uncompressed size (first chunk's bytes per row times the table's rows) is at least this fraction of the memory of the GPUs it pins to; store a smaller one uncompressed. Host pins and explicit table plans are not gated. `0` disables the gate. |
 | `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Optional directory of per-table Simpatico plan overrides. An empty path or no readable, nonempty matching file selects plans automatically. A selected plan that does not cover the pinned columns leaves the pin raw. |
 
 The YAML loader and DuckDB `SET` surface reject negative, NaN, and infinite
@@ -302,7 +304,7 @@ sirius:
 
 ## Executor Configuration
 
-**Files:** `src/include/exec/config.hpp`, `src/include/creator/config.hpp`
+**Files:** `src/exec/config.hpp`, `src/creator/config.hpp`
 
 The `sirius.executor` block configures the thread pools and task scheduling. It has four
 per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`. The
@@ -370,12 +372,13 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 0**) | 18 | Metadata-producer worker threads; fixed default. |
+| `num_threads` | int (**> 0**) | max(18, eligible NUMA domains) | Shared metadata and Parquet-coalescing worker count. Explicit values must cover all eligible domains. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`, including S3 listing and globs. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 2 if T < 32, otherwise 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
 | `rest_n_reactors` | int (**>= 0**) | kTLS loaded: one per steered NIC IRQ CPU when there are fewer than 16, else clamp(floor(T/6), 4, 16); no kTLS: clamp(floor(T/6), 8, 16) | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. Unnamed, the count depends on whether cuCascade's topology reports kernel TLS loaded (`system_topology_info::kernel_tls.loaded`: the kernel `tls` module loaded or built in). With kTLS, when the egress NIC's queue IRQs are also steered to a strict subset of its NUMA node's cores on fewer than 16 CPUs, the count is the number of IRQ CPUs, at least 4 (the reactors are pinned round-robin onto those CPUs); otherwise it is clamp(floor(T/6), 4, 16). Without kTLS it is clamp(floor(T/6), 8, 16): user-space TLS costs the reactor threads CPU per byte. A named count, `0` included, is used as written. |
-| `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built from the startup mask the CPUs were planned from, so it pins the same way. |
+| `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built under the saved rank startup mask, so it pins the same way while preserving the caller's CUDA and thread-local context. |
+| `httpfs_external_file_cache` | bool | false | Whether DuckDB's external file cache (EFC) may keep what DuckDB reads through Sirius's S3 file system: bind-time footer reads, the footer-statistics pass with `sirius_analyze_parquet` and `pin_table`, and the CPU Parquet delete reader. With `false`, DuckDB requests the needed ranges and retains no EFC byte blocks; the probe stash and metadata caches remain separate. With `true`, DuckDB may fetch an object no larger than its remote cache block (`external_file_cache_remote_max_block_size`, 2 MiB by default) whole, which after a footer probe requires another data GET when the whole-file range is not already in the stash, and it can serve a later read of the unchanged object from the cache; without it, a planning that reads an Iceberg Parquet position-delete file through the CPU reader can fetch the same bytes again. ETag and size checks are unaffected, and so is DuckDB's `enable_external_file_cache` for other file systems. Taken when a file is opened: set it in the configuration the database starts with. GPU Parquet column-data reads use cuCascade directly and are not affected. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
@@ -685,7 +688,7 @@ These settings are loaded at initialization. Metadata jobs default to a limit of
 | `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
 | `native_reader_workers` | 2 | Native-reader worker threads per scan manager, started lazily at the first native reservation. Positive and independent of metadata workers and GPU count. |
 | `max_native_readers` | 64 | Reader slots shared by all attempts within that manager. Must be at least `native_reader_workers`; an attempt reserves its full group before any reader starts. |
-| `coordinator_workers` | 1 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per reader attempt. Metadata-only attempts still run coordination on the query owner. |
+| `coordinator_workers` | 1 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per asynchronous-coalescing or reader attempt. Parquet/Iceberg attempts also use independent coordination; synchronous-only metadata attempts retain query-owner coordination. |
 | `max_control_work` | N | Maximum coordinator actions per iteration. |
 | `drain_quantum` | N | Maximum coalescing work per result advancement. |
 | `partial_batch` | enabled | Partial-publication policy. An omitted or empty block uses the defaults below. |
@@ -743,7 +746,7 @@ S3 credentials are not YAML-loadable. Use `CREATE SECRET (TYPE SIRIUS_S3, ...)` 
 
 ## Operator Parameters
 
-**File:** `src/include/sirius_config.hpp` — `operator_params` struct
+**File:** `src/sirius_config.hpp` — `operator_params` struct
 
 The five batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
 `concat_batch_bytes`, `cross_join_task_bytes`, `sort_sample_bytes`) share one built-in default. Without an
@@ -783,14 +786,18 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing filters or accumulated partials, skip an eligible key when the complete build covers at least this fraction of its unfiltered row domain. Native scans use catalog bounds and genuine uniqueness proofs; matching materialized Parquet pins may supply exact row counts and per-column `unique_cols` usefulness hints. Unknown/zero domains and builds exceeding the domain disable the gate. Values above 1.0 disable it; exactly 1.0 fires only at full coverage. `0.45` is an explicit measurement profile, not the production default. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
-| `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
+| `enable_runtime_distinct_build_probe` | false | Internal: not accepted in YAML, and settable with `SET` only when `SIRIUS_ENABLE_TEST_OPTIONS=1`; see the note below. For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
 | `use_hw_decompression` | false | Startup-only opt-in to cuDF hardware (on-GPU) decompression for compressed Parquet scans. When set and every GPU reports support, Sirius exports `LIBCUDF_HW_DECOMPRESSION=ON` for the lifetime of the context. Enable only on GPUs known to support it: the support probe is also true on some GPUs (e.g. T4) where the runtime path fails. |
 | `enable_dense_count_join` | true | Fuse `COUNT(col \| *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join into the `DENSE_COUNT_JOIN` operator (TPC-H q13 shape): a direct-address count histogram over the preserved key domain replaces the join build, output materialization, and re-aggregation. |
-| `enable_delim_aggregate_reuse` | true | Compute a decorrelated subquery's MIN/MAX/AVG from the delim join's outer rows instead of rescanning the subquery's tables, when the outer rows provably hold every subquery row for their key (TPC-H q2 and q17 shapes). See [Subquery Aggregates from the Delim Join's Rows](optimizations.md#subquery-aggregates-from-the-delim-joins-rows). |
-| `enable_partial_aggregate_below_join` | true | Compute `SUM`/`MIN`/`MAX` per join key below an inner join whose other side only adds variable-width columns the aggregate groups by, and combine the partial results above it (TPC-H q10 shape). See [Partial Aggregate Below a Payload Join](optimizations.md#partial-aggregate-below-a-payload-join). |
-| `dense_count_join_max_bytes` | 2 GiB | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Must be greater than zero. |
+| `enable_delim_aggregate_reuse` | true | Compute a decorrelated subquery's MIN/MAX/AVG from the delim CTE's outer rows instead of rescanning the subquery's tables, when the outer rows provably hold every subquery row for their key (TPC-H q2 and q17 shapes). See [Subquery Aggregates from the Delim CTE's Rows](optimizations.md#subquery-aggregates-from-the-delim-ctes-rows). |
+| `enable_partial_aggregate_below_join` | true | Compute `SUM`/`MIN`/`MAX` per join key below a join whose other side only adds variable-width columns the aggregate groups by, and combine the partial results above it (TPC-H q10 shape). The join is an inner join, or an outer join that keeps every row of the aggregated side. See [Partial Aggregate Below a Payload Join](optimizations.md#partial-aggregate-below-a-payload-join). |
+| `enable_subquery_key_carry` | true | Restrict every table a correlated subquery ties to its correlation column by an equality to the outer rows' keys, before DuckDB orders the joins (TPC-Havoc Q05 shape). See [Subquery Keys Carried Across an Equality](optimizations.md#subquery-keys-carried-across-an-equality). |
+| `enable_exists_from_aggregate` | true | Drop a correlated `EXISTS` whose rows a scalar aggregate subquery of the same query also reads, and keep the outer rows that have a group. See [EXISTS Answered from an Aggregate Subquery](optimizations.md#exists-answered-from-an-aggregate-subquery). |
+| `dense_count_join_max_bytes` | 0 (auto) | Internal: not accepted in YAML, and settable with `SET` only when `SIRIUS_ENABLE_TEST_OPTIONS=1`. Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Auto = 10% of the smallest GPU memory space, or 2 GiB when that capacity is unknown. |
 | `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and disables the probe, so late materialization also gets no group-by-rowid ride or rider. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values a pin retains, across all columns together, for the pin-time exact uniqueness check, which sorts a whole column when its chunks overlap in range. Each retained chunk holds a GPU reservation, and integer columns, then earlier columns, take priority when the cap, free GPU memory or a reservation is short; the check's peak GPU use is about three times the cap. A column that no longer fits stays unproven. `0` uses 10% of the capacity of the GPU memory space the pin runs on. |
+| `parquet_footer_statistics_max_remote_reads` | 1024 | The most footers of remote files (`s3://`) the footer-statistics pass reads for one Parquet scan while planning. A scan that needs more is planned without footer statistics and without a footer row count; none of its footers is read. Only files whose statistics are not cached for their current version count. `-1`: no limit. `0`: cached statistics only. The SQL setting of the same name overrides it for a connection. |
+| `parquet_footer_statistics_max_local_reads` | 16384 | The same limit for local files. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
@@ -971,6 +978,11 @@ requires startup configuration.
   Level and enable are governed by DuckDB, not `sirius_log_level`.
 - **`noop`**: discards all logs.
 
+Each statement's SQL text is logged at `info` when it begins. `CREATE SECRET` and `ATTACH` are the
+exception, also when `EXPLAIN` wraps them: their literals are credentials, so the log names the
+statement kind and withholds the text.
+The statement is classified with DuckDB's tokenizer.
+
 Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA
 error reports, and its I/O layer where enabled) go to the same sink, prefixed `[cucascade]`.
 cuCascade's own gate mirrors what the active sink accepts: `sirius_log_level` under `spdlog`,
@@ -1012,7 +1024,9 @@ Evaluators retain their own policy values rather than reading mutable global def
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
-| `parquet_footer_statistics` | true | Give DuckDB's optimizer the merged footer statistics of every file of a multi-file Parquet scan. |
+| `parquet_footer_statistics` | true | Give DuckDB's optimizer the merged footer statistics of every file of an eligible multi-file Parquet scan; a scan over one of the two read limits below is planned without them. |
+| `parquet_footer_statistics_max_remote_reads` | NULL | The most footers of remote files the pass reads for one scan: `-1` no limit, `0` cached statistics only. `NULL` takes `sirius.operator_params.parquet_footer_statistics_max_remote_reads`. |
+| `parquet_footer_statistics_max_local_reads` | NULL | The same for local files; `NULL` takes `sirius.operator_params.parquet_footer_statistics_max_local_reads`. |
 
 DuckDB reads column statistics for a scan of several Parquet files only with `union_by_name`.
 Without them its optimizer estimates every scan filter at a fixed 20%, even an `IS NOT NULL` on a
@@ -1026,20 +1040,51 @@ size, inode and modification time are unchanged, but never while that time is le
 old (the rule DuckDB's own file caches use), and while an S3 object's size and strong ETag are
 unchanged; an object without a strong ETag is read on every query. The glob's listing supplies
 these, so checking costs no request; a local file listed without them (an explicit file list) costs
-one `stat`. A scan's merged statistics are kept with the per-file statistics they were made from and
-reused until one of those files changes, one entry per set of paths a scan is given (at most 128),
+one `stat`. A scan's merged statistics are kept with the ids of the per-file statistics they were
+made from and reused while the cache still answers every file with those statistics,
+one entry per set of paths a scan is given (at most 128),
 so a glob that gains files replaces its entry; footers that must be read are read in parallel on DuckDB's
 worker threads. Scans with
 `union_by_name`, explicit `column_statistics` or a `schema` are left alone. At TPC-H SF1000 this makes the
 `delim_join_as_cte = true` plan of Q21 build its `NOT EXISTS` anti join on the small side (1.34 s
 to 0.50 s).
 
-The footers are read when a query first scans the files, unless they were read ahead:
+The footers are read when a query scans files whose statistics are not cached, unless they were
+read ahead or a read limit skips the scan:
 `pin_table` reads the footers of the Parquet files it pins, and `sirius_analyze_parquet` reads
 those of any path or glob, including `s3://` globs, returning the number of files read (an error when nothing matches).
 Reading ahead moves the cost, about 0.2 s for the 60 `lineitem` files at SF1000, from the first
 query to table loading. Footers read ahead use DuckDB's default Parquet options, so only scans
 with those options reuse them; a scan with other options reads the footers again.
+
+Reading the footers costs planning time in proportion to the number of files, and remote footer
+work can require network requests. The two read limits bound it: by default one scan reads at most
+1,024 remote and 16,384 local footers. Before reading, the pass counts
+the footers a scan needs that are not cached for the file's current version, remote and local
+files apart. If either count is over its limit the scan is planned as DuckDB bound it: no footer is
+read and the scan gets neither statistics nor a footer row count. For local files the count stops
+at the first miss that exceeds the local limit: the admission pass does not check the remaining
+files of such a scan. It is all or nothing because the
+statistics of some files are not statistics of the scan. A remote file named in an explicit list,
+which the listing did not describe, counts as a read even when cached, since checking it takes a
+request. `sirius_analyze_parquet` and `pin_table` are not limited: they process every file, so
+reading ahead is how a scan over a limit gets its statistics. Once they are read, a scan in the
+same process with the default reader options, whose listing identifies the unchanged files, finds
+them cached, and cached files do not count. The
+two SQL settings are per connection; `SET GLOBAL` and `RESET GLOBAL` are refused, and the
+engine-wide values come from the YAML.
+
+The statistics of every file read stay cached, for each set of reader options, so the cache grows
+with the number of distinct files scanned. They have no capacity limit: a limit would make scans
+that together use more files than it holds miss the excess at every planning, and a miss is read
+again or counts against a read limit. A read limit bounds misses, not the total scan size. A scan's
+footer row count belongs to the plan whose planning
+covered the scan, and to the copies Sirius makes of that plan; another statement over the same
+paths does not supply it. It is unknown when `parquet_footer_statistics` is off, when a limit is
+exceeded, when a footer cannot be read, and when DuckDB replaces the scan's file list while
+optimizing, as partition pruning does. A collected count is kept, without a capacity limit, while
+the plan or a Sirius copy holding the scan's file list exists; it is also missing when DuckDB
+copies a scan while optimizing. Entries of file lists that are gone are dropped lazily.
 
 ```sql
 SELECT files FROM sirius_analyze_parquet('/data/tpch_sf1000/lineitem/*.parquet');
@@ -1076,11 +1121,14 @@ SET enable_compressed_materialization = false;
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
-| `enable_delim_aggregate_reuse` | true | Compute decorrelated subquery aggregates from the delim join's outer rows |
+| `enable_delim_aggregate_reuse` | true | Compute decorrelated subquery aggregates from the delim CTE's outer rows |
 | `enable_exists_minmax_rewrite` | true | Rewrite sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same table into one scan and a per-key `MIN`/`MAX` aggregate; see [Optimizations](optimizations.md#correlated-exists-minmax-rewrite). |
-| `enable_partial_aggregate_below_join` | true | Aggregate below an inner join that only adds group-by payload; see [Optimizations](optimizations.md#partial-aggregate-below-a-payload-join). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_partial_aggregate_below_join` in YAML. |
-| `enable_subquery_key_carry` | false | Under `delim_join_as_cte`, restrict every table a subquery ties to its correlation column by an equality to the outer rows' keys, before DuckDB orders the joins; see [Optimizations](optimizations.md#subquery-keys-carried-across-an-equality). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_subquery_key_carry` in YAML. |
-| `enable_exists_from_aggregate` | false | Drop a correlated `EXISTS` whose rows a scalar aggregate subquery of the same query also reads, and keep the outer rows that have a group; see [Optimizations](optimizations.md#exists-answered-from-an-aggregate-subquery). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_exists_from_aggregate` in YAML. |
+| `enable_partial_aggregate_below_join` | true | Aggregate below a join that only adds group-by payload: an inner join, or an outer join that keeps every row of the aggregated side; see [Optimizations](optimizations.md#partial-aggregate-below-a-payload-join). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_partial_aggregate_below_join` in YAML. |
+| `partial_aggregate_min_kept_share` | 0.7 | The share of its unfiltered rows a scan joined to the aggregated input must be estimated to keep for the partial aggregate pushdown to apply; 0 accepts any other side. Test-only: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`, and has no YAML key. |
+| `partial_aggregate_max_extra_keys` | 1 | The columns the pushed aggregate may group by beyond the join's keys. Test-only: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`, and has no YAML key. |
+| `partial_aggregate_min_rows_per_key` | 8 | The rows each group of the pushed aggregate must be estimated to combine, at least, for the partial aggregate pushdown to apply where the query does not group by the aggregate's keys; 0 leaves the statistics out, so only the grouping decides. Test-only: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`, and has no YAML key. |
+| `enable_subquery_key_carry` | true | Restrict every table a subquery ties to its correlation column by an equality to the outer rows' keys, before DuckDB orders the joins; see [Optimizations](optimizations.md#subquery-keys-carried-across-an-equality). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_subquery_key_carry` in YAML. |
+| `enable_exists_from_aggregate` | true | Drop a correlated `EXISTS` whose rows a scalar aggregate subquery of the same query also reads, and keep the outer rows that have a group; see [Optimizations](optimizations.md#exists-answered-from-an-aggregate-subquery). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_exists_from_aggregate` in YAML. |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see
@@ -1131,11 +1179,12 @@ rejected as unknown, and the old `SET` variables no longer exist.
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 
-Accumulation holds each GPU's arrays, at most the cap, until safe release after build tasks drain; published filters can remain until query teardown. The arrays are not spillable. Publication also allocates short-lived scratch on the final PARTITION task's allocator: at most two transfer chunks (8 MiB each at most) per contributing non-root GPU. The task's ignore-limit policy may admit that scratch beyond its reservation against global capacity. Initialization admission failure or safely recoverable scratch OOM skips the optional filter. The multi-partition switch and byte cap are YAML settings; like the other switches in this section, their `SET` variables exist only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`.
+Accumulation holds each GPU's arrays, at most four times `scan_task_batch_size`, until safe release after build tasks drain; published filters can remain until query teardown. The arrays are not spillable. Publication also allocates short-lived scratch on the final PARTITION task's allocator: at most two transfer chunks (8 MiB each at most) per contributing non-root GPU. The task's ignore-limit policy may admit that scratch beyond its reservation against global capacity. Initialization admission failure or safely recoverable scratch OOM skips the optional filter. The multi-partition switch is a YAML setting; like the other switches in this section, its `SET` variable exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 
-The direct DuckDB session overrides are registered only when the process
-explicitly enables Sirius test options; they are not part of the normal user
-surface.
+The `SET` variables `enable_dynamic_filter`, `enable_dynamic_zone_map_filter` and
+`enable_dynamic_filter_multi_partition` are registered only when the process explicitly enables
+Sirius test options; they are not part of the normal user surface. The three thresholds are always
+registered.
 
 ### Distributed Execution
 
@@ -1181,6 +1230,7 @@ retention gates.
 | `pin_table_input_compression_plan_dir` | (empty) | Optional directory of per-table Simpatico plan overrides (`<table_name>.<ext>`, multi-column plan DSL). If no readable, nonempty matching file is found, plans are selected automatically; a selected plan that does not cover the pinned columns leaves the pin raw. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
 | `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). Spill compression uses `spill_max_compressed_fraction` instead. |
+| `pin_table_compression_min_table_device_fraction` | 0.05 | Select plans automatically for a GPU-tier pin only when its uncompressed size is at least this fraction of its GPUs' memory; store a smaller one uncompressed; host pins are not gated; `0` disables. |
 | `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time and use those facts as join-key proofs (single-pass distinct hash join) and as late materialization's proof for a group-by-rowid ride. Affects pins and plans made after it is set. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values retained across all columns for the pin-time exact uniqueness check; `0` uses 10% of the GPU memory space capacity. |
 
@@ -1272,12 +1322,17 @@ SET enable_runtime_size_estimation = true;   -- off by default
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `gpu_execution` | true | Enable transparent GPU execution for plain SQL queries. When enabled, supported queries are automatically intercepted and executed on the GPU. When disabled, only explicit `CALL gpu_execution('...')` uses the GPU. |
+| `sirius_s3_header_signing` | false | Sign S3 requests whose credentials come from a DuckDB secret in the `Authorization` header instead of a presigned URL. Needed for endpoints that refuse presigned URLs. See [scan.md](scan.md#s3--object-store-backend). |
+
+When `LOAD sirius` cannot load a CUDA backend, the loader registers `gpu_execution` with default
+`false` and rejects `SET gpu_execution = true` and `CALL gpu_execution(...)` with the reason, which
+`SELECT fallback_reason FROM sirius_status()` also shows.
 
 ### Debug
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus explicit `CALL gpu_execution(...)`. Set to `false` to surface Sirius errors instead of falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates plan-time fallback (unsupported operator/type) and runtime fallback for transparent SELECT, plus explicit `CALL gpu_execution(...)`. Unsupported COPY options can fall back during planning; transparent [Parquet COPY](parquet-output.md#failure-and-cleanup) never replays runtime failures because files may already be visible. Set to `false` to surface Sirius errors instead of falling back. Queries that read `s3://` never fall back. |
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
@@ -1336,3 +1391,76 @@ prefetcher `min_free_fraction` below 0.4, prefetcher threads above 3,
 pipeline threads above 8. The H2D interconnect sustains ~350-380 GB/s
 regardless of stream count; past these settings the link, not scheduling,
 is the bound.
+
+### Metadata worker NUMA placement and asynchronous Parquet preparation
+
+The existing `scan_manager.num_threads` budget is divided across eligible NUMA domains
+associated with configured GPUs. When `num_threads` is omitted or null, its initial default
+is 18; after discovering eligible domains, initialization
+raises that default if necessary to provide at least one worker per domain. An explicitly
+supplied value is never raised: initialization rejects it when it cannot cover all eligible
+domains. Each worker binds once, before accepting work; there is no per-operation affinity
+guard or extra coalescing pool. cuCascade discovers the rank's main-thread CPU affinity
+and its effective cgroup v2 CPU allowance. Configuration resolution saves their intersection
+as the startup CPU boundary shared by metadata placement, worker startup and lazy REST and
+exchange construction. GPU-local CPU sets and explicit pool affinity may narrow this boundary;
+they cannot expand it. Reserved REST-reactor CPUs remain excluded from worker pools, subject
+to the documented explicit-affinity fallback.
+
+A `taskset` or `numactl --cpunodebind` launch is honored through the main thread's mask, even
+when several ranks share a broader cgroup. A later single-CPU DuckDB worker mask does not
+replace that boundary. Capture occurs at engine configuration resolution: the embedder must
+preserve the launch mask on the main thread until then. Changing the main thread's affinity
+before capture changes the boundary; this mechanism cannot reconstruct historical launch
+settings. Native/coordinator workers start lazily from the saved mask, and each startup scope
+restores its caller's previous affinity on success and failure without changing CUDA/TLS state.
+If the deployment cpuset shrinks before lazy startup, coordinator/native workers, the
+dedicated coordinator runner, and lazy REST/exchange construction use the nonempty subset
+the kernel grants from the saved boundary and log the narrowed mask. They never substitute
+the creating thread's narrower mask or expand beyond the saved boundary. An empty subset
+still rejects startup; dormant worker pools may retry after the allowance is restored.
+
+cuCascade resolves cgroup2 mount roots and inherited effective cpusets. If cgroup discovery is
+unavailable, it retains the main-thread affinity with a diagnostic. If the main thread's mask
+cannot be read, it falls back to caller affinity with a diagnostic. A known empty intersection
+fails initialization; no broader mask is substituted. Missing GPU-local topology uses the
+permitted CPU boundary and reports the locality fallback. CPU restrictions do not select GPUs
+or change memory-binding policy, and ranks sharing a socket are not automatically assigned
+exclusive CPU or memory shares.
+
+Each preparation source selects a stable coalescing domain from the query's eligible GPU
+domains. A manager-wide cursor rotates the starting domain across queries, including
+independent single-source scans; each query rotates within its own eligible GPU-domain set.
+If CPU restrictions leave none of the query's GPU-local domains available, the query uses
+the first permitted manager domain instead. That domain may be remote from all of the
+query's GPUs; CPU restrictions still apply. This exception also applies when a per-query
+GPU limit selects only GPUs whose local domains were excluded.
+Independent metadata jobs rotate across the query's eligible domains, so a single source
+can use metadata workers in multiple domains. Each whole job executes in its assigned domain;
+plain Parquet creates one metadata job per file. There is no persistent file-to-domain mapping,
+so separate jobs referencing the same file may use different domains. A source's Parquet
+coalescer operations retain their stable domain. Workers do not steal domain-routed jobs from
+other domains. Metadata may therefore be produced in a different domain from its coalescer.
+This routing does not select I/O reactor or driver queues. Final GPU batch placement is unchanged;
+CPU placement does not imply page migration or pin all batches to one GPU.
+
+The query dispatcher alternates pending metadata and coalescing work when both are ready.
+Running metadata I/O is not preempted: a domain whose workers are all blocked on reads can
+still delay coalescing. No worker waits for another job in the pool. Trace logs report
+coalescing queue and execution duration; storage/concurrency qualification must check both.
+
+Thread counts are separate budgets. `scan_manager.num_threads` counts only the shared
+metadata/coalescing workers. Asynchronous Parquet/Iceberg attempts additionally use the
+manager's `preparation.coordinator_workers` control pool (one worker by default, started
+lazily). Setting that value to zero instead starts one coordinator thread per asynchronous
+or reader attempt. Native reads use their own `preparation.native_reader_workers` pool
+(two workers by default, started lazily). Each uring or REST reactor is another worker;
+reactor counts are per IO context. These workers are additional to pipeline, task-creator
+and downgrade threads. Pool defaults are independently sized and capped; the scan-manager
+default of 18 is not a total process thread cap and does not subtract coordinator, native-reader
+or additional IO-context workers.
+
+Completed coalescing operations are consumed in rotating source order, with at most one
+completion per control turn. This prevents a repeatedly ready first source from bypassing
+later ready sources. Shared admission can still delay work before an idle domain worker
+receives it; class alternation and rotating consumption provide no wall-clock latency bound.

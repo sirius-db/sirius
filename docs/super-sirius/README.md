@@ -2,10 +2,10 @@
 
 Super Sirius is the task-based GPU execution engine in Sirius. It uses `namespace sirius` and a pipelined, multi-threaded architecture that partitions work across GPU and CPU thread pools.
 
-With a Sirius config file (`~/.sirius/sirius.yaml`), GPU execution is **transparent** — users write plain SQL and supported queries automatically execute on the GPU. Unsupported queries silently fall back to CPU. The explicit `CALL gpu_execution('...')` function is still available but no longer required.
+Once the extension is loaded, GPU execution is **transparent** — users write plain SQL and supported queries automatically execute on the GPU. Unsupported queries silently fall back to CPU, except `s3://` scans and when `enable_duckdb_fallback` is `false`. The explicit `CALL gpu_execution('...')` function is still available but no longer required.
 
 ```sql
--- Just load the extension. If ~/.sirius/sirius.yaml exists, GPU is automatic.
+-- Just load the extension; sirius.yaml is optional (see Configuration).
 LOAD 'sirius.duckdb_extension';
 
 -- Plain SQL — transparently executed on GPU:
@@ -21,6 +21,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Query Lifecycle](query-lifecycle.md) | Per-query submission guards, work leases, spill borrows and retirement barriers |
 | [Execution Flow](execution-flow.md) | End-to-end query trace with file:line references |
 | [Physical Plan Generation](physical-plan-generation.md) | Logical-to-physical mapping, pipeline construction, splitting rules |
+| [Parquet Output](parquet-output.md) | COPY directory export, parallel writing, ordering, and failure cleanup |
 | [Operators](operators.md) | All physical operators: interface, GPU implementation, cuDF APIs |
 | [Expression Evaluator](expression-executor.md) | `expression_evaluator`, Sirius AST hierarchy, GPU expression translator, cuDF AST |
 | [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling, per-task-device contract under SCHED-RR |

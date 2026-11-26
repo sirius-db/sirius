@@ -22,7 +22,6 @@
 
 #include <duckdb/common/enums/expression_type.hpp>
 #include <duckdb/common/enums/join_type.hpp>
-#include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/expression/bound_columnref_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
@@ -45,16 +44,6 @@ using binding_key = std::pair<duckdb::idx_t, duckdb::idx_t>;
 binding_key key_of(duckdb::ColumnBinding const& binding)
 {
   return {binding.table_index.index, binding.column_index.GetIndex()};
-}
-
-// The identity projections that block DuckDB's own conversion come from the delim-to-CTE rewrite,
-// which runs exactly when `delim_join_as_cte` is true. Keying on the setting, not on a CTE being
-// left in the plan, also covers plans where DuckDB later inlined the CTE but kept the projections.
-bool delim_join_as_cte_enabled(duckdb::ClientContext& context)
-{
-  duckdb::Value setting;
-  return context.TryGetCurrentSetting("delim_join_as_cte", setting) && !setting.IsNull() &&
-         setting.GetValue<bool>();
 }
 
 void count_references(duckdb::LogicalOperator& op, std::map<binding_key, std::size_t>& refs)
@@ -317,7 +306,7 @@ struct converter {
 std::size_t convert_mark_joins(duckdb::ClientContext& context,
                                duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
-  if (!plan || !delim_join_as_cte_enabled(context)) return 0;
+  if (!plan) return 0;
   std::map<binding_key, std::size_t> refs;
   count_references(*plan, refs);
   converter pass{context, refs, {}, 0};
