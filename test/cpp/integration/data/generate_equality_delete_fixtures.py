@@ -85,8 +85,9 @@ are listed beside the right ones, so a failure says which rule broke:
                                     fields, a NULL key whose delete records no null count,
                                     string bounds truncated to 16 characters, a delete beside
                                     both files next to one that meets both, a delete whose own
-                                    bounds are 2000 characters long, and six deletes with
-                                    61-character bounds. Skipping a delete whose range still
+                                    bounds are 2000 characters long, six deletes with
+                                    61-character bounds, and a composite key with bounds for one
+                                    column only. Skipping a delete whose range still
                                     meets a file, or whose NULL key does, returns deleted rows.
                                     One more manifest, listed by no snapshot, has a literal %20
                                     in its name and no live entry.
@@ -101,9 +102,11 @@ are listed beside the right ones, so a failure says which rule broke:
   iceberg_v2_eq_duplicate_entry     For the plan only. The data manifest lists its data file
                                     twice; the second entry's bounds are beside a delete that
                                     matches the file.
-  iceberg_v2_eq_repeated_bound      The bounds maps of the data file list the key twice. The
-                                    first pair is beside a delete that matches the file, the
-                                    second is the file's. Taking the first skips the delete.
+  iceberg_v2_eq_repeated_bound      For the plan only. The bounds maps of the data file list
+                                    the key twice, and both pairs are beside a delete that
+                                    matches the file. Taking either skips the delete.
+  iceberg_v2_eq_repeated_delete_bound
+                                    The same with the repeat in the delete file's entry.
   iceberg_v2_eq_bounds_stream       For the plan only: its data files are not written. A data
                                     manifest large enough that a streamed read hands out entries
                                     before it ends, and a delete beside their bounds.
@@ -1160,6 +1163,7 @@ KEY_RANGES = {
         6,
     ],  # s = 2000 times "z": bounds longer than a plan reads by default
     13: [1, 2, 3, 4, 5, 6],  # six delete files of s, each with 61-byte bounds
+    14: [1, 2, 3, 4, 5, 6],  # (k, s) = (20, "zz") with bounds recorded for s alone
 }
 
 
@@ -1281,6 +1285,16 @@ def build_key_ranges():
                 metrics(s=("z" * 60 + str(n), "z" * 60 + str(n))),
             )
             for n in range(6)
+        ],
+    )
+    delete(
+        14,
+        [
+            (
+                k([20]) + [(3, "s", pa.string(), ["zz"])],
+                [2, 3],
+                metrics(s=("zz", "zz")),
+            )
         ],
     )
     # A manifest no snapshot lists, whose only entry is deleted. Its name holds a literal %20:
@@ -1509,35 +1523,31 @@ def build_bounds_stream():
     t.finish()
 
 
-def build_repeated_bound():
-    """A data file whose bounds maps list the key twice; the first pair is not the file's."""
+def build_repeated_bound(name="iceberg_v2_eq_repeated_bound", in_delete=False):
+    """Bounds maps that list the key twice, in the data file's entry or in the delete's. No
+    pair is the file's: whichever a reader takes, it skips a delete that matches."""
     import pyarrow as pa
 
-    t = Table("iceberg_v2_eq_repeated_bound", [[(1, "id", "long"), (2, "k", "long")]])
+    t = Table(name, [[(1, "id", "long"), (2, "k", "long")]])
     long = lambda value: struct.pack("<q", value)  # noqa: E731
     a = t.parquet(
         "data-a.parquet",
         [(1, "id", pa.int64(), [1, 2, 3]), (2, "k", pa.int64(), [10, 20, 30])],
     )
     repeated = {
-        "lower_bounds": [(2, long(200)), (2, long(10))],
-        "upper_bounds": [(2, long(300)), (2, long(30))],
+        "lower_bounds": [(2, long(200)), (2, long(400))],
+        "upper_bounds": [(2, long(300)), (2, long(500))],
         "null_value_counts": {2: 0},
     }
+    data_metrics = _long_bounds(10, 30) if in_delete else repeated
+    delete_metrics = repeated if in_delete else _long_bounds(20, 20)
     t.commit(
-        "append", [("m-data-1.avro", 0, 0, [(1, None, a, 0, None, None, repeated)])]
+        "append", [("m-data-1.avro", 0, 0, [(1, None, a, 0, None, None, data_metrics)])]
     )
     delete = t.parquet("delete-eq-2.parquet", [(2, "k", pa.int64(), [20])])
     t.commit(
         "delete",
-        [
-            (
-                "m-delete-2.avro",
-                1,
-                0,
-                [(1, None, delete, 2, None, [2], _long_bounds(20, 20))],
-            )
-        ],
+        [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, None, [2], delete_metrics)])],
     )
     t.finish()
 
@@ -1654,7 +1664,12 @@ FIXTURES = {
         [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)],
     ),
     "iceberg_v2_eq_duplicate_entry": (build_duplicate_entry, None),
-    "iceberg_v2_eq_repeated_bound": (build_repeated_bound, [(1, 10), (3, 30)]),
+    # Not checked: DuckDB's reader takes one of the pairs and skips the delete.
+    "iceberg_v2_eq_repeated_bound": (build_repeated_bound, None),
+    "iceberg_v2_eq_repeated_delete_bound": (
+        lambda: build_repeated_bound("iceberg_v2_eq_repeated_delete_bound", True),
+        None,
+    ),
     "iceberg_v2_eq_bounds_stream": (build_bounds_stream, None),
 }
 

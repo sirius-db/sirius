@@ -493,7 +493,8 @@ class key_bounds_reader {
     bool bound = false;
   };
 
-  /// A serialized bound, or empty when the manifest records none or one the plan does not read.
+  /// A serialized bound, or empty when the manifest records none or one longer than the plan
+  /// keeps.
   [[nodiscard]] std::string_view bound(metric_map const& map, duckdb::idx_t row, int32_t id) const
   {
     auto const at = map.find(row, id);
@@ -520,8 +521,8 @@ using key_bounds_sink =
 /// manifest may not have, and is streamed, so the stream's buffer is held and not every entry.
 /// It can still fail, and a failed query aborts the connection's transaction: nothing may
 /// follow it. `file_index` is the position of a row's manifest in the list, whatever the
-/// spelling `read_avro` reports it under; a name it would expand as a pattern could shift the
-/// positions, so such a list is not read.
+/// spelling `read_avro` reports it under; the caller passes no name it would expand as a
+/// pattern, which could shift the positions.
 bool read_key_bounds(iceberg_metadata_connection& connection,
                      std::vector<std::string_view> const& manifests,
                      std::vector<int32_t> const& ids,
@@ -529,10 +530,8 @@ bool read_key_bounds(iceberg_metadata_connection& connection,
                      key_bounds_sink const& sink)
 {
   std::string sql = "SELECT data_file.file_path, data_file, file_index FROM read_avro([";
-  for (auto const manifest : manifests) {
-    if (duckdb::FileSystem::HasGlob(std::string(manifest))) return false;
+  for (auto const manifest : manifests)
     sql += (sql.back() == '[' ? "'" : ", '") + escape_sql_string(std::string(manifest)) + "'";
-  }
   sql += "]) WHERE status <> 2";
   try {
     auto result = connection.get().Submit(sql);
@@ -639,9 +638,9 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
   // One manifest's live entries of one content kind, with the spec its header names. Kind 0 is
   // not tested: a data manifest holds data files only, and has no `content` field when format
   // version 1 wrote it. The inventory supplies the manifest paths, so the table path is not
-  // resolved again. The read is streamed, so one chunk of entries is held and not the
-  // manifest's: the result hands out the next chunk, or null after the last, and throws when
-  // the read fails part way as it does when it fails at once.
+  // resolved again. The read is streamed, so the stream's buffer is held and not every entry
+  // of the manifest: the result hands out the next chunk, or null after the last, and throws
+  // when the read fails part way as it does when it fails at once.
   auto const read_manifest = [&](std::string_view manifest, std::string const& columns, int kind) {
     auto const path       = "'" + escape_sql_string(std::string(manifest)) + "'";
     auto const unreadable = [&fail, name = std::string(manifest)](std::string const& why) {
@@ -714,10 +713,19 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
     bounds_bytes += bytes;
     return true;
   };
+  // A manifest name `read_avro` would expand as a pattern may be read from another file than
+  // the one the inventory names, and in a list it may shift the positions rows are attributed
+  // by. The bounds of a table with such a name are not used.
+  auto const named_by_pattern = [](std::unordered_map<std::string_view, listed> const& files) {
+    return std::any_of(files.begin(), files.end(), [](auto const& file) {
+      return duckdb::FileSystem::HasGlob(std::string(file.second.manifest));
+    });
+  };
   // Bounds are read and compared while this holds. When it stops holding, for whatever reason,
   // no bounds are used and both sets are released.
-  bool pruning =
-    key_types && limits.max_bytes > 0 && limits.max_comparisons > 0 && limits.max_bound_length > 0;
+  bool pruning = key_types && limits.max_bytes > 0 && limits.max_comparisons > 0 &&
+                 limits.max_bound_length > 0 && !named_by_pattern(deletes) &&
+                 !named_by_pattern(data);
   auto const stop_pruning = [&] {
     pruning = false;
     decltype(delete_bounds)().swap(delete_bounds);
@@ -912,8 +920,8 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
 
   // Whether the bounds prove that delete file @p file matches no row of a data file. One key is
   // enough. A NULL key matches a NULL value and bounds leave NULLs out, so a key decides only
-  // when one of the two files holds no NULL in it. Each key compared counts against the plan's
-  // budget; past it nothing is compared, and the file may match.
+  // when one of the two files holds no NULL in it and both record a range. Each key compared
+  // counts against the plan's budget; past it nothing is compared, and the file may match.
   std::size_t compared = 0;
   auto const ruled_out = [&](uint32_t file, std::vector<key_bounds> const& data_keys) {
     auto const& delete_keys = delete_bounds[file];
@@ -925,6 +933,9 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
       auto const& deleted  = delete_keys[key];
       auto const& existing = data_keys[k];
       if (!deleted.no_nulls && !existing.no_nulls) continue;
+      if (deleted.lower.empty() || deleted.upper.empty() || existing.lower.empty() ||
+          existing.upper.empty())
+        continue;
       if (compared == limits.max_comparisons) return false;
       ++compared;
       if (equality_key_ranges_disjoint(

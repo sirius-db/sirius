@@ -3130,12 +3130,19 @@ static void SetPinTableUniqueExactMaxBytes(ClientContext& context, SetScope scop
                    params->unique_exact_max_bytes);
 }
 
+/// The value of one of the Iceberg key-bound limits, which have no NULL.
+static uint64_t iceberg_key_bound_limit(Value const& parameter, char const* name)
+{
+  if (parameter.IsNull()) { throw InvalidInputException(std::string(name) + " cannot be NULL"); }
+  return UBigIntValue::Get(parameter);
+}
+
 static void SetIcebergEqualityKeyBoundsMaxBytes(ClientContext& context,
                                                 SetScope scope,
                                                 Value& parameter)
 {
   get_operator_params(context, scope)->iceberg_equality_key_bounds_max_bytes =
-    UBigIntValue::Get(parameter);
+    iceberg_key_bound_limit(parameter, "iceberg_equality_key_bounds_max_bytes");
 }
 
 static void SetIcebergEqualityKeyBoundsMaxComparisons(ClientContext& context,
@@ -3143,7 +3150,7 @@ static void SetIcebergEqualityKeyBoundsMaxComparisons(ClientContext& context,
                                                       Value& parameter)
 {
   get_operator_params(context, scope)->iceberg_equality_key_bounds_max_comparisons =
-    UBigIntValue::Get(parameter);
+    iceberg_key_bound_limit(parameter, "iceberg_equality_key_bounds_max_comparisons");
 }
 
 static void SetIcebergEqualityKeyBoundMaxLength(ClientContext& context,
@@ -3151,7 +3158,7 @@ static void SetIcebergEqualityKeyBoundMaxLength(ClientContext& context,
                                                 Value& parameter)
 {
   get_operator_params(context, scope)->iceberg_equality_key_bound_max_length =
-    UBigIntValue::Get(parameter);
+    iceberg_key_bound_limit(parameter, "iceberg_equality_key_bound_max_length");
 }
 
 static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
@@ -4163,7 +4170,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
 
   config.AddExtensionOption(
     "iceberg_equality_key_bound_max_length",
-    "Longest Iceberg equality-delete key bound, in bytes, a plan reads from a manifest; a longer "
+    "Longest Iceberg equality-delete key bound, in bytes, a plan keeps and compares; a longer "
     "one counts as not recorded. 0 turns the pruning off",
     LogicalType::UBIGINT,
     Value::UBIGINT(operator_defaults.iceberg_equality_key_bound_max_length),

@@ -1809,6 +1809,15 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->Collection().GetValue(26, 0).GetValue<uint64_t>() == 10 * mib);
   REQUIRE(settings->Collection().GetValue(27, 0).GetValue<uint64_t>() == 1234);
   REQUIRE(settings->Collection().GetValue(28, 0).GetValue<uint64_t>() == 48);
+  // The three limits have no NULL, and a refused SET leaves the value as it was.
+  for (auto const* name : {"iceberg_equality_key_bounds_max_bytes",
+                           "iceberg_equality_key_bounds_max_comparisons",
+                           "iceberg_equality_key_bound_max_length"}) {
+    CAPTURE(name);
+    REQUIRE(con.Query("SET " + std::string(name) + " = NULL")->HasError());
+  }
+  REQUIRE(duckdb::session_operator_params(*con.context).iceberg_equality_key_bound_max_length ==
+          48);
   REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu() ==
           4 * mib);
   for (auto const* name : {"enable_late_materialization",

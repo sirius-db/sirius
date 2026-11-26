@@ -367,7 +367,7 @@ struct operator_params {
   uint64_t iceberg_equality_key_bounds_max_comparisons{
     config::DEFAULT_ICEBERG_EQUALITY_KEY_BOUNDS_MAX_COMPARISONS};
 
-  /// Longest key bound, in bytes, a plan reads from a manifest. A longer one counts as not
+  /// Longest key bound, in bytes, a plan keeps and compares. A longer one counts as not
   /// recorded, so a comparison costs no more than this. 0 turns the pruning off.
   uint64_t iceberg_equality_key_bound_max_length{
     config::DEFAULT_ICEBERG_EQUALITY_KEY_BOUND_MAX_LENGTH};

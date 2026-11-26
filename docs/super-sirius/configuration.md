@@ -893,7 +893,7 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `parquet_footer_statistics_max_local_reads` | 16384 | The same limit for local files. |
 | `iceberg_equality_key_bounds_max_bytes` | 256 MiB | Host bytes of Iceberg equality-delete key bounds one scan's plan keeps, of delete and data files together. A plan that would keep more keeps none and takes no delete file off a list. `0` turns the pruning off. See [Equality deletes](scan.md#equality-deletes). |
 | `iceberg_equality_key_bounds_max_comparisons` | 4194304 | Times one plan compares the bounds of a key between an equality-delete file and a data file. Past it a delete file stays on the lists it was not compared for. `0` turns the pruning off. |
-| `iceberg_equality_key_bound_max_length` | 64 | Longest key bound, in bytes, a plan reads from a manifest; a longer one counts as not recorded. `0` turns the pruning off. |
+| `iceberg_equality_key_bound_max_length` | 64 | Longest key bound, in bytes, a plan keeps and compares; a longer one counts as not recorded. `0` turns the pruning off. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
@@ -1228,7 +1228,7 @@ SET enable_dictionary_carrier = true;
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `iceberg_equality_key_bounds_max_bytes` | 256 MiB | Host bytes of Iceberg equality-delete key bounds one scan's plan keeps; `0` turns the pruning off |
 | `iceberg_equality_key_bounds_max_comparisons` | 4194304 | Comparisons of a key's bounds one plan makes; `0` turns the pruning off |
-| `iceberg_equality_key_bound_max_length` | 64 | Longest key bound, in bytes, a plan reads; `0` turns the pruning off |
+| `iceberg_equality_key_bound_max_length` | 64 | Longest key bound, in bytes, a plan keeps and compares; `0` turns the pruning off |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
 | `enable_delim_aggregate_reuse` | true | Compute decorrelated subquery aggregates from the delim CTE's outer rows |

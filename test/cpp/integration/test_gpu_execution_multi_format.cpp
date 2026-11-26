@@ -2042,15 +2042,25 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
                    1},
         // Longer than iceberg_equality_key_bound_max_length, the bounds count as not recorded.
         range_case{"a delete whose own bounds are 2000 characters long", 12, all, 1},
-        range_case{"six deletes with 61-character bounds", 13, all, 0}}) {
+        range_case{"six deletes with 61-character bounds", 13, all, 0},
+        range_case{"(k, s) with bounds recorded for s alone", 14, all, 0}}) {
     INFO(c.what);
     expect_equality_rows(scan(c.sequence), c.expected, c.loads);
   }
   using sirius::test::scoped_setting;
   {
-    // With bounds that long read, the delete of sequence 12 is beside both files.
+    // With bounds that long kept, the delete of sequence 12 is beside both files.
     scoped_setting length(*con, "iceberg_equality_key_bound_max_length", 4096);
     expect_equality_rows(scan(12), all, 0);
+  }
+  {
+    // The bounds of sequence 13 are 61 bytes long: kept at a limit of 61, not at 60.
+    scoped_setting length(*con, "iceberg_equality_key_bound_max_length", 61);
+    expect_equality_rows(scan(13), all, 0);
+  }
+  {
+    scoped_setting length(*con, "iceberg_equality_key_bound_max_length", 60);
+    expect_equality_rows(scan(13), all, 6);
   }
   {
     // One comparison is allowed. The pairs past it are not compared, so both delete files of
@@ -2058,10 +2068,20 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
     scoped_setting comparisons(*con, "iceberg_equality_key_bounds_max_comparisons", 1);
     expect_equality_rows(scan(11), {{"1"}, {"3"}, {"4"}, {"6"}}, 2);
   }
-  {
-    // Zero turns the pruning off: the delete of sequence 2, beside both files, is opened.
-    scoped_setting comparisons(*con, "iceberg_equality_key_bounds_max_comparisons", 0);
+  for (auto const* limit : {"iceberg_equality_key_bounds_max_bytes",
+                            "iceberg_equality_key_bounds_max_comparisons",
+                            "iceberg_equality_key_bound_max_length"}) {
+    // Zero in any limit turns the pruning off: the delete of sequence 2, beside both files, is
+    // opened.
+    INFO(limit);
+    scoped_setting off(*con, limit, 0);
     expect_equality_rows(scan(2), all, 1);
+  }
+  {
+    // Only a comparison of two recorded ranges counts. Sequence 14 records bounds for the
+    // second of its two keys alone, so two comparisons rule it out for both data files.
+    scoped_setting comparisons(*con, "iceberg_equality_key_bounds_max_comparisons", 2);
+    expect_equality_rows(scan(14), all, 0);
   }
   {
     // Each key compared counts. Sequence 6 is ruled out for data file a by its second key and
@@ -2180,19 +2200,31 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
                               : with_space;
     }
     CHECK(listed(plan_of(inventory), "data-a.parquet") == 1);
+    fs::remove(with_space);
   }
   {
     INFO("a manifest name read_avro would expand as a pattern");
-    // [1] matches the 1 of m-data-1.avro, so the same manifest is read; a pattern may also
-    // match several files and shift the positions the entries are attributed by.
-    auto inventory = key_ranges();
-    for (auto& entry : inventory.entries) {
-      if (!is_data(entry)) continue;
-      auto const at = entry.manifest_path.rfind("m-data-1.avro");
-      REQUIRE(at != std::string::npos);
-      entry.manifest_path.replace(at, std::string("m-data-1.avro").size(), "m-data-[1].avro");
+    // The manifest is copied under a name with brackets. As a pattern, [1] matches the 1 of
+    // m-data-1.avro and [2] the 2 of m-delete-2.avro, so read_avro opens the original, not the
+    // file of that name; with other files around it may open another manifest, or several.
+    for (auto const& [content, name, pattern] :
+         {std::tuple{"DATA", "m-data-1.avro", "m-data-[1].avro"},
+          std::tuple{"EQUALITY_DELETES", "m-delete-2.avro", "m-delete-[2].avro"}}) {
+      INFO(pattern);
+      auto inventory = key_ranges();
+      std::string copy;
+      for (auto& entry : inventory.entries) {
+        if (entry.content != content) continue;
+        auto const original = entry.manifest_path;
+        auto const at       = entry.manifest_path.rfind(name);
+        REQUIRE(at != std::string::npos);
+        entry.manifest_path.replace(at, std::string(name).size(), pattern);
+        copy = entry.manifest_path;
+        fs::copy_file(original, copy, fs::copy_options::overwrite_existing);
+      }
+      CHECK(listed(plan_of(inventory), "data-a.parquet") == 1);
+      fs::remove(copy);
     }
-    CHECK(listed(plan_of(inventory), "data-a.parquet") == 1);
   }
   {
     INFO("an entry the inventory does not list");
@@ -2206,11 +2238,13 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
   }
   {
     INFO("bounds maps that list the key twice");
-    // The first pair of bounds is beside the delete and the second is the file's. Neither is
-    // used: the delete stays on the list and removes id 2.
-    auto path = table("iceberg_v2_eq_repeated_bound");
-    require_delete_files(path, 1);
-    expect_equality_rows("SELECT id FROM " + pinned_scan(path) + " ORDER BY id;", {{"1"}, {"3"}});
+    // In the data file's entry, then in the delete's. Both pairs are beside a delete that
+    // matches the file, so taking either takes the delete off the list.
+    for (auto const* name :
+         {"iceberg_v2_eq_repeated_bound", "iceberg_v2_eq_repeated_delete_bound"}) {
+      INFO(name);
+      CHECK(listed(plan_of(inventory_of(table(name))), "data-a.parquet") == 1);
+    }
   }
   {
     INFO("a data file with two live entries");
@@ -2251,6 +2285,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
     for (auto const& [data_file, files] : plan.by_data_file)
       lists += files.size();
     CHECK(lists == plan.by_data_file.size());
+    fs::remove(damaged);
   }
 }
 
@@ -4794,6 +4829,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                                        }),
                                        64),
                     Catch::Matchers::ContainsSubstring("could not be read"));
+  fs::remove(damaged);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
