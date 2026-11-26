@@ -16,12 +16,12 @@
 
 #pragma once
 
-#include "cudf/ast_compat.hpp"
 #include "cudf/hugeint_carrier.hpp"
 #include "helper/hugeint.hpp"
 #include "helper/logical_type.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>

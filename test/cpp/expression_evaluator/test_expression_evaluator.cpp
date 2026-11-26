@@ -4204,8 +4204,8 @@ TEST_CASE("AST_JIT keeps non-null inputs non-null on batches spanning several gr
           "[expression_evaluator][ast_jit]")
 {
   auto& space = *get_default_gpu_space();
-  // Row counts that are not a multiple of 32 and exceed the resident grid make one warp diverge
-  // across grid-stride iterations in cuDF < 26.12's null-aware JIT kernel.
+  // Row counts that are not a multiple of 32 and exceed the resident grid exercise the warp
+  // divergence across grid-stride iterations fixed by rapidsai/cudf#23981.
   auto const rows = GENERATE(100, 4'000'000, 1'000'003, 2'000'029, 4'000'003);
   std::vector<int32_t> left(rows), right(rows);
   for (int i = 0; i < rows; ++i) {

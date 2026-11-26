@@ -6,7 +6,6 @@
  */
 
 #include "catch.hpp"
-#include "cudf/ast_compat.hpp"
 #include "io/parquet_helpers.hpp"
 #include "op/scan/parquet_materialize.hpp"
 #include "utils/held_bulk_reads.hpp"
@@ -14,6 +13,7 @@
 #include "utils/test_validation_utility.hpp"
 #include "utils/utils.hpp"
 
+#include <cudf/ast/expressions.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>

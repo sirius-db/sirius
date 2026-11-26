@@ -15,7 +15,7 @@
    LabelT vq_label = 0;
 -  if (vq_labels.has_value()) { vq_label = vq_labels.value()(row_ix); }
 +  if (vq_labels != nullptr) { vq_label = vq_labels[row_ix]; }
-   cuvs::preprocessing::quantize::detail::bitfield_view_t code_view{&codes(row_ix, 0), pq_bits};
+   bitfield_view_t code_view{&codes(row_ix, 0), pq_bits};
    for (uint32_t j = lane_id; j < pq_len; j += SubWarpSize) {
      const CodeT code = code_view[j];
 @@ -329,7 +329,13 @@

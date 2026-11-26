@@ -120,16 +120,6 @@ In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash
 **Code path:**
 - `src/op/aggregate/gpu_aggregate_impl.cpp` — `local_grouped_agg()` COLLECT_SET handling
 
-### Label-Encoded Group Keys for COUNT DISTINCT (PR #1375)
-
-**Motivation:** cuDF's sorted groupby finds group boundaries via `stable_sorted_order(keys)`, which takes the radix fast path only for a single key column. A multi-column group key falls to lexicographic merge sort — on TPC-H q16 at SF1000, 308.7 ms for 118.8M rows, 92% of the aggregate. The pre-existing dictionary-encode path narrows the comparators but leaves multiple key columns, so the single-column gate is never reached.
-
-**Mechanism:** the key table collapses into one dense INT32 label; the groupby sorts on that label, and representative keys are recovered with a gather at group cardinality. Sirius first computes distinct keys with equal nulls and all NaNs equal, then sorts those keys lexicographically with nulls last. The sorted distinct table is the unique build side of a `cudf::distinct_hash_join`; probing the original rows returns one build-row index per input row, which is already the required dense label. Gated on: a COLLECT_SET aggregation, at least 1,048,576 input rows, a non-nested key that is not already a single null-free fixed-width column, and an HLL estimate below 1% of rows. A single nullable or variable-width key can qualify. Non-fatal label construction failures fall back to the original key columns; an active label path bypasses STRING dictionary encoding.
-
-**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` -- `gpu_aggregate_impl::local_grouped_aggregate()`, label path (`use_label_keys`)
-
-**Config:** none (thresholds are internal). TPC-H SF1000 GB300 measured workload: q16 0.490 s -> 0.298 s.
-
 ### Fused Dense Count Join (PR #1606)
 
 **Motivation:** A `COUNT(col | *) GROUP BY key` over a preserved-side outer equi-join on the same key materializes the whole join result only to collapse it again. The count is a pure cardinality product, so the joined rows never have to exist.
@@ -305,7 +295,7 @@ The aggregate has a group for a key exactly when `S` has a row for it, which is 
 
 **Motivation:** cuDF's hash group-by pays for a hash table and global atomics even when a batch's keys are already in order. TPC-H q18 groups lineitem by `l_orderkey`, which a table pinned in key order delivers sorted; its per-batch partial aggregation was 631 ms of q18's kernel time at SF1000.
 
-**Mechanism:** For a batch with a single fixed-width, null-free, non-dictionary key and no COLLECT_SET aggregate, `grouped_aggregate_table()` verifies with `keys_ascending()` (`src/cuda/sorted_keys.cu`) that the key is ascending and, if so, builds the group-by with `cudf::sorted::YES`, so cuDF reduces runs of equal keys instead of hashing. Unsorted batches keep the hash path, so correctness never depends on the data layout. For integer, boolean, timestamp, duration and fixed-point keys the check is one `thrust::is_sorted` pass that stops at the first descent; `cudf::is_sorted`'s generic row comparator is about 2.4 times slower on a sorted INT64 column (SF1000 q18: 0.620 s with it, 0.597 s with the typed pass). Other keys use `cudf::is_sorted`. Verified-sorted keys also let the stable STDDEV_SAMP path skip its own sort.
+**Mechanism:** For a batch with a single fixed-width, null-free, non-dictionary key and no COLLECT_SET aggregate, `grouped_aggregate_table()` verifies with `keys_ascending()` (`src/cuda/sorted_keys.cu`) that the key is ascending and, if so, builds the group-by with `cudf::sorted::YES`, so cuDF reduces runs of equal keys instead of hashing. Unsorted batches keep the hash path, so correctness never depends on the data layout. For integer, boolean, timestamp, duration and fixed-point keys the check is one `thrust::is_sorted` pass that stops at the first descent; `cudf::is_sorted`'s generic row comparator is about 2.4 times slower on a sorted INT64 column (SF1000 q18: 0.620 s with it, 0.597 s with the typed pass). Other keys use `cudf::is_sorted`.
 
 **Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` — `grouped_aggregate_table()`
 

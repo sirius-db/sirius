@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#include "cudf/ast_compat.hpp"
-
+#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/bit.hpp>

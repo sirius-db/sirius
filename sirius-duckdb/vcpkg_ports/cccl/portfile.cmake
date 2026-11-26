@@ -4,10 +4,10 @@ vcpkg_from_github(
   REPO
   NVIDIA/cccl
   REF
-  # Match the CCCL commit pinned by rapids-cmake 26.10.
-  b98d4bd6ff0715be42b7cfc78dfa9c4e212c5c5a
+  # Match the CCCL commit pinned by rapids-cmake 26.12.
+  084c5e6673faff38b8d2785982c01be055025b29
   SHA512
-  c1f194125145a9ae76e1cd8468eacdce3968b58c4f9bcad612637725eadd5cd6173716986d81bcee191d6ddae6d4f8ad7b3e4e9e514b4860cd0874b7a775d3f3
+  e753cef637bd89d53cf58047b59b44bbbd17a5c9e8dde0240a01078dbb979b2bed3cbba201f27c21aab504a4c89cdc6138ae19e42beda0c035a78f6d40004dae
   HEAD_REF
   main)
 

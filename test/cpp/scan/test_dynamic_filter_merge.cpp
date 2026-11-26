@@ -21,13 +21,13 @@
  *        column indices through scan_plan and skipping hive-partition columns.
  */
 
-#include "cudf/ast_compat.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "utils/host_allocation_fault.hpp"
 #include "utils/sirius_test_env.hpp"
 #include "utils/test_validation_utility.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>

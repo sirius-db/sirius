@@ -76,8 +76,7 @@ struct carried_row_selector {
  * @brief Appends the request that picks each group's carried row to @p requests
  *
  * The request is a MIN over the row positions `0 .. num_rows - 1`, so its result is the lowest
- * input row of each group. It stays an input position when the caller sorts every request's values
- * together with the keys before the groupby. Subsequent requests do not change its identity.
+ * input row of each group. Subsequent requests do not change its identity.
  *
  * @param requests The groupby's requests
  * @param num_rows Number of rows in the groupby input

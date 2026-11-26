@@ -4,17 +4,15 @@ vcpkg_from_github(
   OUT_SOURCE_PATH
   SOURCE_PATH
   REPO
-  rapidsai/cuvs
+  NVIDIA/cuvs
   REF
   v${VERSION}
   SHA512
-  73c98310f8f2723545eba183ef4e40f531e60f62976c0306a281a8dd4da9927262982f687ec5d2ead1bf61eb224b16a991499c32474667b4785d6b2e87f2a124
+  0
   PATCHES
   # NVCC 13.2 miscompiles kernel pointers with std::optional parameters.
   fix-pq-kernel-optional.patch
   static-cuda-math.patch
-  disable-openmp.patch
-  fix-host-refine-template-arguments.patch
   exclude-sources.patch
   # Unfiltered brute-force search no longer links cuSPARSE.
   split-filtered-brute-force.patch
@@ -27,9 +25,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v26.10.00
+  v26.12.00
   SHA512
-  c5c2be8672faae3990713a990b8e0d4e1082307c9dfd5857805bd543243daf0ec2c1fe41bbdb1736d5ea4e4e9fa261de44b2e8b885d812ce822814251d9f65d2
+  0
   HEAD_REF
   main)
 
@@ -54,11 +52,11 @@ vcpkg_from_github(
   OUT_SOURCE_PATH
   RAFT_PATH
   REPO
-  rapidsai/raft
+  NVIDIA/raft
   REF
-  v26.10.00
+  v26.12.00
   SHA512
-  337e03c28fe351bb6108cf0409b661781db6db44b40b957f86e50cdc92b2dd33ed92379ed4d3e1789bc7230b2c7112623312b90d5fdd18562fc06f279384a106
+  0
   PATCHES
   "${CMAKE_CURRENT_LIST_DIR}/../raft/static-cuda-math.patch"
   HEAD_REF
@@ -116,8 +114,8 @@ vcpkg_replace_string("${SOURCE_PATH}/cpp/cmake/modules/ConfigureCUDA.cmake"
 # optional cuTile generation so distribution builds need no cuda.tile package.
 vcpkg_replace_string(
   "${SOURCE_PATH}/cpp/cmake/modules/generate_cutile_kernels.cmake"
-  "  find_package(CUDAToolkit REQUIRED)"
-  "  if(CUVS_DISABLE_CUTILE)\n    message(STATUS \"cuTile kernels disabled for the Sirius vcpkg port\")\n    set(_CUTILE_SETUP_OK FALSE PARENT_SCOPE)\n    return()\n  endif()\n\n  find_package(CUDAToolkit REQUIRED)"
+  "  set_property(GLOBAL PROPERTY CUVS_CUTILE_ENABLED 0)\n"
+  "  set_property(GLOBAL PROPERTY CUVS_CUTILE_ENABLED 0)\n  if(CUVS_DISABLE_CUTILE)\n    message(STATUS \"cuTile kernels disabled for the Sirius vcpkg port\")\n    return()\n  endif()\n"
 )
 
 # Sirius only uses brute-force and IVF-Flat search (src/cuda/vss/). Skip the
@@ -126,16 +124,17 @@ set(CUVS_EXCLUDED_SOURCES
     "^src/cluster/(agglomerative|gmm_|single_linkage|spectral)"
     "^src/core/(bloom_filter|roaring)"
     "^src/distance/(kde|sparse_distance)"
-    "^src/neighbors/(all_neighbors|ball_cover|brute_force_serialize|cagra|composite/|detail/cagra/|dynamic_batching|epsilon_neighborhood|iface/|ivf_pq|ivf_rabitq|ivf_sq|nn_descent|refine/|roaring_bitmap_filter|scann/|sparse_brute_force|tiered_index|vamana)"
+    "^src/neighbors/(all_neighbors|ball_cover|brute_force_serialize|cagra|composite/|detail/cagra/|dynamic_batching|epsilon_neighborhood|iface/|ivf_binary|ivf_pq|ivf_rabitq|ivf_sq|nn_descent|refine/|roaring_bitmap_filter|scann/|sparse_brute_force|tiered_index|vamana)"
     "^src/(preprocessing|stats)/"
     "^generated_kernels/(cagra|ivf_pq|ivf_rabitq|ivf_sq)/")
 list(JOIN CUVS_EXCLUDED_SOURCES "|" CUVS_EXCLUDE_SOURCES_REGEX)
 
 # cuVS consumes RTCX, which is installed by the cuDF port and declared as a
-# direct manifest dependency below. Static link forces BUILD_TESTS/
-# BUILD_C_LIBRARY/BUILD_CAGRA_HNSWLIB OFF (so no gtest/hnswlib source is
-# needed). BUILD_MG_ALGOS OFF drops the multi-GPU/NCCL path. Sirius uses GPU
-# brute-force and IVF-Flat; disable CPU OpenMP support.
+# direct manifest dependency below. cuVS pins an older RTCX commit than cuDF;
+# the two differ only in documentation and a <variant> include. Static link
+# forces BUILD_TESTS/ BUILD_C_LIBRARY/BUILD_CAGRA_HNSWLIB OFF (so no
+# gtest/hnswlib source is needed). BUILD_MG_ALGOS OFF drops the multi-GPU/NCCL
+# path. Sirius uses GPU brute-force and IVF-Flat; disable CPU OpenMP support.
 vcpkg_cmake_configure(
   SOURCE_PATH
   "${SOURCE_PATH}/cpp"

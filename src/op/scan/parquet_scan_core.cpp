@@ -63,7 +63,6 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
-#include <cudf/version_config.hpp>
 
 #include <cuda/std/utility>
 
@@ -179,63 +178,6 @@ bool references_virtual_batch_column(duckdb::Expression const& expr, std::size_t
   bool found = false;
   duckdb::ExpressionIterator::EnumerateChildren(expr, [&](duckdb::Expression const& child) {
     if (!found) found = references_virtual_batch_column(child, physical_columns);
-  });
-  return found;
-}
-
-// cuDF before 26.12 hashes bloom-filter literals using the logical cuDF type
-// instead of the Parquet physical type. That can incorrectly discard row
-// groups for narrow integers, decimals and several other logical types.
-constexpr bool cudf_bloom_filter_probe_is_fixed = CUDF_VERSION_MAJOR > 26 ||
-                                                  (CUDF_VERSION_MAJOR == 26 &&
-                                                   CUDF_VERSION_MINOR >= 12);
-
-bool has_unreliable_bloom_filter_probe(duckdb::LogicalType const& type)
-{
-  if constexpr (cudf_bloom_filter_probe_is_fixed) { return false; }
-  switch (type.id()) {
-    case duckdb::LogicalTypeId::BOOLEAN:
-    case duckdb::LogicalTypeId::TINYINT:
-    case duckdb::LogicalTypeId::SMALLINT:
-    case duckdb::LogicalTypeId::UTINYINT:
-    case duckdb::LogicalTypeId::USMALLINT:
-    case duckdb::LogicalTypeId::DECIMAL:
-    case duckdb::LogicalTypeId::FLOAT:
-    case duckdb::LogicalTypeId::DOUBLE:
-    case duckdb::LogicalTypeId::TIME:
-    case duckdb::LogicalTypeId::TIME_NS:
-    case duckdb::LogicalTypeId::TIMESTAMP:
-    case duckdb::LogicalTypeId::TIMESTAMP_SEC:
-    case duckdb::LogicalTypeId::TIMESTAMP_MS:
-    case duckdb::LogicalTypeId::TIMESTAMP_NS:
-    case duckdb::LogicalTypeId::TIMESTAMP_TZ: return true;
-    default: return false;
-  }
-}
-
-bool references_unreliable_bloom_filter_column(duckdb::Expression const& expr)
-{
-  if (expr.GetExpressionType() == duckdb::ExpressionType::BOUND_REF) {
-    return has_unreliable_bloom_filter_probe(expr.GetReturnType());
-  }
-  bool found = false;
-  duckdb::ExpressionIterator::EnumerateChildren(expr, [&](duckdb::Expression const& child) {
-    if (!found) { found = references_unreliable_bloom_filter_column(child); }
-  });
-  return found;
-}
-
-bool has_unreliable_bloom_filter_equality(duckdb::Expression const& expr)
-{
-  auto const kind = expr.GetExpressionType();
-  if ((kind == duckdb::ExpressionType::COMPARE_EQUAL ||
-       kind == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
-      references_unreliable_bloom_filter_column(expr)) {
-    return true;
-  }
-  bool found = false;
-  duckdb::ExpressionIterator::EnumerateChildren(expr, [&](duckdb::Expression const& child) {
-    if (!found) { found = has_unreliable_bloom_filter_equality(child); }
   });
   return found;
 }
@@ -1015,28 +957,11 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
       }
     }
 
-    _reader_pushdown_expression  = _static_pushdown_expression;
-    _reader_pushdown_is_complete = _static_pushdown_is_complete;
-    if (_static_pushdown_expression &&
-        has_unreliable_bloom_filter_equality(*_static_pushdown_expression)) {
-      _reader_pushdown_is_complete = false;
-      _reader_pushdown_expression =
-        conjuncts_without(*_static_pushdown_expression, [](duckdb::Expression const& conjunct) {
-          return has_unreliable_bloom_filter_equality(conjunct);
-        });
-      SIRIUS_LOG_DEBUG(
-        "[parquet_gpu_ingestible] Predicate has an equality on a column with an unreliable "
-        "bloom filter probe. Pushing only the other conjuncts into the reader ({}), full "
-        "predicate applied post-decode: {}",
-        _reader_pushdown_expression ? _reader_pushdown_expression->ToString() : "none",
-        _duckdb_filter_expression->ToString());
-    }
-
     // Match complete catalogue items against the actual reader subset. In
     // particular, a safe child of a discarded compound item was NOT executed.
-    if (_reader_pushdown_expression) {
+    if (_static_pushdown_expression) {
       std::vector<duckdb::Expression const*> reader_conjuncts;
-      top_level_conjuncts(*_reader_pushdown_expression, reader_conjuncts);
+      top_level_conjuncts(*_static_pushdown_expression, reader_conjuncts);
       for (std::size_t id = 0; id < catalogue.size(); ++id)
         if (std::any_of(
               reader_conjuncts.begin(), reader_conjuncts.end(), [&](auto const* expression) {
@@ -1622,7 +1547,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   // sets. Preserve unsafe residual errors and a common no-filter batching decision.
   bool const preserve_iceberg_virtual_flow =
     _source_kind == parquet_source_kind::ICEBERG && _plan->has_user_virtual_columns() &&
-    ((!_reader_pushdown_expression && !_sirius_dynamic_filters) ||
+    ((!_static_pushdown_expression && !_sirius_dynamic_filters) ||
      (_duckdb_filter_expression && !safe_before_file_visibility(*_duckdb_filter_expression)));
   bool const disable_filter_pushdown =
     metadata_only || bool(mapping) || stats_filter_unsafe || preserve_iceberg_virtual_flow;
@@ -2058,25 +1983,13 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   // scans retain interval deletion before query predicate evaluation.
   out->position_filter_eligible =
     _source_kind == parquet_source_kind::ICEBERG && _plan->has_user_virtual_columns() &&
-    (_reader_pushdown_expression || _sirius_dynamic_filters) && !stats_filter_unsafe && !mapping &&
+    (_static_pushdown_expression || _sirius_dynamic_filters) && !stats_filter_unsafe && !mapping &&
     !metadata_only && !_plan->has_partitions() &&
     (!out->datasource || !out->datasource->prefers_bulk_io()) &&
     (!_duckdb_filter_expression || safe_before_file_visibility(*_duckdb_filter_expression));
-  if (out->position_filter_eligible && _reader_pushdown_expression) {
-    // Reuse the statistics translation when it is the same expression. Reader
-    // exclusions can leave a different subset; verify that subset once here.
-    out->static_reader_filter_ready =
-      _reader_pushdown_expression == _static_pushdown_expression && ast_expression.has_value();
-    if (_reader_pushdown_expression != _static_pushdown_expression) {
-      gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-      auto expression = sirius::ast::from_duckdb(*_reader_pushdown_expression);
-      out->static_reader_filter_ready =
-        translator
-          .translate_expression_with_names(
-            *expression,
-            [plan = _plan](duckdb::idx_t index) { return plan->batch_column_name(index); })
-          .has_value();
-    }
+  if (out->position_filter_eligible && _static_pushdown_expression) {
+    // The reader filter is the statistics expression; reuse its translation.
+    out->static_reader_filter_ready = ast_expression.has_value();
   }
   out->row_groups.reserve(row_group_indices.size());
   for (auto const rg_idx : row_group_indices) {
@@ -2660,8 +2573,8 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
   bool const disable_reader_filter = split.reader_filter_disabled(mem_space.get_device_id());
 
   // Null-free conjuncts only; the dynamic-filter block below is unaffected.
-  if (_reader_pushdown_expression && !disable_reader_filter && !all_slices_pruned) {
-    auto sirius_filter_ast = sirius::ast::from_duckdb(*_reader_pushdown_expression);
+  if (_static_pushdown_expression && !disable_reader_filter && !all_slices_pruned) {
+    auto sirius_filter_ast = sirius::ast::from_duckdb(*_static_pushdown_expression);
     D_ASSERT(sirius_filter_ast != nullptr);
     auto name_resolver = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
       return plan->batch_column_name(ref_index);
@@ -2822,7 +2735,7 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
   // The reader discharged the row filter only if it pushed the WHOLE predicate.
   // After a partial push the dropped conjuncts still have to be applied below.
   bool const reader_applied_full_filter =
-    ast_expression.has_value() && _reader_pushdown_is_complete;
+    ast_expression.has_value() && _static_pushdown_is_complete;
 
   if (_plan->has_partitions()) {
     auto progress = decoded_execution(ast_expression.has_value(), false);
@@ -2958,7 +2871,7 @@ scan_execution_record parquet_scan_core::decoded_execution(bool static_filter_ap
   record.projection_complete     = assembled;
   record.layout                  = execution_layout(assembled);
   record.whole_static_complete   = assembled || _catalogue->residual().empty() ||
-                                 (static_filter_applied && _reader_pushdown_is_complete);
+                                 (static_filter_applied && _static_pushdown_is_complete);
   // Whole completion needs no per-conjunct allocation. Partial coverage retains IDs.
   if (static_filter_applied && !record.whole_static_complete)
     for (auto id : _reader_conjuncts)

@@ -9,11 +9,11 @@ vcpkg_from_github(
   OUT_SOURCE_PATH
   SOURCE_PATH
   REPO
-  rapidsai/raft
+  NVIDIA/raft
   REF
-  v26.10.00
+  v26.12.00
   SHA512
-  337e03c28fe351bb6108cf0409b661781db6db44b40b957f86e50cdc92b2dd33ed92379ed4d3e1789bc7230b2c7112623312b90d5fdd18562fc06f279384a106
+  0
   PATCHES
   static-cuda-math.patch
   HEAD_REF
@@ -27,9 +27,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v26.10.00
+  v26.12.00
   SHA512
-  c5c2be8672faae3990713a990b8e0d4e1082307c9dfd5857805bd543243daf0ec2c1fe41bbdb1736d5ea4e4e9fa261de44b2e8b885d812ce822814251d9f65d2
+  0
   HEAD_REF
   main)
 

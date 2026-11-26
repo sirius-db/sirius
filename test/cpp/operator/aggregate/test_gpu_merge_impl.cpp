@@ -1051,10 +1051,9 @@ TEST_CASE("Grouped aggregate carries columns from one row of each group",
 TEST_CASE("Grouped aggregate carries columns beside an M2 state",
           "[operator][merge_grouped_agg][distinct]")
 {
-  // M2 sorts the local input by key, and the merge's MERGE_M2 runs on cuDF's sort path. The keys
-  // interleave, and 24 rows give each key 8, so each group starts at sorted index 0, 8 or 16, whose
-  // input rows hold keys 0, 2 and 1: a sorted index read as an input row gathers another group's
-  // row.
+  // The keys interleave, and 24 rows give each key 8, so each group's sorted start index 0, 8 or
+  // 16 holds keys 0, 2 and 1 as input rows: a sorted index read as an input row gathers another
+  // group's row.
   auto* mem_space                                       = get_shared_mem_space();
   std::vector<int> const group_idx                      = {0};
   std::vector<cudf::aggregation::Kind> const aggregates = {cudf::aggregation::Kind::M2};

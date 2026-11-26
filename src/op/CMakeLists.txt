@@ -2,7 +2,6 @@ target_sources(
   sirius_objects
   PRIVATE aggregate/aggregate_op_util.cpp
           aggregate/stddev.cpp
-          aggregate/group_key_labels.cpp
           aggregate/carried_columns.cpp
           aggregate/gpu_aggregate_impl.cpp
           window/aggregate_types.cpp

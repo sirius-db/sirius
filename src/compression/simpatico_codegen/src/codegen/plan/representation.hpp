@@ -12,7 +12,6 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
-#include <cudf/version_config.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -76,18 +75,14 @@ namespace simpatico {
 
 class decode_frame;
 
-// cuDF 26.12 changed null masks to CUDA buffers, but column data still uses RMM.
+// cuDF null masks are CUDA buffers, but column data uses RMM.
 inline rmm::device_buffer copy_bitmask_as_data(cudf::column_view const& source,
                                                ::cuda::stream_ref stream,
                                                rmm::device_async_resource_ref mr)
 {
   auto mask = cudf::copy_bitmask(source, stream, mr);
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
   // CUDA mask buffers count elements, while the sidecar and column data count bytes.
   return rmm::device_buffer(mask.data(), mask.size() * sizeof(*mask.data()), stream, mr);
-#else
-  return mask;
-#endif
 }
 
 struct compressible_output {
