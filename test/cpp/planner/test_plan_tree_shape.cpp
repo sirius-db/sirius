@@ -61,10 +61,13 @@
 #include <cudf/types.hpp>
 
 #include <catch.hpp>
+#include <duckdb/catalog/catalog.hpp>
+#include <duckdb/common/vector_operations/unary_executor.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/cte_filter_pusher.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
+#include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_columnref_expression.hpp>
@@ -2791,6 +2794,28 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                "SELECT pk, first(pk ORDER BY pname COLLATE NOCASE), max(lower(pname)) FROM parts "
                "GROUP BY pk");
     require_rejected(query, "NOCASE-collated or lower() ORDER BY key");
+  }
+
+  // An overload registered under create_sort_key joins the built-in's catalog set, and DuckDB's
+  // rewrite then binds it for an INTEGER key. Decoded as the built-in, it would keep the smallest
+  // `val` where the overload ranks by -val.
+  SECTION("an ordered FIRST over a registered create_sort_key overload is refused")
+  {
+    con->context->RunFunctionInTransaction([&]() {
+      ScalarFunction negated_key(
+        "create_sort_key",
+        {LogicalType::INTEGER, LogicalType::VARCHAR},
+        LogicalType::BIGINT,
+        [](DataChunk& args, ExpressionState&, Vector& result) {
+          UnaryExecutor::Execute<int32_t, int64_t>(
+            args.data[0], result, args.size(), [](int32_t x) { return -int64_t{x}; });
+        });
+      CreateScalarFunctionInfo info(negated_key);
+      info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+      Catalog::GetSystemCatalog(*con->context).CreateFunction(*con->context, info);
+    });
+    require_rejected("SELECT id, first(val ORDER BY val) FROM big_left GROUP BY id",
+                     "Unsupported expression in aggregate (falling back to CPU): create_sort_key");
   }
 
   SECTION("an ungrouped ordered FIRST is refused")

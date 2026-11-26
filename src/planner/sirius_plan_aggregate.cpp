@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "core_functions/aggregate/distributive_functions.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
@@ -22,6 +23,7 @@
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/scalar/generic_functions.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression_map.hpp"
@@ -209,29 +211,49 @@ bool is_first(duckdb::BoundAggregateExpression const& aggregate)
          sirius::aggregate_id::first;
 }
 
+// Whether @p signature is one of @p builtins' overloads. An overload registered under a built-in's
+// name joins its catalog set, so the name alone does not identify DuckDB's function.
+bool is_builtin_overload(duckdb::FunctionSignature const& signature,
+                         duckdb::AggregateFunctionSet const& builtins)
+{
+  return std::ranges::any_of(builtins.functions, [&](auto const& builtin) {
+    return builtin->GetSignature().IsSameOverload(signature);
+  });
+}
+
+bool is_arg_min_null(duckdb::BoundAggregateExpression const& aggregate)
+{
+  static auto const builtins = duckdb::ArgMinNullFun::GetFunctions();
+  return aggregate.Function().GetName().GetIdentifierName() == "arg_min_null" &&
+         is_builtin_overload(aggregate.Function().GetDefinition()->GetSignature(), builtins);
+}
+
 bool is_arg_max_null(duckdb::BoundAggregateExpression const& aggregate)
 {
-  return aggregate.Function().GetName().GetIdentifierName() == "arg_max_null";
+  static auto const builtins = duckdb::ArgMaxNullFun::GetFunctions();
+  return aggregate.Function().GetName().GetIdentifierName() == "arg_max_null" &&
+         is_builtin_overload(aggregate.Function().GetDefinition()->GetSignature(), builtins);
 }
 
 // DuckDB rewrites first(v ORDER BY ...) to arg_min_null(v, sort_key) and last(v ORDER BY ...) to
-// arg_max_null(v, sort_key). Matched by name only: create_sort_key returns BIGINT or BLOB. One with
-// its own ORDER BY, which breaks ties on the sort key, is not a decodable FIRST.
+// arg_max_null(v, sort_key). One with its own ORDER BY, which breaks ties on the sort key, is not a
+// decodable FIRST.
 bool is_unordered_arg_min_or_max_null(duckdb::BoundAggregateExpression const& aggregate)
 {
-  return (aggregate.Function().GetName().GetIdentifierName() == "arg_min_null" ||
-          is_arg_max_null(aggregate)) &&
+  return (is_arg_min_null(aggregate) || is_arg_max_null(aggregate)) &&
          aggregate.GetChildren().size() == 2 && !aggregate.GetOrderBys();
 }
 
-// create_sort_key(k1, 'm1', ...) with every modifier a non-NULL constant.
+// DuckDB's create_sort_key(k1, 'm1', ...) with every modifier a non-NULL constant.
 bool is_decodable_sort_key(duckdb::Expression const& expression)
 {
   if (expression.GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) { return false; }
   auto const& sort_key = expression.Cast<duckdb::BoundFunctionExpression>();
   auto const& terms    = sort_key.GetChildren();
-  if (sort_key.Function().GetName().GetIdentifierName() != "create_sort_key" || terms.empty() ||
-      terms.size() % 2 != 0) {
+  if (sort_key.Function().GetName().GetIdentifierName() != "create_sort_key" ||
+      !sort_key.Function().GetDefinition()->GetSignature().IsSameOverload(
+        duckdb::CreateSortKeyFun::GetFunction().GetSignature()) ||
+      terms.empty() || terms.size() % 2 != 0) {
     return false;
   }
   for (std::size_t i = 1; i < terms.size(); i += 2) {
