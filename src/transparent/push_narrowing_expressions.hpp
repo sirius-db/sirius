@@ -32,9 +32,9 @@ namespace sirius::transparent {
 /// q9's `l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity`: 16 bytes for 32).
 ///
 /// DuckDB's PROJECTION_PLACEMENT refuses any expression that can throw, which is every arithmetic
-/// function: below the join it would also run on rows the join drops. This moves only DECIMAL
-/// `+`, `-` and `*`, which Sirius evaluates without an overflow check wherever they sit, and only
-/// in Sirius's copy of the plan, never in the plan a CPU fallback runs.
+/// function: below the join it would also run on rows the join drops. This moves only DECIMAL and
+/// DOUBLE `+`, `-` and `*`, which Sirius evaluates without an overflow check wherever they sit, and
+/// only in Sirius's copy of the plan, never in the plan a CPU fallback runs.
 ///
 /// @return The number of moved expressions.
 std::size_t push_narrowing_expressions(duckdb::LogicalOperator& plan, duckdb::Binder& binder);
