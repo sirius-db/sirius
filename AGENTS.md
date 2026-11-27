@@ -58,6 +58,9 @@ the [source quick start](docs/README.md#quick-start).
 [sirius-fuzz skill](.agents/skills/sirius-fuzz/SKILL.md) for requests to run the fuzzer or check
 fuzzing readiness. It selects from the developer's available environments and checks GPU
 interception before a bounded run. CLI details live in [test/fuzz/README.md](test/fuzz/README.md).
+For a complete campaign that investigates findings, implements fixes, validates them, and
+prepares contributor-fork PRs, use the
+[sirius-fuzz-fix skill](.agents/skills/sirius-fuzz-fix/SKILL.md).
 
 ## Architecture
 
