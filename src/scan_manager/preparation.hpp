@@ -31,6 +31,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace sirius::scan_manager {
 enum class preparation_execution_domain { metadata_worker, query_owner, native_reader };
@@ -71,6 +72,19 @@ struct checkpoint_input {
 };
 
 struct preparation_gate {
+  class callback_use {
+   public:
+    callback_use()                        = default;
+    callback_use(callback_use&&) noexcept = default;
+    ~callback_use();
+    callback_use(callback_use const&)            = delete;
+    callback_use& operator=(callback_use const&) = delete;
+    // Activate while holding the gate; destroy after detached payloads and locks.
+    void activate_under_gate(std::shared_ptr<preparation_gate> const& gate) noexcept;
+
+   private:
+    std::shared_ptr<preparation_gate> gate_;
+  };
   std::mutex mutex;
   std::condition_variable cv;
   // Protected by mutex; captures notifications that arrive during unlocked callbacks.
@@ -126,7 +140,7 @@ class preparation_unit {
 
  private:
   friend class preparation_coordinator;
-  bool cancel_under_gate();
+  bool cancel_under_gate(op::scan::split_dependencies& retired);
   bool accept(required_input);
   void finish_input(required_input);
   std::shared_ptr<preparation_gate> gate_;

@@ -73,6 +73,9 @@ jobs:
           pixi run -e ${{ matrix.cuda.pixi-environment }} python -m unittest discover \
             -s test/tpch_performance -p 'test_performance_test_s3.py'
 
+      - name: Test Pixi activation invariants without a GPU
+        run: pixi run -e ${{ matrix.cuda.pixi-environment }} python -B test/scripts/test_pixi_activate.py -v
+
       - name: Test Simpatico cache identity without a GPU
         run: |
           pixi run -e ${{ matrix.cuda.pixi-environment }} cmake \
@@ -168,6 +171,11 @@ jobs:
         run: |
           pixi run -e ${{ matrix.cuda.pixi-environment }} cmake --build build/release \
             --target simpatico_cache_gpu_tests
+
+      - name: Build preparation allocation fault helper
+        run: |
+          pixi run -e ${{ matrix.cuda.pixi-environment }} cmake --build build/release \
+            --target sirius_host_allocation_fault
 
       - name: Package build artifacts
         run: tar -cf build.tar build/release/ sirius-duckdb/build/release/
@@ -273,6 +281,35 @@ jobs:
         run: |
           nvidia-smi
           python3 scripts/run_unit_tests.py --require-gpus 2 -- --abort
+
+      - name: Test cancelled waiter watchdog
+        if: matrix.cuda.version == '13'
+        timeout-minutes: 5
+        env:
+          SIRIUS_EXTENSION_PATH: ${{ github.workspace }}/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+          SIRIUS_TEST_GPU: "1"
+          SIRIUS_TEST_SINGLE_GPU: "1"
+          SIRIUS_TEST_INTEGRATION_CONFIG: ${{ github.workspace }}/test/cpp/integration/integration-shard.yaml
+          SIRIUS_TEST_LOG_DIR: ${{ github.workspace }}/build/release/test/cpp/log/ac9-watchdog
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          CUDA_VISIBLE_DEVICES="$(python3 -B -c 'from scripts.run_unit_tests import visible_gpus; print(visible_gpus()[0])')"
+          export CUDA_VISIBLE_DEVICES
+          mkdir -p "$SIRIUS_TEST_LOG_DIR"
+          exec build/release/test/cpp/sirius_unittest \
+            'a cancelled waiter cannot enter a later execution window' \
+            --success --reporter xml --out "$SIRIUS_TEST_LOG_DIR/results.xml"
+
+      - name: Test preparation allocation failures
+        timeout-minutes: 5
+        env:
+          LD_PRELOAD: ${{ github.workspace }}/build/release/libsirius_host_allocation_fault.so
+          SIRIUS_TEST_LOG_DIR: ${{ github.workspace }}/build/release/test/cpp/log/preparation-faults
+        run: |
+          mkdir -p build/release/test/cpp/log/preparation-faults
+          build/release/test/cpp/sirius_unittest '[preparation_allocation_fault]' \
+            --reporter xml \
+            --out build/release/test/cpp/log/preparation-faults/results.xml
 
       - name: Run Rust bindings tests
         run: |
