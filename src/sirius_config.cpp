@@ -703,6 +703,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("enable_partial_aggregate_below_join", opt.enable_partial_aggregate_below_join);
   r.optional("enable_subquery_key_carry", opt.enable_subquery_key_carry);
   r.optional("enable_exists_from_aggregate", opt.enable_exists_from_aggregate);
+  r.optional("enable_late_dimension_join", opt.enable_late_dimension_join);
   if (r.has("dense_count_join_max_bytes")) {
     throw std::runtime_error(
       "'sirius.operator_params.dense_count_join_max_bytes': removed; dense count-join histogram "
