@@ -364,11 +364,11 @@ TEST_CASE("distribute_plan has a merged join's build CONCAT close its publicatio
                 .cross_rank_merge());
       auto const& filters =
         join->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan();
-      CHECK(filters.policy().fixed_bloom_keys ==
-            sirius::planner::merged_bloom_keys(join->children.at(1)->estimated_cardinality,
-                                               filters.max_bloom_bytes_per_gpu(),
-                                               3,
-                                               filters.admitted_keys().size()));
+      // Each rank sizes its Blooms from its own build rows times the 3 ranks, within the budget.
+      CHECK(filters.policy().bloom_rows_scale == 3);
+      CHECK(filters.policy().scaled_bloom_max_keys ==
+            sirius::planner::merged_bloom_key_cap(
+              filters.max_bloom_bytes_per_gpu(), 3, filters.admitted_keys().size()));
       CHECK(closed_by_build_finalize(*join));
     }
   }

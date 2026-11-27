@@ -67,9 +67,13 @@ struct dynamic_filter_publication_policy {
   std::uint64_t max_bloom_bytes_per_gpu = default_max_dynamic_filter_bloom_bytes_per_gpu;
   //! Membership filters are Blooms only, never IN-lists.
   bool bloom_only = false;
-  //! Non-zero: every Bloom, whole-build or accumulated, is sized for this many keys whatever the
-  //! build's rows, and max_bloom_bytes_per_gpu does not cut it. Zero: sized from the build.
-  std::size_t fixed_bloom_keys = 0;
+  //! Non-zero: this build holds one part in bloom_rows_scale of the keys its filters must cover.
+  //! Every Bloom, whole-build or accumulated, is then sized for the build's rows times it, within
+  //! [scaled_bloom_min_keys, scaled_bloom_max_keys], as a power-of-two number of blocks
+  //! (scaled_bloom_keys), and max_bloom_bytes_per_gpu does not cut it. Zero: sized from the build.
+  std::size_t bloom_rows_scale      = 0;
+  std::size_t scaled_bloom_min_keys = std::size_t{1} << 16;
+  std::size_t scaled_bloom_max_keys = std::size_t{1} << 30;
   //! Publish even an empty build, or with every target drained, rather than skip the publication.
   bool publish_when_empty_or_drained = false;
 };
