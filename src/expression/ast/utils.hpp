@@ -88,8 +88,14 @@ void visit_references(node const& root, Fn&& fn)
           detail::visit_child(child, fn);
         }
       } else if constexpr (std::is_same_v<T, function_call>) {
-        for (auto const& child : alt.arguments()) {
-          detail::visit_child(child, fn);
+        // A list_transform lambda has its own reference namespace: reference 0
+        // is a list element, not column 0 of the surrounding projection.
+        if (alt.function() == function_id::list_transform) {
+          detail::visit_child(alt.arguments()[0], fn);
+        } else {
+          for (auto const& child : alt.arguments()) {
+            detail::visit_child(child, fn);
+          }
         }
       } else if constexpr (std::is_same_v<T, aggregate>) {
         for (auto const& child : alt.arguments()) {

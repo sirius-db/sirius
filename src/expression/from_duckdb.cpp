@@ -44,6 +44,7 @@
 #include <duckdb/common/assert.hpp>
 #include <duckdb/common/enums/expression_type.hpp>
 #include <duckdb/common/exception.hpp>
+#include <duckdb/common/types.hpp>
 #include <duckdb/planner/expression.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_between_expression.hpp>
@@ -53,6 +54,7 @@
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_lambda_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <re2/re2.h>
@@ -238,6 +240,22 @@ std::optional<int64_t> bigint_constant(duckdb::Expression const& expr)
   return value.GetValue<int64_t>();
 }
 
+std::optional<int64_t> integer_index_constant(duckdb::Expression const& expr)
+{
+  if (duckdb::BoundCastExpression::IsCast(expr) &&
+      expr.GetReturnType().id() == duckdb::LogicalTypeId::BIGINT) {
+    return integer_index_constant(
+      duckdb::BoundCastExpression::Child(expr.Cast<duckdb::BoundFunctionExpression>()));
+  }
+  if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return std::nullopt; }
+  auto const& value = expr.Cast<duckdb::BoundConstantExpression>().GetValue();
+  if (value.IsNull() || (value.type().id() != duckdb::LogicalTypeId::INTEGER &&
+                         value.type().id() != duckdb::LogicalTypeId::BIGINT)) {
+    return std::nullopt;
+  }
+  return value.GetValue<int64_t>();
+}
+
 // The GPU evaluator applies one slice to every row, so it needs constant BIGINT bounds that
 // gpu_substring_slice can map onto DuckDB's semantics.
 bool gpu_supports_substring(duckdb::BoundFunctionExpression const& expr)
@@ -289,6 +307,70 @@ bool gpu_supports_negate(duckdb::BoundFunctionExpression const& expr)
   }
 }
 
+bool gpu_supports_list_aggr(duckdb::BoundFunctionExpression const& expr)
+{
+  auto const& children = expr.GetChildren();
+  if (children[0]->GetReturnType().id() != duckdb::LogicalTypeId::LIST ||
+      children[1]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+    return false;
+  }
+  auto const& element_type = duckdb::ListType::GetChildType(children[0]->GetReturnType());
+  if (!element_type.IsNumeric()) { return false; }
+  auto const& operation = children[1]->Cast<duckdb::BoundConstantExpression>().GetValue();
+  if (operation.IsNull() || operation.type().id() != duckdb::LogicalTypeId::VARCHAR) {
+    return false;
+  }
+  auto const& name = duckdb::StringValue::Get(operation);
+  if (name == "avg") { return true; }
+  if (name != "sum") { return false; }
+  // A LIST can contain up to 2^31 elements. Wider inputs can overflow the
+  // fixed-width segmented SUM before DuckDB's decimal overflow check.
+  return element_type.id() != duckdb::LogicalTypeId::HUGEINT &&
+         element_type.id() != duckdb::LogicalTypeId::UHUGEINT &&
+         (element_type.id() != duckdb::LogicalTypeId::DECIMAL ||
+          duckdb::DecimalType::GetWidth(element_type) <= 28);
+}
+
+std::unique_ptr<node> translate_list_transform(duckdb::BoundFunctionExpression const& expr)
+{
+  auto const& children = expr.GetChildren();
+  if (children[0]->GetReturnType().id() != duckdb::LogicalTypeId::LIST ||
+      children[1]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_LAMBDA) {
+    return nullptr;
+  }
+  auto const& lambda = children[1]->Cast<duckdb::BoundLambdaExpression>();
+  // A lambda body refers to its element as reference 0. Captured columns and index
+  // parameters require a separate row-to-element expansion and are not handled here.
+  if (lambda.ParameterCount() != 1 || !lambda.Captures().empty()) { return nullptr; }
+  auto list = from_duckdb(*children[0]);
+  auto body = from_duckdb(*lambda.LambdaExpr());
+  if (!list || !body) { return nullptr; }
+  std::vector<std::unique_ptr<node>> arguments;
+  arguments.push_back(std::move(list));
+  arguments.push_back(std::move(body));
+  return std::make_unique<node>(function_call{
+    function_id::list_transform, std::move(arguments), sirius::from_duckdb(expr.GetReturnType())});
+}
+
+std::unique_ptr<node> translate_array_extract(duckdb::BoundFunctionExpression const& expr)
+{
+  auto const& children = expr.GetChildren();
+  auto const index     = integer_index_constant(*children[1]);
+  if ((children[0]->GetReturnType().id() != duckdb::LogicalTypeId::STRUCT &&
+       children[0]->GetReturnType().id() != duckdb::LogicalTypeId::TUPLE) ||
+      !index) {
+    return nullptr;
+  }
+  auto source = from_duckdb(*children[0]);
+  if (!source) { return nullptr; }
+  std::vector<std::unique_ptr<node>> arguments;
+  arguments.push_back(std::move(source));
+  arguments.push_back(
+    std::make_unique<node>(constant{*index, sirius::logical_type::make(sirius::type_id::BIGINT)}));
+  return std::make_unique<node>(function_call{
+    function_id::array_extract, std::move(arguments), sirius::from_duckdb(expr.GetReturnType())});
+}
+
 std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& expr)
 {
   // Optional scan predicates are hints; the required predicate remains in the plan.
@@ -311,6 +393,20 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   }
   auto const func_id_opt = sirius::from_duckdb_function_name(name, children.size());
   if (!func_id_opt.has_value()) { return nullptr; }
+  if (*func_id_opt == function_id::list_transform) { return translate_list_transform(expr); }
+  if (*func_id_opt == function_id::array_extract) { return translate_array_extract(expr); }
+  if (*func_id_opt == function_id::list_aggr && !gpu_supports_list_aggr(expr)) { return nullptr; }
+  if (*func_id_opt == function_id::list_zip) {
+    if (expr.GetReturnType().id() != duckdb::LogicalTypeId::LIST) { return nullptr; }
+    for (auto const& child : children) {
+      if (child->GetReturnType().id() != duckdb::LogicalTypeId::LIST) { return nullptr; }
+    }
+  }
+  if (*func_id_opt == function_id::length &&
+      children[0]->GetReturnType().id() != duckdb::LogicalTypeId::VARCHAR &&
+      children[0]->GetReturnType().id() != duckdb::LogicalTypeId::LIST) {
+    return nullptr;
+  }
   if (*func_id_opt == function_id::negate && !gpu_supports_negate(expr)) { return nullptr; }
   if (*func_id_opt == function_id::date_trunc) {
     // Match the GPU evaluator's supported frequencies. It requires a constant string;

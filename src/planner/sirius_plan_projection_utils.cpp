@@ -142,8 +142,18 @@ void mark_conditional_uses(sirius::ast::node const& expr,
         }
       } else if constexpr (std::is_same_v<T, sirius::ast::function_call> ||
                            std::is_same_v<T, sirius::ast::aggregate>) {
-        for (auto const& argument : alt.arguments()) {
-          descend(argument, false);
+        if constexpr (std::is_same_v<T, sirius::ast::function_call>) {
+          if (alt.function() == function_id::list_transform) {
+            descend(alt.arguments()[0], false);
+          } else {
+            for (auto const& argument : alt.arguments()) {
+              descend(argument, false);
+            }
+          }
+        } else {
+          for (auto const& argument : alt.arguments()) {
+            descend(argument, false);
+          }
         }
       } else {
         static_assert(sizeof(T) == 0,

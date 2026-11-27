@@ -37,10 +37,16 @@
 // cudf
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/datetime.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/lists/count_elements.hpp>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/replace.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/search.hpp>
 #include <cudf/strings/attributes.hpp>
@@ -52,6 +58,7 @@
 #include <cudf/strings/replace_re.hpp>
 #include <cudf/strings/slice.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/structs/structs_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -63,6 +70,7 @@
 
 // standard library
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <optional>
@@ -466,6 +474,181 @@ evaluate_result expression_evaluator::evaluate_function_kernel(
 {
   auto const resolved_id = alt.function();
   auto const& args       = alt.arguments();
+  if (resolved_id == function_id::array_extract) {
+    auto source            = evaluate_as_column(*args[0]);
+    auto const one_based   = std::get<int64_t>(args[1]->get<sirius::ast::constant>().payload);
+    auto const struct_view = cudf::structs_column_view{source.get_column_view()};
+    if (one_based < 1 || one_based > struct_view.num_children()) {
+      throw not_implemented_exception("array_extract struct index is out of range");
+    }
+    auto const child = struct_view.get_sliced_child(static_cast<int>(one_based - 1), _stream);
+    auto result      = std::make_unique<cudf::column>(child, _stream, _mr);
+    auto [mask, null_count] =
+      cudf::bitmask_and(cudf::table_view{{source.get_column_view(), result->view()}}, _stream, _mr);
+    result->set_null_mask(std::move(mask), null_count);
+    return evaluate_result(std::move(result));
+  }
+  if (resolved_id == function_id::list_aggr) {
+    auto input             = evaluate_as_column(*args[0]);
+    auto const lists       = cudf::lists_column_view{input.get_column_view()};
+    auto const& operation  = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
+    auto const result_type = sirius::require_cudf_type(alt.return_type());
+    if (lists.size() == 0) { return evaluate_result(cudf::make_empty_column(result_type)); }
+    auto values = lists.child();
+    std::unique_ptr<cudf::column> promoted;
+    // cuDF's segmented decimal reduction requires the input and output physical
+    // types to match. DuckDB widens decimal SUM and returns DOUBLE for AVG.
+    if (cudf::is_fixed_point(values.type()) && values.type() != result_type) {
+      promoted = cudf::cast(values, result_type, _stream, _mr);
+      values   = promoted->view();
+    }
+    auto const offsets = cudf::device_span<cudf::size_type const>{
+      lists.offsets_begin(), static_cast<std::size_t>(lists.size()) + 1};
+    auto result =
+      operation == "sum"
+        ? cudf::segmented_reduce(values,
+                                 offsets,
+                                 *cudf::make_sum_aggregation<cudf::segmented_reduce_aggregation>(),
+                                 result_type,
+                                 cudf::null_policy::EXCLUDE,
+                                 _stream,
+                                 _mr)
+        : cudf::segmented_reduce(values,
+                                 offsets,
+                                 *cudf::make_mean_aggregation<cudf::segmented_reduce_aggregation>(),
+                                 result_type,
+                                 cudf::null_policy::EXCLUDE,
+                                 _stream,
+                                 _mr);
+    auto [mask, null_count] =
+      cudf::bitmask_and(cudf::table_view{{input.get_column_view(), result->view()}}, _stream, _mr);
+    result->set_null_mask(std::move(mask), null_count);
+    return evaluate_result(std::move(result));
+  }
+  if (resolved_id == function_id::list_transform) {
+    auto input = evaluate_as_column(*args[0]);
+    // Materializing a sliced LIST rebases its offsets and child, which the new
+    // output LIST needs when it reuses those offsets with transformed values.
+    std::unique_ptr<cudf::column> normalized;
+    if (input.get_column_view().offset() != 0) {
+      normalized = std::make_unique<cudf::column>(input.get_column_view(), _stream, _mr);
+    }
+    auto const list_view = normalized ? normalized->view() : input.get_column_view();
+    auto const lists     = cudf::lists_column_view{list_view};
+    auto const child     = lists.size() == 0 ? lists.parent().child(1) : lists.child();
+    expression_evaluator lambda{*args[1], _mr, _stream, _policy};
+    auto result_table = lambda.evaluate(cudf::table_view{{child}});
+    auto output       = result_table->release();
+    auto offsets =
+      lists.size() == 0
+        ? cudf::make_column_from_scalar(
+            cudf::numeric_scalar<cudf::size_type>{0, true, _stream, _mr}, 1, _stream, _mr)
+        : std::make_unique<cudf::column>(lists.offsets(), _stream, _mr);
+    return evaluate_result(cudf::make_lists_column(lists.size(),
+                                                   std::move(offsets),
+                                                   std::move(output[0]),
+                                                   lists.null_count(),
+                                                   cudf::copy_bitmask(list_view, _stream, _mr)));
+  }
+  if (resolved_id == function_id::list_zip) {
+    std::vector<evaluate_result> inputs;
+    inputs.reserve(args.size());
+    std::vector<cudf::lists_column_view> lists;
+    lists.reserve(args.size());
+    for (auto const& arg : args) {
+      inputs.push_back(evaluate_as_column(*arg));
+      lists.emplace_back(inputs.back().get_column_view());
+    }
+    auto const rows = lists.front().size();
+    if (rows == 0) {
+      std::vector<std::unique_ptr<cudf::column>> empty_fields;
+      for (auto const& list : lists) {
+        empty_fields.push_back(cudf::empty_like(list.parent().child(1)));
+      }
+      auto empty_struct = cudf::make_structs_column(
+        0, std::move(empty_fields), 0, rmm::device_buffer{}, _stream, _mr);
+      auto const zero = cudf::numeric_scalar<cudf::size_type>{0, true, _stream, _mr};
+      auto offsets    = cudf::make_column_from_scalar(zero, 1, _stream, _mr);
+      return evaluate_result(cudf::make_lists_column(
+        0, std::move(offsets), std::move(empty_struct), 0, rmm::device_buffer{}));
+    }
+    auto const zero = cudf::numeric_scalar<cudf::size_type>{0, true, _stream, _mr};
+    auto const one  = cudf::numeric_scalar<cudf::size_type>{1, true, _stream, _mr};
+    std::vector<std::unique_ptr<cudf::column>> counts;
+    counts.reserve(lists.size());
+    for (auto const& list : lists) {
+      auto count = cudf::lists::count_elements(list, _stream, _mr);
+      counts.push_back(cudf::replace_nulls(count->view(), zero, _stream, _mr));
+    }
+    auto widths = std::make_unique<cudf::column>(counts.front()->view(), _stream, _mr);
+    for (std::size_t i = 1; i < counts.size(); ++i) {
+      widths = cudf::binary_operation(widths->view(),
+                                      counts[i]->view(),
+                                      cudf::binary_operator::NULL_MAX,
+                                      cudf::data_type{cudf::type_id::INT32},
+                                      _stream,
+                                      _mr);
+    }
+    auto const sum = cudf::make_sum_aggregation<cudf::scan_aggregation>();
+    auto ends      = cudf::scan(
+      widths->view(), *sum, cudf::scan_type::INCLUSIVE, cudf::null_policy::EXCLUDE, _stream, _mr);
+    auto zero_column = cudf::make_column_from_scalar(zero, 1, _stream, _mr);
+    std::array<cudf::column_view, 2> offset_parts{zero_column->view(), ends->view()};
+    auto offsets = cudf::concatenate(offset_parts, _stream, _mr);
+    auto starts  = cudf::slice(offsets->view(), {0, rows}, _stream)[0];
+
+    // Repeating row starts and each input's offsets/counts creates one row per
+    // output element. The flat position minus the repeated row start is its
+    // position inside the zipped list.
+    std::vector<cudf::column_view> repeat_columns{starts};
+    for (std::size_t i = 0; i < lists.size(); ++i) {
+      repeat_columns.push_back(
+        cudf::slice(lists[i].offsets(), {lists[i].offset(), lists[i].offset() + rows}, _stream)[0]);
+      repeat_columns.push_back(counts[i]->view());
+    }
+    auto repeated = cudf::repeat(cudf::table_view{repeat_columns}, widths->view(), _stream, _mr);
+    auto const elements = repeated->num_rows();
+    auto positions      = cudf::sequence(elements, zero, one, _stream, _mr);
+    auto const flat     = cudf::binary_operation(positions->view(),
+                                             repeated->view().column(0),
+                                             cudf::binary_operator::SUB,
+                                             cudf::data_type{cudf::type_id::INT32},
+                                             _stream,
+                                             _mr);
+    std::vector<std::unique_ptr<cudf::column>> fields;
+    fields.reserve(lists.size());
+    auto const missing = cudf::numeric_scalar<cudf::size_type>{-1, true, _stream, _mr};
+    for (std::size_t i = 0; i < lists.size(); ++i) {
+      auto const offsets_i = repeated->view().column(1 + 2 * i);
+      auto const counts_i  = repeated->view().column(2 + 2 * i);
+      auto const candidate = cudf::binary_operation(offsets_i,
+                                                    flat->view(),
+                                                    cudf::binary_operator::ADD,
+                                                    cudf::data_type{cudf::type_id::INT32},
+                                                    _stream,
+                                                    _mr);
+      auto const valid     = cudf::binary_operation(flat->view(),
+                                                counts_i,
+                                                cudf::binary_operator::LESS,
+                                                cudf::data_type{cudf::type_id::BOOL8},
+                                                _stream,
+                                                _mr);
+      auto const indices =
+        cudf::copy_if_else(candidate->view(), missing, valid->view(), _stream, _mr);
+      auto gathered         = cudf::gather(cudf::table_view{{lists[i].child()}},
+                                   indices->view(),
+                                   cudf::out_of_bounds_policy::NULLIFY,
+                                   cudf::negative_index_policy::NOT_ALLOWED,
+                                   _stream,
+                                   _mr);
+      auto gathered_columns = gathered->release();
+      fields.push_back(std::move(gathered_columns.front()));
+    }
+    auto struct_values =
+      cudf::make_structs_column(elements, std::move(fields), 0, rmm::device_buffer{}, _stream, _mr);
+    return evaluate_result(cudf::make_lists_column(
+      rows, std::move(offsets), std::move(struct_values), 0, rmm::device_buffer{}));
+  }
   auto const output_type = sirius::require_cudf_type(alt.return_type());
 
   if (auto const date_operation = alt.date_operation(); date_operation.has_value()) {
@@ -824,7 +1007,12 @@ evaluate_result expression_evaluator::evaluate_function_kernel(
   }
   if (resolved_id == function_id::length) {
     D_ASSERT(args.size() == 1);
-    auto input         = evaluate_as_column(*args[0]);
+    auto input = evaluate_as_column(*args[0]);
+    if (input.get_column_view().type().id() == cudf::type_id::LIST) {
+      auto counts =
+        cudf::lists::count_elements(cudf::lists_column_view{input.get_column_view()}, _stream, _mr);
+      return evaluate_result(cudf::cast(counts->view(), output_type, _stream, _mr));
+    }
     auto result_column = cudf::strings::count_characters(
       cudf::strings_column_view(input.get_column_view()), _stream, _mr);
     return evaluate_result(std::move(result_column));

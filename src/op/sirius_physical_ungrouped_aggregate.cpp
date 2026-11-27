@@ -116,6 +116,7 @@ enum class aggregate_kind {
   MAX,
   COUNT,
   COUNT_DISTINCT,
+  LIST,
   COUNT_STAR,
   AVG,
   FIRST,
@@ -178,7 +179,16 @@ aggregate_layout build_aggregate_layout(
         "not supported in GPU path yet");
     }
 
-    auto agg_return_type = sirius::to_duckdb(agg.return_type());
+    if (agg.function() == sirius::aggregate_id::list &&
+        (children.size() != 1 || !children[0]->is_reference())) {
+      throw not_implemented_exception("list() requires one column argument");
+    }
+    // Sirius's flat LIST type does not carry the element type. Reconstruct the local
+    // one-row partial's schema from the argument, which still has its element type.
+    auto agg_return_type =
+      agg.function() == sirius::aggregate_id::list
+        ? duckdb::LogicalType::LIST(sirius::to_duckdb(children[0]->return_type()))
+        : sirius::to_duckdb(agg.return_type());
     auto child_ref_index = [&]() { return children[0]->as_reference().column_index; };
 
     aggregate_spec spec;
@@ -224,6 +234,14 @@ aggregate_layout build_aggregate_layout(
           layout.local_types.push_back(duckdb::LogicalType::BIGINT);
           layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
         }
+        break;
+      case sirius::aggregate_id::list:
+        spec.kind          = aggregate_kind::LIST;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(agg_return_type);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::MERGE_LISTS);
+        layout.merge_nth_index.push_back(std::nullopt);
         break;
       case sirius::aggregate_id::sum:
       case sirius::aggregate_id::sum_no_overflow:
@@ -510,6 +528,16 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream, mr));
           break;
         }
+        case aggregate_kind::LIST: {
+          auto const mr = space->get_default_allocator();
+          auto col      = view.column(static_cast<cudf::size_type>(spec.input_idx));
+          auto agg_op   = cudf::make_collect_list_aggregation<cudf::reduce_aggregation>(
+            cudf::null_policy::INCLUDE);
+          auto scalar = cudf::reduce(
+            col, *agg_op, cudf::data_type{cudf::type_id::LIST}, std::nullopt, stream, mr);
+          cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream, mr));
+          break;
+        }
         case aggregate_kind::STDDEV_SAMP: {
           cols.push_back(local_stddev_state(
             view.column(spec.input_idx), stream, space->get_default_allocator()));
@@ -715,6 +743,12 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
           zero = cudf::cast(zero->view(), physical_type, stream, mr);
         }
         columns.push_back(std::move(zero));
+      } else if (kind == aggregate_kind::LIST) {
+        auto const& agg =
+          sirius::ast::require_aggregate(aggregates[i].get(), "empty list aggregate");
+        auto prototype = cudf::make_empty_lists_column(
+          sirius::require_cudf_type(agg.arguments()[0]->return_type()));
+        columns.push_back(sirius::make_null_column(prototype->view(), 1, stream, mr));
       } else if (cudf::is_fixed_width(physical_type)) {
         columns.push_back(
           cudf::make_fixed_width_column(physical_type, 1, cudf::mask_state::ALL_NULL, stream, mr));

@@ -203,6 +203,8 @@ mutable process globals. Standalone callers may omit the policy to use fixed def
 | BETWEEN | `sirius::ast::between` | `x BETWEEN 10 AND 20` |
 | Aggregate | `sirius::ast::aggregate` | `SUM(x)`, `COUNT(*)` |
 
+`list()` is supported for a single non-nested input column in grouped and ungrouped aggregates. Its scalar consumers used by TPC-Havoc Q01_V07 are also supported: `list_aggr(list, 'sum'|'avg')`, `list_zip(lists...)`, `list_transform(list, x -> expression)`, and `len(list)`. `list_transform` accepts one lambda parameter and does not support captured columns. `list_zip` pads shorter lists with NULL elements, and tuple extraction such as `x[1]` in the lambda uses a constant, one-based index. Aggregate and scalar list calls with unsupported shapes are rejected during planning and fall back to DuckDB.
+
 `coalesce` is materialized via `cudf::replace_nulls` iteratively across children: the first child is materialized (scalars are lifted to a column); each subsequent child replaces the residual nulls in the running result. Children are only evaluated when the running result still has nulls. The result is wrapped via `materialize_as_ast_column` so COALESCE composes inside AST-capable parents. `cudf_ast_op_count` returns 0 — `coalesce` always takes the materialize-only path.
 
 ### Conditional evaluation and row-dependent errors

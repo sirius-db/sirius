@@ -508,6 +508,9 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
     if (aggregate_kind == cudf::aggregation::Kind::COLLECT_SET) {
       groupby_aggregation =
         cudf::make_collect_set_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE);
+    } else if (aggregate_kind == cudf::aggregation::Kind::COLLECT_LIST) {
+      groupby_aggregation =
+        cudf::make_collect_list_aggregation<cudf::groupby_aggregation>(cudf::null_policy::INCLUDE);
     } else {
       groupby_aggregation = get_local_aggregation<cudf::groupby_aggregation>(aggregate_kind);
     }
