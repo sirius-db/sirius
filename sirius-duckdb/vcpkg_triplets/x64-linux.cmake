@@ -34,3 +34,9 @@ if(PORT MATCHES "^(cudf|cuvs|kvikio|raft|rmm)$")
   list(APPEND VCPKG_HASH_ADDITIONAL_FILES
        "${CMAKE_CURRENT_LIST_DIR}/../vcpkg_ports/rapids_common.cmake")
 endif()
+
+# Shared nvprune helper for NVIDIA prebuilt static libraries.
+if(PORT MATCHES "^(cublas|curand|cusolver|nvcomp)$")
+  list(APPEND VCPKG_HASH_ADDITIONAL_FILES
+       "${CMAKE_CURRENT_LIST_DIR}/../vcpkg_ports/cuda_prune.cmake")
+endif()

@@ -64,6 +64,9 @@ file(INSTALL ${HEADER_FILES} DESTINATION "${CURRENT_PACKAGES_DIR}/include")
 file(GLOB LIB_FILES "${SOURCE_PATH}/lib/*.a")
 file(INSTALL ${LIB_FILES} DESTINATION "${CURRENT_PACKAGES_DIR}/lib")
 
+include("${CMAKE_CURRENT_LIST_DIR}/../cuda_prune.cmake")
+cuda_prune("${CURRENT_PACKAGES_DIR}/lib/libnvcomp_static.a")
+
 # Keep nvCOMP's bundled logger ABI private to its static archives.
 vcpkg_cmake_get_vars(NVCOMP_CMAKE_VARS)
 include("${NVCOMP_CMAKE_VARS}")
