@@ -2186,11 +2186,17 @@ TEST_CASE("iceberg equality deletes are applied on every GPU a query can be admi
   std::set<int> devices;
   std::size_t second_while_scanning    = idle;
   auto counters                        = sirius->physical_counters();
-  auto reset                           = reset_after_test(counters->scan_execution_for_testing);
+  auto reset                           = reset_after_test(counters->scan_execution_for_testing,
+                                counters->iceberg_equality_open_for_testing);
   counters->scan_execution_for_testing = [&](bool, auto const&) {
     std::lock_guard lock{mutex};
     devices.insert(rmm::get_current_cuda_device().value());
     second_while_scanning = std::min(second_while_scanning, second->get_available_memory());
+  };
+  // By the last delete file, the earlier groups are built on every device the load was given.
+  std::size_t second_while_loading            = idle;
+  counters->iceberg_equality_open_for_testing = [&](std::string const&) {
+    second_while_loading = std::min(second_while_loading, second->get_available_memory());
   };
 
   run("SET gpu_execution=true");
@@ -2198,9 +2204,10 @@ TEST_CASE("iceberg equality deletes are applied on every GPU a query can be admi
   run("SET admission_bytes_per_gpu=" + std::to_string(admission_bytes_per_gpu));
   auto const query = "SELECT v FROM iceberg_scan('" +
                      equality_fixture("iceberg_v2_eq_partition_shapes") + "') ORDER BY v";
-  auto const before = sirius::test::get_transparent_execution_stats(con);
-  auto gpu          = run(query);
-  auto const after  = sirius::test::get_transparent_execution_stats(con);
+  auto const before                           = sirius::test::get_transparent_execution_stats(con);
+  auto gpu                                    = run(query);
+  auto const after                            = sirius::test::get_transparent_execution_stats(con);
+  counters->iceberg_equality_open_for_testing = {};
   sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 0);
   // Five delete files, each read once: a second device copies the keys the first one decoded.
   CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads + 5);
@@ -2210,6 +2217,9 @@ TEST_CASE("iceberg equality deletes are applied on every GPU a query can be admi
       // No task runs on the second GPU, so it holds no tables while the scan runs.
       CHECK(devices == std::set<int>{0});
       CHECK(second_while_scanning == idle);
+      // A cap of one GPU builds nothing on the second. The estimate is made after the load, so
+      // its tables are built there and then released.
+      CHECK((second_while_loading == idle) == (gpus_per_query == 1));
     } else {
       CHECK(devices == std::set<int>{0, 1});
     }
