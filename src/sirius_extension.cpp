@@ -3941,9 +3941,10 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "Distributed execution: how the exchange's writes reach a peer; auto and never take the "
     "NVLink fabric first where it reaches (sirius_exchange_mnnvl). auto: over TCP lanes to "
     "ranks on other hosts, and through a pinned shared-memory mirror to same-host GPUs without "
-    "peer access; always: the mirror for every same-host peer; never: NIXL to every peer; "
-    "remote: TCP lanes to every peer. Same on every rank; set before sirius_exchange_rank, "
-    "which connects",
+    "peer access, or, from a GPU without NVLink on a host of more than two ranks, to same-host "
+    "peers that keep a mirror; always: the mirror for every same-host peer; never: NIXL to "
+    "every peer; remote: TCP lanes to every peer. Same on every rank; set before "
+    "sirius_exchange_rank, which connects",
     LogicalType::VARCHAR,
     Value("auto"),
     SetExchangeHostStaging);

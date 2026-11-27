@@ -159,6 +159,25 @@ bool some_gpu_lacks_peer_access(std::string const& bus_id)
   return false;
 }
 
+/// Whether the GPU at @p bus_id has an active NVLink link, by NVML's link states: a rank confined
+/// to its own GPU can read those, but nothing of a peer's GPU. True when NVML cannot tell, which
+/// keeps direct writes.
+bool has_nvlink(std::string const& bus_id)
+{
+  nvmlDevice_t device{};
+  if (!nvml_up() || nvmlDeviceGetHandleByPciBusId_v2(bus_id.c_str(), &device) != NVML_SUCCESS) {
+    return true;
+  }
+  for (unsigned link = 0; link < NVML_NVLINK_MAX_LINKS; ++link) {
+    nvmlEnableState_t active{};
+    auto const status = nvmlDeviceGetNvLinkState(device, link, &active);
+    // Not supported: a GPU without NVLink. Invalid argument: past its last link.
+    if (status == NVML_ERROR_NOT_SUPPORTED || status == NVML_ERROR_INVALID_ARGUMENT) { break; }
+    if (status != NVML_SUCCESS || active == NVML_FEATURE_ENABLED) { return true; }
+  }
+  return false;
+}
+
 /// The NVLink domain of the GPU at @p bus_id, by NVML's fabric info; invalid when NVML cannot
 /// tell or the GPU's fabric registration has not completed.
 nvlink_domain nvlink_domain_of(std::string const& bus_id)
@@ -352,7 +371,7 @@ std::string writer_name(rank_t rank) { return agent_name(rank) + "-writer"; }
 template <typename Peer>
 endpoint endpoint_of(Peer const& p, rank_t rank)
 {
-  return endpoint{rank, p.pci_bus_id, p.fabric_ring, p.domain, p.boot_id};
+  return endpoint{rank, p.pci_bus_id, p.fabric_ring, p.domain, p.boot_id, p.pid != 0};
 }
 
 nixl_reg_dlist_t ring_descs(frame_ring const& ring, int device)
@@ -541,6 +560,7 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
   auto const& my_host = _peers[_rank].host;
   auto const on_my_host =
     std::count_if(_peers.begin(), _peers.end(), [&](peer const& p) { return p.host == my_host; });
+  _host.ranks     = static_cast<std::size_t>(on_my_host);
   _lane_count     = cfg.lanes != 0
                       ? cfg.lanes
                       : std::max<std::uint32_t>(2, host_lanes / static_cast<std::uint32_t>(on_my_host));
@@ -560,14 +580,12 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
   _peers[_rank].domain      = nvlink_domain_of(bus_id);
   _peers[_rank].boot_id     = boot_id();
   _near_cpus                = cpus_near(bus_id);
-  // The mirror exists before the hello names it, so a peer that hears the hello can map it. In
-  // automatic mode only a same-host GPU without peer access to this one would stage to it. A
+  // The mirror exists before the hello names it, so a peer that hears the hello can map it. A
   // peer that writes to it over TCP lanes learns its address with the lanes, so choose_route()
   // makes it then: boot ids and NVLink domains, which decide that path, come with the hellos.
-  bool const mirror = _peers.size() > 1 && (cfg.staging == host_staging::always ||
-                                            (cfg.staging == host_staging::automatic &&
-                                             some_gpu_lacks_peer_access(_peers[_rank].pci_bus_id)));
-  if (mirror) {
+  _host.nvlink = has_nvlink(_peers[_rank].pci_bus_id);
+  if (keeps_mirror(
+        cfg.staging, _peers.size(), _host, some_gpu_lacks_peer_access(_peers[_rank].pci_bus_id))) {
     try {
       make_mirror();
     } catch (std::exception const& e) {
@@ -730,13 +748,24 @@ void nixl_fabric::choose_route(rank_t r)
   auto const& self     = _peers[_rank];
   bool const same_host = p.boot_id == self.boot_id;
   // NVML knows this host's GPUs only.
-  p.route = choose_path(endpoint_of(self, _rank),
-                        endpoint_of(p, r),
-                        _staging,
-                        _mnnvl,
-                        _staging != host_staging::automatic || !same_host ||
-                          peer_access(self.pci_bus_id, p.pci_bus_id));
-  if (p.route == path::shared_memory) { map_mirror(r); }
+  bool const direct =
+    _staging != host_staging::automatic || !same_host || peer_access(self.pci_bus_id, p.pci_bus_id);
+  auto me   = endpoint_of(self, _rank);
+  me.mirror = !_mirror_name.empty();
+  p.route   = choose_path(me, endpoint_of(p, r), _staging, _mnnvl, direct, _host);
+  if (p.route == path::shared_memory) {
+    try {
+      map_mirror(r);
+    } catch (std::exception const& e) {
+      // Staged for speed on a crowded host: the peer is still reachable directly.
+      if (_staging != host_staging::automatic || !direct) { throw; }
+      SIRIUS_LOG_WARN("exchange: rank {} cannot map rank {}'s mirror ({}); it writes directly",
+                      _rank,
+                      r,
+                      e.what());
+      p.route = path::nixl;
+    }
+  }
   if (p.route == path::tcp_lanes) {
     // The peer's lanes write into the mirror, and this rank's lanes register it. Only this
     // process maps it, so it needs no name in /dev/shm.

@@ -64,7 +64,8 @@ path choose_path(endpoint const& me,
                  endpoint const& peer,
                  host_staging staging,
                  mnnvl_mode mnnvl,
-                 bool peer_access)
+                 bool peer_access,
+                 host_view host)
 {
   bool const fabric = mnnvl != mnnvl_mode::off && me.fabric_ring && peer.fabric_ring &&
                       me.domain.same_as(peer.domain);
@@ -92,7 +93,11 @@ path choose_path(endpoint const& me,
   if (fabric) { return path::nvlink_fabric; }
   if (staging == host_staging::never) { return path::nixl; }
   if (!same_host) { return path::tcp_lanes; }
-  return peer_access ? path::nixl : path::shared_memory;
+  // NVLink, or one GPU, is no PCIe link to share. A peer with peer access and no mirror is
+  // written directly.
+  bool const stage_crowded =
+    crowded_host(host.ranks) && !host.nvlink && peer.mirror && me.pci_bus_id != peer.pci_bus_id;
+  return peer_access && !stage_crowded ? path::nixl : path::shared_memory;
 }
 
 }  // namespace sirius::exchange
