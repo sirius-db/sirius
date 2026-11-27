@@ -20,12 +20,16 @@
 
 #include <cudf/aggregation.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -65,6 +69,34 @@ class gpu_merge_impl {
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});
+
+  /**
+   * @brief Concatenate tables, in groups where one cudf::concatenate gives wrong strings.
+   *
+   * cudf::concatenate (libcudf 26.10) returns wrong characters for a strings column when the
+   * concatenated characters pass 2^31 bytes and the inputs are many small columns: the offsets
+   * are right and the characters are not. TPC-H Q12 at SF300000 hit this with about 10,600
+   * inputs of 330 KB each; the same total in about 3,500 inputs was concatenated correctly.
+   * When a strings column would pass @p string_chars_limit, the inputs are therefore
+   * concatenated in groups of at most @p group_chars characters first, and the groups are
+   * concatenated last. Otherwise this is one cudf::concatenate.
+   *
+   * @param input The tables to concatenate, all with the same schema.
+   * @param stream CUDA stream used for device memory operations and kernel launches.
+   * @param mr Device memory resource of the output table and of the groups.
+   * @param string_chars_limit Characters of one strings column above which the inputs are
+   *                           grouped.
+   * @param group_chars Most characters of one strings column in a group; a single input
+   *                    with more is a group of its own.
+   *
+   * @return The concatenated table.
+   */
+  static std::unique_ptr<cudf::table> concat_tables(
+    const std::vector<cudf::table_view>& input,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    std::int64_t string_chars_limit = std::numeric_limits<cudf::size_type>::max(),
+    std::int64_t group_chars        = std::int64_t{1} << 30);
 
   /**
    * @brief Perform ungrouped merge aggregate on multiple data batches.

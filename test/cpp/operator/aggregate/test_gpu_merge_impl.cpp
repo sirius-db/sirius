@@ -27,6 +27,7 @@
 #include "utils/data_utils.hpp"
 #include "utils/utils.hpp"
 
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/bit.hpp>
 
@@ -218,6 +219,40 @@ TEST_CASE("Concatenate multiple data batches with different size", "[operator][m
   }
   auto output_batch = gpu_merge_impl::concat(ro_batches, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
+  validate_concat(input.batches, *output_batch);
+}
+
+TEST_CASE("Concatenate tables in groups", "[operator][merge_concat]")
+{
+  auto* mem_space = get_shared_mem_space();
+  REQUIRE(mem_space);
+
+  constexpr int num_batches           = 37;
+  constexpr size_t num_rows_per_batch = 100;
+  std::vector<int> num_input_rows(num_batches, num_rows_per_batch);
+  std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::STRING}};
+  auto input                                = create_batches_with_random_data(
+    num_batches, num_input_rows, column_types, {column_types.size(), std::nullopt}, *mem_space);
+  std::vector<read_only_data_batch> ro_batches;
+  std::vector<cudf::table_view> views;
+  for (auto& b : input.batches) {
+    ro_batches.push_back(b->to_read_only());
+    views.push_back(sirius::get_cudf_table_view(ro_batches.back()));
+  }
+
+  // Limits far below the data: the strings pass the limit, and a group holds a few inputs.
+  auto const first_chars =
+    cudf::strings_column_view(views.front().column(1)).chars_size(cudf::get_default_stream());
+  REQUIRE(first_chars > 0);
+  auto table = gpu_merge_impl::concat_tables(views,
+                                             cudf::get_default_stream(),
+                                             mem_space->get_default_allocator(),
+                                             first_chars,
+                                             4 * first_chars);
+  ro_batches.clear();
+  auto output_batch =
+    sirius::make_data_batch(std::move(table), *mem_space, cudf::get_default_stream(), {});
   validate_concat(input.batches, *output_batch);
 }
 
