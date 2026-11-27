@@ -20,6 +20,7 @@
 #include "creator/config.hpp"
 #include "exec/config.hpp"
 #include "exec/thread_defaults.hpp"
+#include "io/gds/gds_config.hpp"
 #include "scan_manager/preparation_options.hpp"
 
 #include <cucascade/io/config.hpp>
@@ -121,6 +122,9 @@ inline bool enum_to_string(prefetch_strategy s, std::string& out)
 enum class io_backend {
   /// cuCascade's native IO stack: uring for local paths, REST for @c s3:// URLs.
   native,
+  /// GPUDirect Storage: local files read into GPU memory with cuFile
+  /// (@c sirius::io::gds::gds_ioctx).
+  gds,
 };
 
 /// Parse a @ref io_backend from its lowercase YAML spelling.  @c "sirius" is the
@@ -128,7 +132,9 @@ enum class io_backend {
 inline bool string_to_enum(std::string_view sv, io_backend& out)
 {
   static const std::unordered_map<std::string_view, io_backend> map = {
-    {"native", io_backend::native}, {"sirius", io_backend::native},  // deprecated alias
+    {"native", io_backend::native},
+    {"sirius", io_backend::native},  // deprecated alias
+    {"gds", io_backend::gds},
   };
   auto it = map.find(sv);
   if (it != map.end()) {
@@ -143,6 +149,7 @@ inline bool enum_to_string(io_backend b, std::string& s)
 {
   switch (b) {
     case io_backend::native: s = "native"; return true;
+    case io_backend::gds: s = "gds"; return true;
   }
   return false;
 }
@@ -303,6 +310,9 @@ struct scan_manager_config {
   /// @c min_segment_bytes / @c max_segment_bytes.
   cucascade::io::rest::config rest{};
 
+  /// GPUDirect Storage backend settings (backend=gds).
+  sirius::io::gds::gds_config gds{};
+
   /// The read path's caching configuration: mode, eviction policy and the
   /// prefetching cache's tunables.  One block, rather than a mode here and the
   /// tunables in a sibling one.
@@ -331,6 +341,10 @@ struct scan_manager_config {
     cucascade::io::io_config out{};
     switch (backend) {
       case io_backend::native: out.backend = cucascade::io::io_backend::native; break;
+      // cuCascade has no backend of its own for gds. Its registry stays native, so
+      // local paths resolve to the uring type, which gds_ioctx reports, and s3://
+      // paths to REST.
+      case io_backend::gds: out.backend = cucascade::io::io_backend::native; break;
     }
     out.uring_n_reactors = uring_n_reactors;
     out.rest_n_reactors  = rest_n_reactors;

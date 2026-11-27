@@ -259,6 +259,12 @@ if [ -n "${SIRIUS_RANK_LOG_ROOT:-}" ]; then
   export SIRIUS_LOG_DIR=$SIRIUS_RANK_LOG_ROOT/$(hostname -s)-$port
   mkdir -p "$SIRIUS_LOG_DIR"
 fi
+# SIRIUS_GDS=1 (set it with scan_manager.backend: gds): give the rank a cuFile configuration
+# that cannot fall back to POSIX reads, with its log in the rank's node-local folder.
+if [ "${SIRIUS_GDS:-0}" = 1 ]; then
+  CUFILE_ENV_PATH_JSON=$("$here/gds/cufile_json.sh" "$dir/cufile") || exit 1
+  export CUFILE_ENV_PATH_JSON
+fi
 trap stop TERM INT
 backoff=1
 first=1
@@ -277,6 +283,12 @@ while :; do
   if [ "$rc" -eq 0 ]; then
     backoff=1
     continue
+  fi
+  # 70: the GDS backend gave up on a cuFile read that never returned. A new rank would read from
+  # the same filesystem that just stopped answering, so it stays down.
+  if [ "$rc" -eq 70 ]; then
+    echo "rank exited with 70 (GDS read stalled); not starting it again" >&2
+    exit 70
   fi
   echo "rank exited with $rc; starting it again in ${backoff}s" >&2
   # In the background, so that the TERM trap runs at once, not after the sleep.

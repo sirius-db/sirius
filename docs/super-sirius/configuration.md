@@ -392,7 +392,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | max(18, eligible NUMA domains) | Shared metadata and Parquet-coalescing worker count. Explicit values must cover all eligible domains. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`, including S3 listing and globs. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
+| `backend` | enum: `native`, `gds` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`, including S3 listing and globs. `gds` reads local files into GPU memory with cuFile (GPUDirect Storage), see [`scan_manager.gds`](#scan_managergds--gpudirect-storage-backend-srciogds); `s3://` reads still go through native REST. `gds` is single-GPU only: a multi-GPU configuration with `gds` is rejected. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 2 if T < 32, otherwise 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
 | `rest_n_reactors` | int (**>= 0**) | kTLS loaded: one per steered NIC IRQ CPU when there are fewer than 16, else clamp(floor(T/6), 4, 16); no kTLS: clamp(floor(T/6), 8, 16) | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. Unnamed, the count depends on whether cuCascade's topology reports kernel TLS loaded (`system_topology_info::kernel_tls.loaded`: the kernel `tls` module loaded or built in). With kTLS, when the egress NIC's queue IRQs are also steered to a strict subset of its NUMA node's cores on fewer than 16 CPUs, the count is the number of IRQ CPUs, at least 4 (the reactors are pinned round-robin onto those CPUs); otherwise it is clamp(floor(T/6), 4, 16). Without kTLS it is clamp(floor(T/6), 8, 16): user-space TLS costs the reactor threads CPU per byte. A named count, `0` included, is used as written. |
 | `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built under the saved rank startup mask, so it pins the same way while preserving the caller's CUDA and thread-local context. |
@@ -627,6 +627,25 @@ sirius:
           user_space_rx: record_layer
           recv_placement: automatic
 ```
+
+### `scan_manager.gds` — GPUDirect Storage backend (`src/io/gds/`)
+
+Used when `backend: gds`. Local files are read into GPU memory with cuFile, with no copy through
+host memory. This backend runs without the prefetching cache and the readahead.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `num_threads` | int (**1–64**) | 32 | Threads that issue cuFile reads: the bound on reads in flight per process. On GPFS 32 and 64 were fastest, 128 slower, and at 256 a read stopped returning, so more than 64 is rejected. |
+| `task_size` | bytes (**> 0**) | 16Mi | Bytes per cuFile read. A larger read is cut into pieces of this size. |
+| `require` | bool | true | Refuse to start unless cuFile reports GDS available with its POSIX fallback off, and fail reads once cuFile serves most reads through POSIX (after the first GiB; cuFile reads a few KiB at a time through POSIX even under GDS). With `false` these are logged only. |
+| `slow_read_ms_per_mib` | number (**>= 0**) | 5 | Reads fail with "GDS reads slowed down" once they stay slower than this many milliseconds per MiB for two seconds; 0 turns the check off. Measured on GPFS: 0.8–1.2 ms per MiB when healthy, 10–62 on a path that was going bad. |
+| `read_timeout_s` | int (**> 0**) | 10 | A cuFile read in flight longer than this ends the process with status 70. cuFile reads cannot be cancelled, and failing the query instead would free buffers a stuck read still writes to. `scripts/sirius_rank_node.sh` does not restart a rank that exits with 70. |
+
+cuFile falls back to POSIX reads without an error while its own configuration has
+`allow_compat_mode: true`, so `require: true` needs a cuFile configuration with that turned off.
+`scripts/gds/cufile_json.sh <dir>` writes such a copy of the node's file; `scripts/sirius_rank_node.sh`
+does it for each rank when `SIRIUS_GDS=1` is set. See [Scan](scan.md#gpudirect-storage-backend) for
+the start-up line, the per-query proof line and the first test to run on a new machine.
 
 ### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 

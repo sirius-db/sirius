@@ -177,3 +177,6 @@ endif()
 
 # Rust telemetry instrumentation (C++ FFI via Corrosion)
 add_subdirectory(rust/crates/telemetry/bridge)
+
+# The GPUDirect Storage scan backend (src/io/gds) reads with kvikio::FileHandle.
+find_package(kvikio REQUIRED CONFIG)

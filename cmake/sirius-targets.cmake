@@ -61,6 +61,8 @@ set(SIRIUS_LINK_LIBRARIES
     absl::any_invocable
     absl::strings
     utf8proc::utf8proc
+    # kvikIO: the GPUDirect Storage scan backend (src/io/gds).
+    kvikio::kvikio
     # NVML: the NIXL fabric checks peer access between GPUs other processes own.
     CUDA::nvml)
 
