@@ -4,15 +4,39 @@ This document covers Super Sirius configuration: the `sirius_config` class, oper
 
 ## `sirius_config`
 
-**File:** `src/sirius_config.hpp`
+**Files:** `src/sirius_config.hpp`, `src/config/` (the typed configuration the user writes)
 
-The `sirius_config` class loads configuration from a YAML file or uses built-in defaults. It provides:
+The `sirius_config` class is the configuration the engine runs with: what the user configured,
+resolved against this machine's hardware. It provides:
 
 - Hardware topology (GPU count, NUMA layout)
 - Memory space configurations (GPU, Host, Disk)
 - Thread pool configs for all executor types
 - Operator parameters (batch sizes, limits)
 - Telemetry options
+
+### From file to engine
+
+Configuration passes through two representations:
+
+1. **`sirius::config::user_config`** (`src/config/user_config.hpp`) — what the user writes: the
+   `sirius:` document as one typed block per YAML block (`src/config/options/`). Each option is
+   declared once, with its key, type, fallback, validator, mutually exclusive alternatives
+   (`capacity_bytes` | `capacity_fraction`), whether it is required when its block is present, a
+   short description that ends every error about it, and whether it is a production setting (any
+   other is developer-only).
+   `user_defined()` tells a value the user wrote from a fallback. `read_user_config()` reads YAML
+   text; `write_user_config()` writes the user's values back (optionally with every fallback too,
+   or only the production settings).
+2. **`sirius::sirius_config`** — the runtime configuration.
+   `sirius::create_sirius_config(user, topology, nic_probe)` builds it: memory spaces through
+   cuCascade's configurator, then a hardware-derived default for every option the user left unset
+   (thread and reactor counts, operator batch sizes from GPU memory, REST limits from kernel TLS
+   and the egress NIC), then the checks that need those values.
+
+`SiriusContext::initialize(const config::user_config&)` resolves the configuration once telemetry
+is up. `parsed_sirius_config` (from a file, a YAML node, or a `user_config`) is the translated
+but unresolved form the extension and the C API hold before hardware discovery.
 
 ### Config File Resolution
 
@@ -24,6 +48,42 @@ Sirius searches for a config file in this order:
 
 If no config file is found, Sirius uses built-in capacity budgets of 95% of GPU memory and 90% of each backing NUMA node's RAM for pinned host memory.
 Initial host pools target 10% of that node's RAM, capped by the host budget and rounded down to whole pools.
+
+### Effective configuration (`SIRIUS_WRITE_EFFECTIVE_CONFIG`)
+
+When asked, Sirius writes the configuration it runs with when it starts. Set
+`SIRIUS_WRITE_EFFECTIVE_CONFIG` to a path to write it there, or to `1`, `true`, `on` or `yes` to
+write `~/.sirius/effective_config.yaml`; unset, empty, `0`, `false`, `off` or `no` writes nothing.
+The TPC-H benchmark runner writes it into each benchmark directory as `resolved_config.yaml`. The
+file is replaced on every start and is readable by the owner only. It holds every value the config
+file named, and spells out every production setting (below) the file left out: its default, or what
+was derived from this machine — thread and reactor counts, REST limits, operator batch sizes,
+initial host pools. Derived values are this machine's, so the file may not suit another. The file is
+a record and is not on the search path above; copy it to `~/.sirius/sirius.yaml` to make those
+values your configuration.
+
+Every other setting is developer-only. All settings are read in every build, but only a build with
+**developer mode** on writes the developer-only ones the config file did not name: configure with
+`-DSIRIUS_DEVELOPER_MODE=ON` (`pixi run cmake -DSIRIUS_DEVELOPER_MODE=ON build/release`, then
+`pixi run make`; the setting stays in the CMake cache). Resolving the file again on the same
+machine runs with the same values; developer-only settings it leaves out resolve as they did the
+first time.
+
+Production settings (a setting with two spellings, such as `usage_limit_fraction` and
+`usage_limit_bytes`, is one setting):
+
+| Block | Keys |
+|---|---|
+| `sirius.memory.gpu` | `usage_limit_fraction`, `reservation_limit_fraction`, `downgrade_trigger_fraction`, `downgrade_stop_fraction` |
+| `sirius.memory.host` | `capacity_bytes`, `capacity_fraction`, `reservation_limit_fraction`, `downgrade_trigger_fraction`, `downgrade_stop_fraction`, `block_size`, `pool_size`, `initial_number_pools` |
+| `sirius.memory.disk` | `disk_id`, `capacity_bytes`, `downgrade_root_dirs` |
+| `sirius.executor.task_creator`, `.pipeline`, `.downgrade` | `num_threads` |
+| `sirius.executor.scan_manager` | `num_threads`, `backend`, `rest_n_reactors`, `max_readahead_scans` |
+| `sirius.executor.scan_manager.rest` | `pin_to_irq_cpus`, `max_connections`, `min_mtu`, `conn_max_age_s` |
+| `sirius.executor.scan_manager.cache` | `mode`, `eviction`, `min_prefetching_budget_fraction`, `eviction_threshold_fraction` |
+| `sirius.executor.scan_manager.memory_prefetcher` | `enable` |
+| `sirius.operator_params` | `max_broadcast_join_size`, `max_sort_partition_bytes`, `hash_partition_bytes`, `concat_batch_bytes`, `cross_join_task_bytes`, `sort_sample_bytes`, `max_build_hash_table_bytes`, `scan_task_batch_size`, `max_build_probe_resident_bytes` |
+| `sirius.compression` | `enable_spill_compression` |
 
 ### Concurrent query admission
 
@@ -50,9 +110,10 @@ These related modes have different behavior:
 
 Use `SIRIUS_DISABLE=1` for a pure DuckDB CPU baseline in a process that contains the Sirius extension. Use `SET gpu_execution = false` when the initialized Sirius runtime must remain available to turn back on later.
 
-### Byte Suffixes
+### Value formats
 
-Any integer config value that represents bytes supports human-readable suffixes:
+**Sizes.** A value that represents bytes is a number with an optional unit; a bare number is
+bytes:
 
 | Suffix | Base | Example | Bytes |
 |--------|------|---------|-------|
@@ -65,7 +126,21 @@ Any integer config value that represents bytes supports human-readable suffixes:
 | `T`, `TB` | 1000⁴ | `1T` | 1,000,000,000,000 |
 | `Ti`, `TiB` | 1024⁴ | `1Ti` | 1,099,511,627,776 |
 
-Fractional values are supported (e.g. `1.5Gi`). Follows the [Kubernetes resource units](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#meaning-of-memory) convention.
+Units are case-insensitive (`8GIB` is 8 GiB) and may follow a space (`1.5 GiB`). Fractional values
+are supported (`1.5Gi`) when they come to a whole number of bytes: `0.1 KiB` is rejected rather
+than rounded. Sizes reach 2^64 − 1; negative values are rejected. Follows the
+[Kubernetes resource units](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#meaning-of-memory)
+convention.
+
+**Durations.** A number with a unit — `ns`/`nsec`, `us`/`usec`, `ms`/`msec`, `s`/`sec`/`seconds`,
+`m`/`min`/`minutes`, `h`/`hr`/`hours`, case-insensitive — or a bare number in the key's own unit
+(`*_ms` keys count milliseconds, `*_s` keys seconds). Exact as well: `1.5s` for a key counted in
+seconds is rejected rather than truncated. The REST `*_s` keys and the memory prefetcher's `*_ms`
+keys accept units too (`request_timeout_s: 2 min`).
+
+**Numbers.** Integers are decimal: a leading zero (`010`, which YAML 1.1 reads as octal) and hex
+are rejected. Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, `y`/`n`. Enumerations take
+the spellings listed with each key.
 
 ```yaml
 sirius:
@@ -77,11 +152,24 @@ sirius:
     scan_task_batch_size: 512Mi  # 536,870,912 bytes
 ```
 
+### Errors
+
+A configuration that cannot be used is rejected with the key it concerns, by its full path:
+`'sirius.executor.scan_manager.rest.max_retry_attempts': value out of range: '4294967296' (must be
+between 1 and 4294967295)`. A file's errors are prefixed with its path. Also rejected: unknown keys
+(`unknown config key: 'k' in sirius.memory.gpu`), keys that were removed (with what to do
+instead), both keys of a mutually exclusive pair, a key that appears twice in one mapping, and a
+second YAML document in the file. A key present with a null value counts as absent.
+
 ### Loading (C++ API)
 
 ```cpp
 sirius_config config;
 config.load_from_file("/path/to/config.yaml");  // Optional
+
+// Or explicitly: read what the user wrote, then resolve it against a machine.
+auto user     = sirius::config::read_user_config(yaml_text);
+auto resolved = sirius::create_sirius_config(user, topology);
 ```
 
 ### Example Config File
@@ -148,7 +236,7 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 |-----|------|---------|-------------|
 | `usage_limit_fraction` | double | 0.95 | Fraction of total VRAM to use as Sirius's GPU memory capacity. The remaining 5% is left for the CUDA runtime, cuDF temporaries, and other GPU consumers. Mutually exclusive with `usage_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `usage_limit_bytes` | bytes | — | Absolute VRAM limit. Mutually exclusive with `usage_limit_fraction`; configuration loading rejects both when both values are non-null. |
-| `reservation_limit_fraction` | double | 1.0 | Fraction of the GPU capacity (set by `usage_limit_*`) that can be reserved by pipeline tasks. Reservations are acquired before task execution and prevent overcommit. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
+| `reservation_limit_fraction` | double (0,1] | 1.0 | Fraction of the GPU capacity (set by `usage_limit_*`) that can be reserved by pipeline tasks. Reservations are acquired before task execution and prevent overcommit. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `downgrade_trigger_fraction` | double (0,1] | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
@@ -164,13 +252,13 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `capacity_fraction` | double (0,1] | 0.9 | Pinned host memory capacity as a fraction of **each backing NUMA node's total RAM** (read from `/sys/devices/system/node/node<id>/meminfo`). Mutually exclusive with `capacity_bytes`; configuration loading rejects both when both values are non-null. Initialization fails if a node's capacity cannot be determined. |
-| `capacity_bytes` | bytes | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
-| `reservation_limit_fraction` | double | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
+| `capacity_bytes` | bytes (**> 0**) | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
+| `reservation_limit_fraction` | double (0,1] | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `downgrade_trigger_fraction` | double (0,1] | 0.9 | Start HOST memory reclamation above this fraction. Must be greater than `downgrade_stop_fraction`. File-cache reclaim needs no DISK tier and only frees cache memory above the prefetch reservation; spilling HOST repository data requires configured `downgrade_root_dirs`. |
 | `downgrade_stop_fraction` | double (0,1] | 0.8 | Stop evicting when reserved memory drops to this fraction. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
-| `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
-| `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
+| `block_size` | bytes (**> 0**) | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
+| `pool_size` | int (**> 0**) | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
 | `initial_number_pools` | int | auto | When omitted, pre-allocate 10% of each backing NUMA node's total RAM, capped by host capacity and rounded down to whole pools (possibly zero). Requires discovered host RAM capacity. An explicit count overrides automatic sizing. Additional pools are created on demand. Initial host footprint = aligned `block_size × pool_size × initial_number_pools`. |
 
 ### Disk Memory (`sirius.memory.disk`)
@@ -262,7 +350,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `device_id` | int | 0 | CUDA device the space lives on. |
+| `device_id` | int | -1 | CUDA device the space lives on. |
 | `per_stream_reservation` | bool | false | Track reservations per CUDA stream (forced false unless set). |
 | `reservation_limit_fraction` | double [0,1] | space default | Fraction of the space that may be reserved. |
 | `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |
@@ -273,7 +361,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `numa_id` | int | 0 | NUMA node the pinned pool is bound to. |
+| `numa_id` | int | -1 | NUMA node the pinned pool is bound to. |
 | `reservation_limit_fraction` | double [0,1] | space default | Fraction of the space that may be reserved. |
 | `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | space default | Stop evicting below this fraction. Must be less than `downgrade_trigger_fraction`. |
@@ -286,7 +374,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `disk_id` | int | 0 | Identifier for the disk space. |
+| `disk_id` | int | -1 | Identifier for the disk space. |
 | `mount_path` | string | "" | Spill directory. |
 | `memory_capacity` | bytes | space default | Maximum disk space for spill files. |
 
@@ -320,7 +408,7 @@ See [Thread Pool Configuration](#thread-pool-configuration) for rounding, limits
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | per pool (below) | Worker threads in the pool. |
-| `cpu_affinity` | list of int | — | Cores to pin task-creator and downgrade threads. GPU pipeline affinity is the selected GPU's local cores, within the pipeline pool's `cpu_affinity` when one is set. With `scan_manager.reserve_rest_reactor_cpus` (default), the pinned REST reactors' CPUs are removed from every pool. |
+| `cpu_affinity` | list of int | — | Cores to pin task-creator, downgrade and scan-manager threads. The `pipeline` pool has no `cpu_affinity` key: GPU pipeline affinity is the selected GPU's local cores. With `scan_manager.reserve_rest_reactor_cpus` (default), the pinned REST reactors' CPUs are removed from every pool. |
 
 ### `sirius.executor.task_creator`
 
@@ -341,7 +429,8 @@ Thread pool (default `num_threads: clamp(floor(T/(8G)), 1, 4)`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `monitor_period` | int (ms) | 10 | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely. |
+| `monitor_period` | duration (ms, **>= 0**) | 10 | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely. |
+| `copy_chunk_bytes` | bytes | 1Gi | Copy granularity of GPU-to-host spills: copies are submitted every ~`copy_chunk_bytes`. `0` submits a batch's copies at once (cuCascade's built-in converter). |
 
 HOST downgrade executors synchronously reclaim idle staging chunks from the default local
 ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
@@ -461,10 +550,13 @@ The `rest.tls` block below controls protocol/offload policy only, not trust.
 
 Sirius sets no transport defaults of its own: every default below is cuCascade's
 `rest::config` default (the exceptions are `n_max_concurrent_scans`, `min_mtu` and
-`max_connections`, which Sirius derives). Each key is range-checked when the config loads, and the loaded block is then checked with
-cuCascade's own `rest::config::validate()`, so cross-field rules (`queue_depth`
-against `max_connections`, `max_segment_bytes` against `min_segment_bytes`, the TLS
-session-cache rule) fail at load time, naming the YAML key. Sirius hands the loaded
+`max_connections`, which Sirius derives). Each key is range-checked when the config loads, as
+are the cross-field rules that need no derived value (`max_segment_bytes` against
+`min_segment_bytes`, the TLS version bounds and session-cache rule, and `queue_depth` against a
+`max_connections` the file names), each naming the offending key. Once the derived values are in
+place, the resolved block is checked with cuCascade's own `rest::config::validate()`, so
+`queue_depth` against a derived `max_connections` fails when the configuration is resolved. Sirius
+hands the resolved
 `rest::config` to cuCascade inside a `rest_reactor::reactor_context`, which is
 non-copyable and shared by the pool's reactors through a `shared_ptr`.
 
@@ -473,11 +565,11 @@ non-copyable and shared by the pool's reactors through a `shared_ptr`.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `n_max_concurrent_scans` | int (**>= 0**) | max(8, 2 × `pipeline.num_threads`) | Readahead budget the REST backend publishes, which an unset `max_readahead_scans` defers to. Unset derives it from the pipeline pool, since several splits per pipeline thread give an object-store prefetch time to land; an explicit value wins. |
-| `request_timeout_s` | int (seconds, **>= 0**) | 30 | Whole-exchange timeout of one control-plane request (HEAD / LIST / footer probe / warm-up); retries can extend a call's total time. Also the base of the presigned-URL TTL (this value plus 60 s). `0` = no limit on control requests, and presigned URLs then live 300 s. Data GETs use the stall detector instead. |
-| `stall_speed_limit_bytes` | int (bytes/s, **>= 0**) | 65536 | Stall detector for data GETs: a transfer that received fewer than `stall_speed_limit_bytes` × `stall_time_s` bytes during the last `stall_time_s` seconds fails and is retried. `0` disables the detector. |
-| `stall_time_s` | int (seconds, **>= 0**) | 30 | Window of the stall detector; `0` disables it. |
-| `retry_backoff_base_ms` | int (ms, **>= 0**) | 50 | Base of the exponential backoff between retries. |
-| `retry_jitter_ms` | int (ms, **>= 0**) | 50 | Random jitter added to each retry backoff. |
+| `request_timeout_s` | duration (s, **>= 0**) | 30 | Whole-exchange timeout of one control-plane request (HEAD / LIST / footer probe / warm-up); retries can extend a call's total time. Also the base of the presigned-URL TTL (this value plus 60 s). `0` = no limit on control requests, and presigned URLs then live 300 s. Data GETs use the stall detector instead. |
+| `stall_speed_limit_bytes` | bytes (per second, **>= 0**) | 65536 | Stall detector for data GETs: a transfer that received fewer than `stall_speed_limit_bytes` × `stall_time_s` bytes during the last `stall_time_s` seconds fails and is retried. `0` disables the detector. |
+| `stall_time_s` | duration (s, **>= 0**) | 30 | Window of the stall detector; `0` disables it. |
+| `retry_backoff_base_ms` | duration (ms, **>= 0**) | 50 | Base of the exponential backoff between retries. |
+| `retry_jitter_ms` | duration (ms, **>= 0**) | 50 | Random jitter added to each retry backoff. |
 | `max_retry_attempts` | int (**>= 1**) | 10 | Attempt budget (the first attempt included) for transient transport failures and HTTP 408/429/500/502/503/504; `1` = no retry. |
 | `max_auth_retry_attempts` | int (**>= 1**) | 3 | Async data attempt budget for HTTP 403 (an expired presigned URL); each attempt re-authorizes. Kept low so a genuine AccessDenied fails fast. Control requests treat 403 as terminal. |
 | `honor_retry_after` | bool | true | Wait a numeric `Retry-After` instead of the backoff. |
@@ -505,15 +597,15 @@ so staging is proportional to the device work in flight.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_connections` | int (**1..4096**) | 128 with kTLS loaded, 64 without | Keep-alive connections per reactor (one in-flight request each), not a process-wide cap. Unnamed, Sirius derives it from cuCascade's topology (`kernel_tls.loaded`), capped at half of `queue_depth` so a smaller named `queue_depth` stays valid; a named value wins. Past the point where the link is full, more connections only split the bandwidth into thinner streams; add reactors (`rest_n_reactors`) instead. |
-| `conn_max_age_s` | int (seconds, **>= 0**) | 20 | Idle cutoff of a pooled connection (curl's `CURLOPT_MAXAGE_CONN`): a connection idle for longer is closed and replaced when a request needs its slot, never in a sweep. Also the window in which the query-start warm-up skips a repeat of the bucket it warmed last (60 s when `0`). `0` = no idle cutoff. |
+| `conn_max_age_s` | duration (s, **>= 0**) | 20 | Idle cutoff of a pooled connection (curl's `CURLOPT_MAXAGE_CONN`): a connection idle for longer is closed and replaced when a request needs its slot, never in a sweep. Also the window in which the query-start warm-up skips a repeat of the bucket it warmed last (60 s when `0`). `0` = no idle cutoff. |
 | `upkeep_http1` | bool | false | Send idle upkeep: while a reactor is idle, one zero-key `ListObjectsV2` per established connection every `upkeep_interval_ms`, staggered across the interval, so the endpoint does not idle-close the pool. Off by default, as libcurl's upkeep is a no-op on HTTP/1.1. |
-| `upkeep_interval_ms` | int (ms, **>= 0**) | 15000 | Upkeep period; only acts with `upkeep_http1`. `0` disables upkeep. |
-| `connect_timeout_ms` | int (ms, **> 0**) | 3000 | Bound of one connection's TCP connect plus TLS handshake (curl's `CONNECTTIMEOUT`). |
-| `dns_ttl_s` | int (seconds, **> 0**) | 60 | DNS answer lifetime. Answers are refreshed ahead of expiry on a resolver thread shared by the pool, so a reactor never blocks on a lookup. IP literals bypass the resolver. |
+| `upkeep_interval_ms` | duration (ms, **>= 0**) | 15000 | Upkeep period; only acts with `upkeep_http1`. `0` disables upkeep. |
+| `connect_timeout_ms` | duration (ms, **> 0**) | 3000 | Bound of one connection's TCP connect plus TLS handshake (curl's `CONNECTTIMEOUT`). |
+| `dns_ttl_s` | duration (s, **> 0**) | 60 | DNS answer lifetime. Answers are refreshed ahead of expiry on a resolver thread shared by the pool, so a reactor never blocks on a lookup. IP literals bypass the resolver. |
 | `dns_accumulate` | bool | false | Union fresh answers with the previous ones (aged out after 5 minutes) instead of replacing them, so connections spread over more front-end addresses over time. |
 | `dns_max_addresses` | int (**1..4096**) | 64 | Addresses kept per host. |
-| `keepalive_idle_s` | int (seconds, **> 0**) | 60 | TCP keepalive (always on): idle time before the first probe. |
-| `keepalive_interval_s` | int (seconds, **> 0**) | 60 | TCP keepalive: time between probes. |
+| `keepalive_idle_s` | duration (s, **> 0**) | 60 | TCP keepalive (always on): idle time before the first probe. |
+| `keepalive_interval_s` | duration (s, **> 0**) | 60 | TCP keepalive: time between probes. |
 | `keepalive_count` | int (**>= 0**) | 0 | TCP keepalive: probes before the connection is dropped; `0` = kernel default. |
 | `min_mtu` | bytes (**0..65607**) | the egress NIC's MTU when above 1500 (jumbo frames), else 0 | Reject connections whose effective MTU is below this many bytes. `0` = off. Unnamed, Sirius derives it from cuCascade's topology: the MTU of the egress NIC (`rest.interface`, else the default route's interface) when that is a jumbo-frame MTU, otherwise `0`; a named value, `0` included, wins. See below. |
 | `mtu_reject_max_attempts` | int (**>= 1**) | 8 | Consecutive `min_mtu` rejections of one request after which the connection is accepted anyway. |
@@ -737,8 +829,8 @@ devices; independent background placement could conflict with a task's already s
 | `enable` | bool | false | Master switch for the prefetcher. |
 | `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each acquires an exclusive stream lease for a sweep and returns it before parking. |
 | `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of the GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
-| `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
-| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining until this long passes since its last pop. One worker may prefetch it tail-first, leaving four batches at the head for scan tasks; other workers skip it. Must exceed the scan's inter-pop interval. |
+| `poll_interval_ms` | duration (ms, **> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
+| `drain_quiet_ms` | duration (ms) | 100 | A connector counts as actively draining until this long passes since its last pop. One worker may prefetch it tail-first, leaving four batches at the head for scan tasks; other workers skip it. Must exceed the scan's inter-pop interval. |
 
 ### Programmatic S3 credentials
 

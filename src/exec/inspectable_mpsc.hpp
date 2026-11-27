@@ -37,7 +37,7 @@ namespace sirius::exec {
 /// own `front_to_back` argument and ignore this ordering.
 enum class queue_ordering { FIFO, LIFO };
 
-/// ADL-discoverable string conversion so yaml_reader can parse queue_ordering values.
+/// ADL-discoverable string conversion for queue_ordering values.
 inline bool string_to_enum(std::string_view sv, queue_ordering& out)
 {
   static const std::unordered_map<std::string_view, queue_ordering> map = {

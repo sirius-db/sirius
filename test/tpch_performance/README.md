@@ -374,7 +374,9 @@ is kept beside it as `config.yml`.
 | `hot` | `cucs` | `lru` | back-to-back per query | nothing |
 
 **Config overrides come from `--profile` and `--pin parquet`.** With neither, the supplied
-YAML is used unchanged; otherwise the runner can write `effective_config.yml`.
+YAML is used unchanged; otherwise the runner can write `effective_config.yml`. Either way, Sirius
+writes the configuration it resolved at startup (every named value, plus defaults and the values it
+derived from the machine) to `<bench>/resolved_config.yaml`.
 
 The runner requests dataset-file eviction once at startup, even when `--profile` is omitted. `cold` keeps the
 *connection* (and so the GPU context and compiled plans) — it targets caches, not the process.

@@ -1016,7 +1016,7 @@ TEST_CASE("Sirius configuration rejects invalid GPU topology selections", "[siri
     {"invalid_topology_negative_gpu_id.yaml", "only non-negative device ids"},
     {"invalid_topology_duplicate_gpu_ids.yaml", "duplicate device ids"},
     {"invalid_topology_gpu_ids_and_num_gpus.yaml", "mutually exclusive"},
-    {"invalid_topology_negative_num_gpus.yaml", "num_gpus must be non-negative"},
+    {"invalid_topology_negative_num_gpus.yaml", "num_gpus': must be a nonnegative integer"},
   };
 
   std::source_location loc = std::source_location::current();
@@ -1025,7 +1025,7 @@ TEST_CASE("Sirius configuration rejects invalid GPU topology selections", "[siri
     INFO("fixture=" << invalid.fixture);
     sirius::sirius_config config;
     REQUIRE_THROWS_WITH(config.load_from_file(data_dir / invalid.fixture),
-                        Catch::Matchers::ContainsSubstring("topology") &&
+                        Catch::Matchers::ContainsSubstring("'sirius.topology") &&
                           Catch::Matchers::ContainsSubstring(invalid.expected));
   }
 }
@@ -1181,9 +1181,9 @@ uint64_t expected_effective_batch(const sirius::sirius_config& config)
 TEST_CASE("Sirius derives GPU pipeline affinity from hardware topology", "[sirius][config]")
 {
   sirius::sirius_config config;
-  REQUIRE_THROWS_WITH(
-    config.load_from_file(config_fixture("invalid_pipeline_cpu_affinity.yaml")),
-    Catch::Matchers::ContainsSubstring("unknown config key: 'cpu_affinity' in thread_pool"));
+  REQUIRE_THROWS_WITH(config.load_from_file(config_fixture("invalid_pipeline_cpu_affinity.yaml")),
+                      Catch::Matchers::ContainsSubstring(
+                        "unknown config key: 'cpu_affinity' in sirius.executor.pipeline"));
 }
 
 TEST_CASE("operator batch defaults use the smallest low-level GPU capacity",
@@ -1228,10 +1228,12 @@ TEST_CASE("Sirius keeps executor thread-name prefixes internal", "[sirius][confi
     const char* context;
   };
   constexpr std::array cases{
-    invalid_prefix{"invalid_task_creator_thread_name_prefix.yaml", "task_creator"},
-    invalid_prefix{"invalid_pipeline_thread_name_prefix.yaml", "thread_pool"},
-    invalid_prefix{"invalid_downgrade_thread_name_prefix.yaml", "downgrade"},
-    invalid_prefix{"invalid_scan_manager_thread_name_prefix.yaml", "scan_manager"},
+    invalid_prefix{"invalid_task_creator_thread_name_prefix.yaml",
+                   "in sirius.executor.task_creator"},
+    invalid_prefix{"invalid_pipeline_thread_name_prefix.yaml", "in sirius.executor.pipeline"},
+    invalid_prefix{"invalid_downgrade_thread_name_prefix.yaml", "in sirius.executor.downgrade"},
+    invalid_prefix{"invalid_scan_manager_thread_name_prefix.yaml",
+                   "in sirius.executor.scan_manager"},
   };
 
   for (auto const& test : cases) {
@@ -1561,7 +1563,7 @@ TEST_CASE("Sirius high-level GPU config keeps per-stream tracking internal", "[s
   REQUIRE_THROWS_WITH(
     config.load_from_file(config_fixture("invalid_memory_gpu_per_stream_reservation.yaml")),
     Catch::Matchers::ContainsSubstring(
-      "unknown config key: 'track_per_stream_reservation' in memory.gpu"));
+      "unknown config key: 'track_per_stream_reservation' in sirius.memory.gpu"));
 }
 
 TEST_CASE("Sirius configuration rejects conflicting memory budget forms", "[sirius][config]")
@@ -2870,7 +2872,7 @@ TEST_CASE("Sirius configuration enables dense count join by default and accepts 
   REQUIRE_THROWS_WITH(
     invalid_type.load_from_file(data_dir / "invalid_dense_count_join_enable_type.yaml"),
     Catch::Matchers::ContainsSubstring("operator_params.enable_dense_count_join") &&
-      Catch::Matchers::ContainsSubstring("bad conversion"));
+      Catch::Matchers::ContainsSubstring("expected a scalar, got a sequence"));
 
   sirius::sirius_config invalid_budget;
   REQUIRE_THROWS_WITH(
