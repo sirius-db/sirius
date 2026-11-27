@@ -144,6 +144,13 @@ DATA=/path/to/tpcds_sf100 pixi run bash test/performance/run_tpcds.sh \
   --engine both --validation --keep-going --iterations 2 --pin gpu
 ```
 
+DuckDB reference results only need to be captured once per dataset: copy the
+`duckdb/q<N>/result.txt` files of an `--engine cpu` run (plus its
+`result_mode.json`) to `<dataset>_duckdb_results/duckdb/` next to the dataset
+(`/path/to/tpcds_sf100_duckdb_results` above). When that directory exists and
+neither `--engine` nor `--duckdb-results` is passed, `run_tpcds.sh` runs only
+the GPU and validates against the saved results (`REF=<dir>` overrides it).
+
 ## Prerequisites
 
 - Sirius must be built: `pixi run make -j12` (from project root)
