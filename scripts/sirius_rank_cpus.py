@@ -51,7 +51,10 @@ def core(cpu):
 
 def gpu_share(gpu, allowed):
     query = ["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader", "-i", gpu]
-    smi = subprocess.run(query, capture_output=True, text=True)
+    try:
+        smi = subprocess.run(query, capture_output=True, text=True)
+    except OSError as error:
+        sys.exit(f"cannot run nvidia-smi: {error}" + HINT)
     if smi.returncode != 0 or ":" not in smi.stdout:
         sys.exit(
             f"nvidia-smi does not show GPU '{gpu}': {(smi.stdout + smi.stderr).strip()}"
