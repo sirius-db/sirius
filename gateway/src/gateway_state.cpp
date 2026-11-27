@@ -99,6 +99,18 @@ bool changes_state(std::string const& sql)
   });
 }
 
+/// The number of statements in @p sql; 0 for a text that does not parse, which every rank refuses.
+duckdb::idx_t statement_count(std::string const& sql)
+{
+  duckdb::Parser parser{duckdb::ParserOptions::Builtin()};
+  try {
+    parser.ParseQuery(sql);
+  } catch (std::exception&) {
+    return 0;
+  }
+  return parser.statements.size();
+}
+
 /// Whether @p sql carries credentials (CREATE SECRET, a secret-like setting, an ATTACH token),
 /// which the gateway keeps out of the DDL log file.
 bool holds_credentials(std::string const& sql)
@@ -523,6 +535,13 @@ void gateway_state::restart(ClientContext& context)
 
 std::shared_ptr<rank_result> gateway_state::run(ClientContext& context, std::string const& sql)
 {
+  // A rank commits each statement of a text on its own. If a later one failed, the earlier ones
+  // would stay on the ranks, not always the same ones on each, and nothing would log them.
+  if (auto const count = statement_count(sql); count > 1) {
+    throw InvalidInputException(
+      "sirius_gateway_run takes one statement, and this text holds %d: call it once for each",
+      count);
+  }
   wait_for_ranks(context, sql);
   turn t{*this, context};
   return run_locked(context, sql, false);
