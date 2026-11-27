@@ -505,8 +505,9 @@ void LoadInternal(ExtensionLoader& loader)
          LogicalType::VARCHAR,
          Value(""));
   option("sirius_gateway_exchange_host_staging",
-         "sirius_exchange_host_staging for every rank: auto (TCP lanes to "
-         "other hosts), always, never or remote",
+         "sirius_exchange_host_staging for every rank: auto (the NVLink fabric where it "
+         "reaches, else TCP lanes to other hosts), always, never (the fabric, else NIXL "
+         "to every peer) or remote",
          LogicalType::VARCHAR,
          Value("auto"),
          check_host_staging);

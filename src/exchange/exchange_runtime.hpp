@@ -45,10 +45,9 @@ constexpr std::uint32_t max_tcp_lanes = 64;
 /// frames (credits) for each peer, each @p frame_bytes, a positive multiple of 256. A write covers
 /// consecutive frames, up to half of the smaller of a peer's credits and the send frames. The
 /// defaults keep the rings, which are outside the GPU memory budget, at 576 MiB for 8 ranks.
-/// NVLink between nodes needs larger writes (about 450 GB/s at 16 MiB, 700 at 128 MiB, 770 at
-/// 1 GiB): 16 MiB frames, 32 send frames and 16 credits keep two 128 MiB writes to a peer in
-/// flight, for 2.25 GiB at 8 ranks. The sizing is fixed until credits are granted on demand
-/// (#2371).
+/// NVLink between nodes needs larger writes (see distributed-sirius.md): 16 MiB frames, 32 send
+/// frames and 16 credits keep two 128 MiB writes to a peer in flight, for 2.25 GiB at 8 ranks.
+/// The sizing is fixed until credits are granted on demand (#2371).
 struct nixl_exchange_options {
   std::size_t frame_bytes   = std::size_t{8} * 1024 * 1024;  // 8 MiB
   std::uint32_t send_frames = 16;

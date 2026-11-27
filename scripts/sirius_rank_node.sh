@@ -74,7 +74,7 @@ fi
 [ -n "${ucx_tls:-}" ] && export UCX_TLS=${UCX_TLS:-$ucx_tls}
 [ -n "${ucx_net_devices:-}" ] && export UCX_NET_DEVICES=${UCX_NET_DEVICES:-$ucx_net_devices}
 [ -n "${ucx_rails:-}" ] && export SIRIUS_UCX_RAILS=${SIRIUS_UCX_RAILS:-$ucx_rails}
-# Before priority_networks names an interface: the GPU rail NICs win where the host has them.
+# Before priority_networks names an interface: with SIRIUS_UCX_RAILS=1 the GPU rail NICs win.
 source "$here/launcher_env.sh"
 priority_networks=${priority_networks:-${networks:-}}
 if [ -n "$priority_networks" ]; then

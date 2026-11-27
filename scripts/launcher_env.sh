@@ -3,8 +3,8 @@
 # SIRIUS_UCX_RAILS=1, on a host with GPU rail NICs (sirius_net.sh: sirius_rail_devices): UCX_TLS
 # defaults to every transport and UCX_NET_DEVICES to those NICs. UCX's notifications between nodes
 # then go over RC, which an exchange over the NVLink fabric needs at full speed (4 GPU pairs on
-# two GB200 nodes, both ways: 5.9 TB/s against 5.2 with tcp on bond0). Never add bond0 to them:
-# UCX then tries to reach a peer's bond0 address from a rail NIC and hangs.
+# two GB200 nodes, both ways: 5.8 TB/s against 4.9 to 5.2 with tcp on bond0). Never add bond0 to
+# them: UCX then tries to reach a peer's bond0 address from a rail NIC and hangs.
 # The gateway's ranks then also write GPU memory over NIXL to every peer the NVLink fabric does
 # not reach (host_staging never). auto reaches ranks on other hosts over lanes, which on these
 # NICs are RDMA too, but of host copies: 33 GB/s per rank against 65 when every rank sends to

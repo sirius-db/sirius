@@ -238,12 +238,16 @@ On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid
 the gateway set it up as its only rank), and `sirius_rank_exit()`
 (`src/exchange/rank_control.cpp`).
 
+The gateway reads these settings when `sirius_gateway_start` runs, or when the first
+statement starts the registered ranks. `sirius_gateway_restart` and the gateway's own
+restarts reuse what it read then.
+
 | Setting | Default | What |
 |---|---|---|
 | `sirius_gateway_duckdb_binary` | | DuckDB that runs each spawned rank |
 | `sirius_gateway_sirius_extension` | | Sirius extension the ranks load; empty runs CPU ranks, for tests |
 | `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings. It must not change them: a rank whose exchange settings differ from the ones it connected with fails every distributed query |
-| `sirius_gateway_exchange_host_staging` | `auto` | `sirius_exchange_host_staging` for every rank: `auto` (TCP lanes to ranks on other hosts), `always`, `never` or `remote` |
+| `sirius_gateway_exchange_host_staging` | `auto` | `sirius_exchange_host_staging` for every rank: `auto` (the NVLink fabric where it reaches, else TCP lanes to ranks on other hosts), `always`, `never` (the fabric, else NIXL to every peer) or `remote` |
 | `sirius_gateway_exchange_tcp_lanes` | 0 | `sirius_exchange_tcp_lanes` for every rank, at most 64; 0 shares 16 lanes among the ranks of a host |
 | `sirius_gateway_exchange_mnnvl` | `auto` | `sirius_exchange_mnnvl` for every rank: `auto`, `require` or `off` put the rings in fabric memory, for NVLink between nodes |
 | `sirius_gateway_exchange_frame_bytes` | 8388608 | `sirius_exchange_frame_bytes` for every rank |
