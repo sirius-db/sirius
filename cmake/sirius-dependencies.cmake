@@ -175,5 +175,4 @@ if(VCPKG_BUILD)
   endif()
 endif()
 
-# Rust telemetry instrumentation (C++ FFI via Corrosion)
-add_subdirectory(rust/crates/telemetry/bridge)
+add_subdirectory(rust)

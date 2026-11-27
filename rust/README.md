@@ -12,7 +12,9 @@ Before [#2436](https://github.com/sirius-db/sirius/pull/2436), `sirius` and
 `sirius-sys` referred to the C++ bridge. These names now refer to the public C ABI
 crates; the existing C++ bridge lives in `sirius-ffi`.
 
-The `telemetry/*` crates are unrelated: CMake links those into the engine.
+CMake uses Corrosion to build `sirius-engine` as a single Rust static library
+for libsirius. It includes the Quent telemetry bridge and `sirius-substrait`,
+the crate reserved for importing Substrait plans.
 
 ## Configuration
 

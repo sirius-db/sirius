@@ -53,7 +53,7 @@ set(SIRIUS_LINK_LIBRARIES
     yaml-cpp::yaml-cpp
     roaring::roaring
     nixl::nixl
-    telemetry_bridge
+    sirius_engine
     $<BUILD_INTERFACE:sirius::duckdb_dependency>
     simpatico
     PkgConfig::LIBURING
@@ -137,12 +137,12 @@ foreach(_target sirius_objects sirius_core sirius_shared)
 
   target_link_libraries(${_target} PRIVATE ${SIRIUS_LINK_LIBRARIES})
 
-  # Corrosion exposes telemetry_bridge as an INTERFACE target whose concrete
-  # Rust archive is telemetry_bridge-static. Apply WHOLE_ARCHIVE to that real
-  # archive so the unreferenced NVTX static-injection shim reaches the final
-  # loadable extension instead of being dropped at the nested archive boundary.
+  # Corrosion exposes sirius_engine as an INTERFACE target whose concrete Rust
+  # archive is sirius_engine-static. Apply WHOLE_ARCHIVE to that real archive so
+  # the unreferenced NVTX static-injection shim reaches the final loadable
+  # extension instead of being dropped at the nested archive boundary.
   set_property(
-    TARGET ${_target} PROPERTY "LINK_LIBRARY_OVERRIDE_telemetry_bridge-static"
+    TARGET ${_target} PROPERTY "LINK_LIBRARY_OVERRIDE_sirius_engine-static"
                                WHOLE_ARCHIVE)
 
 endforeach()
@@ -156,7 +156,7 @@ target_link_libraries(sirius_core
 # WHOLE_ARCHIVE item instead; DuckDB and every other final consumer then retain
 # the static NVTX pointer shim as well.
 target_link_libraries(
-  sirius_core PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,telemetry_bridge-static>")
+  sirius_core PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_engine-static>")
 
 # A statically embedded Sirius cannot give NVTX a DSO path. Its private dlopen
 # interposer maps one sentinel path to the running executable instead. Carry
@@ -192,7 +192,7 @@ endforeach()
 target_link_options(sirius_shared PRIVATE "LINKER:--gc-sections"
                     "LINKER:--allow-multiple-definition")
 
-# Cargo builds the Rust API crates separately from the telemetry bridge above.
+# Cargo builds the Rust API crates separately from the embedded Rust crates.
 # sirius-sys links libsirius from build/<preset>; sirius-ffi additionally
 # compiles its C++ bridge against include/. See rust/README.md.
 

@@ -5,7 +5,6 @@ edition.workspace = true
 
 [lib]
 name = "telemetry_bridge"
-crate-type = ["staticlib"]
 
 [dependencies]
 cxx = "1"

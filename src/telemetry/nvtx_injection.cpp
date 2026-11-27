@@ -23,10 +23,9 @@
 #include <filesystem>
 #include <string_view>
 
-// Statically embedded by telemetry_bridge. Rust archives are localized by the
-// extension link (`--exclude-libs,ALL`), so this regular C++ object supplies the
-// public NVTX entry point and forwards it into the same Quent hook state used by
-// Sirius's static-injection pointer.
+// The extension link localizes the engine's Rust archive (`--exclude-libs,ALL`).
+// This C++ object exports the NVTX entry point and forwards it to the same
+// Quent hook state used by Sirius's static-injection pointer.
 extern "C" int quent_InitializeInjectionNvtx2(void* get_export_table);
 extern "C" int (*InitializeInjectionNvtx2_fnptr)(void* get_export_table);
 extern "C" __attribute__((visibility("default"))) int InitializeInjectionNvtx2(
