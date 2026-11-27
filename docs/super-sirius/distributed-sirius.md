@@ -205,9 +205,9 @@ The ring sizes are settings, the same on every rank: `sirius_exchange_frame_byte
 memory budget: 576 MiB with 8 ranks by default. For NVLink between nodes, set 16 MiB frames, 32
 send frames and 16 receive frames per peer, which keep two 128 MiB writes to a peer in flight,
 and `SIRIUS_UCX_RAILS=1`: 2.25 GiB with 8 ranks, 18.3 GiB with 72 (credits on demand, #2371,
-would bound it). With that sizing one GPU pair moved 685 to 706 GB/s, and 626 with 8 receive
-frames per peer; with `tcp` on bond0 for the notifications, 677 and 579. With the default sizes it
-moved 312.
+would bound it). With that sizing one GPU pair moved 670 to 687 GB/s, and 606 with 8 receive
+frames per peer; with `tcp` on bond0 for the notifications, 623 to 652 and 471 to 488. With the
+default sizes it moved 312.
 
 `scripts/distributed_test_nixl_pairs.sh <node1>,<node2>` runs the hidden `[nixl_pairs]` test on
 two nodes of a Slurm partition, one rank per GPU paired with the same GPU on the other node: one
@@ -404,7 +404,7 @@ pixi run build-distributed
 
 | Variable | Default | Why |
 |---|---|---|
-| `UCX_TLS`, `UCX_NET_DEVICES` | `cuda_copy,cuda_ipc,tcp,self` on the interface of the rank's address | The transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout"). `SIRIUS_UCX_RAILS=1` takes every UCX transport on the GPU rail NICs (`sirius_rail_devices` in `scripts/sirius_net.sh`: active RDMA ports in no bond, at the highest link speed). They carry UCX's notifications over RC, which the exchange over NVLink needs at full speed: 4 GPU pairs both ways moved 5.9 TB/s, against 5.2 with tcp on bond0 |
+| `UCX_TLS`, `UCX_NET_DEVICES` | `cuda_copy,cuda_ipc,tcp,self` on the interface of the rank's address | The transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout"). `SIRIUS_UCX_RAILS=1` takes every UCX transport on the GPU rail NICs (`sirius_rail_devices` in `scripts/sirius_net.sh`: active RDMA ports in no bond, at the highest link speed). They carry UCX's notifications over RC, which the exchange over NVLink needs at full speed: 4 GPU pairs both ways moved 5.8 TB/s, against 4.9 to 5.2 with tcp on bond0 |
 | `DUCKDB_AGENT_MODE` | 0 | DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse that output |
 
 ## Running TPC-H Q12 on 4 GPUs

@@ -94,7 +94,7 @@ number or list, stops the scripts before they apply any of it. `gateway.min_rank
 | `gateway.networks` | `SIRIUS_GATEWAY_PRIORITY_NETWORKS` | | Or this host's first address in these CIDRs (`;` or `,` between them). Without either, the address of the default route's interface; with ranks spawned on this host, 127.0.0.1 |
 | `node.gpus` | `SIRIUS_NODE_GPUS` | `all` | The GPUs that get a rank: `all` (the entries of `CUDA_VISIBLE_DEVICES` when that is set), a list, or `slurm` (the GPU Slurm gave the task) |
 | `node.cpus` | `SIRIUS_NODE_CPUS` | `auto` | The CPUs of each rank. `auto`: its GPU's share of the cores next to that GPU (on a GB200 node, 36 of the 72 on the GPU's socket), or the CPUs the node script was started with when those are fewer than the host's, as under a Slurm that binds tasks to cores. `all`: every CPU the script was started with, shared by the host's ranks |
-| `node.networks` | `SIRIUS_NODE_NETWORKS` | the gateway's subnet | Each rank listens on this node's first address in these CIDRs, and UCX uses that address's interface unless `ucx.net_devices` names others |
+| `node.networks` | `SIRIUS_NODE_NETWORKS` | the gateway's subnet | Each rank listens on this node's first address in these CIDRs, and UCX uses that address's interface unless `ucx.net_devices` names others or `ucx.rails` takes the rail NICs |
 | `node.quack_port` | `SIRIUS_NODE_QUACK_PORT` | 9500 | First rank's Quack port |
 | `node.exchange_port` | `SIRIUS_NODE_EXCHANGE_PORT` | 27000 | First rank's exchange port |
 | `exchange.host_staging` | `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING` | `auto`; `never` with `ucx.rails: true` | `sirius_gateway_exchange_host_staging`, which the gateway sets as `sirius_exchange_host_staging` on every rank. `auto` reaches ranks on other hosts over TCP lanes. With RDMA between hosts on other devices than the rails, set `never` |
@@ -137,7 +137,10 @@ pixi run sirius-node
 `node ready for gateway <cluster>`. `sirius-node` starts one rank per GPU, each under
 `scripts/sirius_rank_node.sh`, which starts the rank again whenever it exits and registers it
 with the gateway. Ranks started before the gateway wait for its `gateway.conf`. Logs are in
-`/tmp/sirius_node_<user>_<cluster>/rank_<port>/rank.log` and `register.log`. Ctrl-C stops the
+`/tmp/sirius_node_<user>_<cluster>/rank_<port>/rank.log` and `register.log`. Sirius's own log
+of every rank goes to `log/` under the directory the node was started in; export
+`SIRIUS_RANK_LOG_ROOT=<dir>` to give each rank `<dir>/<short hostname>-<quack port>/`, which
+nodes that share a file system need. Ctrl-C stops the
 node's ranks. If one rank's script exits on an error it cannot retry, the node stops all its
 ranks.
 
