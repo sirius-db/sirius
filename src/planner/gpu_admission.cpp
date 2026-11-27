@@ -240,13 +240,34 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
   return hint;
 }
 
+namespace {
+
+/// `admission_bytes_per_gpu` as `query_operator_options` resolves it, without creating the
+/// session's overrides. Those snapshot the global configuration, and this is asked for every
+/// statement the optimizer sees, so creating them here would stop the session from seeing later
+/// changes to the global configuration.
+uint64_t resolved_admission_bytes_per_gpu(duckdb::ClientContext& context,
+                                          duckdb::SiriusContext& runtime)
+{
+  auto const state = duckdb::get_sirius_connection_state(context);
+  if (state && state->execution_options) {
+    return state->execution_options->admission_bytes_per_gpu;
+  }
+  if (state && state->operator_overrides) {
+    return state->operator_overrides->admission_bytes_per_gpu;
+  }
+  return runtime.get_config().get_operator_params().admission_bytes_per_gpu;
+}
+
+}  // namespace
+
 bool admission_estimate_needed(duckdb::ClientContext& context)
 {
   if (!context.registered_state) { return false; }
   auto const sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   // No GPU memory spaces exist before the runtime is initialized, and no query runs on it.
   if (!sirius_ctx || !sirius_ctx->is_initialized()) { return false; }
-  auto const bytes_per_gpu = duckdb::query_operator_options(context)->admission_bytes_per_gpu;
+  auto const bytes_per_gpu = resolved_admission_bytes_per_gpu(context, *sirius_ctx);
   // Off is the common case: answer it before looking at the GPUs.
   if (bytes_per_gpu == 0) { return false; }
   // The same candidates sirius_engine admits from: one per GPU memory space, capped by
