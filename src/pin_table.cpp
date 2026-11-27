@@ -333,6 +333,11 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
       chunk_stats = scan_manager::compute_pinned_chunk_stats(
         tbl->view(), pinned_column_types, stream, target->get_default_allocator());
     }
+    // The exact stage needs every chunk of a column on one device. Tell the probe before it looks
+    // at this chunk, so that it does not sort it for a column only the exact stage could settle.
+    if (exact_retaining && exact_gpu.has_value() && *exact_gpu != gpu_id) {
+      abandon_exact("the pin spans devices");
+    }
     // Observe BEFORE narrowing: the proof is about values, and same-family
     // narrowing preserves them, so the native carriers are both cheaper to
     // reduce and equally conclusive.
@@ -342,15 +347,17 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
       // let the probe drop the column when the memory space cannot grant one.
       decltype(target->make_reservation_or_null(std::size_t{})) sort_reservation;
       unique_probe.observe(tbl->view(), stream, [&](std::size_t bytes) {
+        // The sort before this one is over. Its pledge goes back first, so that a column's
+        // request never has to fit beside the one before it: a string chunk's is far larger than
+        // an integer key's.
+        sort_reservation.reset();
         sort_reservation = target->make_reservation_or_null(bytes);
         return sort_reservation != nullptr;
       });
     }
     if (exact_retaining) {
-      if (exact_gpu.has_value() && *exact_gpu != gpu_id) {
-        abandon_exact("the pin spans devices");
-      } else if (exact_rows + static_cast<std::size_t>(tbl->num_rows()) >
-                 static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
+      if (exact_rows + static_cast<std::size_t>(tbl->num_rows()) >
+          static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
         abandon_exact("the pin has more rows than a cuDF column holds");
       } else if (static_cast<std::size_t>(tbl->num_columns()) !=
                  options.probe_unique_columns.size()) {

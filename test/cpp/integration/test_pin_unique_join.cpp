@@ -239,6 +239,29 @@ void generate_overlapping_named_dim(fs::path const& dir)
   }
 }
 
+/// A dimension past the probe's small-table row cap, in the shape of TPC-DS customer: a join key
+/// `k`, a string `id` that no row repeats and that is not in the rows' order, a string `label`
+/// that many rows share and an integer `tier`. The fact holds each key twice, too few for its
+/// statistics to show that the keys repeat.
+constexpr std::int64_t big_dim_rows = 1'200'000;
+void generate_big_named_dim(fs::path const& dim, fs::path const& fact)
+{
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(nullptr);
+  duckdb::Connection gen(gen_db);
+  auto const rows = std::to_string(big_dim_rows);
+  // 7919 is prime and does not divide the row count, so the ids are a permutation of the rows.
+  run_generator(gen,
+                "COPY (SELECT range AS k, 'id_' || lpad(((range * 7919) % " + rows +
+                  ")::VARCHAR, 7, '0') AS id, 'label_' || (range % 100) AS label, "
+                  "(range % 3)::INTEGER AS tier FROM range(" +
+                  rows + ")) TO " + sirius::test::sql_literal(dim.string()) + " (FORMAT PARQUET);");
+  run_generator(gen,
+                "COPY (SELECT range % " + rows + " AS f_k, range % 7 AS v FROM range(" +
+                  std::to_string(2 * big_dim_rows) + ")) TO " +
+                  sirius::test::sql_literal(fact.string()) + " (FORMAT PARQUET);");
+}
+
 /// The pin's per-column uniqueness facts for the pinned entry @p name.
 std::vector<bool> proven_columns_of(duckdb::Connection& con, std::string const& name)
 {
@@ -581,6 +604,82 @@ TEST_CASE("a proven string column ahead of an integer key neither hides nor crow
   }
 
   con.Query("CALL unpin_table('pin_unique_join_named_dim');");
+}
+
+TEST_CASE("a big dimension's string id is proven at pin time and fixes the key of its join",
+          "[integration][pin_unique_join]")
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  sirius::test::scratch_dir scratch{"pin_unique_join_big_named_dim"};
+  auto const& tmp = scratch.path();
+  auto const dim  = tmp / "big_named_dim.parquet";
+  auto const fact = tmp / "big_fact.parquet";
+  generate_big_named_dim(dim, fact);
+
+  // Several pinned chunks, so that the id is settled across them by the exact stage.
+  auto const yaml_path = tmp / "pin_unique_join_big_named_dim.yaml";
+  write_config(yaml_path,
+               "  operator_params:\n"
+               "    scan_task_batch_size: 8MiB\n");
+  sirius::test::shared_test_env local_env(yaml_path);
+  auto con = local_env.make_connection();
+  set_option(con, "SET enable_duckdb_fallback = false;");
+
+  pin(con, dim, "pin_unique_join_big_named_dim");
+  // The key and the id are proven. The label and the tier repeat.
+  CHECK(proven_columns_of(con, "pin_unique_join_big_named_dim") ==
+        std::vector<bool>{true, true, false, false});
+
+  // The fact's least and greatest value per group of the dimension's columns, summed up so that
+  // one row answers for every group. Both groupings below hold the label.
+  auto const per_group = [&](std::string const& groups) {
+    return "SELECT count(*), sum(low), sum(top), max(label) FROM (SELECT d.label AS label, "
+           "min(f.v) AS low, max(f.v) AS top FROM read_parquet(" +
+           sirius::test::sql_literal(fact.string()) + ") f JOIN read_parquet(" +
+           sirius::test::sql_literal(dim.string()) + ") d ON f.f_k = d.k GROUP BY " + groups + ")";
+  };
+  auto const pushdowns = [&] {
+    return sirius::test::get_transparent_execution_stats(con).partial_aggregate_pushdowns;
+  };
+
+  SECTION("grouped by the id, the aggregate goes below the join")
+  {
+    // As TPC-DS q11 groups by c_customer_id: not by the join key, but one id is one row of the
+    // dimension and so one key.
+    auto const sql    = per_group("d.id, d.label");
+    auto const before = pushdowns();
+    CHECK(gpu_answer(con, sql) == cpu_answer(sql));
+    CHECK(pushdowns() > before);
+  }
+
+  SECTION("grouped by columns that repeat, it stays above")
+  {
+    auto const sql    = per_group("d.label, d.tier");
+    auto const before = pushdowns();
+    CHECK(gpu_answer(con, sql) == cpu_answer(sql));
+    CHECK(pushdowns() == before);
+  }
+
+  SECTION("with pin_table_prove_unique_keys off the id proves nothing")
+  {
+    set_option(con, "SET pin_table_prove_unique_keys = false;");
+    auto const sql    = per_group("d.id, d.label");
+    auto const before = pushdowns();
+    CHECK(gpu_answer(con, sql) == cpu_answer(sql));
+    CHECK(pushdowns() == before);
+    set_option(con, "RESET pin_table_prove_unique_keys;");
+  }
+
+  con.Query("CALL unpin_table('pin_unique_join_big_named_dim');");
 }
 
 TEST_CASE("a Hive partition column is not proven unique by a same-named file column",

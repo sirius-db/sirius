@@ -196,10 +196,12 @@ struct pushdown_fixture {
   }
 
   /// Why the rule left the aggregates of @p query alone: one entry per aggregate over a join.
-  reasons why(std::string const& query, pushdown_options const& options = by_grouping)
+  /// With @p order as written the answer does not turn on how DuckDB orders the joins.
+  reasons why(std::string const& query,
+              pushdown_options const& options = by_grouping,
+              join_order order                = join_order::optimized)
   {
-    return with_resolved_plan(
-             *con, query, join_order::optimized, true, options, [](ClientContext&, auto&) {})
+    return with_resolved_plan(*con, query, order, true, options, [](ClientContext&, auto&) {})
       .declined;
   }
 
@@ -565,10 +567,14 @@ TEST_CASE_METHOD(pushdown_fixture,
 
   // A grouped column that is not proven unique fixes nothing, whatever its values.
   CHECK(why(per_member("m_name, m_tier")) == reasons{"keys:not-grouped"});
-  // Nor does the id fix a key the aggregate above does not group by.
+  // Nor does the id fix a key the aggregate above does not group by: the order key, which the
+  // join with lineitem reads. Joined in another order that key would not be one, so the joins
+  // stay as written.
   CHECK(why(per_member("m_id, m_name, m_tier",
                        "(orders JOIN members ON o_custkey = m_custkey) JOIN lineitem "
-                       "ON o_orderkey = l_orderkey")) == reasons{"keys:not-grouped"});
+                       "ON o_orderkey = l_orderkey"),
+            by_grouping,
+            join_order::as_written) == reasons{"keys:not-grouped"});
   // An outer join pads the id with NULL where an order finds no member, so the orders without
   // one share a group above.
   CHECK(why(per_member("m_id, m_name", "orders LEFT JOIN members ON o_custkey = m_custkey")) ==

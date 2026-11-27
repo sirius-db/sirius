@@ -243,8 +243,8 @@ TEST_CASE("the exact check decides what the range test could not", "[late_mat][p
 TEST_CASE("a column is settled by its first chunk where it can be", "[late_mat][pin_uniqueness]")
 {
   // Observing every column of a fact table must not hand each of them to the exact stage's sort,
-  // so an unsorted chunk is sorted on the spot to find a repeat, and a non-integer column goes no
-  // further than a small table (below).
+  // so an unsorted chunk is sorted on the spot to find a repeat, and a column that is neither an
+  // integer nor a string goes no further than a small table (below).
   ::cuda::stream_ref const stream{cudaStream_t{}};
   using sirius::late_mat::unique_verdict;
 

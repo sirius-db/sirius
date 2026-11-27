@@ -535,12 +535,17 @@ void add_columns_of_unique_row(duckdb::ClientContext& context,
                                LogicalOperator& side,
                                duckdb::column_binding_set_t& fixed)
 {
-  auto const scanned = scan_columns_behind(side, side.GetColumnBindings());
-  if (!scanned.get) { return; }
+  auto const scanned  = scan_columns_behind(side, side.GetColumnBindings());
+  auto const is_fixed = [&](auto const& column) { return fixed.contains(column.first); };
+  // The scan's facts cost a look-up of its files and their pin, so they are asked for only where
+  // they could add a column: where some column of the side is fixed and some is not.
+  if (!scanned.get || std::ranges::none_of(scanned.columns, is_fixed) ||
+      std::ranges::all_of(scanned.columns, is_fixed)) {
+    return;
+  }
   auto const unique = unique_columns(context, *scanned.get);
-  if (!std::ranges::any_of(scanned.columns, [&](auto const& column) {
-        return fixed.contains(column.first) &&
-               std::ranges::find(unique, column.second) != unique.end();
+  if (std::ranges::none_of(scanned.columns, [&](auto const& column) {
+        return is_fixed(column) && std::ranges::find(unique, column.second) != unique.end();
       })) {
     return;
   }

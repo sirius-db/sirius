@@ -17,9 +17,9 @@
 #pragma once
 
 // Pin-time proof that a column's values are distinct across a whole pinned
-// table. Every integer column of a pin (and a small table's other columns) is observed when
-// `pin_table_prove_unique_keys` is set and the pin is a parquet one or late materialization is on;
-// the join planner and late materialization both read the facts.
+// table. Every integer and string column of a pin (and a small table's other columns) is observed
+// when `pin_table_prove_unique_keys` is set and the pin is a parquet one or late materialization
+// is on; the join planner and late materialization both read the facts.
 //
 // This fact is what lets a ride survive a GROUP BY: if the deferred columns are
 // functionally determined by a key that is unique over the pinned table, the
