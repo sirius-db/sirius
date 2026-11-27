@@ -122,6 +122,23 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
     reject_nested_column_operation(*target, "DISTINCT");
   }
 
+  // Until #2598 is fixed: the GPU lower() and upper() map some characters differently from
+  // DuckDB's, so they can rank rows differently. Checked before planning the child, which takes
+  // the expressions out of its projections.
+  if (op.order_by) {
+    auto const surviving = op.order_by->Copy();
+    if (!surviving->Simplify(op.distinct_targets, nullptr)) {
+      for (auto const& key : surviving->orders) {
+        if (reads_case_mapping(*key.expression, *op.children[0])) {
+          throw duckdb::NotImplementedException(
+            "DISTINCT ON with a NOCASE-collated, lower() or upper() ORDER BY key is not supported "
+            "on the GPU (falling back to CPU): '" +
+            key.expression->ToString() + "'");
+        }
+      }
+    }
+  }
+
   auto plan = create_plan(*op.children[0]);
   // The dedup's output types are the child's, so the child must plan the declared schema.
   auto const& planned_types = plan->get_types();

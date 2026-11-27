@@ -1065,15 +1065,20 @@ TEST_CASE_METHOD(DistinctFixture,
   compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord WHERE t = 26 ORDER BY t");
 }
 
-// The GPU lower() maps U+0130 to "i" + U+0307 where DuckDB maps it to "i" (#2598), so a NOCASE key
-// could keep another row; every key that reads lower() falls back.
-TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution ordered FIRST over a NOCASE or lower() key falls back at plan time",
-                 "[integration][gpu_execution][distinct][aggregate]")
+// The GPU lower() maps U+0130 to "i" + U+0307 where DuckDB maps it to "i", and the GPU upper() maps
+// U+00DF to "SS" where DuckDB maps it to U+1E9E (#2598), so a NOCASE, lower() or upper() key could
+// keep another row; every such key falls back.
+TEST_CASE_METHOD(
+  DistinctFixture,
+  "gpu_execution ordered FIRST and DISTINCT ON over a case-mapped key fall back at plan time",
+  "[integration][gpu_execution][distinct][aggregate]")
 {
   // DuckDB orders 'ia' (from 'İa') before 'ib' and keeps v 1; the GPU's 'i̇a' sorts after 'ib'.
+  // DuckDB orders 'STRASZ' before 'STRAẞE' and keeps v 4; the GPU's 'STRASSE' sorts first.
   run_ok("CREATE TABLE dist_nocase (k INTEGER, s VARCHAR, v INTEGER);");
-  run_ok("INSERT INTO dist_nocase VALUES (1, 'İa', 1), (1, 'ib', 2);");
+  run_ok(
+    "INSERT INTO dist_nocase VALUES (1, 'İa', 1), (1, 'ib', 2), (2, 'straße', 3), (2, 'strasz', "
+    "4);");
   run_ok("CHECKPOINT;");
 
   SECTION("an explicit collation")
@@ -1084,10 +1089,23 @@ TEST_CASE_METHOD(DistinctFixture,
       "SELECT k, last(v ORDER BY s COLLATE NOCASE DESC) FROM dist_nocase GROUP BY k");
   }
 
-  SECTION("a lower() key")
+  SECTION("a lower() or upper() key")
   {
     expect_plan_fallback_matches_cpu(
       "SELECT k, first(v ORDER BY lower(s)) FROM dist_nocase GROUP BY k");
+    expect_plan_fallback_matches_cpu(
+      "SELECT k, first(v ORDER BY upper(s)) FROM dist_nocase GROUP BY k");
+  }
+
+  // DuckDB projects an explicit lower() or upper() key below the Distinct.
+  SECTION("a DISTINCT ON key")
+  {
+    expect_plan_fallback_matches_cpu(
+      "SELECT DISTINCT ON (k) k, v FROM dist_nocase ORDER BY k, s COLLATE NOCASE");
+    expect_plan_fallback_matches_cpu(
+      "SELECT DISTINCT ON (k) k, v FROM dist_nocase ORDER BY k, lower(s)");
+    expect_plan_fallback_matches_cpu(
+      "SELECT DISTINCT ON (k) k, v FROM dist_nocase ORDER BY k, upper(s)");
   }
 
   // Two FIRSTs share the sort key, and a max(lower(s)) beside one moves lower(s) into the
@@ -1110,6 +1128,8 @@ TEST_CASE_METHOD(DistinctFixture,
     {
       sirius::test::scoped_sirius_setting collation{*con, "default_collation", "nocase"};
       expect_plan_fallback_matches_cpu("SELECT k, first(v ORDER BY s) FROM dist_nocase GROUP BY k");
+      expect_plan_fallback_matches_cpu(
+        "SELECT DISTINCT ON (k) k, v FROM dist_nocase ORDER BY k, s");
     }
     // A failed restore would leak nocase into every later integration case.
     REQUIRE(

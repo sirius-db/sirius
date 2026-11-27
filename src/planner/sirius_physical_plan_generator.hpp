@@ -303,6 +303,11 @@ class sirius_physical_plan_generator {
   static void reject_nested_column_operation(duckdb::Expression const& expr,
                                              std::string_view operation);
 
+  // Whether @p expression calls a GPU lower() or upper(), directly or through a column of the
+  // projections below @p child, where DuckDB can move it. NOCASE collates a key as lower(key).
+  static bool reads_case_mapping(duckdb::Expression const& expression,
+                                 duckdb::LogicalOperator const& child);
+
   // Same check when only a column type + name are available (e.g. a predicate
   // pushed into LogicalGet::table_filters).
   static void reject_nested_column_type(duckdb::LogicalType const& type,

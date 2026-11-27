@@ -2800,21 +2800,25 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE_NOTHROW(generate_sirius_plan(*con, query));
   }
 
-  SECTION("a collated DISTINCT ON ORDER BY key is refused")
+  SECTION("a DISTINCT ON ORDER BY key over NOCASE, lower() or upper() is refused")
   {
-    // The binder wraps the key in its collation, so it is not a plain reference to a child column.
-    require_rejected("SELECT DISTINCT ON (pk) pk, pname FROM parts ORDER BY pname COLLATE NOCASE",
-                     "is not a plain reference to a child column");
+    // DuckDB projects an explicit lower() or upper() key below the Distinct.
+    auto const* query =
+      GENERATE("SELECT DISTINCT ON (pk) pk, pname FROM parts ORDER BY pk, pname COLLATE NOCASE",
+               "SELECT DISTINCT ON (pk) pk, pname FROM parts ORDER BY pk, lower(pname)",
+               "SELECT DISTINCT ON (pk) pk, pname FROM parts ORDER BY pk, upper(pname) DESC");
+    require_rejected(query, "DISTINCT ON with a NOCASE-collated, lower() or upper() ORDER BY key");
   }
 
-  SECTION("an ordered FIRST over a NOCASE or lower() key is refused")
+  SECTION("an ordered FIRST over a NOCASE, lower() or upper() key is refused")
   {
     auto const* query =
       GENERATE("SELECT pk, first(pk ORDER BY pname COLLATE NOCASE) FROM parts GROUP BY pk",
                "SELECT pk, last(pk ORDER BY lower(pname)) FROM parts GROUP BY pk",
+               "SELECT pk, first(pk ORDER BY upper(pname)) FROM parts GROUP BY pk",
                "SELECT pk, first(pk ORDER BY pname COLLATE NOCASE), max(lower(pname)) FROM parts "
                "GROUP BY pk");
-    require_rejected(query, "NOCASE-collated or lower() ORDER BY key");
+    require_rejected(query, "NOCASE-collated, lower() or upper() ORDER BY key");
   }
 
   // An overload registered under create_sort_key joins the built-in's catalog set, and DuckDB's
