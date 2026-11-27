@@ -344,7 +344,11 @@ See [Thread Pool Configuration](#thread-pool-configuration) for rounding, limits
 
 Thread pool (fixed default `num_threads: 4`). Task creation
 policy and within-branch priority are internal: Sirius currently creates tasks
-on demand and prioritizes source-side pipelines first. The former
+on demand and prioritizes source-side pipelines first. Setting the environment
+variable `SIRIUS_PRIORITY_DOWNSTREAM_FIRST=1` reverses that ranking, so pipelines
+closer to the result run first and consume what the scans produced before more
+is read; at 16 ranks it keeps a large shuffle join from piling up its probe
+input (TPC-H SF100000 Q3). The former
 `sirius.executor.task_creator.strategy` and
 `sirius.executor.task_creator.priority_order` keys have been removed;
 configurations that still contain either key must delete it.
