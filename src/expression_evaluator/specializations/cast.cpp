@@ -155,6 +155,8 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
   auto const input = child.get_column_view();
   std::unique_ptr<cudf::column> result_column;
   if (alt.kind == sirius::ast::cast_kind::carrier_restore) {
+    // A dictionary carrier is a hint: the batch may already hold the restored STRING form.
+    if (input.type() == return_type) { return child; }
     // Only planner-certified carrier restoration may tunnel through the representation.
     result_column = sirius::cast_through_rep(input, return_type, _stream, _mr);
   } else if (alt.child->return_type().is_decimal() && alt.target_type.is_integer()) {

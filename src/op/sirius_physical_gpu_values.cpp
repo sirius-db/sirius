@@ -420,7 +420,8 @@ std::unique_ptr<operator_data> sirius_physical_gpu_values::execute(const operato
                             schema[i].id() == duckdb::LogicalTypeId::MAP ||
                             schema[i].id() == duckdb::LogicalTypeId::ARRAY;
         columns.push_back(has_physical_overrides() && !nested &&
-                              get_physical_types()[i].id() != cudf::type_id::STRING
+                              get_physical_types()[i].id() != cudf::type_id::STRING &&
+                              get_physical_types()[i].id() != cudf::type_id::DICTIONARY32
                             ? cudf::make_empty_column(get_physical_types()[i])
                             : empty_bound_column(schema[i], stream, mr));
       }

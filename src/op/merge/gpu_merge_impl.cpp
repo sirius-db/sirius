@@ -18,6 +18,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/carried_columns.hpp"
@@ -108,8 +109,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   for (const auto& batch : input) {
     input_cudf_table_views.push_back(get_cudf_table_view(batch));
   }
-  auto output_cudf_table =
-    cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
+  auto output_cudf_table = concatenate_carriers(
+    std::move(input_cudf_table_views), stream, memory_space.get_default_allocator());
 
   // Create output data batch.
   return make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info);

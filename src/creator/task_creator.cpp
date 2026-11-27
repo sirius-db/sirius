@@ -784,8 +784,9 @@ void task_creator::manager_loop()
                                                        return a.second < b.second;
                                                      })
                                       ->first;
-                    preferred_device_id =
-                      _numa_affinity.next_gpu(top_host, _topology_index->gpus_of(top_host));
+                    auto const local = sirius::memory::admitted_local_gpus(
+                      _topology_index->gpus_of(top_host), query_state->active_gpu_ids);
+                    preferred_device_id = _numa_affinity.next_gpu(top_host, local);
                   }
                   SIRIUS_LOG_DEBUG(
                     "Task Creator: locality score gpu_sources={} host_sources={} "
@@ -819,10 +820,14 @@ void task_creator::manager_loop()
                           // memory_space; map back through the topology index to
                           // pick a GPU on the same NUMA. The host space's device id
                           // is the NUMA key verbatim (-1 = "unknown"), matching the
-                          // pipelineable locality block above.
-                          auto const host = space->get_device_id();
-                          preferred_device_id =
-                            _numa_affinity.next_gpu(host, _topology_index->gpus_of(host));
+                          // pipelineable locality block above. Only the query's admitted
+                          // GPUs are walked: a chunk sent to an excluded GPU would be moved by
+                          // the clamp below onto a GPU that already has its own chunk. With no
+                          // admitted GPU on that NUMA node the chunk gets no preference here.
+                          auto const host  = space->get_device_id();
+                          auto const local = sirius::memory::admitted_local_gpus(
+                            _topology_index->gpus_of(host), query_state->active_gpu_ids);
+                          preferred_device_id = _numa_affinity.next_gpu(host, local);
                         }
                         SIRIUS_LOG_DEBUG(
                           "Task Creator: cached-scan locality tier={} device_id={} "

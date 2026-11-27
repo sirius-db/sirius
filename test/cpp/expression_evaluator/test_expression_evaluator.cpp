@@ -50,6 +50,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/dictionary/encode.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/unary.hpp>
@@ -3003,6 +3004,36 @@ TEST_CASE("native_ast - cast INTEGER->BIGINT (MATERIALIZE)",
   REQUIRE(out_host.size() == in_host.size());
   for (size_t i = 0; i < in_host.size(); ++i) {
     REQUIRE(out_host[i] == static_cast<int64_t>(in_host[i]));
+  }
+}
+
+TEST_CASE("native_ast - a carrier restore accepts the carrier's STRING form",
+          "[expression_evaluator_ast_native][cast][dictionary_carrier]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::STRING}}, {std::pair<int, int>{1, 5}});
+  auto ro             = input->to_read_only();
+  auto& in_repr       = ro.get_data()->cast<gpu_table_representation>();
+  auto strings        = in_repr.get_table_view();
+  auto const expected = copy_string_column_to_host(strings.column(0));
+  auto const encoded =
+    cudf::dictionary::encode(strings.column(0), cudf::data_type{cudf::type_id::INT32});
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::cast{ref_node_native(0),
+                      sirius::logical_type::make(sirius::type_id::VARCHAR),
+                      /*try_cast=*/false,
+                      sirius::ast::cast_kind::carrier_restore});
+
+  for (auto const& tv : {strings, cudf::table_view{{encoded->view()}}}) {
+    for (auto const strategy : {MAT, exp_strategy_enum::AST_JIT}) {
+      auto out = run_native_ast(*space, hand_ast.get(), tv, strategy);
+      REQUIRE(out);
+      REQUIRE(out->get_column(0).type().id() == cudf::type_id::STRING);
+      CHECK(copy_string_column_to_host(out->view().column(0)) == expected);
+    }
   }
 }
 

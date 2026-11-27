@@ -1,39 +1,25 @@
 ---
-description: Build Sirius with pixi and run tests. Asks the user which tests to run.
+description: Build Sirius with pixi and run the requested tests.
 ---
 
 # Build and Run Tests
 
-Build Sirius using pixi and run the tests the user selects.
+Use the test name, tag, or scope supplied by the user. If no test is specified,
+select tests relevant to the request and changes, or ask if the intended scope
+cannot be inferred. Run commands in the Pixi environment:
 
-## Steps
+- All C++ unit tests: `pixi run make test` (builds first).
+- A specific test: build with `pixi run make`, then run
+  `pixi run build/release/test/cpp/sirius_unittest '<name-or-tag>'`.
+  Set `SIRIUS_EXTENSION_PATH` to the built
+  `sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension`
+  to include extension-loading checks; report those skips when it is unset.
 
-1. Build Sirius using pixi:
-   ```
-   pixi run make
-   ```
-   If build fails, diagnose and fix. If OOM, retry with `CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run make`.
+For an inferred normal-suite tag selection, exclude hidden tests with `~[.]`, as
+in [test/README.md](../../test/README.md). Honor explicitly requested hidden tests,
+tags, or names without adding that exclusion.
 
-2. After a successful build, present the user with test options:
-
-   ```
-   Build succeeded. Which tests would you like to run?
-
-   1. All C++ unit tests (make test)
-   2. A specific C++ unit test (provide name or [tag])
-   3. Auto-detect from changed files
-   ```
-
-   Wait for the user to choose before proceeding.
-
-3. Run the selected tests using pixi:
-   - **All C++ unit tests**: `pixi run make test`
-   - **Specific C++ unit test**: `pixi run bash -c "build/release/test/cpp/sirius_unittest '<name-or-tag>'"`
-   - **Auto-detect**: Check `git diff main --name-only` to identify changed files, then run the most relevant tests. Explain the reasoning to the user before running.
-
-4. If tests fail:
-   - Show the failure output clearly.
-   - Analyze the root cause.
-   - Ask the user if they want you to fix it. If yes, apply the fix and re-run the failing test.
-
-5. Report results: total passed, failed, and skipped.
+If a build runs out of memory, retry with lower parallelism, for example
+`CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run make`. Report failures and their likely
+cause. Apply fixes and rerun relevant tests when the user's request includes fixes;
+otherwise report the findings. Summarize the results and any tests not run.

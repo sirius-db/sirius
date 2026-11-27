@@ -18,6 +18,7 @@
 
 #include "cudf/hugeint_carrier.hpp"
 #include "data/data_batch_utils.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/key_preparation.hpp"
 
@@ -34,6 +35,11 @@
 #include <cudf/utilities/traits.hpp>
 
 #include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -112,6 +118,50 @@ hash_partition_result stable_hash_partition(cudf::table_view const& input,
   return {std::move(reordered), std::move(offsets)};
 }
 
+/// @p input with its dictionary carriers in @p key_indices decoded, so their rows hash as they do
+/// in batches that carry their strings. The decoded columns are appended to @p owners.
+cudf::table_view decode_carrier_keys(cudf::table_view input,
+                                     std::vector<int> const& key_indices,
+                                     std::vector<std::unique_ptr<cudf::column>>& owners,
+                                     ::cuda::stream_ref stream,
+                                     rmm::device_async_resource_ref mr)
+{
+  std::vector<cudf::column_view> columns(input.begin(), input.end());
+  bool decoded = false;
+  for (auto const i : key_indices) {
+    if (columns[i].type().id() != cudf::type_id::DICTIONARY32) { continue; }
+    owners.push_back(decode_dictionary_carrier(columns[i], stream, mr));
+    columns[i] = owners.back()->view();
+    decoded    = true;
+  }
+  return decoded ? cudf::table_view(columns) : input;
+}
+
+/// Whether splitting a batch of @p batch_bytes into @p num_partitions copies too many of carrier
+/// @p column's keys: each partition copies them whole, which is too much once the keys times the
+/// partitions exceed an eighth of the batch.
+bool costly_carrier(cudf::column const& column, int num_partitions, std::size_t batch_bytes)
+{
+  return column.type().id() == cudf::type_id::DICTIONARY32 &&
+         dictionary_keys_bytes(column) * static_cast<std::size_t>(num_partitions) > batch_bytes / 8;
+}
+
+/// @p table with its costly carriers (see costly_carrier) decoded.
+std::unique_ptr<cudf::table> decode_costly_carriers(std::unique_ptr<cudf::table> table,
+                                                    int num_partitions,
+                                                    std::size_t batch_bytes,
+                                                    ::cuda::stream_ref stream,
+                                                    rmm::device_async_resource_ref mr)
+{
+  auto columns = table->release();
+  for (auto& column : columns) {
+    if (costly_carrier(*column, num_partitions, batch_bytes)) {
+      column = decode_dictionary_carrier(column->view(), stream, mr);
+    }
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 }  // namespace
 
 std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_partition(
@@ -130,7 +180,12 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
     throw std::runtime_error("`num_partitions` in `hash_partition()` should be at least 2");
   }
 
-  auto input_table = get_cudf_table_view(input);
+  std::vector<std::unique_ptr<cudf::column>> decoded_keys;
+  auto input_table = decode_carrier_keys(get_cudf_table_view(input),
+                                         partition_key_idx,
+                                         decoded_keys,
+                                         stream,
+                                         memory_space.get_default_allocator());
 
   // When a join condition has mixed key types (e.g. INT32 vs INT64), cuDF's murmur3 hash
   // produces different values for the same integer in different representations. We apply the
@@ -196,6 +251,12 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
                                                    seed,
                                                    stream,
                                                    memory_space.get_default_allocator());
+  // The partitioned table owns its carriers' keys, whose size it knows without a sync.
+  partition_result.first = decode_costly_carriers(std::move(partition_result.first),
+                                                  num_partitions,
+                                                  input.get_data()->get_size_in_bytes(),
+                                                  stream,
+                                                  memory_space.get_default_allocator());
 
   // Build a column-index list for the original (non-cast) columns.
   std::vector<cudf::size_type> orig_col_indices;
@@ -240,8 +301,9 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_p
     throw std::runtime_error("`num_partitions` in `evenly_partition()` should be at least 2");
   }
 
+  auto input_table = get_cudf_table_view(input);
+
   // Compute slice indices
-  auto input_table                        = get_cudf_table_view(input);
   cudf::size_type partition_num_rows_base = input_table.num_rows() / num_partitions;
   cudf::size_type remainder               = input_table.num_rows() % num_partitions;
   std::vector<cudf::size_type> slice_indices;
@@ -252,11 +314,30 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_p
   }
 
   // Slice and create separate partitions
-  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  auto const mr               = memory_space.get_default_allocator();
   auto sliced_partition_views = cudf::slice(input_table, slice_indices, stream);
+  auto first = std::make_unique<cudf::table>(sliced_partition_views[0], stream, mr);
+
+  // Every partition copies a carrier's keys whole; the first copy owns them, so it knows their size
+  // without a sync.
+  std::vector<cudf::column_view> columns(input_table.begin(), input_table.end());
+  std::vector<std::unique_ptr<cudf::column>> decoded_carriers;
+  auto const batch_bytes = input.get_data()->get_size_in_bytes();
+  for (cudf::size_type c = 0; c < input_table.num_columns(); ++c) {
+    if (!costly_carrier(first->get_column(c), num_partitions, batch_bytes)) { continue; }
+    decoded_carriers.push_back(decode_dictionary_carrier(columns[c], stream, mr));
+    columns[c] = decoded_carriers.back()->view();
+  }
+  if (!decoded_carriers.empty()) {
+    sliced_partition_views = cudf::slice(cudf::table_view(columns), slice_indices, stream);
+    first                  = std::make_unique<cudf::table>(sliced_partition_views[0], stream, mr);
+  }
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   for (int i = 0; i < num_partitions; ++i) {
-    auto output_partition = std::make_unique<cudf::table>(
-      sliced_partition_views[i], stream, memory_space.get_default_allocator());
+    auto output_partition =
+      i == 0 ? std::move(first)
+             : std::make_unique<cudf::table>(sliced_partition_views[i], stream, mr);
     output_batches.push_back(
       make_data_batch(std::move(output_partition), memory_space, stream, telemetry_info));
   }

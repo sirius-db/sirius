@@ -19,13 +19,13 @@
 #include "data/data_batch_utils.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"  // IWYU pragma: keep
 #include "op/scan/scan_utils.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/nvtx.hpp"
 
-#include <cudf/concatenate.hpp>
 #include <cudf/cudf_utils.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -138,7 +138,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
         "pipelineable_operator_data: get_data_batches.size() != get_read_only_batches.size()");
     }
     // When multiple small batches were coalesced by get_next_task_input_data(),
-    // concatenate their GPU tables into one to issue fewer, larger kernel launches.
+    // concatenate their GPU tables into one to issue fewer, larger kernel launches. A dictionary
+    // carrier may be strings in some of them.
     std::vector<cudf::table_view> table_views;
     table_views.reserve(ro_input_batches.size());
 
@@ -151,8 +152,9 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       }
     }
     if (table_views.size() > 1 && space) {
-      auto concatenated = cudf::concatenate(table_views, stream, space->get_default_allocator());
-      auto concat_rep   = std::make_unique<cucascade::gpu_table_representation>(
+      auto concatenated =
+        sirius::concatenate_carriers(table_views, stream, space->get_default_allocator());
+      auto concat_rep = std::make_unique<cucascade::gpu_table_representation>(
         std::move(concatenated), *space, stream);
       size_t const batch_id = get_next_batch_id();
       single_batch          = cucascade::data_batch::make(

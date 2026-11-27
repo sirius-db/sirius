@@ -135,6 +135,31 @@ TEST_CASE("a batch of another shape is declined", "[late_mat][directive]")
   REQUIRE_FALSE(pair.port.matches(shorter));
 }
 
+TEST_CASE("a carrier that only passes the port may arrive as its strings",
+          "[late_mat][directive][dictionary_carrier]")
+{
+  auto schema     = customer_schema();
+  schema[3]       = dt(cudf::type_id::DICTIONARY32);
+  auto const pair = make_defer_pair(schema, {1, 2}, schema, {1, 2}, origins(2));
+  REQUIRE(pair.valid());
+  REQUIRE(pair.port.expected_schema[3].id() == cudf::type_id::DICTIONARY32);
+
+  REQUIRE(pair.port.matches(pair.port.expected_schema));
+  auto as_strings = pair.port.expected_schema;
+  as_strings[3]   = dt(cudf::type_id::STRING);
+  REQUIRE(pair.port.matches(as_strings));
+
+  // Only the carrier's STRING form stands in for it, and not the other way round.
+  auto other = pair.port.expected_schema;
+  other[3]   = dt(cudf::type_id::INT32);
+  REQUIRE_FALSE(pair.port.matches(other));
+  auto const plain =
+    make_defer_pair(customer_schema(), {1, 2}, customer_schema(), {1, 2}, origins(2));
+  auto as_dictionary = plain.port.expected_schema;
+  as_dictionary[3]   = dt(cudf::type_id::DICTIONARY32);
+  REQUIRE_FALSE(plain.port.matches(as_dictionary));
+}
+
 TEST_CASE("unbuildable requests produce no pair at all", "[late_mat][directive]")
 {
   // Each of these would install a half-deferral, which is worse than none.

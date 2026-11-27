@@ -40,6 +40,8 @@ struct compressed_materialization_stats {
   /// Plan-time count of narrow scan sidecar targets flipped back to native; the keep/retract rule
   /// is `apply_tier_narrowing_policy`'s.
   uint64_t scan_narrow_targets_retracted = 0;
+  /// Runtime count of columns a scan emitted as DICTIONARY32 carriers, per batch.
+  uint64_t scan_dictionary_carriers = 0;
 };
 
 /// Only tests aggregate these events. Construct before the operation being measured.
@@ -103,6 +105,7 @@ class compressed_materialization_recorder {
         case scan_sidecar_installed: _stats.scan_sidecars_installed += count; break;
         case partition_narrow_columns: _stats.partition_narrow_columns += count; break;
         case scan_narrow_targets_retracted: _stats.scan_narrow_targets_retracted += count; break;
+        case scan_dictionary_carriers: _stats.scan_dictionary_carriers += count; break;
       }
     }
 

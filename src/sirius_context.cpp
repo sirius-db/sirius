@@ -1960,6 +1960,18 @@ bool compressed_materialization_enabled(ClientContext& context)
   return sirius::operator_params{}.enable_compressed_materialization;
 }
 
+bool dictionary_carrier_enabled(ClientContext& context)
+{
+  // The exchange wire cannot send a dictionary, and decoding one at the exchange would leave the
+  // operators above it planned for the carrier.
+  if (query_operator_options(context)->distributed()) { return false; }
+  Value setting;
+  if (context.TryGetCurrentSetting("enable_dictionary_carrier", setting) && !setting.IsNull()) {
+    return setting.GetValue<bool>();
+  }
+  return sirius::operator_params{}.enable_dictionary_carrier;
+}
+
 void print_cpu_fallback_banner(std::string_view reason)
 {
   const bool tty  = ::isatty(::fileno(stdout)) != 0;

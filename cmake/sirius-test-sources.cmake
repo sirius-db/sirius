@@ -111,11 +111,13 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_decimal_integer_cast.cpp
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
+    test/cpp/helper/test_dictionary_carrier.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_numeric_narrowing.cpp
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_compressed_materialization_gate.cpp
     test/cpp/integration/test_compressed_materialization_partition.cpp
+    test/cpp/integration/test_dictionary_carrier_sources.cpp
     test/cpp/integration/test_gpu_execution_aggregate_filter.cpp
     test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
@@ -264,6 +266,7 @@ set(TEST_SOURCES
     test/cpp/operator/window/test_whole_partition.cpp
     test/cpp/operator/aggregate/test_average_as_double.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
+    test/cpp/operator/aggregate/test_dictionary_carrier_groupby.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_sorted_keys.cpp
     test/cpp/operator/aggregate/test_group_key_labels.cpp
