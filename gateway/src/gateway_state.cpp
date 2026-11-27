@@ -961,6 +961,7 @@ void gateway_state::add_rank(ClientContext& context, rank_spec spec)
 void gateway_state::drop_rank(ClientContext& context, std::string const& name)
 {
   turn t{*this, context};
+  bool none_left = false;
   {
     std::lock_guard lock{state_mutex_};
     auto* spec = find_registered(name);
@@ -970,7 +971,12 @@ void gateway_state::drop_rank(ClientContext& context, std::string const& name)
       fail_locked("membership changed: dropped " + name +
                   ", so the gateway restarts the ranks before the next statement");
     }
+    none_left = registered_.empty() && options_.ranks == 0;
   }
+  // No rank is left to start: the next statement's restart would be refused before it ended
+  // these sessions, and so would every statement after it, also the catalog reads of an ATTACH,
+  // which a node needs to register its rank.
+  if (none_left) { stop_locked(); }
   ranks_cv_.notify_all();
 }
 
