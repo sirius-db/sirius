@@ -1245,6 +1245,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       projected_output_count,
       op.returned_types);
     node->named_parameters             = std::move(op.named_parameters);
+    node->relied_dynamic_filter_target = relied_filter_targets.contains(&op);
     node->read_views                   = read_views;
     node->scan_node_id                 = next_scan_node_id++;
     node->table_index                  = op.table_index.index;
@@ -1330,6 +1331,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     }
   }
   node->named_parameters             = std::move(op.named_parameters);
+  node->relied_dynamic_filter_target = relied_filter_targets.contains(&op);
   node->read_views                   = read_views;
   node->scan_node_id                 = next_scan_node_id++;
   node->table_index                  = op.table_index.index;

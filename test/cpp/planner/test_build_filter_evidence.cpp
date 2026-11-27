@@ -262,6 +262,122 @@ TEST_CASE("a right-family join publishes only with filters, accumulation and a B
   CHECK_FALSE(sirius::planner::right_family_publication_enabled(params));
 }
 
+namespace {
+
+// A scan with one projected column, so a join key can be traced to it.
+duckdb::unique_ptr<duckdb::LogicalGet> make_scannable_get()
+{
+  auto get = make_get();
+  get->AddColumnId(0);
+  return get;
+}
+
+void add_key(duckdb::LogicalComparisonJoin& join,
+             duckdb::idx_t probe_ordinal,
+             duckdb::ExpressionType comparison = duckdb::ExpressionType::COMPARE_EQUAL)
+{
+  join.conditions.emplace_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER,
+                                                        probe_ordinal),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    comparison);
+}
+
+sirius::operator_params filters_on()
+{
+  sirius::operator_params params;
+  params.enable_dynamic_filter                 = true;
+  params.enable_dynamic_filter_multi_partition = true;
+  return params;
+}
+
+}  // namespace
+
+TEST_CASE("a join expects to filter the scan its probe key comes from",
+          "[dynamic_filter][evidence]")
+{
+  using sirius::planner::expected_probe_targets;
+  auto const params = filters_on();
+
+  SECTION("an equality on a scan column names that scan")
+  {
+    auto join         = make_join_over(make_scannable_get(), make_scannable_get());
+    auto const* probe = join->children[0].get();
+    add_key(*join, 0);
+    add_key(*join, 0);  // a second key on the same scan adds nothing
+    join->ResolveOperatorTypes();
+    auto const targets = expected_probe_targets(*join, params);
+    REQUIRE(targets.size() == 1);
+    CHECK(targets[0] == probe);
+  }
+  SECTION("the key may come from the build side of a join below")
+  {
+    auto inner         = make_join_over(make_scannable_get(), make_scannable_get());
+    auto const* target = inner->children[1].get();
+    auto join          = make_join_over(std::move(inner), make_scannable_get());
+    add_key(*join, 1);
+    join->ResolveOperatorTypes();
+    auto const targets = expected_probe_targets(*join, params);
+    REQUIRE(targets.size() == 1);
+    CHECK(targets[0] == target);
+  }
+  SECTION("a join type that binds no scan names none")
+  {
+    auto const join_type =
+      GENERATE(duckdb::JoinType::LEFT, duckdb::JoinType::OUTER, duckdb::JoinType::ANTI);
+    auto join       = make_join_over(make_scannable_get(), make_scannable_get());
+    join->join_type = join_type;
+    add_key(*join, 0);
+    join->ResolveOperatorTypes();
+    CHECK(expected_probe_targets(*join, params).empty());
+  }
+  SECTION("a null-safe equality names none")
+  {
+    auto join = make_join_over(make_scannable_get(), make_scannable_get());
+    add_key(*join, 0, duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+    join->ResolveOperatorTypes();
+    CHECK(expected_probe_targets(*join, params).empty());
+  }
+  SECTION("a key behind a sort names none")
+  {
+    auto order = make_order_over(make_scannable_get());
+    auto join  = make_join_over(std::move(order), make_scannable_get());
+    add_key(*join, 0);
+    join->ResolveOperatorTypes();
+    CHECK(expected_probe_targets(*join, params).empty());
+  }
+  SECTION("a right semi join names its scan only when it can publish early")
+  {
+    auto join       = make_join_over(make_scannable_get(), make_scannable_get());
+    join->join_type = duckdb::JoinType::RIGHT_SEMI;
+    add_key(*join, 0);
+    join->ResolveOperatorTypes();
+    CHECK(expected_probe_targets(*join, params).size() == 1);
+    auto without_accumulation                                  = params;
+    without_accumulation.enable_dynamic_filter_multi_partition = false;
+    CHECK(expected_probe_targets(*join, without_accumulation).empty());
+  }
+}
+
+TEST_CASE("an expected filter target in the build side is found anywhere below",
+          "[dynamic_filter][evidence]")
+{
+  using sirius::planner::expected_targets_in_build;
+  auto get           = make_get();
+  auto const* target = get.get();
+  auto const other   = make_get();
+  auto const build   = make_join_over(make_get(), make_projection_over(std::move(get)));
+
+  std::vector<duckdb::LogicalGet const*> const expected{target};
+  auto const found = expected_targets_in_build(*build, expected);
+  REQUIRE(found.size() == 1);
+  CHECK(found[0] == target);
+
+  CHECK(expected_targets_in_build(*build, {}).empty());
+  std::vector<duckdb::LogicalGet const*> const unrelated{other.get()};
+  CHECK(expected_targets_in_build(*build, unrelated).empty());
+}
+
 TEST_CASE("joins that can keep every row carry no join evidence", "[dynamic_filter][evidence]")
 {
   SECTION("a bare GET") { REQUIRE_FALSE(build_subtree_has_filtering_join(*make_get())); }

@@ -705,6 +705,62 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
+
+  auto unbound_expected_targets = [&] {
+    auto state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(state != nullptr);
+    return state->get_dynamic_filter_stats().snapshot().expected_targets_unbound;
+  };
+  auto require_single_scan_target = [](sirius_physical_operator* join) {
+    auto const& targets =
+      join->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().probe_targets();
+    REQUIRE(targets.size() == 1);
+    CHECK(targets[0].route_class == sirius::op::dynamic_filter_route_class::scan);
+  };
+
+  SECTION("filter on, filtered outer build: the inner join publishes too")
+  {
+    // The outer join filters small_right, the inner join's unfiltered build side. That expected
+    // filter is the inner join's evidence, so it filters big_left in turn.
+    const std::string filtered_build_query =
+      "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
+      "JOIN small_c c ON r.other = c.ckey WHERE c.cother >= 0";
+
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+    auto const unbound_before = unbound_expected_targets();
+    auto plan                 = generate_sirius_plan(*con, filtered_build_query, keep_shape);
+    INFO(tree_to_string(plan.get()));
+
+    auto* inner = require_nested_join(plan.get());
+    require_single_scan_target(inner);
+    auto* probe_subtree =
+      require_join_child_wrap(inner->children[0].get(), inner, /*is_build=*/false);
+    REQUIRE(probe_subtree->type == SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+    CHECK(probe_subtree->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
+    CHECK(unbound_expected_targets() == unbound_before);
+  }
+
+  SECTION("filter on, three joins: every level publishes")
+  {
+    con->Query("CREATE TABLE small_d (dkey INTEGER, dother INTEGER)");
+    con->Query("INSERT INTO small_d VALUES (0, 0), (1, 1)");
+    const std::string chain_query =
+      "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
+      "JOIN small_c c ON r.other = c.ckey JOIN small_d d ON c.cother = d.dkey "
+      "WHERE d.dother >= 0";
+
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+    auto const unbound_before = unbound_expected_targets();
+    auto plan                 = generate_sirius_plan(*con, chain_query, keep_shape);
+    INFO(tree_to_string(plan.get()));
+
+    auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(joins.size() == 3);
+    for (auto* join : joins) {
+      require_single_scan_target(join);
+    }
+    CHECK(unbound_expected_targets() == unbound_before);
+  }
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,

@@ -1022,3 +1022,31 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(deltas.on.filters_pushed > 0);
   compare_gpu_vs_cpu(query);
 }
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - a chain of joins filters each scan in turn",
+                 "[integration][gpu_execution][dynamic_filter][filter_target]")
+{
+  // chain_top's filter reaches chain_mid through the upper join; chain_mid, unfiltered itself, is
+  // the lower join's build side and passes the reduction on to chain_fact.
+  run_ok("SET gpu_execution = false");
+  run_ok(
+    "CREATE TABLE chain_fact AS SELECT (range % 1000)::INTEGER sk, range::INTEGER v "
+    "FROM range(100000)");
+  run_ok(
+    "CREATE TABLE chain_mid AS SELECT range::INTEGER sk, (range % 50)::INTEGER nk "
+    "FROM range(1000)");
+  run_ok(
+    "CREATE TABLE chain_top AS SELECT range::INTEGER nk, (range < 5)::INTEGER keep "
+    "FROM range(50)");
+  run_ok("CHECKPOINT");
+  sirius::test::disabled_optimizers_guard shape(*con, "statistics_propagation");
+  sirius::test::coverage_gate_disable_guard gate_off(*con);
+  std::string const query =
+    "SELECT sum(f.v), count(*) FROM chain_fact f JOIN chain_mid m ON f.sk = m.sk "
+    "JOIN chain_top t ON m.nk = t.nk WHERE t.keep = 1";
+  auto const deltas = require_switch_result_equivalence(*con, query);
+  CHECK(deltas.on.producers_enabled >= 2);
+  CHECK(deltas.on.filters_pushed >= 2);
+  compare_gpu_vs_cpu(query);
+}

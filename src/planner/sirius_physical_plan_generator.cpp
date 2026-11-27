@@ -978,6 +978,17 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> assemble_gpu_scan_leaf(
 {
   auto dynamic_filters = scan.sirius_dynamic_filters;
   if (dynamic_filters && !dynamic_filters->has_producers()) dynamic_filters.reset();
+  if (scan.relied_dynamic_filter_target && !dynamic_filters) {
+    // A join published a filter on the strength of one expected here that was never bound.
+    if (sirius_ctx) {
+      sirius_ctx->get_dynamic_filter_stats().expected_targets_unbound.fetch_add(
+        1, std::memory_order_relaxed);
+    }
+    SIRIUS_LOG_INFO(
+      "[sirius_physical_plan_generator] Scan '{}' was counted as dynamic-filter build evidence "
+      "but received no filter.",
+      scan.function.GetName().GetIdentifierName());
+  }
   auto consumer =
     dynamic_filters
       ? sirius::op::scan::make_dynamic_filter_consumer(

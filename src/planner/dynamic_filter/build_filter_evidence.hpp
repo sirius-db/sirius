@@ -16,7 +16,12 @@
 
 #pragma once
 
+#include <span>
+#include <vector>
+
 namespace duckdb {
+class LogicalComparisonJoin;
+class LogicalGet;
 class LogicalOperator;
 }  // namespace duckdb
 
@@ -56,5 +61,30 @@ namespace sirius::planner {
  * the probe is read. That takes dynamic filters, Bloom accumulation and a non-zero Bloom budget.
  */
 [[nodiscard]] bool right_family_publication_enabled(sirius::operator_params const& params);
+
+/**
+ * @brief The base scans a dynamic filter from @p join is expected to be bound to.
+ *
+ * Traces the probe side of every plain equality whose probe key is a bare reference, on a join
+ * type that binds scans, with `origin_policy::filter_route`. The answer is a prediction made
+ * before the probe side is planned: key admission or the physical plan can still leave a scan
+ * unbound. Null-safe equalities are left out because their route depends on the admitted key.
+ *
+ * @pre Types are resolved on @p join.
+ */
+[[nodiscard]] std::vector<duckdb::LogicalGet const*> expected_probe_targets(
+  duckdb::LogicalComparisonJoin const& join, sirius::operator_params const& params);
+
+/**
+ * @brief The scans of @p expected found anywhere in the subtree @p op.
+ *
+ * A join above expects to filter such a scan at run time, so a build side that contains one is
+ * reduced even when it carries no filter of its own. Under demand-driven scheduling that build
+ * side is normally requested after the join above has finished its own build. Nothing holds the
+ * scan back: one that starts early is read unfiltered, and the join it feeds then publishes a
+ * filter that removes less, which the run-time gates can decline or switch off.
+ */
+[[nodiscard]] std::vector<duckdb::LogicalGet const*> expected_targets_in_build(
+  duckdb::LogicalOperator const& op, std::span<duckdb::LogicalGet const* const> expected);
 
 }  // namespace sirius::planner

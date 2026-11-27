@@ -582,7 +582,17 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);
   bool const build_join_filtered =
     dynamic_filter_enabled && build_subtree_has_filtering_join(*op.children[1]);
-  bool const build_evidence = build_filtered || build_opaque || build_join_filtered;
+  // A scan in the build side that a join above expects to filter reduces the build at run time.
+  auto const build_targets  = dynamic_filter_enabled
+                                ? expected_targets_in_build(*op.children[1], expected_filter_targets)
+                                : std::vector<duckdb::LogicalGet const*>{};
+  bool const build_targeted = !build_targets.empty();
+  bool const build_evidence =
+    build_filtered || build_opaque || build_join_filtered || build_targeted;
+  // Only a join with no other evidence depends on the prediction.
+  if (build_targeted && !(build_filtered || build_opaque || build_join_filtered)) {
+    relied_filter_targets.insert(build_targets.begin(), build_targets.end());
+  }
 
   // Capture domain and uniqueness evidence before create_plan() moves the logical children.
   auto condition_domains =
@@ -600,8 +610,22 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                        origin_policy::value_preserving)
                    : std::vector<std::size_t>{};
 
-  auto build_side_unique_keys  = prove_unique_columns(pin_facts_of(context).get(), *op.children[1]);
-  auto left                    = create_plan(*op.children[0]);
+  auto build_side_unique_keys = prove_unique_columns(pin_facts_of(context).get(), *op.children[1]);
+  // Tell the joins below which scans this join expects to filter, while its probe side is planned.
+  auto const outer_target_count = expected_filter_targets.size();
+  if (build_evidence) {
+    auto own_targets = expected_probe_targets(op, *duckdb::query_operator_options(context));
+    expected_filter_targets.insert(
+      expected_filter_targets.end(), own_targets.begin(), own_targets.end());
+  }
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> left;
+  try {
+    left = create_plan(*op.children[0]);
+  } catch (...) {
+    expected_filter_targets.resize(outer_target_count);
+    throw;
+  }
+  expected_filter_targets.resize(outer_target_count);
   auto right                   = create_plan(*op.children[1]);
   left->estimated_cardinality  = lhs_cardinality;
   right->estimated_cardinality = rhs_cardinality;
@@ -832,7 +856,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       std::string evidence;
       for (auto const& [present, name] : {std::pair{build_filtered, "filtered"},
                                           std::pair{build_opaque, "opaque"},
-                                          std::pair{build_join_filtered, "semi-join"}}) {
+                                          std::pair{build_join_filtered, "semi-join"},
+                                          std::pair{build_targeted, "filter-target"}}) {
         if (!present) { continue; }
         if (!evidence.empty()) { evidence += '+'; }
         evidence += name;
@@ -853,7 +878,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     } else if (dynamic_filter_enabled && !build_evidence && !admitted_keys.empty()) {
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side carries "
-        "no filter, opaque-build or semi-join evidence (build est {} rows).",
+        "no filter, opaque-build, semi-join or filter-target evidence (build est {} rows).",
         rhs_cardinality);
     }
 

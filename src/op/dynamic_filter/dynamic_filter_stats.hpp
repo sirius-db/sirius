@@ -31,7 +31,9 @@ namespace sirius::op {
  * counts that one publication attempt adds to them (`dynamic_filter_publication_outcome`).
  * `dynamic_filter_counter_fields` lists every field once for both conversions.
  *
- * `producers_enabled` counts plan construction, not execution. Each claim increments
+ * `producers_enabled` counts plan construction, not execution. `expected_targets_unbound` counts
+ * scans that a join took as build evidence because a join above was expected to filter them, and
+ * that then received no producer. Each claim increments
  * `publication_attempts` and exactly one of `publications_finished`, `publications_failed`, or
  * `publications_skipped_source_not_resident`; a source skip may reopen the claim window.
  * `publications_skipped_build_not_whole` is counted once per join rather than once per delivery.
@@ -83,6 +85,7 @@ struct dynamic_filter_counters {
   Counter keys_skipped_bloom_size_gate{};
   Counter keys_skipped_bloom_unsupported{};
   Counter producers_enabled{};
+  Counter expected_targets_unbound{};
 
   Counter keys_considered{};
   Counter keys_with_known_domain{};
@@ -133,6 +136,7 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_size_gate,
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_unsupported,
   &dynamic_filter_counters<Counter>::producers_enabled,
+  &dynamic_filter_counters<Counter>::expected_targets_unbound,
   &dynamic_filter_counters<Counter>::keys_considered,
   &dynamic_filter_counters<Counter>::keys_with_known_domain,
   &dynamic_filter_counters<Counter>::keys_skipped_domain_gate,
