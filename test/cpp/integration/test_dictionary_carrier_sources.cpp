@@ -184,7 +184,7 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
       carried = static_cast<std::size_t>(std::ranges::count_if(
         scan->get_physical_types(),
         [](cudf::data_type type) { return type.id() == cudf::type_id::DICTIONARY32; }));
-      CHECK(scan->sidecar_from_source_dictionaries == (!pinned && carried > 0));
+      CHECK(scan->sidecar_from_source_dictionaries == (!pinned && !pinned_mixed && carried > 0));
     }
     run_ok("ROLLBACK;");
     run_ok("SET gpu_execution = true;");
