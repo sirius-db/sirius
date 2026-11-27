@@ -453,12 +453,13 @@ struct nixl_fabric::lane {
             continue;
           }
           static_cast<void>(agent->releaseXferReq(it->req));
+          auto const slot = it->slot;
+          it              = in_flight.erase(it);
           check(s, "a TCP lane write");
           {
             std::lock_guard lock{mutex};
-            free_slots.push_back(it->slot);
+            free_slots.push_back(slot);
           }
-          it       = in_flight.erase(it);
           progress = true;
         }
         nixl_notifs_t notifs;
@@ -493,13 +494,13 @@ struct nixl_fabric::lane {
           std::this_thread::sleep_for(std::chrono::microseconds{200});
         }
       }
-      for (auto const& f : in_flight) {
-        static_cast<void>(agent->releaseXferReq(f.req));
-      }
     } catch (std::exception const& e) {
       std::lock_guard lock{mutex};
       error = e.what();
       failed.store(true);
+    }
+    for (auto const& f : in_flight) {
+      static_cast<void>(agent->releaseXferReq(f.req));
     }
   }
 };
