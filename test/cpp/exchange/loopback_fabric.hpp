@@ -141,6 +141,9 @@ class loopback_hub {
     write_status status(std::uint64_t id) override
     {
       auto it = _writes.find(id);
+      if (it == _writes.end()) {
+        throw sirius::invalid_input_exception("loopback: unknown write {}", id);
+      }
       if (it->second.failed) {
         _writes.erase(it);
         return write_status::failed;
