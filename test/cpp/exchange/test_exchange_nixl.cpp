@@ -244,10 +244,13 @@ TEST_CASE("two ranks in one process exchange batches over TCP lanes", "[exchange
 {
   // Frames go device to host into a lane's send slot, host to host over the lane into the
   // peer's mirror, then host to device: the path to a rank on another host.
-  auto [r0, r1] = two_ranks(nixl_fabric::host_staging::remote, 3);
+  // 3 lanes have 6 send slots for the peer's 4 credits, so a write always finds one. 1 lane has
+  // 2, so writes wait for a slot.
+  auto const lanes = GENERATE(std::uint32_t{3}, std::uint32_t{1});
+  auto [r0, r1]    = two_ranks(nixl_fabric::host_staging::remote, lanes);
   REQUIRE(r0->fab->path_to(1) == sirius::exchange::path::tcp_lanes);
   REQUIRE(r1->fab->path_to(0) == sirius::exchange::path::tcp_lanes);
-  REQUIRE(r0->fab->lanes_to(1) == 3);
+  REQUIRE(r0->fab->lanes_to(1) == lanes);
   r0->start();
   r1->start();
 
@@ -431,7 +434,11 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   auto const* mnnvl = std::getenv("SIRIUS_EXCHANGE_MNNVL");
   cfg.mnnvl         = sirius::exchange::parse_mnnvl(mnnvl != nullptr ? mnnvl : "auto");
   auto const world  = static_cast<rank_t>(cfg.peers.size());
-  sirius::exchange::nixl_exchange_options const ring_opts{};
+  sirius::exchange::nixl_exchange_options ring_opts{};
+  // Frames are at most 1 GiB, so the count helper holds a frame size.
+  ring_opts.frame_bytes = count_from_env("SIRIUS_EXCHANGE_FRAME_BYTES",
+                                         static_cast<std::uint32_t>(ring_opts.frame_bytes));
+  ring_opts.send_frames = count_from_env("SIRIUS_EXCHANGE_SEND_FRAMES", ring_opts.send_frames);
   auto const memory = sirius::exchange::ring_memory_for(cfg.mnnvl);
   auto const recv_frames =
     count_from_env("SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER", ring_opts.recv_frames_per_peer);
