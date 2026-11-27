@@ -497,6 +497,9 @@ static void from_yaml(const YAML::Node& node, sirius::io::gds::gds_config& opt)
   if (opt.slow_read_ms_per_mib < 0) {
     throw std::runtime_error("'gds.slow_read_ms_per_mib': must be >= 0");
   }
+  r.optional("max_gb_per_s", opt.max_gb_per_s);
+  // Written so that NaN is refused too: it would reach an integer cast in the pacing.
+  if (!(opt.max_gb_per_s >= 0)) { throw std::runtime_error("'gds.max_gb_per_s': must be >= 0"); }
   if (opt.task_size == 0) { throw std::runtime_error("'gds.task_size': must be > 0"); }
   r.reject_unknown();
 }

@@ -123,7 +123,7 @@ class gds_ioctx final : public cucascade::io::ioctx {
     std::uint64_t host_bytes{0};
     /// Time device reads spent inside cuFile, summed over reads.
     std::uint64_t device_read_ns{0};
-    /// Time device reads waited for a pool thread, summed over reads.
+    /// Time device reads waited for a pool thread and for `max_gb_per_s`, summed over reads.
     std::uint64_t device_wait_ns{0};
     /// Reads that took longer than `options::held_after`.
     std::uint64_t held_reads{0};
@@ -184,6 +184,8 @@ class gds_ioctx final : public cucascade::io::ioctx {
                  std::size_t piece_size,
                  std::int64_t queued_at,
                  std::size_t worker);
+  /// Waits until @p bytes more may be read under `gds_config::max_gb_per_s`.
+  void pace(std::size_t bytes);
   void settle(std::shared_ptr<request> const& req, std::exception_ptr error) noexcept;
   void note_read(std::int64_t read_ns,
                  std::size_t worker,
@@ -217,6 +219,10 @@ class gds_ioctx final : public cucascade::io::ioctx {
   std::deque<std::function<void(std::size_t)>> _queue;
   bool _stop{false};
   bool _watchdog_stop{false};
+
+  std::mutex _pace_mutex;
+  /// Earliest start of the next paced read, as steady-clock nanoseconds.
+  std::int64_t _pace_next{0};
 
   std::mutex _live_mutex;
   std::unordered_set<std::shared_ptr<request>> _live;

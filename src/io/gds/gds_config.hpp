@@ -38,6 +38,13 @@ struct gds_config {
   /// two seconds; zero turns the check off. Measured on GPFS: 0.8-1.2 ms per
   /// MiB when healthy, 10-62 ms per MiB on a path that was going bad.
   double slow_read_ms_per_mib{5.0};
+  /// Most bytes per second this process starts reading from storage, in GB/s;
+  /// zero is no cap. GPFS serves data not read lately at about 1.2 GB/s per
+  /// thread and data read lately at about 3, so a thread count that suits the
+  /// former runs a NIC at the rate that stalled storage rails (38 GB/s and more
+  /// per NIC, summed over the processes sharing it) on the latter. The cap
+  /// bounds the latter.
+  double max_gb_per_s{0.0};
 };
 
 }  // namespace sirius::io::gds
