@@ -268,6 +268,15 @@ target_include_directories(simpatico_cli
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(simpatico_cli PRIVATE simpatico)
 
+# Plain-Parquet-decode throughput benchmark — a methodology-matched counterpart
+# to `simpatico benchmark` for comparing GPU ingestion compute throughput. No
+# dependency on the simpatico lib itself.
+add_executable(parquet_ingest_bench_cli cli/parquet_ingest_main.cpp)
+set_target_properties(parquet_ingest_bench_cli PROPERTIES OUTPUT_NAME
+                                                          parquet_ingest_bench)
+target_compile_features(parquet_ingest_bench_cli PRIVATE cxx_std_20)
+target_link_libraries(parquet_ingest_bench_cli PRIVATE cudf rmm cudart cuda dl)
+
 enable_testing()
 add_subdirectory(tests/cache)
 add_test(NAME compress_with_plan_roundtrip

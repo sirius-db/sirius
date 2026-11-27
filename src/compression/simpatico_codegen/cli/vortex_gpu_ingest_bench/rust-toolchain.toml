@@ -1,0 +1,4 @@
+[toolchain]
+# The toolchain the pinned Vortex revision builds with.
+channel = "1.99.1"
+profile = "minimal"
