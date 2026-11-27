@@ -503,7 +503,13 @@ void downgrade_executor::processing_loop()
       }
 
       // === TIER 2: task_scheduler task queue ===
-      if (can_convert && !req->satisfied.load() && !target_completed() && _pipeline_task_queue) {
+      // A queued task runs next, so spilling its GPU inputs just to reach the monitor's stop
+      // threshold usually brings them straight back. Only demand requests, which a pipeline is
+      // blocked on, take GPU inputs from queued tasks.
+      bool const tier2_allowed =
+        !req->is_monitor_request || _space_id.tier != cucascade::memory::Tier::GPU;
+      if (can_convert && tier2_allowed && !req->satisfied.load() && !target_completed() &&
+          _pipeline_task_queue) {
         size_t max_tasks_to_convert = _pipeline_task_queue->size();
         size_t tasks_converted      = 0;
         failed_pipeline_candidates.reserve(max_tasks_to_convert);
