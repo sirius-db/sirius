@@ -144,7 +144,8 @@ string column (and every other column of a table under one million rows) of a pa
 a native table's pin when late materialization is on; a native table's join takes its PRIMARY KEY
 instead. A string column of a larger table, such as TPC-DS `customer.c_customer_id`, stays in the
 running while each of its chunks holds no value twice; a fact table's flags and comments repeat
-within a chunk and are refused there. An unsorted chunk is sorted on the spot, so a value repeated
+within a chunk and are refused there. An unsorted chunk is sorted on the spot, its first million
+rows before the rest where it holds two million or more, so a value repeated
 within a chunk refuses the column at once; a repeat across chunks is caught only by the exact
 stage's final check. That sort is optional: the pin reserves
 GPU memory for it first, and a column whose sort cannot be reserved, or fails, simply gets no proof

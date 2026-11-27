@@ -165,6 +165,12 @@ static std::optional<duckdb::idx_t> through_projection_map(ProjectionMap const& 
 /// distinct at pin time (see late_mat::unique_probe: no nulls and no repeated value across the
 /// whole table), each a single-column key. Only the scan's own files count, so a filter or
 /// projection above the scan keeps the fact valid: a subset of distinct values is distinct.
+///
+/// A pinned copy speaks for the scan only where it can serve it, which takes every column the
+/// scan reads (cache_entry_info::column_projection_for). A scan that reads a column the copy
+/// lacks reads the files as they are now, and those need not be what was pinned. The files may
+/// be pinned under several names with different columns, and the scan may be served from any
+/// copy that holds its columns, so a column counts only where each of those proved it.
 static unique_keys prove_unique_from_pin(duckdb::SiriusContext* sirius_context,
                                          duckdb::LogicalGet& get)
 {
@@ -172,17 +178,19 @@ static unique_keys prove_unique_from_pin(duckdb::SiriusContext* sirius_context,
   auto const files = resolve_parquet_scan_file_paths(
     get.function.GetName().GetIdentifierName(), get.bind_data.get(), get.parameters);
   if (files.empty()) { return {}; }
-  auto const entry = sirius_context->get_scan_manager().find_pinned_entry_for_parquet_files(files);
-  if (!entry) { return {}; }
-  auto const& pinned_names = entry->cache_info.names;
+  auto entries = sirius_context->get_scan_manager().find_pinned_entries_for_parquet_files(files);
+  std::erase_if(entries, [&](auto const& entry) {
+    return entry->cache_info.column_projection_for(get.GetColumnIds()).empty();
+  });
+  if (entries.empty()) { return {}; }
   auto const proven_unique = [&](std::string const& name) {
-    for (std::size_t entry_idx = 0; entry_idx < pinned_names.size(); ++entry_idx) {
-      if (pinned_names[entry_idx] == name) {
-        return entry_idx < entry->proven_unique_columns.size() &&
-               entry->proven_unique_columns[entry_idx];
-      }
-    }
-    return false;
+    return std::ranges::all_of(entries, [&](auto const& entry) {
+      auto const& pinned_names = entry->cache_info.names;
+      auto const found         = std::ranges::find(pinned_names, name);
+      auto const entry_idx     = static_cast<std::size_t>(found - pinned_names.begin());
+      return found != pinned_names.end() && entry_idx < entry->proven_unique_columns.size() &&
+             entry->proven_unique_columns[entry_idx];
+    });
   };
 
   // A Hive partition column takes its value from the directory name, even when the files also hold

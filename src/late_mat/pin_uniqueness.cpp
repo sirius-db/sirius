@@ -20,6 +20,7 @@
 #include "sirius_config.hpp"
 
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/reduction/unique_count.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -192,16 +193,25 @@ void unique_probe::observe(cudf::table_view const& chunk,
   };
 
   // The bytes of @p values that a sort reads, or nothing for a type whose size is not known here.
+  // A string's are the characters of its own rows, between its first and last offsets:
+  // strings_column_view::chars_size counts the whole column's, whatever part of it a view covers.
   auto const value_bytes = [&](cudf::column_view const& values) -> std::optional<std::size_t> {
     auto const rows = static_cast<std::size_t>(values.size());
     if (cudf::is_fixed_width(values.type())) { return rows * cudf::size_of(values.type()); }
     if (values.type().id() != cudf::type_id::STRING) { return std::nullopt; }
-    return static_cast<std::size_t>(cudf::strings_column_view{values}.chars_size(stream)) +
-           (rows + 1) * sizeof(std::int64_t);
+    auto const offsets = cudf::strings_column_view{values}.offsets();
+    auto const offset  = [&](cudf::size_type row) {
+      return integer_scalar_value(*cudf::get_element(offsets, values.offset() + row, stream),
+                                  stream);
+    };
+    auto const begin = offset(0);
+    auto const end   = offset(values.size());
+    if (!begin || !end || *end < *begin) { return std::nullopt; }
+    return static_cast<std::size_t>(*end - *begin) + (rows + 1) * sizeof(std::int64_t);
   };
 
-  // Whether column @p i's chunk @p values holds no value twice. The column is dropped where it
-  // does, and where that cannot be told.
+  // Whether @p values, a chunk of column @p i or its first rows, hold no value twice. The column
+  // is dropped where they do, and where that cannot be told.
   //
   // Counted off SORTEDNESS, never off a hash set. cuco's open-addressing
   // extent is bounded, and a pinned chunk is sized in GIGABYTES: at SF1000 an
@@ -209,7 +219,7 @@ void unique_probe::observe(cudf::table_view const& chunk,
   // maximum representable value" and takes the whole pin down with it. Over
   // sorted values, counting consecutive runs IS the exact distinct count and
   // costs one pass.
-  auto const chunk_is_distinct = [&](std::size_t i, cudf::column_view const& values) {
+  auto const holds_no_repeat = [&](std::size_t i, cudf::column_view const& values) {
     cudf::size_type distinct = 0;
     try {
       std::unique_ptr<cudf::table> sorted_copy;
@@ -242,6 +252,18 @@ void unique_probe::observe(cudf::table_view const& chunk,
       return false;
     }
     return true;
+  };
+
+  // Whether column @p i's chunk @p values holds no value twice. Most columns of a big table hold
+  // few values and repeat one within their first rows, so those rows are judged first: such a
+  // column then costs a sort of them, in time and in memory, and not of a chunk of gigabytes.
+  auto const chunk_is_distinct = [&](std::size_t i, cudf::column_view const& values) {
+    if (static_cast<std::size_t>(values.size()) >= 2 * chunk_screen_rows) {
+      auto const first_rows =
+        cudf::slice(values, {0, static_cast<cudf::size_type>(chunk_screen_rows)}, stream).front();
+      if (!holds_no_repeat(i, first_rows)) { return false; }
+    }
+    return holds_no_repeat(i, values);
   };
 
   for (std::size_t i = 0; i < _columns.size() && _live_candidates > 0; ++i) {

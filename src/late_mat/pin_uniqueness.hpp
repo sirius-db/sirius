@@ -115,6 +115,12 @@ inline constexpr std::size_t sort_scratch_factor = 3;
 /// and before anything is retained.
 inline constexpr std::size_t small_table_max_rows = 1'000'000;
 
+/// Rows at the head of a chunk that are judged for a repeat before the whole chunk is (see
+/// unique_probe::observe). A column of few values repeats one within them, and then costs a sort
+/// of these rows and not of the chunk. A chunk of under twice as many rows is judged whole at
+/// once.
+inline constexpr std::size_t chunk_screen_rows = 1'000'000;
+
 /// How many batches' worth of free GPU memory the pin keeps beside an optional retained copy: the
 /// next required batch and its working data (narrowing and compression buffers).
 inline constexpr std::size_t retention_headroom_batches = 2;
@@ -223,8 +229,10 @@ class unique_probe {
   /// than risking a positional misread. Runs on @p stream and synchronizes it
   /// via the scalar reads it performs.
   /// A column whose chunk is unsorted is sorted on the spot, which needs about
-  /// sort_scratch_factor times the column's bytes of GPU memory. @p try_reserve_sort_memory is
-  /// asked for that many bytes first and is expected to reserve them until its next call; when it
+  /// sort_scratch_factor times the column's bytes of GPU memory. The first chunk_screen_rows rows
+  /// of a big chunk are judged before the chunk, as a sort of their own, so a column that
+  /// repeats a value there is dropped without a sort of the chunk. @p try_reserve_sort_memory is
+  /// asked for each sort's bytes first and is expected to reserve them until its next call; when it
   /// declines, or the sort fails for want of memory, the column is dropped without a proof and the
   /// pin goes on. The reservation is a pledge only: cuDF's sort takes its temporary buffers from
   /// the current device resource, so they cannot be allocated from it.
