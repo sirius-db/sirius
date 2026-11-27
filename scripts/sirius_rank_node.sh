@@ -238,7 +238,9 @@ first=1
 while :; do
   "$duckdb" -unsigned -init "$dir/init.sql" <> "$dir/stdin" >> "$dir/rank.log" 2>&1 &
   child=$!
-  announce "$child" "$first" &
+  # Without fd 8: only the rank may outlive this script with the directory's lock. The
+  # announcer's background sleeps would hold it for up to 30 s after a stop.
+  announce "$child" "$first" 8>&- &
   announcer=$!
   first=0
   rc=0
@@ -253,7 +255,7 @@ while :; do
   fi
   echo "rank exited with $rc; starting it again in ${backoff}s" >&2
   # In the background, so that the TERM trap runs at once, not after the sleep.
-  sleep "$backoff" &
+  sleep "$backoff" 8>&- &
   wait $! || true
   backoff=$((backoff < 30 ? backoff * 2 : 30))
 done
