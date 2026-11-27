@@ -169,12 +169,13 @@ case $host in
     # A key pair kept across restarts, so the fingerprint clients and ranks pin stays valid.
     # -init /dev/null: output a ~/.duckdbrc prints (.timer on) would end up in the fingerprint.
     fingerprint=$("$gateway" -no-agent -init /dev/null -noheader -list \
-      -c "SELECT fingerprint FROM quack_generate_keys(directory := '$state/tls')")
+      -c "SELECT fingerprint FROM quack_generate_keys(directory := $(sirius_sql_quote "$state/tls"))")
     [[ $fingerprint =~ ^[0-9A-F]{2}(:[0-9A-F]{2})+$ ]] || {
       echo "unexpected TLS fingerprint from quack_generate_keys: '$fingerprint'" >&2
       exit 1
     }
-    serve+=", ssl_cert_file := '$state/tls/server.pem', ssl_key_file := '$state/tls/private_key.pem'"
+    serve+=", ssl_cert_file := $(sirius_sql_quote "$state/tls/server.pem")"
+    serve+=", ssl_key_file := $(sirius_sql_quote "$state/tls/private_key.pem")"
     ;;
 esac
 # Replaced in one rename: nodes re-read it every 10 s. A new gateway_id tells them to register again.
@@ -193,10 +194,10 @@ allow_join=${SIRIUS_GATEWAY_ALLOW_JOIN:-$([ "$ranks" -eq 0 ] && echo 1 || echo 0
 }
 init="$logs/gateway.init.sql"
 {
-  echo "SET GLOBAL sirius_gateway_duckdb_binary = '$build/duckdb';"
-  echo "SET GLOBAL sirius_gateway_sirius_extension = '$build/extension/sirius/sirius.duckdb_extension';"
-  echo "SET GLOBAL sirius_gateway_log_dir = '$logs';"
-  echo "SET GLOBAL sirius_gateway_state_dir = '$state';"
+  echo "SET GLOBAL sirius_gateway_duckdb_binary = $(sirius_sql_quote "$build/duckdb");"
+  echo "SET GLOBAL sirius_gateway_sirius_extension = $(sirius_sql_quote "$build/extension/sirius/sirius.duckdb_extension");"
+  echo "SET GLOBAL sirius_gateway_log_dir = $(sirius_sql_quote "$logs");"
+  echo "SET GLOBAL sirius_gateway_state_dir = $(sirius_sql_quote "$state");"
   echo "SET GLOBAL sirius_gateway_min_ranks = ${SIRIUS_GATEWAY_MIN_RANKS:-1};"
   # The gateway's own default applies to each exchange setting whose variable is not set.
   [ -z "${SIRIUS_GATEWAY_EXCHANGE_MNNVL:-}" ] ||

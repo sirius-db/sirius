@@ -129,7 +129,7 @@ mapfile -t vars < <(env | grep '^SIRIUS_')                # %q: a ; or a space i
 on_node="cd $CHECKOUT && env $(printf '%q ' "${vars[@]}")$(command -v pixi) run scripts/sirius_node.sh"
 stop()
 {
-  for n in $NODES; do ssh "$n" "pkill -u \$USER -f '$CHECKOUT/script[s]/'"; done
+  for n in $NODES; do ssh "$n" "pkill -u $USER -f 'sirius_node_${USER}_${SIRIUS_CLUSTER}[/]'"; done
   kill $(jobs -p) 2> /dev/null; wait; rm -rf "$state"
 }
 trap 'exit 1' INT TERM
@@ -243,9 +243,13 @@ FROM (SELECT DISTINCT file_name, row_group_id, row_group_num_rows
 ### Stop what a killed run left
 
 ```bash
-pkill -u "$USER" -f "$CHECKOUT/script[s]/"; sleep 5      # the gateway, the client, every rank
-pkill -9 -u "$USER" -f "$CHECKOUT/script[s]/"            # whatever did not stop
+mine="sirius_(gateway|node)_${USER}_bench/|[.]sirius/gateways/bench/"
+pkill -u "$USER" -f "$mine"; sleep 5                     # the gateway, the client, every rank
+pkill -9 -u "$USER" -f "$mine"                           # whatever did not stop
 ```
 
-Then repeat the last two checks of step 3; with several machines, do both on each. The `[s]`
-keeps the command from matching, and killing, the shell that runs it.
+Then repeat the last two checks of step 3; with several machines, do both on each. The pattern
+names the cluster's own folders, which the command line of its gateway, of its client and of
+every rank holds: `/tmp/sirius_gateway_<user>_bench/`, `/tmp/sirius_node_<user>_bench/` and
+`~/.sirius/gateways/bench/`. The launcher scripts themselves exit once those are gone. Another
+cluster of yours, from this checkout or not, keeps running.
