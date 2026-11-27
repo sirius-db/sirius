@@ -17,6 +17,7 @@
 #pragma once
 
 #include "cudf/aggregation.hpp"
+#include "cudf/column/column.hpp"
 #include "cudf/types.hpp"
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
@@ -39,6 +40,31 @@
 
 namespace sirius {
 namespace op {
+
+/**
+ * @brief The HAVING above a distributed aggregate's merge, applied to the partial groups that are
+ * already whole.
+ *
+ * `planner::distribute_plan` installs it when the aggregate reads its group key straight from a
+ * Parquet scan and the row groups of every file of that scan, on every rank, hold key ranges that
+ * meet at most at their ends. A key that is no row group's min or max then lies inside one row
+ * group, which a scan batch holds whole: the batch's partial for that key is its final value.
+ */
+struct complete_group_having {
+  complete_group_having()                                        = default;
+  complete_group_having(complete_group_having const&)            = delete;
+  complete_group_having& operator=(complete_group_having const&) = delete;
+  ~complete_group_having();
+
+  /// The HAVING predicate, over the aggregate's output columns.
+  std::unique_ptr<sirius::ast::node> predicate;
+  /// The output column of the group key.
+  cudf::size_type key = 0;
+  /// Every min and max of the group key over the row groups of this rank's files, on the GPU.
+  std::unique_ptr<cudf::column> row_group_bounds;
+  mutable std::atomic<std::uint64_t> groups_seen{0};
+  mutable std::atomic<std::uint64_t> groups_kept{0};
+};
 
 class sirius_physical_grouped_aggregate : public sirius_physical_operator {
  public:
@@ -103,6 +129,10 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   bool has_avg            = false;
   bool has_count_distinct = false;
 
+  /// Drops the whole groups that fail the merge's HAVING from each batch of whole row groups; null
+  /// when not proven safe.
+  std::shared_ptr<complete_group_having const> complete_groups;
+
  public:
   [[nodiscard]] bool has_first() const { return has_slot<first_slot>(aggregate_slots); }
 
@@ -152,6 +182,13 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
+
+ private:
+  /// @p partial without its groups that complete_groups proves whole and its predicate rejects.
+  std::shared_ptr<::cucascade::data_batch> drop_failed_complete_groups(
+    std::shared_ptr<::cucascade::data_batch> partial,
+    ::cuda::stream_ref stream,
+    ::cucascade::memory::memory_space& space);
 };
 
 }  // namespace op
