@@ -68,6 +68,12 @@ struct connector;
 using parquet_footer_reader =
   std::function<std::shared_ptr<cudf::io::parquet::FileMetaData const>(std::string const& path)>;
 
+/// What distribute_plan needs to defer a join's probe scan (partition_exchange::defer_scan).
+struct deferred_scan_policy {
+  parquet_footer_reader footers;  ///< Reads the scan's row counts. Empty turns deferral off.
+  std::uint64_t min_bytes = 0;    ///< The smallest scan, over all ranks, that is deferred.
+};
+
 /**
  * @brief Rewrites a plan, after insert_gpu_pipeline_operators, to run on every rank of
  * @p service, each over its own share of the scanned files.
@@ -99,7 +105,8 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      cucascade::memory::memory_space& gpu,
                      std::uint64_t query,
                      exec::query_lifecycle_registry& lifecycle,
-                     parquet_footer_reader footers = {});
+                     parquet_footer_reader footers = {},
+                     deferred_scan_policy deferred = {});
 
 /// Bytes `[start, start + length)` of file `file` (an index into the table's files).
 struct file_byte_range {

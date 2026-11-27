@@ -338,6 +338,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   // Publication may claim only a delivery known to contain the whole build.
   void set_build_arrives_whole(bool arrives_whole);
+  /// The layout was sized from the probe side's deferred scan while the build was still arriving
+  /// (see partition_exchange::defer_scan): the scan is read before more of the build.
+  void set_scan_holds_layout() noexcept
+  {
+    _scan_holds_layout.store(true, std::memory_order_release);
+  }
 
   /// @brief Called by the build-side PARTITION's observer for every build batch it hash-partitions
   /// (before scattering). For a MARK join with null-propagating keys this records, join-wide,
@@ -434,6 +440,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // Set when a MARK build pipeline finishes without publishing a batch. Probe tasks then emit
   // definite false marks directly, including for NULL probe keys (NULL IN empty is false).
   std::atomic<bool> _mark_build_empty{false};
+  std::atomic<bool> _scan_holds_layout{false};
   uint64_t _max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
   // Maximum build-side bytes eligible for a broadcast join (see get_partition_strategy). Set from
   // operator_params at construction.

@@ -428,6 +428,19 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
       }
     }
     if (auto readiness = _exchange->hint()) { return readiness; }
+    // The layout was sized from the deferred scan while this input was still arriving: its
+    // barrier no longer holds it, and each batch is partitioned when it arrives.
+    if (_exchange->scan_holds() && _exchange->is_sizing_input(*this) && ports.size() == 1) {
+      auto const* input = ports.begin()->second;
+      if (input->repo && input->repo->total_size() > 0) {
+        return task_creation_hint{TaskCreationHint::READY, this};
+      }
+      if (input->src_pipeline && !input->src_pipeline->is_pipeline_finished()) {
+        auto* producer = &(input->src_pipeline->get_operators()[0].get());
+        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+      }
+      return std::nullopt;
+    }
   } else {
     auto const fixed = layout();
     if (!fixed) {
@@ -456,6 +469,12 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
 void sirius_physical_partition::on_input_batch_pushed(std::string_view port,
                                                       cucascade::data_batch& batch)
 {
+  if (_count_received) {
+    if (auto arrived = batch.try_to_read_only(); arrived && arrived->get_data()) {
+      _received_bytes.fetch_add(arrived->get_data()->get_uncompressed_data_size_in_bytes(),
+                                std::memory_order_relaxed);
+    }
+  }
   if (_input_observer) { _input_observer->on_arrival(port, batch); }
 }
 

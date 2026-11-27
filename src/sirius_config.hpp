@@ -394,7 +394,7 @@ struct operator_params {
 
   /// Join a lookup table whose columns are only GROUP BY keys after the aggregation. See
   /// `join_dimensions_after_aggregate`.
-  bool enable_late_dimension_join = false;
+  bool enable_late_dimension_join = true;
 
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.
@@ -575,6 +575,10 @@ struct sirius_config {
 
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
   get_memory_space_configs() const noexcept;
+
+  /// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving
+  /// data off it. 0 when no GPU capacity is configured.
+  [[nodiscard]] std::uint64_t smallest_gpu_downgrade_threshold() const;
 
   [[nodiscard]] const creator::task_creator_config& get_task_creator_config() const noexcept;
 

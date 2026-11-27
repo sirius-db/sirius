@@ -61,6 +61,9 @@ bool hash_join_partition_observer::before_claim()
       declined = "the build input is not a FULL barrier";
     } else if (!input->src_pipeline) {
       declined = "the build input has no source pipeline";
+    } else if (auto const exchange = _input.exchange(); exchange && exchange->scan_holds()) {
+      // The probe scan has started and this input is partitioned as it arrives.
+      declined = "the layout was sized from a deferred scan";
     } else if (!input->src_pipeline->is_pipeline_finished()) {
       return false;
     } else if (auto inventory =

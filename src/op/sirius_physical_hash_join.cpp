@@ -1124,7 +1124,14 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
       auto* producer = &build_port->src_pipeline->get_operators()[0].get();
       return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
     }
-    switch (peek_cross_schedule_kind(_cross, finished.first, finished.second)) {
+    auto kind = peek_cross_schedule_kind(_cross, finished.first, finished.second);
+    // The probe scan holds the layout. Once it is whole, a build batch leaves as soon as it is
+    // paired, so the scan is read before more of the build.
+    if (kind == cross_schedule_kind::wait_build && !finished.first &&
+        _scan_holds_layout.load(std::memory_order_acquire)) {
+      kind = cross_schedule_kind::wait_probe;
+    }
+    switch (kind) {
       case cross_schedule_kind::emit_pair: return task_creation_hint{TaskCreationHint::READY, this};
       case cross_schedule_kind::wait_build: {
         auto* producer = &build_port->src_pipeline->get_operators()[0].get();

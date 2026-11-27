@@ -21,6 +21,7 @@ target_sources(
           sirius_physical_plan_generator.cpp
           substrait_scan_ranges.cpp
           sirius_plan_copy.cpp
+          build_side_choice.cpp
           sirius_plan_aggregate.cpp
           sirius_plan_column_data_get.cpp
           sirius_plan_comparison_join.cpp

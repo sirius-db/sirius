@@ -1653,6 +1653,18 @@ const std::vector<cucascade::memory::memory_space_config>& sirius_config::get_me
   return _memory_space_configs;
 }
 
+std::uint64_t sirius_config::smallest_gpu_downgrade_threshold() const
+{
+  std::uint64_t smallest = 0;
+  for (auto const& space : _memory_space_configs) {
+    auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+    if (gpu == nullptr || gpu->memory_capacity == 0) { continue; }
+    std::uint64_t const threshold = gpu->downgrade_trigger_threshold();
+    smallest                      = smallest == 0 ? threshold : std::min(smallest, threshold);
+  }
+  return smallest;
+}
+
 const exec::thread_pool_config& sirius_config::get_gpu_pipeline_executor_config() const noexcept
 {
   return _gpu_pipeline_executor_config;

@@ -89,15 +89,7 @@ bool plan_optimization_enabled(duckdb::ClientContext& context,
 std::uint64_t gpu_memory_budget(duckdb::ClientContext& context)
 {
   auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!runtime) { return 0; }
-  std::uint64_t budget = 0;
-  for (auto const& space : runtime->get_config().get_memory_space_configs()) {
-    auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
-    if (gpu == nullptr || gpu->memory_capacity == 0) { continue; }
-    std::uint64_t const threshold = gpu->downgrade_trigger_threshold();
-    budget                        = budget == 0 ? threshold : std::min(budget, threshold);
-  }
-  return budget;
+  return runtime ? runtime->get_config().smallest_gpu_downgrade_threshold() : 0;
 }
 
 using top_n_filter_copies = std::unordered_map<duckdb::DynamicFilterData const*,
