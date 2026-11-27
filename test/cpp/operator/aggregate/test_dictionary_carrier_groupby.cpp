@@ -69,10 +69,13 @@ std::unique_ptr<cudf::column> strings_with_nulls(int modulus, int null_every)
   for (int row = 0; row < num_rows; ++row) {
     if (row % null_every != 0) { mask[row / 32] |= cudf::bitmask_type{1} << (row % 32); }
   }
-  column->set_null_mask(
-    rmm::device_buffer(
-      mask.data(), mask.size() * sizeof(cudf::bitmask_type), cudf::get_default_stream()),
-    num_rows / null_every + (num_rows % null_every != 0 ? 1 : 0));
+  auto device_mask = cudf::create_null_mask(num_rows, cudf::mask_state::UNINITIALIZED);
+  REQUIRE(cudaMemcpy(device_mask.data(),
+                     mask.data(),
+                     mask.size() * sizeof(cudf::bitmask_type),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  column->set_null_mask(std::move(device_mask),
+                        num_rows / null_every + (num_rows % null_every != 0 ? 1 : 0));
   return column;
 }
 
