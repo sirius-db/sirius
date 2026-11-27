@@ -1171,6 +1171,10 @@ def _flush_between_runs(con, profile, use_gpu, source, data_source, workload=Non
         drop_os_cache(
             source, data_source, **({"workload": workload} if workload else {})
         )
+        if not use_gpu:
+            # DuckDB keeps Parquet bytes in its own external file cache, which an
+            # OS cache drop does not touch.
+            con.execute("SET enable_external_file_cache = false;")
     if profile["reset_cache_between"] and use_gpu:
         # Sirius's own prefetching cache survives an OS cache drop -- it holds
         # its chunks in pinned host memory, not the page cache -- so a cold run
