@@ -85,8 +85,14 @@ if ! [[ ${SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING:-auto} =~ ^(auto|always|never|rem
 fi
 
 here=$(cd "$(dirname "$0")" && pwd)
-source "$here/launcher_env.sh"
 source "$here/sirius_net.sh"
+# A gateway that starts no rank runs no UCX: on a host without rail NICs it takes only the rails'
+# host_staging.
+if [ "$ranks" -eq 0 ] && [[ ${SIRIUS_UCX_RAILS:-0} =~ ^(1|true)$ ]] && ! sirius_rail_devices > /dev/null; then
+  export SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING=${SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING:-never}
+  SIRIUS_UCX_RAILS=0
+fi
+source "$here/launcher_env.sh"
 build="$here/../sirius-duckdb/build/release"
 gateway="$here/../gateway/build/release/duckdb"
 [ -x "$gateway" ] || {

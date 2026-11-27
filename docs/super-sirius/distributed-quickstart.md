@@ -105,7 +105,7 @@ number or list, stops the scripts before they apply any of it. `gateway.min_rank
 | `exchange.recv_frames_per_peer` | `SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER` | 8 | `sirius_gateway_exchange_recv_frames_per_peer`: receive frames each peer may fill; over TCP lanes, one frame in flight per lane |
 | `ucx.tls` | `UCX_TLS` | `cuda_copy,cuda_ipc,tcp,self`; `all` with `ucx.rails: true` | UCX transports; the default is `scripts/launcher_env.sh`'s |
 | `ucx.net_devices` | `UCX_NET_DEVICES` | the interface of the rank's address; the rail NICs with `ucx.rails: true` | UCX devices, for example `mlx5_0:1`. Never list bond0 with rail NICs: UCX then hangs reaching a peer's bond0 address from a rail NIC |
-| `ucx.rails` | `SIRIUS_UCX_RAILS` | `false` | `true` puts UCX on the host's GPU rail NICs: `ucx.tls` then defaults to `all` and `ucx.net_devices` to the active RDMA ports in no bond at the highest link speed (on GB200 nodes `mlx5_0:1,mlx5_1:1,mlx5_4:1,mlx5_5:1`). Notifications over RC on them let the exchange over NVLink reach full speed. A launcher fails on a host without such NICs |
+| `ucx.rails` | `SIRIUS_UCX_RAILS` | `false` | `true` puts UCX on the host's GPU rail NICs: `ucx.tls` then defaults to `all` and `ucx.net_devices` to the active RDMA ports in no bond at the highest link speed (on GB200 nodes `mlx5_0:1,mlx5_1:1,mlx5_4:1,mlx5_5:1`). Notifications over RC on them let the exchange over NVLink reach full speed. A launcher that starts ranks fails on a host without such NICs; a gateway that starts none only takes `exchange.host_staging: never` from it |
 
 A gateway on an address other than loopback serves TLS. It writes the subnet of its address to
 `gateway.conf`, and nodes without `node.networks` pick their address in that subnet.

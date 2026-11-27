@@ -9,7 +9,7 @@
 # not reach (host_staging never). auto reaches ranks on other hosts over lanes, which on these
 # NICs are RDMA too, but of host copies: 33 GB/s per rank against 65 when every rank sends to
 # every other (8 ranks on two GB200 nodes, fabric off).
-source "${BASH_SOURCE[0]%/*}/sirius_net.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/sirius_net.sh"
 case ${SIRIUS_UCX_RAILS:-0} in
   1 | true)
     if ! _rails=$(sirius_rail_devices); then
