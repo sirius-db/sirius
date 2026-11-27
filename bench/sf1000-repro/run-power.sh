@@ -176,7 +176,7 @@ fi
 # `|| RC=$?` keeps a failed run from tripping `set -e` before the rollback
 # below finishes — a crashed run is exactly the one whose scratch must be restored.
 RC=0
-"${LAUNCHER[@]}" python3 test/tpch_performance/tpch_power_throughput.py \
+"${LAUNCHER[@]}" python3 test/performance/tpch_power_throughput.py \
   --sf "$SF" --input "$DB" --refresh-dir "$REFRESH" \
   --mode "$MODE" --pin gpu --pin-compression \
   --pin-layout "$LAYOUT" \

@@ -883,7 +883,7 @@ For TPC-H Parquet runs, the helper script runs queries and labels each
 `(query, iteration)` pair before executing it:
 
 ```bash
-pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
+pixi run -- ./test/performance/run_tpch_parquet_and_generate_telemetry.sh \
   --iterations 1 \
   --parquet-dir /data/tpch/sf100/p16/zstd-8/ \
   100

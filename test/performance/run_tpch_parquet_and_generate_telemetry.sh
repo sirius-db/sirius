@@ -30,7 +30,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DUCKDB="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
 SIRIUS_EXTENSION="${SIRIUS_EXTENSION_PATH:-$PROJECT_DIR/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension}"
 DUCKDB_ARGS=(-unsigned -bail -cmd "LOAD '${SIRIUS_EXTENSION//\'/\'\'}';")
-QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
+QUERY_DIR="$PROJECT_DIR/test/performance/tpch_queries/orig"
 DEFAULT_SIRIUS_TELEMETRY_CONFIG="$SCRIPT_DIR/tpch_telemetry_sirius.yaml"
 SIRIUS_CONFIG="$DEFAULT_SIRIUS_TELEMETRY_CONFIG"
 

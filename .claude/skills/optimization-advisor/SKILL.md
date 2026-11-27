@@ -36,19 +36,19 @@ Run `nsys_hotspots.sh` on the selected input:
 
 ```bash
 # Analyze all queries in a profile directory
-bash test/tpch_performance/nsys_hotspots.sh <path_to_profiles>
+bash test/performance/nsys_hotspots.sh <path_to_profiles>
 
 # Analyze specific queries
-bash test/tpch_performance/nsys_hotspots.sh <path_to_profiles> 1 3 10
+bash test/performance/nsys_hotspots.sh <path_to_profiles> 1 3 10
 
 # Analyze a single query
-bash test/tpch_performance/nsys_hotspots.sh <path_to_q1.sqlite>
+bash test/performance/nsys_hotspots.sh <path_to_q1.sqlite>
 
 # If the user gave a report directory, use its profiles/ subdirectory
-bash test/tpch_performance/nsys_hotspots.sh reports/<label>/profiles/
+bash test/performance/nsys_hotspots.sh reports/<label>/profiles/
 
 # Save the report
-bash test/tpch_performance/nsys_hotspots.sh <path_to_profiles> > optimization_guide.md
+bash test/performance/nsys_hotspots.sh <path_to_profiles> > optimization_guide.md
 ```
 
 ### Generating New Profiles (if requested)
@@ -57,10 +57,10 @@ If the user wants fresh profiles instead of existing ones:
 
 ```bash
 # Step 1: Profile (requires SIRIUS_CONFIG_FILE)
-bash test/tpch_performance/nsys_report.sh --sf <scale_factor>
+bash test/performance/nsys_report.sh --sf <scale_factor>
 
 # Step 2: Analyze the generated profiles
-bash test/tpch_performance/nsys_hotspots.sh reports/<generated_dir>/profiles/
+bash test/performance/nsys_hotspots.sh reports/<generated_dir>/profiles/
 ```
 
 ### Validating Optimizations (non-profiled timing run)
@@ -71,11 +71,11 @@ After identifying and implementing an optimization, run queries WITHOUT profilin
 export SIRIUS_CONFIG_FILE=<path_to_config>
 
 # Sirius-only timing (accurate cold/hot without nsys overhead)
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input <parquet_dir> --scale-factor <SF> --engine gpu --iterations <N> [--queries 1,3,6-10]
 
 # Full DuckDB vs Sirius benchmark + result validation
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input <parquet_dir> --scale-factor <SF> --engine both --iterations <N> --validation
 ```
 

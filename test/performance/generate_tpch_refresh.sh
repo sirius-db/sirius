@@ -10,7 +10,7 @@
 # throughput stream, so generate at least <streams> + 1 sets.
 #
 # Usage:
-#   ./test/tpch_performance/generate_tpch_refresh.sh [--dbgen-dir <dir>] [--output-dir <dir>] <SF> <num_sets>
+#   ./test/performance/generate_tpch_refresh.sh [--dbgen-dir <dir>] [--output-dir <dir>] <SF> <num_sets>
 #
 # Defaults:
 #   --dbgen-dir   <project>/test_datasets/tpch-dbgen  (unzipped/built from tpch-dbgen.zip if missing)

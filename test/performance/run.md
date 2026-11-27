@@ -30,8 +30,8 @@ Regenerate existing datasets to apply the new types.
 Generate the reference TPC-H Parquet data first, then write an Iceberg V2 warehouse:
 
 ```bash
-pixi run bash test/tpch_performance/generate_tpch_data.sh 1 --format parquet
-pixi run python test/tpch_performance/generate_tpch_iceberg.py \
+pixi run bash test/performance/generate_tpch_data.sh 1 --format parquet
+pixi run python test/performance/generate_tpch_iceberg.py \
   test_datasets/tpch_parquet_sf1 test_datasets/tpch_iceberg_sf1
 ```
 
@@ -77,7 +77,7 @@ Parquet dataset. TPC-H remains the default; do not supply `--scale-factor` for
 scale_bench. TPC-DS continues to use its separate scripts.
 
 ```bash
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --benchmark scale_bench --input /path/to/dataset \
     --queries gb2,workflow --engine gpu --iterations 3 \
     --config /path/to/sirius.yaml --temp-dir /scratch/scale_work \
@@ -127,7 +127,7 @@ sirius:
 Run four clients against it, with validation:
 
 ```bash
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
   --input test_datasets/tpch_sf10.duckdb --data-source duckdb \
   --config /path/to/sirius.yaml \
   --engine both --queries 1,6 --iterations 3 \
@@ -142,7 +142,7 @@ throughput experiment, not an official TPC-H Power/Throughput score.
 To distribute queries 1–10 between three streams instead of repeating them in every stream:
 
 ```bash
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
   --input test_datasets/tpch_sf10.duckdb --data-source duckdb --scale-factor 10 \
   --config /path/to/sirius.yaml \
   --engine both --queries 1-10 --iterations 1 \
@@ -262,7 +262,7 @@ watchdog timeout; metadata and the summary mark the run failed.
 Harness regression tests:
 
 ```bash
-pixi run python -m unittest discover -s test/tpch_performance -p test_concurrent_benchmark.py
+pixi run python -m unittest discover -s test/performance -p test_concurrent_benchmark.py
 ```
 
 ### Full benchmark with validation (recommended)
@@ -271,30 +271,30 @@ pixi run python -m unittest discover -s test/tpch_performance -p test_concurrent
 
 ```bash
 # Basic usage (uses ~/.sirius/sirius.yaml, both engines, dataset from test_datasets/)
-./test/tpch_performance/benchmark_and_validate.sh 100
+./test/performance/benchmark_and_validate.sh 100
 
 # With explicit options
-./test/tpch_performance/benchmark_and_validate.sh \
+./test/performance/benchmark_and_validate.sh \
   --config ~/.sirius/sirius.yaml \
   --parquet-dir /path/to/tpch_parquet_sf1000 \
   --engines "sirius duckdb" \
   1000
 
 # Sirius only (skip DuckDB baseline)
-./test/tpch_performance/benchmark_and_validate.sh \
+./test/performance/benchmark_and_validate.sh \
   --config ~/.sirius/sirius.yaml \
   --parquet-dir /path/to/tpch_parquet_sf1000 \
   --engines sirius \
   1000
 
 # Regenerate report from an existing run
-./test/tpch_performance/benchmark_and_validate.sh --report runs/<run_dir>
+./test/performance/benchmark_and_validate.sh --report runs/<run_dir>
 ```
 
 Run the same benchmark on local Iceberg tables with:
 
 ```bash
-pixi run bash test/tpch_performance/benchmark_and_validate.sh --data-source iceberg 1
+pixi run bash test/performance/benchmark_and_validate.sh --data-source iceberg 1
 ```
 
 This uses `test_datasets/tpch_iceberg_sf1` by default. Pass `--iceberg-dir` to reuse
@@ -336,18 +336,18 @@ runner above requires existing inputs and is also the entry point for scale_benc
 ```bash
 # Run Sirius on queries 1-22
 SIRIUS_CONFIG_FILE=~/.sirius/sirius.yaml \
-  ./test/tpch_performance/run_tpch_parquet.sh sirius 100 $(seq 1 22)
+  ./test/performance/run_tpch_parquet.sh sirius 100 $(seq 1 22)
 
 # Run DuckDB baseline (no config needed)
-./test/tpch_performance/run_tpch_parquet.sh duckdb 100 $(seq 1 22)
+./test/performance/run_tpch_parquet.sh duckdb 100 $(seq 1 22)
 
 # Run specific queries with custom parquet directory
 SIRIUS_CONFIG_FILE=~/.sirius/sirius.yaml \
-  ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 1 3 6
+  ./test/performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 1 3 6
 
 # Run Sirius with union-pinned hot cache across the query stream
 SIRIUS_CONFIG_FILE=~/.sirius/sirius.yaml \
-  ./test/tpch_performance/run_tpch_parquet.sh --pinning-mode pinned-hot --iterations 5 sirius 100 $(seq 1 22)
+  ./test/performance/run_tpch_parquet.sh --pinning-mode pinned-hot --iterations 5 sirius 100 $(seq 1 22)
 ```
 
 Environment variables:
@@ -375,7 +375,7 @@ labels each `(query, iteration)` pair with `sirius_set_query_label`, and writes
 Quent NDJSON files to `sirius.telemetry.output_directory`.
 
 ```bash
-pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
+pixi run -- ./test/performance/run_tpch_parquet_and_generate_telemetry.sh \
   --iterations 1 \
   --parquet-dir /data/tpch/sf100/p16/zstd-8/ \
   100
@@ -385,12 +385,12 @@ The final `100` is the TPC-H scale factor. If no query numbers are provided,
 all 22 queries are run; append query numbers to limit the run, for example
 `100 1 6 9`.
 
-The script uses `test/tpch_performance/tpch_telemetry_sirius.yaml` by default.
+The script uses `test/performance/tpch_telemetry_sirius.yaml` by default.
 That config only enables telemetry, so pass `--config <path>` when the workload
 also needs custom memory, executor, scan-cache, or operator settings:
 
 ```bash
-pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
+pixi run -- ./test/performance/run_tpch_parquet_and_generate_telemetry.sh \
   --config ~/.sirius/sirius.yaml \
   --iterations 1 \
   --parquet-dir /data/tpch/sf100/p16/zstd-8/ \

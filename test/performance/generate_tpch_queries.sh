@@ -10,7 +10,7 @@
 # generate at least <streams> streams.
 #
 # Usage:
-#   ./test/tpch_performance/generate_tpch_queries.sh [--dbgen-dir <dir>] [--output-dir <dir>] [--seed <n>] <SF> <num_streams>
+#   ./test/performance/generate_tpch_queries.sh [--dbgen-dir <dir>] [--output-dir <dir>] [--seed <n>] <SF> <num_streams>
 #
 # Defaults:
 #   --dbgen-dir   <project>/test_datasets/tpch-dbgen  (unzipped/built from tpch-dbgen.zip if missing)

@@ -35,7 +35,7 @@ after both refresh functions): **Power@Size 7,165,616 · Throughput@Size 4,951,2
 QphH@Size 5,956,411**.
 
 ```bash
-pixi run bash test/tpch_performance/generate_tpch_refresh.sh 1000 9   # one-time refresh sets
+pixi run bash test/performance/generate_tpch_refresh.sh 1000 9   # one-time refresh sets
 DB=/path/to/tpch_sf1000.duckdb pixi run bash bench/sf1000-repro/run-power.sh
 ```
 
@@ -157,7 +157,7 @@ first-iteration cost fell 28.99 s → 10.50 s on a warm cache.
 ## Prerequisites
 
 - **SF1000 TPC-H parquet**, one directory per table (`lineitem/*.parquet`, …). Generate with
-  `test/tpch_performance/generate_test_data.py`.
+  `test/performance/generate_test_data.py`.
 - **~256 GB GPU.** Peak usage is **251.7 GB of 256 GB**. There is under 2 GB of headroom; this
   will not run on a smaller card without lowering `scan_task_batch_size` and re-tuning.
 - **~470 GB host RAM** for the host memory pool (`capacity_bytes` in the YAML).

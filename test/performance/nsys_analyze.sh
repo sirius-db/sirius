@@ -5,16 +5,16 @@
 # from nsys-exported SQLite files in a single execution.
 #
 # Usage:
-#   ./test/tpch_performance/nsys_analyze.sh <sqlite_file_or_directory> [query_numbers...]
+#   ./test/performance/nsys_analyze.sh <sqlite_file_or_directory> [query_numbers...]
 #
 # Examples:
-#   ./test/tpch_performance/nsys_analyze.sh /path/to/q1.sqlite              # Single file
-#   ./test/tpch_performance/nsys_analyze.sh /path/to/nsys_profiles/sf300/    # All queries in dir
-#   ./test/tpch_performance/nsys_analyze.sh /path/to/nsys_profiles/sf300/ 1 3 6  # Specific queries
+#   ./test/performance/nsys_analyze.sh /path/to/q1.sqlite              # Single file
+#   ./test/performance/nsys_analyze.sh /path/to/nsys_profiles/sf300/    # All queries in dir
+#   ./test/performance/nsys_analyze.sh /path/to/nsys_profiles/sf300/ 1 3 6  # Specific queries
 #
 # Output:
 #   Structured markdown-formatted analysis to stdout.
-#   Pipe to a file if needed: ./test/tpch_performance/nsys_analyze.sh ... > analysis.md
+#   Pipe to a file if needed: ./test/performance/nsys_analyze.sh ... > analysis.md
 
 set -euo pipefail
 

@@ -60,7 +60,7 @@ original. Refresh files come from generate_tpch_refresh.sh.
 
 Example:
     export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
-    pixi run python test/tpch_performance/tpch_power_throughput.py \
+    pixi run python test/performance/tpch_power_throughput.py \
         --sf 1 --input test_datasets/tpch_sf1.duckdb \
         --refresh-dir test_datasets/tpch_refresh_sf1
 """
@@ -146,7 +146,7 @@ def refresh_file(refresh_dir, name):
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
         raise SystemExit(
             f"Refresh file missing or empty: {path}\n"
-            "Generate it with test/tpch_performance/generate_tpch_refresh.sh "
+            "Generate it with test/performance/generate_tpch_refresh.sh "
             "<SF> <num_sets> (num_sets >= streams + 1)."
         )
     return path

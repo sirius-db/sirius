@@ -10,7 +10,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DUCKDB="${SWEEP_DUCKDB:-$PROJECT_DIR/sirius-duckdb/build/release/duckdb}"
 SIRIUS_EXTENSION="${SIRIUS_EXTENSION_PATH:-$PROJECT_DIR/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension}"
 DUCKDB_ARGS=(-unsigned -bail -cmd "LOAD '${SIRIUS_EXTENSION//\'/\'\'}';")
-QUERY_DIR="${SWEEP_QUERY_DIR:-$PROJECT_DIR/test/tpch_performance/tpch_queries/orig}"
+QUERY_DIR="${SWEEP_QUERY_DIR:-$PROJECT_DIR/test/performance/tpch_queries/orig}"
 SF="${SWEEP_SF:-100_rg2m}"
 PARQUET_DIR="${SWEEP_PARQUET_DIR:-$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}}"
 if [ -n "${SWEEP_OUTPUT_DIR:-}" ]; then

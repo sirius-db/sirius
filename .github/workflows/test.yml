@@ -67,11 +67,11 @@ jobs:
       - name: Test concurrent benchmark harness without a GPU
         run: |
           pixi run -e ${{ matrix.cuda.pixi-environment }} python -m unittest discover \
-            -s test/tpch_performance -p 'test_concurrent_benchmark.py'
+            -s test/performance -p 'test_concurrent_benchmark.py'
           pixi run -e ${{ matrix.cuda.pixi-environment }} python -m unittest discover \
-            -s test/tpch_performance -p 'test_throughput_validation.py'
+            -s test/performance -p 'test_throughput_validation.py'
           pixi run -e ${{ matrix.cuda.pixi-environment }} python -m unittest discover \
-            -s test/tpch_performance -p 'test_performance_test_s3.py'
+            -s test/performance -p 'test_performance_test_s3.py'
 
       - name: Test Simpatico cache identity without a GPU
         run: |
@@ -405,7 +405,7 @@ jobs:
           SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
           PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf1
         run: |
-          ./test/tpch_performance/benchmark_and_validate.sh 1
+          ./test/performance/benchmark_and_validate.sh 1
           RUN_DIR=$(ls -td runs/*/ | head -1)
           echo "run_dir=$RUN_DIR" >> "$GITHUB_OUTPUT"
           {

@@ -73,7 +73,7 @@ For TPC-H Parquet runs, `run_tpch_parquet_and_generate_telemetry.sh` runs the qu
 files to `sirius.telemetry.output_directory`:
 
 ```bash
-pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
+pixi run -- ./test/performance/run_tpch_parquet_and_generate_telemetry.sh \
   --iterations 1 \
   --parquet-dir /data/tpch/sf100/p16/zstd-8/ \
   100
@@ -82,19 +82,19 @@ pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
 The trailing `100` is the TPC-H scale factor. If no query numbers are provided, all 22 queries are
 run; append query numbers to limit the run, e.g. `100 1 6 9`.
 
-The script uses `test/tpch_performance/tpch_telemetry_sirius.yaml` by default, which only enables
+The script uses `test/performance/tpch_telemetry_sirius.yaml` by default, which only enables
 telemetry. Pass `--config <path>` when the workload also needs custom memory, executor,
 scan-cache, or operator settings:
 
 ```bash
-pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
+pixi run -- ./test/performance/run_tpch_parquet_and_generate_telemetry.sh \
   --config ~/.sirius/sirius.yaml \
   --iterations 1 \
   --parquet-dir /data/tpch/sf100/p16/zstd-8/ \
   100 1 6 9
 ```
 
-See [TPC-H Performance Testing](../../test/tpch_performance/run.md) for the full benchmarking
+See [TPC-H Performance Testing](../../test/performance/run.md) for the full benchmarking
 workflow.
 
 ## 4. Visualize

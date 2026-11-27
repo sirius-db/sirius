@@ -1,6 +1,6 @@
 # Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 """Local writer checks: pixi run python -m unittest discover \
-    -s test/tpch_performance -p test_generate_tpch_iceberg.py
+    -s test/performance -p test_generate_tpch_iceberg.py
 """
 
 from collections import Counter

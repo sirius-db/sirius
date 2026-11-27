@@ -131,7 +131,7 @@ void with_initialized_streaming_fragment(
   std::optional<op::partition_spec> spec,
   const std::function<void(sirius_engine&, op::sirius_physical_streaming_sink&)>& consume);
 
-//! Path to the canonical TPC-H queries (`test/tpch_performance/tpch_queries/orig/`).
+//! Path to the canonical TPC-H queries (`test/performance/tpch_queries/orig/`).
 std::filesystem::path tpch_queries_dir();
 
 //! Read canonical TPC-H query `q` (1..22); throws if the file cannot be opened.

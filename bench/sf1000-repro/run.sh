@@ -53,7 +53,7 @@ echo "config    : $CFG"
 echo
 
 cd "$REPO"
-python3 test/tpch_performance/performance_test.py \
+python3 test/performance/performance_test.py \
   --input "$DATA" \
   --scale-factor 1000 \
   --mode grouped --iterations 3 --engine gpu --pin host \

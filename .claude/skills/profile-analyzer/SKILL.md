@@ -35,7 +35,7 @@ can still be inspected, with their workload and capture boundaries stated.
 
 For unprofiled scale_bench measurements, use Workflow S-A in the
 [benchmark skill](../benchmark/SKILL.md#workflow-s-a-scale_bench) and the
-[runner guide](../../../test/tpch_performance/README.md#scale_bench). Its paths
+[runner guide](../../../test/performance/README.md#scale_bench). Its paths
 are `sirius/<query-name>/sirius.log`, not `sirius/q<N>/sirius.log`. Match the result
 format as well as the queries/config/cache state across comparisons: fingerprint
 mode omits nested payloads, whereas rows/Parquet materialize full results.
@@ -52,7 +52,7 @@ This is the complete workflow: profile for GPU analysis, then run without profil
 **Step 1: Profiled run** (for GPU analysis data)
 ```bash
 # Profile TPC-H queries via nsys_report.sh (delegates to performance_test.py --precmd nsys)
-bash test/tpch_performance/nsys_report.sh --sf <scale_factor> [query_numbers...]
+bash test/performance/nsys_report.sh --sf <scale_factor> [query_numbers...]
 ```
 
 `nsys_report.sh` orchestrates the profiling under the hood: it calls `performance_test.py --precmd nsys` (the same runner the `benchmark` skill uses) to produce one `.nsys-rep` + `.sqlite` per query, then runs `nsys_analyze.sh` to emit `report.md` and `summary.json`.
@@ -62,17 +62,17 @@ bash test/tpch_performance/nsys_report.sh --sf <scale_factor> [query_numbers...]
 export SIRIUS_CONFIG_FILE=<path_to_config>
 
 # Sirius-only timing
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input <parquet_dir> --scale-factor <SF> --engine gpu --iterations <N> [--queries 1,3,6-10]
 
 # DuckDB vs Sirius timing + result validation in one shot
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input <parquet_dir> --scale-factor <SF> --engine both --iterations <N> --validation
 ```
 
 The non-profiled run produces a long-format `<bench>/csv/runtimes.csv` (`engine,query,iteration,runtime_s`) and per-query `result.txt`. `--validation` additionally byte-compares the saved Sirius vs DuckDB results (with a small `abs_tol` on floats).
 
-**Data source (parquet or duckdb).** `--input` accepts either a parquet directory (`--data-source parquet`, the default) or a single `.duckdb` file (`--data-source duckdb`, exercising the GPU-native `seq_scan`); `--pin gpu|host` works for both. Profiling works for both sources through the **same** orchestrator — `nsys_report.sh --data-source duckdb --duckdb-file <file>.duckdb` (or just `--sf <SF>`, which defaults to `test_datasets/tpch_sf<SF>.duckdb`). See `test/tpch_performance/README.md`.
+**Data source (parquet or duckdb).** `--input` accepts either a parquet directory (`--data-source parquet`, the default) or a single `.duckdb` file (`--data-source duckdb`, exercising the GPU-native `seq_scan`); `--pin gpu|host` works for both. Profiling works for both sources through the **same** orchestrator — `nsys_report.sh --data-source duckdb --duckdb-file <file>.duckdb` (or just `--sf <SF>`, which defaults to `test_datasets/tpch_sf<SF>.duckdb`). See `test/performance/README.md`.
 
 **When comparing across runs:**
 - Use the non-profiled timings to determine if performance actually improved or regressed
@@ -81,7 +81,7 @@ The non-profiled run produces a long-format `<bench>/csv/runtimes.csv` (`engine,
 
 **Full options for the profiled run:**
 ```bash
-bash test/tpch_performance/nsys_report.sh \
+bash test/performance/nsys_report.sh \
     --sf <scale_factor> \
     --parquet-dir <path_to_parquet_dir> \
     --data-source parquet|duckdb \
@@ -110,12 +110,12 @@ reports/<label>_<YYYYMMDD_HHMMSS>/
     sirius/q<N>/{nsys.nsys-rep, nsys.sqlite, nsys.sql, timings.csv, log_dir/}
 ```
 
-**Output from non-profiled run** (`performance_test.py` benchmark layout): a timestamped `<benchmark_dir>/` with `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/README.md` for the full layout.
+**Output from non-profiled run** (`performance_test.py` benchmark layout): a timestamped `<benchmark_dir>/` with `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/performance/README.md` for the full layout.
 
 ### Workflow B: Generate Report from Existing Profiles
 
 ```bash
-bash test/tpch_performance/nsys_report.sh --profile-dir <path_to_profiles>
+bash test/performance/nsys_report.sh --profile-dir <path_to_profiles>
 ```
 
 ### Workflow C: Quick Analysis (no archival)
@@ -123,13 +123,13 @@ bash test/tpch_performance/nsys_report.sh --profile-dir <path_to_profiles>
 Use `nsys_analyze.sh` directly for quick, one-off analysis without creating a report directory.
 
 ```bash
-bash test/tpch_performance/nsys_analyze.sh <path_to_profiles_or_file> [query_numbers...]
+bash test/performance/nsys_analyze.sh <path_to_profiles_or_file> [query_numbers...]
 ```
 
 ### Workflow D: Compare Two Existing Reports
 
 ```bash
-bash test/tpch_performance/nsys_compare.sh <baseline_report_dir> <current_report_dir> [--threshold PCT]
+bash test/performance/nsys_compare.sh <baseline_report_dir> <current_report_dir> [--threshold PCT]
 ```
 
 Default threshold is 10%. Values beyond the threshold are flagged:
@@ -149,7 +149,7 @@ Default threshold is 10%. Values beyond the threshold are flagged:
   ```bash
   export SIRIUS_CONFIG_FILE=<path_to_config>
   ```
-- For full options on the profiled run (parquet dir override, custom output dir, label, comparison baseline), see `bash test/tpch_performance/nsys_report.sh --help`.
+- For full options on the profiled run (parquet dir override, custom output dir, label, comparison baseline), see `bash test/performance/nsys_report.sh --help`.
 
 ## Analysis Sections
 

@@ -33,7 +33,7 @@
 # The duckdb path stores decimals as INT64 and prunes correctly.
 #
 # Examples:
-#   cd test/tpch_performance
+#   cd test/performance
 #   pixi run bash generate_tpch_data.sh 100
 #   pixi run bash generate_tpch_data.sh 100 --format duckdb
 #   pixi run bash generate_tpch_data.sh 100 --format duckdb --cluster

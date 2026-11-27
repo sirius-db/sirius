@@ -8,14 +8,14 @@
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=/path/to/config.yaml
-#   ./test/tpch_performance/profile_tpch_nsys.sh <scale_factor> [query_numbers...]
+#   ./test/performance/profile_tpch_nsys.sh <scale_factor> [query_numbers...]
 #
 # If no query numbers are given, queries 1-22 are attempted.
 #
 # Examples:
-#   ./test/tpch_performance/profile_tpch_nsys.sh 300_rg2m
-#   ./test/tpch_performance/profile_tpch_nsys.sh 300_rg2m 1 3 6 9
-#   QUERY_TIMEOUT=120 ./test/tpch_performance/profile_tpch_nsys.sh 100
+#   ./test/performance/profile_tpch_nsys.sh 300_rg2m
+#   ./test/performance/profile_tpch_nsys.sh 300_rg2m 1 3 6 9
+#   QUERY_TIMEOUT=120 ./test/performance/profile_tpch_nsys.sh 100
 #
 # Output:
 #   nsys_profiles/sf<SF>/q<N>.nsys-rep   - Nsight Systems report per query
@@ -25,7 +25,7 @@
 #   nsys_profiles/sf<SF>/summary.txt     - Pass/fail summary across all queries
 #
 # After profiling, analyze with:
-#   ./test/tpch_performance/nsys_analyze.sh nsys_profiles/sf<SF>/
+#   ./test/performance/nsys_analyze.sh nsys_profiles/sf<SF>/
 
 set -uo pipefail
 
@@ -50,7 +50,7 @@ if [ $# -lt 1 ]; then
     echo "  DUCKDB             - path to DuckDB binary (default: sirius-duckdb/build/release/duckdb)"
     echo "  SIRIUS_EXTENSION_PATH - path to the Sirius extension (default: wrapper release build)"
     echo "  PARQUET_DIR        - path to parquet data directory (default: test_datasets/tpch_parquet_sf<SF>)"
-    echo "  QUERY_DIR          - path to TPC-H query SQL files (default: test/tpch_performance/tpch_queries/orig)"
+    echo "  QUERY_DIR          - path to TPC-H query SQL files (default: test/performance/tpch_queries/orig)"
     echo "  OUTPUT_DIR         - output directory for profiles (default: nsys_profiles/sf<SF>)"
     echo "  QUERY_TIMEOUT      - per-query timeout in seconds (default: 90)"
     echo "  ITERATIONS         - number of query iterations (default: 2 for cold+hot)"
@@ -300,7 +300,7 @@ echo "============================================"
 cat "$SUMMARY_FILE"
 echo ""
 echo "Profiles saved to: $OUTPUT_DIR/"
-echo "Analyze with:      ./test/tpch_performance/nsys_analyze.sh $OUTPUT_DIR/"
+echo "Analyze with:      ./test/performance/nsys_analyze.sh $OUTPUT_DIR/"
 echo "Open in nsys-ui:   nsys-ui $OUTPUT_DIR/q<N>.nsys-rep"
 echo "Query SQLite:      sqlite3 $OUTPUT_DIR/q<N>.sqlite"
 

@@ -18,7 +18,7 @@
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
-#   ./test/tpch_performance/run_tpch_parquet.sh [options] <engine> <scale_factor> <query_numbers...>
+#   ./test/performance/run_tpch_parquet.sh [options] <engine> <scale_factor> <query_numbers...>
 # with engine = [sirius/duckdb]
 #
 # Options:
@@ -29,9 +29,9 @@
 #   --multi-session       Run each query in its own DuckDB process
 #
 # Example:
-#   ./test/tpch_performance/run_tpch_parquet.sh sirius 100 `seq 1 22`
-#   ./test/tpch_performance/run_tpch_parquet.sh --multi-session duckdb 100 `seq 1 22`
-#   ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch --timeout 1200 sirius 100 `seq 1 22`
+#   ./test/performance/run_tpch_parquet.sh sirius 100 `seq 1 22`
+#   ./test/performance/run_tpch_parquet.sh --multi-session duckdb 100 `seq 1 22`
+#   ./test/performance/run_tpch_parquet.sh --parquet-dir /data/tpch --timeout 1200 sirius 100 `seq 1 22`
 #
 # Environment variables:
 #   SIRIUS_CONFIG_FILE - path to Sirius config file (required for sirius engine)
@@ -167,7 +167,7 @@ if [ "$ENGINE" = "sirius" ]; then
 fi
 # Both engines use the same plain SQL queries — transparent execution
 # routes queries through GPU when SiriusContext is initialized.
-QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
+QUERY_DIR="$PROJECT_DIR/test/performance/tpch_queries/orig"
 
 
 case "$RESULT_FORMAT" in rows|parquet) ;; *) echo "Invalid --result-format: $RESULT_FORMAT" >&2; exit 1;; esac

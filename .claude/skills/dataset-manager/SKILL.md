@@ -17,7 +17,7 @@ Generate benchmark datasets by running the corresponding shell script under `tes
 not provide a generator for it. Do not ask for a TPC-H scale factor or invoke
 the TPC-H/TPC-DS generators as a substitute. Locate the requested dataset and
 check the directory mapping in the
-[scale_bench guide](../../../test/tpch_performance/README.md#scale_bench).
+[scale_bench guide](../../../test/performance/README.md#scale_bench).
 The benchmark runner owns the temporary prepared table C and its cleanup;
 it is not a separately generated source dataset.
 
@@ -42,7 +42,7 @@ Each entry follows the same structure: script location, command template, suppor
 
 | Field | Value |
 |-------|-------|
-| Script | `test/tpch_performance/generate_tpch_data.sh` |
+| Script | `test/performance/generate_tpch_data.sh` |
 | Default format | `parquet` |
 | Formats | `parquet` (tpchgen-rs), `duckdb` (tpchgen-rs `.tbl` staged via `COPY`; classic dbgen fallback) |
 | Default output (parquet) | `test_datasets/tpch_parquet_sf<SF>` |
@@ -51,7 +51,7 @@ Each entry follows the same structure: script location, command template, suppor
 | Prerequisites | Parquet: pixi env (rust, python, pyarrow). DuckDB: `sirius-duckdb/build/release/duckdb` + pixi env rust for tpchgen-rs (falls back to building the bundled classic dbgen) |
 
 ```bash
-cd test/tpch_performance && pixi run bash generate_tpch_data.sh <SF> --format <FORMAT> [--cluster] [--cluster-keys <spec>] [--output <path>]
+cd test/performance && pixi run bash generate_tpch_data.sh <SF> --format <FORMAT> [--cluster] [--cluster-keys <spec>] [--output <path>]
 ```
 
 Notes:

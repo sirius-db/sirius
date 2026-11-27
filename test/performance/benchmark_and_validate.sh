@@ -24,21 +24,21 @@
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
-#   ./test/tpch_performance/benchmark_and_validate.sh <scale_factor>
-#   ./test/tpch_performance/benchmark_and_validate.sh --pinning-mode per-query <scale_factor>
-#   ./test/tpch_performance/benchmark_and_validate.sh --data-source iceberg <scale_factor>
-#   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb <scale_factor>
-#   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb-native <scale_factor>
-#   ./test/tpch_performance/benchmark_and_validate.sh --report <run_dir>
-#   ./test/tpch_performance/benchmark_and_validate.sh --duckdb-results <run_dir> <scale_factor>
+#   ./test/performance/benchmark_and_validate.sh <scale_factor>
+#   ./test/performance/benchmark_and_validate.sh --pinning-mode per-query <scale_factor>
+#   ./test/performance/benchmark_and_validate.sh --data-source iceberg <scale_factor>
+#   ./test/performance/benchmark_and_validate.sh --data-source duckdb <scale_factor>
+#   ./test/performance/benchmark_and_validate.sh --data-source duckdb-native <scale_factor>
+#   ./test/performance/benchmark_and_validate.sh --report <run_dir>
+#   ./test/performance/benchmark_and_validate.sh --duckdb-results <run_dir> <scale_factor>
 #
 # Example:
-#   ./test/tpch_performance/benchmark_and_validate.sh 1
-#   ./test/tpch_performance/benchmark_and_validate.sh --pinning-mode per-query --pin-after-iteration 2 --iterations 5 1
-#   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb --duckdb-file ./performance_test.duckdb 1
-#   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb-native --duckdb-file ./test_datasets/tpch_sf1.duckdb 1
-#   ./test/tpch_performance/benchmark_and_validate.sh --report runs/2026-03-10_12-00-00_sf1_2iter
-#   ./test/tpch_performance/benchmark_and_validate.sh --duckdb-results runs/2026-03-10_12-00-00_sf1_2iter 1
+#   ./test/performance/benchmark_and_validate.sh 1
+#   ./test/performance/benchmark_and_validate.sh --pinning-mode per-query --pin-after-iteration 2 --iterations 5 1
+#   ./test/performance/benchmark_and_validate.sh --data-source duckdb --duckdb-file ./performance_test.duckdb 1
+#   ./test/performance/benchmark_and_validate.sh --data-source duckdb-native --duckdb-file ./test_datasets/tpch_sf1.duckdb 1
+#   ./test/performance/benchmark_and_validate.sh --report runs/2026-03-10_12-00-00_sf1_2iter
+#   ./test/performance/benchmark_and_validate.sh --duckdb-results runs/2026-03-10_12-00-00_sf1_2iter 1
 
 set -uo pipefail
 

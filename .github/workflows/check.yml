@@ -66,7 +66,7 @@ jobs:
       - name: Test thread sweep harness
         run: |
           set -o pipefail
-          bash test/tpch_performance/test_sweep_threads.sh 2>&1 | tee /tmp/harness.log
+          bash test/performance/test_sweep_threads.sh 2>&1 | tee /tmp/harness.log
 
       - name: Surface thread sweep harness errors
         if: failure()

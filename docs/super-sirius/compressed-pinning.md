@@ -268,7 +268,7 @@ SIRIUS_PRE_SQL="SET pin_table_compression = true; SET pin_table_input_compressio
 SIRIUS_PIN_TIER_LINEITEM=gpu SIRIUS_PIN_TIER_ORDERS=gpu \
 SIRIUS_PIN_TIER_PART=gpu SIRIUS_PIN_TIER_CUSTOMER=gpu SIRIUS_PIN_TIER_SUPPLIER=gpu \
 SIRIUS_PIN_TIER_NATION=gpu SIRIUS_PIN_TIER_REGION=gpu \
-python test/tpch_performance/performance_test.py --engine gpu --mode grouped \
+python test/performance/performance_test.py --engine gpu --mode grouped \
   --iterations 3 --pin host --input /data/tpch_parquet_sf1000 --data-source parquet
 ```
 

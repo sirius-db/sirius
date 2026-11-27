@@ -374,10 +374,10 @@ std::string convert_query_to_raw_schedule(duckdb::Connection& con, const std::st
 std::filesystem::path tpch_queries_dir()
 {
 #ifdef SIRIUS_PROJECT_ROOT
-  return std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test/tpch_performance/tpch_queries/orig";
+  return std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test/performance/tpch_queries/orig";
 #else
   return std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
-         "test/tpch_performance/tpch_queries/orig";
+         "test/performance/tpch_queries/orig";
 #endif
 }
 

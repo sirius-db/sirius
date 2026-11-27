@@ -162,7 +162,7 @@ read handles and the task stream, with a conservative encoding-workspace estimat
 
 ## Benchmarks
 
-`test/tpch_performance/performance_test.py`, `run_tpch_parquet.sh`,
+`test/performance/performance_test.py`, `run_tpch_parquet.sh`,
 `run_tpch_duckdb.sh`, and `benchmark_and_validate.sh` accept:
 
 ```text

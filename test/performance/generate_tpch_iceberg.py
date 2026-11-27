@@ -3,7 +3,7 @@
 """Write local Iceberg V2 tables from the existing TPC-H Parquet dataset.
 
 Run from the project root:
-    pixi run python test/tpch_performance/generate_tpch_iceberg.py \
+    pixi run python test/performance/generate_tpch_iceberg.py \
         test_datasets/tpch_parquet_sf1 test_datasets/tpch_iceberg_sf1
 
 PyIceberg rewrites the data with field IDs and creates the manifests and snapshots.

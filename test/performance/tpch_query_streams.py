@@ -113,7 +113,7 @@ def stream_file(query_dir, stream):
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
         raise SystemExit(
             f"Query stream file missing or empty: {path}\n"
-            "Generate it with test/tpch_performance/generate_tpch_queries.sh "
+            "Generate it with test/performance/generate_tpch_queries.sh "
             "<SF> <num_streams> (num_streams >= throughput streams)."
         )
     return path

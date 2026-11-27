@@ -3,11 +3,11 @@
 # Used as a baseline for validating Sirius results.
 #
 # Usage:
-#   ./test/tpch_performance/run_tpch_parquet_duckdb.sh [--parquet-dir <path>] <scale_factor> <query_numbers...>
+#   ./test/performance/run_tpch_parquet_duckdb.sh [--parquet-dir <path>] <scale_factor> <query_numbers...>
 #
 # Example:
-#   ./test/tpch_performance/run_tpch_parquet_duckdb.sh 100 1 3 6
-#   ./test/tpch_performance/run_tpch_parquet_duckdb.sh --parquet-dir /data/tpch 100 1 3 6
+#   ./test/performance/run_tpch_parquet_duckdb.sh 100 1 3 6
+#   ./test/performance/run_tpch_parquet_duckdb.sh --parquet-dir /data/tpch 100 1 3 6
 #
 # Environment variables:
 #   TIMING_CSV  - path to write per-query timing CSV (optional)
@@ -17,7 +17,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DUCKDB="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
-QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
+QUERY_DIR="$PROJECT_DIR/test/performance/tpch_queries/orig"
 
 PARQUET_DIR=""
 if [ "${1:-}" = "--parquet-dir" ]; then

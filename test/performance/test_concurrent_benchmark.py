@@ -1,5 +1,5 @@
 # Copyright 2026, Sirius Contributors. Licensed under the Apache License, Version 2.0.
-"""Run with pixi run python -m unittest discover -s test/tpch_performance -p test_concurrent_benchmark.py."""
+"""Run with pixi run python -m unittest discover -s test/performance -p test_concurrent_benchmark.py."""
 import argparse
 import csv
 from datetime import date, datetime, time as dtime, timedelta

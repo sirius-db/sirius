@@ -6,16 +6,16 @@
 # bottlenecks, sync overhead, memory issues, and parallelism opportunities.
 #
 # Usage:
-#   ./test/tpch_performance/nsys_hotspots.sh <sqlite_file_or_directory> [query_numbers...]
+#   ./test/performance/nsys_hotspots.sh <sqlite_file_or_directory> [query_numbers...]
 #
 # Examples:
-#   ./test/tpch_performance/nsys_hotspots.sh /path/to/q1.sqlite
-#   ./test/tpch_performance/nsys_hotspots.sh /path/to/profiles/
-#   ./test/tpch_performance/nsys_hotspots.sh /path/to/profiles/ 1 3 6
+#   ./test/performance/nsys_hotspots.sh /path/to/q1.sqlite
+#   ./test/performance/nsys_hotspots.sh /path/to/profiles/
+#   ./test/performance/nsys_hotspots.sh /path/to/profiles/ 1 3 6
 #
 # Output:
 #   Structured markdown optimization guide to stdout.
-#   Pipe to a file: ./test/tpch_performance/nsys_hotspots.sh ... > hotspots.md
+#   Pipe to a file: ./test/performance/nsys_hotspots.sh ... > hotspots.md
 
 set -euo pipefail
 

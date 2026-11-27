@@ -56,7 +56,7 @@ before_dumps=$(ls "$DUMPDIR"/*.nvcudmp 2>/dev/null | wc -l)
 rc=$?
 [ -e "$SCRATCH.wal" ] && rm -f "$SCRATCH.wal"
 after_dumps=$(ls "$DUMPDIR"/*.nvcudmp 2>/dev/null | wc -l)
-rundir=$(ls -td "$REPO"/test/tpch_performance/output/tpch_power_*_sf1000_s${NSTREAMS} 2>/dev/null | head -1)
+rundir=$(ls -td "$REPO"/test/performance/output/tpch_power_*_sf1000_s${NSTREAMS} 2>/dev/null | head -1)
 strikes=0
 if [ -n "$rundir" ]; then
   strikes=$(cat "$rundir"/log_dir/sirius_*.log 2>/dev/null | grep -cE 'signal handler|Invalid unicode|illegal address|cudaErrorIllegal' || true)

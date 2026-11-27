@@ -90,7 +90,7 @@ Sirius plans a correlated subquery only in the form DuckDB's default `delim_join
 For TPC-H benchmarking, use the provided data generation script:
 
 ```bash
-cd test/tpch_performance
+cd test/performance
 pixi run bash generate_tpch_data.sh 100   # generates SF100 parquet data
 ```
 

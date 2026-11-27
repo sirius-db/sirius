@@ -52,7 +52,7 @@ stdout; bundles carry a per-pointer `nsys_status` (+ `nsys_shared_with` when
 ambiguous).
 
 Usage:
-    pixi run python test/tpch_performance/prep_analysis_bundles.py \
+    pixi run python test/performance/prep_analysis_bundles.py \
         <run_dir> <nsys_dir> <quent_dir> [--export-workers N] [--no-export]
 
 The nsys frontend must not see the pixi loader env (its bundled libssl breaks

@@ -6,18 +6,18 @@
 # JSON, and all raw artifacts (sqlite, nsys-rep, timings) for archival.
 #
 # Usage:
-#   test/tpch_performance/nsys_report.sh [OPTIONS] [query_numbers...]
+#   test/performance/nsys_report.sh [OPTIONS] [query_numbers...]
 #
 # Examples:
 #   # Profile and report
-#   test/tpch_performance/nsys_report.sh --sf 300_rg2m
-#   test/tpch_performance/nsys_report.sh --sf 100 --iterations 4 1 3 6 10
+#   test/performance/nsys_report.sh --sf 300_rg2m
+#   test/performance/nsys_report.sh --sf 100 --iterations 4 1 3 6 10
 #
 #   # Report from existing profiles
-#   test/tpch_performance/nsys_report.sh --profile-dir /path/to/nsys_profiles/sf300_rg2m/
+#   test/performance/nsys_report.sh --profile-dir /path/to/nsys_profiles/sf300_rg2m/
 #
 #   # Report and compare against baseline
-#   test/tpch_performance/nsys_report.sh --profile-dir ./profiles/ --compare reports/baseline_20260301/
+#   test/performance/nsys_report.sh --profile-dir ./profiles/ --compare reports/baseline_20260301/
 #
 # Output:
 #   reports/<label>_<YYYYMMDD_HHMMSS>/
@@ -196,7 +196,7 @@ else
     fi
 
     PY_CMD=(
-        pixi run python "$PROJECT_DIR/test/tpch_performance/performance_test.py"
+        pixi run python "$PROJECT_DIR/test/performance/performance_test.py"
         --precmd nsys
         --input "$INPUT"
         --scale-factor "$SCALE_FACTOR"
@@ -515,5 +515,5 @@ if [ -n "$COMPARE_DIR" ]; then
 fi
 echo ""
 echo "View report:  cat $REPORT_DIR/report.md"
-echo "Compare later: test/tpch_performance/nsys_compare.sh $REPORT_DIR <other_report>"
+echo "Compare later: test/performance/nsys_compare.sh $REPORT_DIR <other_report>"
 echo "============================================"

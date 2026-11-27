@@ -65,12 +65,12 @@ mkdir -p /opt/dlami/nvme/spill
 ulimit -l unlimited
 ulimit -n 1048576
 unset SIRIUS_CONFIG_FILE SIRIUS_PRE_SQL SIRIUS_PIN_TIER CUDA_VISIBLE_DEVICES
-pixi run -e cuda12 python test/tpch_performance/performance_test.py \
+pixi run -e cuda12 python test/performance/performance_test.py \
   --input "$TPCH_INPUT" --scale-factor 10000 --engine cpu \
   --iterations 1 --mode isolated --output results/cpu-sf10000
 CPU_RESULTS='/absolute/path/to/results/cpu-sf10000/tpch_TIMESTAMP_RUN'
 SIRIUS_PRE_SQL="$(cat "$REPRO_DIR/configs/sirius-12xl.sql")" \
-  pixi run -e cuda12 python test/tpch_performance/performance_test.py \
+  pixi run -e cuda12 python test/performance/performance_test.py \
   --input "$TPCH_INPUT" --scale-factor 10000 --engine gpu \
   --iterations 1 --mode isolated \
   --config "$REPRO_DIR/configs/tune12-sf10k-host432-cache-watermarks.yaml" \

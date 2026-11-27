@@ -50,7 +50,7 @@ pixi run -e fe fe-start                 # FE on 127.0.0.1 (9030 mysql, 8030 http
 pixi run -e be bash scripts/be.sh start # engine-less backend; registers itself, translate-only
 pixi run -e fe mysql -h127.0.0.1 -P9030 -uroot -e 'SHOW BACKENDS\G'   # Alive: true
 
-# TPC-H SF1 parquet (see the repo's dataset-manager skill / test/tpch_performance), then:
+# TPC-H SF1 parquet (see the repo's dataset-manager skill / test/performance), then:
 pixi run -e fe bash scripts/run-tpch.sh --data /tmp/tpch-sf1 --translate-only   # refresh the corpus
 pixi run -e fe bash scripts/run-tpch.sh --data /tmp/tpch-sf1 --translate-only \
     --sql-dir sql/gaps --out tests/fixtures/gaps                                # refresh the gap probes

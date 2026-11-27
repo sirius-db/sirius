@@ -5,11 +5,11 @@
 # and a current report, flagging regressions and improvements.
 #
 # Usage:
-#   test/tpch_performance/nsys_compare.sh <baseline_report_dir> <current_report_dir> [--threshold PCT]
+#   test/performance/nsys_compare.sh <baseline_report_dir> <current_report_dir> [--threshold PCT]
 #
 # Examples:
-#   test/tpch_performance/nsys_compare.sh reports/baseline_20260301/ reports/current_20260303/
-#   test/tpch_performance/nsys_compare.sh reports/old/ reports/new/ --threshold 5
+#   test/performance/nsys_compare.sh reports/baseline_20260301/ reports/current_20260303/
+#   test/performance/nsys_compare.sh reports/old/ reports/new/ --threshold 5
 #
 # Output:
 #   Markdown comparison table to stdout.

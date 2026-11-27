@@ -44,7 +44,7 @@ factors, refresh functions, or QphH metrics to scale_bench.
 
 ## Working Directory
 
-All commands run from the **project root**. TPC-H scripts live in `test/tpch_performance/`.
+All commands run from the **project root**. TPC-H scripts live in `test/performance/`.
 The shared Python runner and scale_bench adapter also live in that directory.
 
 ## GPU-Compatible Queries
@@ -103,7 +103,7 @@ Use the existing runner with `--benchmark scale_bench`. Do not create a separate
 runner, map the queries to TPC-H numbers, or pass `--scale-factor`.
 
 ```bash
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --benchmark scale_bench --input /path/to/dataset \
     --queries gb2,workflow --engine gpu --iterations 3 \
     --config /path/to/sirius.yaml --temp-dir /scratch/scale_work \
@@ -113,8 +113,8 @@ pixi run python test/tpch_performance/performance_test.py \
 - Queries: `sort1`, `sort2`, `gb1`, `gb2`, `join1`, `workflow`, `bfs`, `pagerank`;
   omit `--queries` or use `all` for the complete set. Shuffle is not included.
 - Input is an existing local Parquet dataset. The exact directory mapping,
-  expected types and query definitions are in `test/tpch_performance/scale_bench.py`;
-  use the [scale_bench guide](../../../test/tpch_performance/README.md#scale_bench)
+  expected types and query definitions are in `test/performance/scale_bench.py`;
+  use the [scale_bench guide](../../../test/performance/README.md#scale_bench)
   for the input layout. No dataset generator is bundled.
 - Defaults to `--result-format fingerprint`: count, numeric sums and VARCHAR
   length sums, excluding nested columns. A matching fingerprint is not full-value
@@ -153,7 +153,7 @@ pixi run python test/tpch_performance/performance_test.py \
 
 # TPC-H Benchmarks
 
-Scripts are in `test/tpch_performance/`.
+Scripts are in `test/performance/`.
 
 ## TPC-H Tables
 
@@ -161,8 +161,8 @@ Scripts are in `test/tpch_performance/`.
 
 ## TPC-H Query Files
 
-- **Sirius and DuckDB runners:** queries are defined in `test/tpch_performance/queries.py`; `performance_test.py` renders the scale-dependent Q11 fraction from `--scale-factor`.
-- Plain SQL files at `test/tpch_performance/tpch_queries/orig/q*.sql` are kept for reference but are no longer wired into the recommended Python runner.
+- **Sirius and DuckDB runners:** queries are defined in `test/performance/queries.py`; `performance_test.py` renders the scale-dependent Q11 fraction from `--scale-factor`.
+- Plain SQL files at `test/performance/tpch_queries/orig/q*.sql` are kept for reference but are no longer wired into the recommended Python runner.
 
 ## Workflow H-A: Generate TPC-H Data
 
@@ -181,7 +181,7 @@ Data generation is owned by the **`/dataset-manager`** skill — the single sour
 If `/dataset-manager` is unavailable, the underlying script is:
 
 ```bash
-cd test/tpch_performance
+cd test/performance
 pixi run bash generate_tpch_data.sh <scale_factor> --format parquet|duckdb [--cluster] [--output <path>]
 ```
 
@@ -193,7 +193,7 @@ pixi run bash generate_tpch_data.sh <scale_factor> --format parquet|duckdb [--cl
 
 ```bash
 export SIRIUS_CONFIG_FILE=/path/to/config.yaml
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input <parquet_dir> --scale-factor <SF> [options]
 ```
 
@@ -202,32 +202,32 @@ pixi run python test/tpch_performance/performance_test.py \
 - `--scale-factor <SF>` — the dataset scale used to render Q11 as `0.0001 / SF`. Always pass it explicitly; omission defaults to SF1 with a warning only for rollout compatibility.
 
 For the available flags and defaults, see `performance_test.py --help` and
-`test/tpch_performance/README.md`. The Python harness's `--data-source` differs from the legacy
+`test/performance/README.md`. The Python harness's `--data-source` differs from the legacy
 shell `benchmark_and_validate.sh --data-source`; the README also describes the shell-only
 `--pinning-mode` and per-query pin column lists.
 
 **Examples:**
 ```bash
 # SF1, both engines, 2 iterations (parquet directory)
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
     --scale-factor 1 \
     --iterations 2 --engine both
 
 # Validate GPU vs CPU after timing (queries 1/3/6)
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
     --scale-factor 1 \
     --engine both --iterations 1 --validation --queries 1,3,6
 
 # DuckDB source (a .duckdb FILE) from disk, both engines, validate
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf1.duckdb --data-source duckdb \
     --scale-factor 1 \
     --engine both --iterations 1 --validation --queries 1,3,6
 
 # DuckDB source pinned into the GPU cache
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf100.duckdb --data-source duckdb \
     --scale-factor 100 \
     --engine gpu --iterations 3 --pin gpu
@@ -253,7 +253,7 @@ when interpreting cold timings.
 
 ### Output Layout
 
-A timestamped benchmark dir `<output>/tpch_<ts>_<profile>_<engine>_iter<N>[_<NAME>]/` (`default` profile when unset) containing `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/README.md` for the full layout.
+A timestamped benchmark dir `<output>/tpch_<ts>_<profile>_<engine>_iter<N>[_<NAME>]/` (`default` profile when unset) containing `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/performance/README.md` for the full layout.
 
 ---
 
@@ -289,18 +289,18 @@ run, QphH, refresh functions, or a "TPC-H official"/"spec" benchmark.
 
 ```bash
 # One-time per SF: generate refresh sets (num_sets >= streams + 1)
-./test/tpch_performance/generate_tpch_refresh.sh <SF> <num_sets>   # -> test_datasets/tpch_refresh_sf<SF>/
+./test/performance/generate_tpch_refresh.sh <SF> <num_sets>   # -> test_datasets/tpch_refresh_sf<SF>/
 
 # Required for an official/spec run: per-stream query sets from qgen (streams 0..N)
-./test/tpch_performance/generate_tpch_queries.sh <SF> <streams>    # -> test_datasets/tpch_queries_sf<SF>/
+./test/performance/generate_tpch_queries.sh <SF> <streams>    # -> test_datasets/tpch_queries_sf<SF>/
 
 export SIRIUS_CONFIG_FILE=/path/to/config.yaml
-pixi run python test/tpch_performance/tpch_power_throughput.py \
+pixi run python test/performance/tpch_power_throughput.py \
     --sf <SF> --input <base.duckdb> --refresh-dir <refresh_dir> \
     --mode both --pin gpu|host [--streams N] --vary-predicates --query-dir <dir>
 ```
 
-**Flags** (full reference in `test/tpch_performance/README.md`): `--mode power|throughput|both`
+**Flags** (full reference in `test/performance/README.md`): `--mode power|throughput|both`
 (default `both`), `--streams N` (default: spec minimum for SF — SF1→2, SF10→3, SF30→4, SF100→5),
 `--pin gpu|host` (always one of these), `--pin-compression/--no-pin-compression`
 (Simpatico compression with automatic plans; runs where every pin is skipped by the automatic
@@ -319,7 +319,7 @@ a scheduling accident, but it must be one of them),
 (default on; adds the clean pre-refresh timing pass so delta/mask overhead is attributable),
 `--query-timeout`, `--output`, `--keep-scratch-db`.
 
-**Output** (`test/tpch_performance/output/tpch_power_<ts>_sf<SF>_s<N>/`): `metrics.json`,
+**Output** (`test/performance/output/tpch_power_<ts>_sf<SF>_s<N>/`): `metrics.json`,
 `summary.txt` (per-query clean/post-RF1/post-RF2 timings + delta/mask overhead + the three
 metrics), `timings.csv`, per-query `power/q<N>/result_*.txt`, `log_dir/`. A **non-zero exit** means
 a validation mismatch or an unexpected row-count after a refresh — treat it as a failure.

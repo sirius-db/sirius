@@ -1,7 +1,7 @@
 -- TPC-H tables as views over parquet files read through the local() table-valued function
 -- (ADR-011 D-4: local() + shared_storage=true, every backend sees the same paths).
 -- @@TPCH_DIR@@ is substituted by scripts/run-tpch.sh with the dataset directory, whose
--- layout is <dir>/<table>/part.N.parquet (test/tpch_performance/generate_tpch_data.sh).
+-- layout is <dir>/<table>/part.N.parquet (test/performance/generate_tpch_data.sh).
 -- OR REPLACE so that a run over another dataset (SF10) re-points the views; the FE
 -- re-resolves a view's local() glob and schema on every query anyway.
 

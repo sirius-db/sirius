@@ -9,7 +9,7 @@
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
-#   ./test/tpch_performance/run_tpch_duckdb.sh [options] <engine> <scale_factor> <query_numbers...>
+#   ./test/performance/run_tpch_duckdb.sh [options] <engine> <scale_factor> <query_numbers...>
 # with engine = [sirius/duckdb]
 #
 # Options:
@@ -22,8 +22,8 @@
 #                         as a backward-compatibility alias.
 #
 # Example:
-#   ./test/tpch_performance/run_tpch_duckdb.sh sirius 1 `seq 1 22`   # uses GPU-native scan by default
-#   ./test/tpch_performance/run_tpch_duckdb.sh --duckdb-file ./data/perf.duckdb duckdb 1 1 6
+#   ./test/performance/run_tpch_duckdb.sh sirius 1 `seq 1 22`   # uses GPU-native scan by default
+#   ./test/performance/run_tpch_duckdb.sh --duckdb-file ./data/perf.duckdb duckdb 1 1 6
 #
 # Set SIRIUS_NATIVE_SCAN_VERIFY=1 to also emit `SET sirius_log_level='debug'`, exposing the
 # GPU-native-scan log markers (off by default to keep query timings clean).
@@ -154,7 +154,7 @@ if [ "$ENGINE" = "sirius" ]; then
         DUCKDB_ARGS+=(-cmd "SET enable_duckdb_fallback=false;")
     fi
 fi
-QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
+QUERY_DIR="$PROJECT_DIR/test/performance/tpch_queries/orig"
 
 if [ ! -f "$DUCKDB_FILE" ]; then
     echo "DuckDB database not found: $DUCKDB_FILE"

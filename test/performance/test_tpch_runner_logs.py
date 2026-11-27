@@ -15,7 +15,7 @@ class RunnerLogChecks:
         self.temporary = tempfile.TemporaryDirectory(prefix="tpch-runner-logs-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        scripts = self.root / "test/tpch_performance"
+        scripts = self.root / "test/performance"
         queries = scripts / "tpch_queries/orig"
         queries.mkdir(parents=True)
         self.runner = scripts / self.runner_name

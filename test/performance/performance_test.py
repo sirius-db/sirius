@@ -535,7 +535,7 @@ CATALOG_SETUP_PATH = None
 
 def _load_yaml(path):
     """Parse a YAML file. Imported locally: PyYAML is in the repo-root pixi env,
-    not test/tpch_performance's own, so a module-scope import would break every
+    not test/performance's own, so a module-scope import would break every
     other invocation."""
     try:
         import yaml
@@ -543,7 +543,7 @@ def _load_yaml(path):
         raise SystemExit(
             "--profile needs PyYAML to derive the effective Sirius config from "
             f"{path!r}. Run this script from the repo root via "
-            "`pixi run python test/tpch_performance/performance_test.py ...`."
+            "`pixi run python test/performance/performance_test.py ...`."
         ) from exc
     with open(path) as f:
         return yaml.safe_load(f) or {}

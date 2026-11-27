@@ -9,7 +9,7 @@ The primary Python runner also supports `--benchmark scale_bench`. Omitting
 runner; the legacy shell scripts in this directory remain TPC-H-specific.
 
 ```bash
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --benchmark scale_bench --input /data/scale_dataset \
     --queries gb2,workflow --iterations 3 --engine gpu \
     --config /path/to/sirius.yaml \
@@ -138,7 +138,7 @@ For iterative workloads that JSON profile describes the final result SELECT;
 Clones and builds `sirius-db/tpchgen-rs` from source with native CPU optimizations, then generates partitioned parquet files with optimized row groups. Run this once per scale factor before invoking `performance_test.py`.
 
 ```bash
-cd test/tpch_performance
+cd test/performance
 
 # Generate SF100 dataset (auto-detects output dir)
 pixi run bash generate_tpch_data.sh 100
@@ -170,7 +170,7 @@ Benchmark it through the unchanged native runner and validate against DuckDB CPU
 
 ```bash
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
-./test/tpch_performance/benchmark_and_validate.sh \
+./test/performance/benchmark_and_validate.sh \
     --data-source duckdb --duckdb-file ./test_datasets/tpch_sf10_sorted.duckdb 10
 ```
 
@@ -178,7 +178,7 @@ Confirm pruning fired (looking for `stats-pruned N row groups` / a reduced `deco
 
 ```bash
 SIRIUS_NATIVE_SCAN_VERIFY=1 OUTPUT_DIR=/tmp/cluster_verify \
-  ./test/tpch_performance/run_tpch_duckdb.sh \
+  ./test/performance/run_tpch_duckdb.sh \
     --duckdb-file ./test_datasets/tpch_sf10_sorted.duckdb sirius 10 1 6
 grep -oE 'stats-pruned [0-9]+ row groups' /tmp/cluster_verify/sirius_*.log
 ```
@@ -209,7 +209,7 @@ their full dataset range fits; every primary and foreign key in a family widens 
 together. The first integer scale factors requiring `BIGINT` are 358 for order keys,
 10,738 for part keys, 14,317 for customer keys, and 214,749 for supplier keys. Nation and
 region keys remain `INTEGER`. This also applies to `--cluster` datasets. To inspect the
-DDL without generating data, run `pixi run python test/tpch_performance/tpch_schema.py 1000`
+DDL without generating data, run `pixi run python test/performance/tpch_schema.py 1000`
 from the project root. Existing databases keep their types until regenerated.
 
 Generation prefers `tpchgen-rs`, which emits byte-identical `.tbl` output to the classic `dbgen`
@@ -228,7 +228,7 @@ equivalent — which is sound precisely because the base data is byte-identical 
 The `rewrite_parquet.py` script reads existing parquet files and rewrites them with larger row groups, snappy compression, V2 page headers, dictionary encoding, and configurable max file size (large tables are split into numbered files). Uses cudf (GPU) if available, otherwise falls back to pyarrow (CPU-only, via the root `pixi install`).
 
 ```bash
-cd test/tpch_performance
+cd test/performance
 
 # Rewrite with 10M-row row groups (recommended for GPU workloads)
 pixi run python rewrite_parquet.py ../../test_datasets/tpch_parquet_sf100 ../../test_datasets/tpch_parquet_sf100_optimized 10000000
@@ -240,7 +240,7 @@ pixi run python rewrite_parquet.py ../../test_datasets/tpch_parquet_sf100 ../../
 ### From tpchgen-rs Python wrapper (alternative, supports partitioned output)
 
 ```bash
-cd test/tpch_performance
+cd test/performance
 pixi run python generate_test_data_tpchgen-rs.py <SF> <partitions> <format>
 ```
 
@@ -256,68 +256,68 @@ All commands run from the **project root** directory.
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
 # Both engines, 2 iterations, supplied cache configuration
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf100 \
     --scale-factor 100 \
     --engine both --iterations 2
 
 # Parquet data on S3 (on EC2, attach an IAM role with ListBucket/GetObject access)
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input s3://my-bucket/tpch_parquet_sf100/ \
     --scale-factor 100 \
     --engine gpu --iterations 2
 
 # Sirius vs DuckDB result validation, queries 1/3/6 only
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
     --scale-factor 1 \
     --engine both --iterations 1 --validation --queries 1,3,6
 
 # Per-query GPU-tier pinning
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf100 \
     --scale-factor 100 \
     --engine gpu --iterations 3 --pin gpu
 
 # DuckDB native source from disk (both engines, validate). --input is a .duckdb FILE.
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf1.duckdb --data-source duckdb \
     --scale-factor 1 \
     --engine both --iterations 1 --validation --queries 1,3,6
 
 # DuckDB native source, pinned into the GPU cache
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf100.duckdb --data-source duckdb \
     --scale-factor 100 \
     --engine gpu --iterations 3 --pin gpu
 
 # Cold-start measurement (per-query dataset file cache eviction hint +
 # reset_sirius_cache(); no sudo required)
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf10 \
     --scale-factor 10 \
     --engine gpu --iterations 2 --profile cold
 
 # Warm-but-contended: caches fill and stay filled, LRU retention, round-robin
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf10 \
     --scale-factor 10 \
     --engine gpu --iterations 2 --profile lukewarm
 
 # nsys profiling (one .nsys-rep + .sqlite per query under <bench>/sirius/q<N>/)
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
     --scale-factor 1 \
     --engine gpu --iterations 2 --precmd nsys --queries 1,3,6
 
 # Batch-mode GDB (one gdb_stdout.txt with an automatic crash backtrace per query)
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
     --scale-factor 1 \
     --engine gpu --iterations 1 --precmd gdb --queries 6
 
 # S3 prefix instead of a local directory (--engine gpu only; see below)
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input s3://<bucket>/datasets/tpch_sf1 \
     --scale-factor 1 \
     --engine gpu --iterations 2 --config /path/to/sirius_s3.yaml
@@ -438,17 +438,17 @@ The **GPU-native DuckDB scan is the only `seq_scan` path** in the engine, so the
 
 ```bash
 # Generate the native .duckdb tables
-pixi run bash test/tpch_performance/generate_tpch_data.sh 1 --format duckdb   # → test_datasets/tpch_sf1.duckdb
+pixi run bash test/performance/generate_tpch_data.sh 1 --format duckdb   # → test_datasets/tpch_sf1.duckdb
 
 # Benchmark + validate the GPU-native scan (now the default duckdb path)
-./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb --duckdb-file ./test_datasets/tpch_sf1.duckdb 1
+./test/performance/benchmark_and_validate.sh --data-source duckdb --duckdb-file ./test_datasets/tpch_sf1.duckdb 1
 ```
 
 **Verifying the native operator actually ran.** A passing result alone does not show which scan path ran. The native-scan log markers are `SIRIUS_LOG_DEBUG`, and timed runs stay at the default `info` level to keep query timings clean. To expose the markers, set `SIRIUS_NATIVE_SCAN_VERIFY=1` (it emits `SET sirius_log_level='debug'`). Run this as a separate, untimed check:
 
 ```bash
 SIRIUS_NATIVE_SCAN_VERIFY=1 OUTPUT_DIR=/tmp/native_verify \
-  ./test/tpch_performance/run_tpch_duckdb.sh \
+  ./test/performance/run_tpch_duckdb.sh \
     --duckdb-file ./test_datasets/tpch_sf1.duckdb sirius 1 1 6
 # decoded-split count >= 1 with refused = 0 proves the native path ran:
 grep -c 'duckdb_native_gpu_ingestible::materialize_table] decoded split' /tmp/native_verify/sirius_*.log
@@ -467,13 +467,13 @@ The per-query column-set is sourced from `tpch_pin_columns.py` (must be a supers
 
 The OS page cache drop in `performance_test.py` uses `posix_fadvise(DONTNEED)` on the dataset files, so no sudo is needed. (The `run_tpch_*.sh` scripts still use `sudo tee /proc/sys/vm/drop_caches`.)
 
-Output layout (under `--output` root, default `test/tpch_performance/output/`):
+Output layout (under `--output` root, default `test/performance/output/`):
 
 `--pin-after-iteration N` (per-query mode only; ignored with pinned-hot) leaves each query's first `N` iterations (e.g. cold + warm) unpinned, then pins for the remaining ("hot") iterations before unpinning again. Default is `0` (pin from the first iteration — the original per-query behavior).
 
 ```bash
-./test/tpch_performance/benchmark_and_validate.sh --pinning-mode per-query --pin-after-iteration 2 --iterations 5 100
-./test/tpch_performance/benchmark_and_validate.sh --pinning-mode pinned-hot --iterations 5 100
+./test/performance/benchmark_and_validate.sh --pinning-mode per-query --pin-after-iteration 2 --iterations 5 100
+./test/performance/benchmark_and_validate.sh --pinning-mode pinned-hot --iterations 5 100
 ```
 
 To verify a query actually hit the cache, grep `runs/.../sirius/q<N>/sirius.log` for `using cached_split_provider`; the matching-fallback log line is `not all the columns are pinned for this query`.
@@ -488,13 +488,13 @@ Tier override: the helper defaults to `tier='gpu'`. Both `gpu` and `host` are su
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
 # Run Sirius on queries 1-22
-./test/tpch_performance/run_tpch_parquet.sh sirius 100 $(seq 1 22)
+./test/performance/run_tpch_parquet.sh sirius 100 $(seq 1 22)
 
 # Run DuckDB baseline
-./test/tpch_performance/run_tpch_parquet.sh duckdb 100 $(seq 1 22)
+./test/performance/run_tpch_parquet.sh duckdb 100 $(seq 1 22)
 
 # Use custom parquet directory
-./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 1 3 6
+./test/performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 1 3 6
 ```
 
 ### Output layout
@@ -519,7 +519,7 @@ export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 `sweep_threads.sh` runs Sirius-only across multiple thread configurations (pipeline, scan, task_creator threads) to find optimal settings. It writes each configuration to a temporary file exported through `SIRIUS_CONFIG_FILE`; the tracked `integration.yaml` is never modified.
 
 ```bash
-bash test/tpch_performance/sweep_threads.sh
+bash test/performance/sweep_threads.sh
 ```
 
 Results are saved as one CSV per configuration under a unique timestamped directory in `benchmark_results_thread_sweep/`. Set `SWEEP_OUTPUT_DIR` to use an explicit run directory.
@@ -736,25 +736,25 @@ loader's job regardless of version.
 
 ```bash
 # One-time per SF: generate refresh sets with classic dbgen -U (needs >= streams+1 sets)
-./test/tpch_performance/generate_tpch_refresh.sh 1 5     # -> test_datasets/tpch_refresh_sf1/
+./test/performance/generate_tpch_refresh.sh 1 5     # -> test_datasets/tpch_refresh_sf1/
 
 # Only for --vary-predicates: per-stream query sets from qgen (streams 0..N),
 # seeded seed0+n per spec clause 2.1.3.3. Official runs pass the load-end
 # timestamp: --seed $(date +%m%d%H%M%S at load end)
-./test/tpch_performance/generate_tpch_queries.sh 1 4     # -> test_datasets/tpch_queries_sf1/
+./test/performance/generate_tpch_queries.sh 1 4     # -> test_datasets/tpch_queries_sf1/
 
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
 # Power + throughput (defaults: --mode both, --pin gpu, validation on, spec-minimum streams)
-pixi run python test/tpch_performance/tpch_power_throughput.py --sf 1
+pixi run python test/performance/tpch_power_throughput.py --sf 1
 
 # Explicit paths / bigger run
-pixi run python test/tpch_performance/tpch_power_throughput.py \
+pixi run python test/performance/tpch_power_throughput.py \
     --sf 10 --input test_datasets/tpch_sf10.duckdb \
     --refresh-dir test_datasets/tpch_refresh_sf10 --streams 4 --pin host
 
 # Power run only, no clean pass, timing only
-pixi run python test/tpch_performance/tpch_power_throughput.py \
+pixi run python test/performance/tpch_power_throughput.py \
     --sf 1 --mode power --no-baseline-pass --no-validation
 ```
 
@@ -789,7 +789,7 @@ MODE=power DB=~/tpch_sf1000.duckdb pixi run bash bench/sf1000-repro/run-power.sh
 QUENT=1 DB=~/tpch_sf1000.duckdb pixi run bash bench/sf1000-repro/run-power.sh
 ```
 
-Output (under `test/tpch_performance/output/tpch_power_<ts>_sf<SF>_s<N>/`): `metrics.json`
+Output (under `test/performance/output/tpch_power_<ts>_sf<SF>_s<N>/`): `metrics.json`
 (all metrics + per-query/per-stream times + validation verdicts), `timings.csv`
 (`phase,stream,element,seconds`), `summary.txt` (per-query clean/post-RF1/post-RF2 table +
 metrics), `run_info.txt`, `config.yml`, `power/q<N>/result_{clean,postrf1,postrf2}.txt`, and
@@ -806,7 +806,7 @@ The primary entry point is `performance_test.py --precmd nsys` (subprocess-per-q
 ```bash
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
-pixi run python test/tpch_performance/performance_test.py \
+pixi run python test/performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
     --scale-factor 1 \
     --engine gpu --iterations 2 --precmd nsys --queries 1,3,6
@@ -820,13 +820,13 @@ For end-to-end profiling + analysis packaging, use `nsys_report.sh` (orchestrato
 
 ```bash
 # Analyze a single query
-./test/tpch_performance/nsys_analyze.sh /path/to/q1.sqlite
+./test/performance/nsys_analyze.sh /path/to/q1.sqlite
 
 # Analyze all queries in a directory
-./test/tpch_performance/nsys_analyze.sh /path/to/nsys_profiles/sf300/
+./test/performance/nsys_analyze.sh /path/to/nsys_profiles/sf300/
 
 # Analyze specific queries
-./test/tpch_performance/nsys_analyze.sh /path/to/nsys_profiles/sf300/ 1 3 6
+./test/performance/nsys_analyze.sh /path/to/nsys_profiles/sf300/ 1 3 6
 ```
 
 ### Identifying optimization targets
@@ -834,7 +834,7 @@ For end-to-end profiling + analysis packaging, use `nsys_report.sh` (orchestrato
 `nsys_hotspots.sh` maps GPU hotspots back to source code functions, detects efficiency bottlenecks, sync overhead, memory issues, and parallelism opportunities.
 
 ```bash
-./test/tpch_performance/nsys_hotspots.sh /path/to/profiles/ 1 3 6
+./test/performance/nsys_hotspots.sh /path/to/profiles/ 1 3 6
 ```
 
 ### Comparing runs
@@ -842,7 +842,7 @@ For end-to-end profiling + analysis packaging, use `nsys_report.sh` (orchestrato
 `nsys_compare.sh` compares per-query timings and aggregate metrics between a baseline and current report, flagging regressions and improvements.
 
 ```bash
-./test/tpch_performance/nsys_compare.sh reports/baseline/ reports/current/ --threshold 5
+./test/performance/nsys_compare.sh reports/baseline/ reports/current/ --threshold 5
 ```
 
 ### Full report generation
@@ -851,19 +851,19 @@ For end-to-end profiling + analysis packaging, use `nsys_report.sh` (orchestrato
 
 ```bash
 # Profile and generate report (parquet source, default)
-./test/tpch_performance/nsys_report.sh --sf 300_rg2m
-./test/tpch_performance/nsys_report.sh --sf 100 --iterations 4 1 3 6 10
+./test/performance/nsys_report.sh --sf 300_rg2m
+./test/performance/nsys_report.sh --sf 100 --iterations 4 1 3 6 10
 
 # DuckDB-native source: --data-source duckdb (defaults to test_datasets/tpch_sf<SF>.duckdb,
 # or pass --duckdb-file). Forwards --data-source to performance_test.py --precmd nsys.
-./test/tpch_performance/nsys_report.sh --sf 10 --data-source duckdb 1 3 6
-./test/tpch_performance/nsys_report.sh --data-source duckdb --duckdb-file ./test_datasets/tpch_sf10.duckdb --sf 10
+./test/performance/nsys_report.sh --sf 10 --data-source duckdb 1 3 6
+./test/performance/nsys_report.sh --data-source duckdb --duckdb-file ./test_datasets/tpch_sf10.duckdb --sf 10
 
 # Report from existing profiles
-./test/tpch_performance/nsys_report.sh --profile-dir /path/to/nsys_profiles/sf300/
+./test/performance/nsys_report.sh --profile-dir /path/to/nsys_profiles/sf300/
 
 # Report with baseline comparison
-./test/tpch_performance/nsys_report.sh --profile-dir ./profiles/ --compare reports/baseline/
+./test/performance/nsys_report.sh --profile-dir ./profiles/ --compare reports/baseline/
 ```
 
 Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.json`, `metadata.json`, and `profiles/`.
