@@ -242,14 +242,16 @@ TEST_CASE("writes of several frames survive shuffled notifications", "[exchange]
 TEST_CASE("a peer that returns no credits leaves send frames for the other peers",
           "[exchange][transport]")
 {
-  // Rank 0's transport, and ranks 1 and 2 as bare endpoints, which never return a credit. 8
-  // credits per peer and 8 send frames; a batch is 19 frames.
+  // Rank 0's transport, and ranks 1 and 2 as bare endpoints, which never return a credit. A
+  // batch is several frames. 8 credits per peer and 8 send frames, then 1 and 1: one send
+  // frame is never staged ahead of a credit.
+  auto const frames = GENERATE(std::uint32_t{8}, std::uint32_t{1});
   loopback_hub hub{3};
-  frame_ring send{8, 64 * KiB};
-  frame_ring recv{16, 64 * KiB};
+  frame_ring send{frames, 64 * KiB};
+  frame_ring recv{2 * frames, 64 * KiB};
   frame_ring unused{1, 64 * KiB};
-  frame_ring recv1{16, 64 * KiB};
-  frame_ring recv2{16, 64 * KiB};
+  frame_ring recv1{2 * frames, 64 * KiB};
+  frame_ring recv2{2 * frames, 64 * KiB};
   auto fab        = hub.attach(0, send, recv);
   auto const one  = hub.attach(1, unused, recv1);
   auto const two  = hub.attach(2, unused, recv2);
@@ -270,10 +272,10 @@ TEST_CASE("a peer that returns no credits leaves send frames for the other peers
   transport t(*fab, send, recv, *env().gpu, env().host, recording(got));
   t.send(1, 1, exchange_batch(0, 1, 1, 0, 30'000));
   // Rank 1's credits are spent; what rank 0 stages for it from here on is never written.
-  REQUIRE(took(*one, 8) == 8);
+  REQUIRE(took(*one, frames) == frames);
   std::this_thread::sleep_for(std::chrono::milliseconds{200});
   t.send(1, 2, exchange_batch(0, 2, 1, 0, 30'000));
-  CHECK(took(*two, 8) == 8);
+  CHECK(took(*two, frames) == frames);
 }
 
 TEST_CASE("a receiver with no room holds the frames until room appears", "[exchange][transport]")
