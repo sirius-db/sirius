@@ -1146,28 +1146,32 @@ void materialize_equality_deletes(duckdb::ClientContext& context,
     for (std::size_t device = 1; device < resources.size(); ++device) {
       auto const& target = resources[device];
       rmm::cuda_set_device_raii device_guard{target.device};
-      rmm::device_buffer copy{packed.gpu_data->size(), target.stream, target.mr};
-      (void)sirius::memory::enqueue_device_copy(
-        {static_cast<std::byte*>(copy.data()), copy.size()},
-        target.device,
-        target.stream,
-        {static_cast<std::byte const*>(packed.gpu_data->data()), copy.size()},
-        origin.device,
-        origin.space,
-        sirius::memory::source_already_complete{},
-        target.space
-          ? sirius::memory::sirius_memory_reservation_manager::host_staging_space(*target.space)
-          : nullptr);
-      // The copy reads the first device's buffer: finish it before either buffer can go.
-      target.stream.sync();
-      auto const keys =
-        cudf::unpack(packed.metadata->data(), static_cast<uint8_t const*>(copy.data()));
+      std::unique_ptr<cudf::table> keys;
+      {
+        rmm::device_buffer copy{packed.gpu_data->size(), target.stream, target.mr};
+        (void)sirius::memory::enqueue_device_copy(
+          {static_cast<std::byte*>(copy.data()), copy.size()},
+          target.device,
+          target.stream,
+          {static_cast<std::byte const*>(packed.gpu_data->data()), copy.size()},
+          origin.device,
+          origin.space,
+          sirius::memory::source_already_complete{},
+          target.space
+            ? sirius::memory::sirius_memory_reservation_manager::host_staging_space(*target.space)
+            : nullptr);
+        // The copy reads the first device's buffer: finish it before either buffer can go.
+        target.stream.sync();
+        keys = std::make_unique<cudf::table>(
+          cudf::unpack(packed.metadata->data(), static_cast<uint8_t const*>(copy.data())),
+          target.stream,
+          target.mr);
+        // The keys are read out of the buffer before it goes, so that the hash table is not
+        // built beside a second copy of them.
+        target.stream.sync();
+      }
       data.equality_replicas[device].groups[group_index] =
-        index_equality_group(ids,
-                             primary,
-                             std::make_unique<cudf::table>(keys, target.stream, target.mr),
-                             target.stream,
-                             target.mr);
+        index_equality_group(ids, primary, std::move(keys), target.stream, target.mr);
     }
   }
 
@@ -1206,6 +1210,17 @@ IcebergDeleteData::~IcebergDeleteData()
     rmm::cuda_set_device_raii device_guard{replica.device};
     replica.groups.clear();
   }
+}
+
+void IcebergDeleteData::release_equality_replicas_outside(std::span<int const> devices) const
+{
+  std::erase_if(equality_replicas, [&](equality_replica& replica) {
+    if (std::find(devices.begin(), devices.end(), replica.device.value()) != devices.end())
+      return false;
+    rmm::cuda_set_device_raii device_guard{replica.device};
+    replica.groups.clear();
+    return true;
+  });
 }
 
 std::vector<EqualityDeleteGroup> const& IcebergDeleteData::equality_groups_on(

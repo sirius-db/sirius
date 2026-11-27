@@ -2089,8 +2089,10 @@ TEST_CASE("iceberg equality deletes are applied on every GPU a query can be admi
           "[iceberg][multi_gpu][isolated_context]")
 {
   if (!sirius::test::has_gpus(2)) SKIP("Requires two visible GPUs");
-  // 0 admits a query to both GPUs, 1 to the first one only.
-  auto const gpus_per_query = GENERATE(0, 1);
+  // 0 admits a query to both GPUs, 1 to the first one only. An estimate that one GPU covers
+  // also admits it to the first only, but is made after the tables are built on both.
+  auto const [gpus_per_query, admission_bytes_per_gpu] =
+    GENERATE(table<int, uint64_t>({{0, 0}, {1, 0}, {0, uint64_t{1} << 40}}));
   sirius::test::scratch_dir scratch{"iceberg_equality_2gpu"};
   {
     std::ofstream config(scratch.path() / "2gpu.yaml");
@@ -2137,6 +2139,7 @@ TEST_CASE("iceberg equality deletes are applied on every GPU a query can be admi
 
   run("SET gpu_execution=true");
   run("SET enable_duckdb_fallback=false");
+  run("SET admission_bytes_per_gpu=" + std::to_string(admission_bytes_per_gpu));
   auto const query = "SELECT v FROM iceberg_scan('" +
                      equality_fixture("iceberg_v2_eq_partition_shapes") + "') ORDER BY v";
   auto const before = sirius::test::get_transparent_execution_stats(con);
@@ -2147,8 +2150,8 @@ TEST_CASE("iceberg equality deletes are applied on every GPU a query can be admi
   CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads + 5);
   {
     std::lock_guard lock{mutex};
-    if (gpus_per_query == 1) {
-      // No task runs on the second GPU, so no tables are built there.
+    if (gpus_per_query == 1 || admission_bytes_per_gpu != 0) {
+      // No task runs on the second GPU, so it holds no tables while the scan runs.
       CHECK(devices == std::set<int>{0});
       CHECK(second_while_scanning == idle);
     } else {

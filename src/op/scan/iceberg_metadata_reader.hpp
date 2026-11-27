@@ -34,6 +34,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -211,9 +212,14 @@ struct IcebergDeleteData {
   std::unordered_map<std::string, std::vector<int64_t>> positional_deletes;
 
   /// One per GPU the query can be admitted to, none when no group applies to a data file. Each
-  /// is released with its device current.
-  std::vector<equality_replica> equality_replicas;
+  /// is released with its device current. Mutable: admission releases the ones it leaves out
+  /// through the scan's const payload.
+  mutable std::vector<equality_replica> equality_replicas;
   ~IcebergDeleteData();
+
+  /// Releases the tables on every device outside @p devices. Not synchronized: call before a
+  /// batch probes.
+  void release_equality_replicas_outside(std::span<int const> devices) const;
 
   /// The groups built on @p device. Throws when there are none: skipping the probe would return
   /// deleted rows, and another device's tables need not be addressable from this one.

@@ -461,7 +461,8 @@ std::shared_ptr<const sirius::op::scan::IcebergDeleteData> load_scan_delete_payl
   auto const spaces =
     sirius_ctx.get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   // Admission takes a prefix of the sorted GPUs no longer than `topology.gpus_per_query`, then
-  // may shorten it by an estimate that needs the finished plan. No task runs past that prefix.
+  // may shorten it by an estimate that needs the finished plan. No task runs past that prefix,
+  // and the tables of the GPUs the estimate leaves out are released when it is made.
   std::vector<int> admissible;
   for (auto const* space : spaces)
     if (space) admissible.push_back(space->get_device_id());

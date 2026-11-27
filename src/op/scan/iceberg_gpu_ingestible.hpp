@@ -123,6 +123,10 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
   void attach_preparation_ledger(std::shared_ptr<scan_manager::preparation_ledger>) override;
   void stop_preparation() noexcept override;
   void finish_preparation() noexcept override;
+  void set_admitted_gpus(std::span<int const> gpu_ids) override
+  {
+    if (_equality_data) _equality_data->release_equality_replicas_outside(gpu_ids);
+  }
 
   filtered_table materialize_metadata_to_table(
     scan_info const& info,
