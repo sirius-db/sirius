@@ -430,6 +430,18 @@ SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up' AND cluster = 'r
 ----
 2
 
+# One statement per call: the ranks would commit the table before the second statement fails,
+# and nothing would log it. The text is refused before it reaches a rank.
+statement error
+FROM sirius_gateway_run('CREATE TABLE two AS SELECT 1 AS i; SELECT error(''later statement'')');
+----
+takes one statement
+
+statement error
+FROM sirius_gateway_run('SELECT count(*) FROM two');
+----
+does not exist
+
 query I
 SELECT state FROM sirius_gateway_stop();
 ----
