@@ -17,6 +17,7 @@
 #pragma once
 
 #include "cudf/ast_compat.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/concatenate.hpp>
@@ -28,6 +29,7 @@
 #include <cuda_runtime_api.h>
 
 #include <array>
+#include <future>
 #include <memory>
 #include <vector>
 
@@ -38,15 +40,35 @@ namespace detail {
 // Nightly cuDF accepts an LTO fragment list before the stream and allocator. Detect that
 // signature instead of a release number, since stable and nightly builds can share a version.
 template <typename Expression>
-std::unique_ptr<cudf::column> compute_column_jit_unchecked(cudf::table_view const& input,
-                                                           Expression const& expression,
-                                                           ::cuda::stream_ref stream,
-                                                           rmm::device_async_resource_ref mr)
+std::unique_ptr<cudf::column> compute_column_jit_once(cudf::table_view const& input,
+                                                      Expression const& expression,
+                                                      ::cuda::stream_ref stream,
+                                                      rmm::device_async_resource_ref mr)
 {
   if constexpr (requires { cudf::compute_column_jit(input, expression, {}, stream, mr); }) {
     return cudf::compute_column_jit(input, expression, {}, stream, mr);
   } else {
     return cudf::compute_column_jit(input, expression, stream, mr);
+  }
+}
+
+// cuDF's JIT cache keeps the entry of a kernel whose compilation threw, and every later caller of
+// that kernel in the process receives std::future_error (broken_promise) instead of the compiler
+// error. Recompiling cannot succeed, so name the failure instead.
+template <typename Expression>
+std::unique_ptr<cudf::column> compute_column_jit_unchecked(cudf::table_view const& input,
+                                                           Expression const& expression,
+                                                           ::cuda::stream_ref stream,
+                                                           rmm::device_async_resource_ref mr)
+{
+  try {
+    return compute_column_jit_once(input, expression, stream, mr);
+  } catch (std::future_error const& e) {
+    if (e.code() != std::future_errc::broken_promise) { throw; }
+    throw sirius::internal_exception(
+      "[compute_column_jit] cuDF JIT compilation of the expression failed earlier in this process "
+      "and cuDF reports the cached failure as '{}'; set LIBCUDF_JIT_VERBOSE=1 for the compiler log",
+      e.what());
   }
 }
 

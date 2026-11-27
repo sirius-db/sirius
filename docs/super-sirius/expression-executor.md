@@ -158,7 +158,7 @@ The result is a tree of AST trees whose edges are AST breakers. Each AST tree is
 
 For nodes that use size-based mode selection, the `min_ast_size` constructor parameter (default `2`) controls whether a subtree is materialized operator-by-operator or built as an AST. The evaluator uses `cudf_ast_op_count()` to estimate its size; a subtree below the threshold normally materializes unless its parent requests AST mode. This is a heuristic, not a universal rule: floating comparisons, BETWEEN, and floating membership may require NaN-aware ASTs independently of the threshold.
 
-`MATERIALIZE` and `AST_INTERPRET` with `min_ast_size = ∞` are therefore not interchangeable. In particular, an all-constant FLOAT/DOUBLE IN list uses `cudf::contains` under `MATERIALIZE`, but follows the floating comparison AST path under `AST_INTERPRET` even when the threshold exceeds the expression size. Floating lists with nonconstant entries retain the comparison chain under either strategy. AST evaluation requested under `MATERIALIZE` is interpreted; only `AST_JIT` selects the JIT backend.
+`MATERIALIZE` and `AST_INTERPRET` with `min_ast_size = ∞` are therefore not interchangeable. In particular, an all-constant FLOAT/DOUBLE IN list of at most `max_ast_in_list_size` entries uses `cudf::contains` under `MATERIALIZE`, but follows the floating comparison AST path under `AST_INTERPRET` even when the threshold exceeds the expression size. Floating lists with nonconstant entries retain the comparison chain under either strategy. AST evaluation requested under `MATERIALIZE` is interpreted; only `AST_JIT` selects the JIT backend.
 
 ### `evaluation_mode` (internal)
 
@@ -300,6 +300,10 @@ round to the requested unit.
 The AST lowering for IN joins per-entry equality comparisons with `NULL_LOGICAL_OR`. The standalone translator lowers NOT IN to per-entry inequality comparisons joined by `NULL_LOGICAL_AND`. For non-floating operands these use primitive `EQUAL` and `NOT_EQUAL` nodes. FLOAT/DOUBLE comparisons instead use the shared NaN-aware comparison builder: equality expands to `EQUAL OR both_nan`, and inequality to `NOT(EQUAL OR both_nan)`, where `both_nan` means both operands are valid NaNs. These expressions retain ordinary comparison NULL propagation. The pinned cuDF implementation normalizes the expanded predicate before Parquet membership pruning; the floating inequality's `NOT` node must not be confused with negating a Bloom-filter membership answer (see [Row Group Pruning](scan.md#row-group-pruning)). The row evaluator can negate its IN result because it operates on actual row values.
 
 Under `MATERIALIZE`, all-constant lists (including FLOAT/DOUBLE) use `cudf::contains` over the non-NULL entries; this lookup treats NaNs and signed zeros as equal. When the list also has a NULL, the evaluator combines the result with a NULL scalar using `NULL_LOGICAL_OR`. Floating lists with nonconstant entries retain the NaN-aware comparison chain.
+
+The AST strategies use the same lookup for all-constant lists with more than `expression_evaluator::max_ast_in_list_size` (16) entries, and materialize its result as a column the enclosing AST references. Shorter lists stay fused into the AST as a comparison chain. A long chain is slower than a hash lookup, and under `AST_JIT` every list entry is a separate kernel input: NVRTC fails to compile kernels with a few hundred of them, as in TPC-DS q8's 400-entry list. The limit counts kernel inputs, so a long `OR` of comparisons written out in SQL still reaches it. Tests are tagged `[large_in_list]`.
+
+cuDF's JIT cache keeps the entry of a kernel whose compilation failed. Only the first caller sees the compiler error; every later caller of the same kernel in the process receives `std::future_error` (broken promise). `sirius::cudf_compat::compute_column_jit` rethrows that as an `internal_exception` naming the failed JIT compilation.
 
 ### String concatenation
 

@@ -352,15 +352,17 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
   auto const all_constants = std::all_of(alt.values.begin(), alt.values.end(), [](auto const& v) {
     return v && v->template holds<sirius::ast::constant>();
   });
-  // cuDF contains treats NaNs and signed zeros as equal. Keep its constant-list lookup under
-  // MATERIALIZE; the path below also handles NULL list entries and NOT IN. Nonconstant floating
-  // lists still need the NaN-aware comparison chain, including when MATERIALIZE is selected.
+  // cuDF contains treats NaNs and signed zeros as equal, as DuckDB does. MATERIALIZE always uses
+  // its constant-list lookup; the AST strategies use it only for long lists, keeping short ones
+  // fused into the enclosing AST. The path below also handles NULL list entries and NOT IN.
+  // Nonconstant floating lists still need the NaN-aware comparison chain under every strategy.
   auto const constant_lookup =
-    _policy.strategy == expression_evaluator_strategy::MATERIALIZE && all_constants;
+    all_constants && (_policy.strategy == expression_evaluator_strategy::MATERIALIZE ||
+                      alt.values.size() > max_ast_in_list_size);
   auto const floating = floating_comparison(alt.probe->return_type(), alt.probe->return_type());
-  if ((floating && !constant_lookup) ||
-      (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
-       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size))) {
+  if (!constant_lookup &&
+      (floating || (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+                    (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)))) {
     D_ASSERT(!alt.values.empty());
 
     // `x IN (a, b)` is `x = a OR x = b` under Kleene logic, so a match stays TRUE when another
