@@ -113,6 +113,24 @@ void validate_operator_output_types(const op::operator_data* data,
   }
 }
 
+// Compute the row count of the concatenation of all batches in @p pd.
+// Returns nullopt for any unknown count.
+std::optional<std::size_t> row_count(const op::pipelineable_operator_data* pd)
+{
+  if (!pd) { return std::nullopt; }
+  std::optional<std::size_t> rows = std::size_t{0};
+  for (const auto& ro : pd->get_read_only_batches()) {
+    if (!ro.get_data()) { continue; }
+    auto const batch_rows = representation_num_rows(ro.get_data());
+    if (!batch_rows) {
+      rows.reset();
+      break;
+    }
+    rows = memory::saturating_add(*rows, *batch_rows);
+  }
+  return rows;
+}
+
 // Authoritative source for the GPU id used by per-task log lines: the
 // executor's _per_thread_init runs cudaSetDevice(executor_gpu) on every
 // worker thread, and compute_task wraps the per-task work in
@@ -985,18 +1003,21 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
         : ls._input_data->get_estimated_working_set_size_in_bytes();
   }
 
-  std::size_t num_batches = 0;
+  std::size_t num_batches         = 0;
+  std::optional<std::size_t> rows = std::nullopt;
   if (auto* pd = dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get())) {
     num_batches = pd->get_data_batches().size();
+    rows        = row_count(pd);
   }
   const op::input_stats stats{
     .num_batches                  = num_batches,
     .bytes                        = input_basis,
     .type                         = input_type,
     .resident                     = input_resident,
-    .working_set_bytes            = working_set_bytes,
     .needs_carrier_conversion     = input_needs_scan_carrier_conversion,
-    .conversion_destination_bytes = input_scan_conversion_destination_bytes};
+    .working_set_bytes            = working_set_bytes,
+    .conversion_destination_bytes = input_scan_conversion_destination_bytes,
+    .rows                         = rows};
 
   pipeline::reservation_size_info info;
   info.input_basis                = input_basis;
