@@ -282,7 +282,10 @@ the gateway set it up as its only rank), and `sirius_rank_exit()`
 - **Dead ranks:** a spawned rank that exits is found by its process. Before each statement, while
   the ranks are ready, the gateway probes every registered rank's Quack port in parallel, for up
   to 2 s; a port that takes no connection makes it restart every rank and replay the DDL log
-  before the statement runs. The probe only checks that the port takes a TCP connection. It
+  before the statement runs. The 2 s cover every address of a rank's host, but not the lookup of
+  a host name: a rank that registers under a name is looked up by the system's resolver, with
+  its timeout. `sirius_node.sh` registers an IP address unless the gateway itself was given a
+  name. The probe only checks that the port takes a TCP connection. It
   misses a rank that hangs with its port open, which only the statement timeout finds, and a rank
   that its launcher has already started again on the same port. The gateway cannot kill a
   registered rank; a cancel it ignores holds the gateway's turn for up to the grace period plus
