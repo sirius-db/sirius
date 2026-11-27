@@ -480,6 +480,43 @@ TEST_CASE("request_free_memory downgrades across multiple repos", "[downgrade_ex
   executor.stop();
 }
 
+TEST_CASE("request_free_memory spills the repository of the last consumer first",
+          "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+
+  auto repo_near  = std::make_unique<cucascade::shared_data_repository>();
+  auto batch_near = make_gpu_batch(*gpu_space);
+  repo_near->add_data_batch(batch_near);
+  auto repo_far  = std::make_unique<cucascade::shared_data_repository>();
+  auto batch_far = make_gpu_batch(*gpu_space);
+  repo_far->add_data_batch(batch_far);
+
+  // The key is the consumer's operator id.
+  repo_mgr.add_new_repository(1, "out", std::move(repo_near));
+  repo_mgr.add_new_repository(2, "out", std::move(repo_far));
+
+  size_t one_batch_size = get_batch_size(*batch_far);
+
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  size_t freed = executor.request_free_memory_and_wait(one_batch_size);
+  REQUIRE(freed == one_batch_size);
+
+  REQUIRE(get_batch_tier(*batch_far) == cucascade::memory::Tier::HOST);
+  REQUIRE(get_batch_tier(*batch_near) == cucascade::memory::Tier::GPU);
+
+  executor.stop();
+}
+
 TEST_CASE("request_free_memory iterates partitions from last to first", "[downgrade_executor]")
 {
   auto mem_mgr    = make_test_memory_manager();
