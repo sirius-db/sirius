@@ -474,6 +474,22 @@ std::optional<double> most_distinct_values(duckdb::ClientContext& context,
   }
 }
 
+/// Whether @p column is proven to hold no value twice, and no NULL, in its scan: its pinned copy
+/// found it distinct, or it is a native table's PRIMARY KEY.
+bool never_repeats(duckdb::ClientContext& context, scan_column const& column)
+{
+  try {
+    auto const outputs = column.get->GetColumnBindings();
+    return std::ranges::any_of(
+      proven_unique_scan_outputs(context, *column.get), [&](auto position) {
+        return position < outputs.size() && outputs[position] == column.binding;
+      });
+  } catch (...) {
+    // A scan whose facts cannot be read proves nothing.
+    return false;
+  }
+}
+
 /// Whether one of @p keys is proven to hold no value twice in @p source, so that an aggregate
 /// grouped by them would have a group for every row and combine nothing. The proof is a scan's:
 /// a column its pinned copy found distinct, or a native table's PRIMARY KEY. It holds only for
@@ -483,26 +499,36 @@ bool key_never_repeats(duckdb::ClientContext& context,
                        LogicalOperator& source,
                        std::vector<ColumnBinding> const& keys)
 {
-  // Filters and projections lead to one scan, so every key that reaches a scan reaches the same.
-  duckdb::LogicalGet* get = nullptr;
-  std::vector<ColumnBinding> scanned;
-  for (auto const& key : keys) {
-    if (auto const behind = scan_column_behind(source, key, /*rows_only=*/true)) {
-      get = behind->get;
-      scanned.push_back(behind->binding);
-    }
-  }
-  if (!get) { return false; }
-  try {
-    auto const outputs = get->GetColumnBindings();
-    return std::ranges::any_of(proven_unique_scan_outputs(context, *get), [&](auto position) {
-      return position < outputs.size() &&
-             std::ranges::find(scanned, outputs[position]) != scanned.end();
-    });
-  } catch (...) {
-    // A scan whose facts cannot be read proves nothing.
+  return std::ranges::any_of(keys, [&](auto const& key) {
+    auto const behind = scan_column_behind(source, key, /*rows_only=*/true);
+    return behind && never_repeats(context, *behind);
+  });
+}
+
+/// Adds to @p fixed the columns of @p side that one of its columns in @p fixed determines: where
+/// @p side is a scan under filters and projections, and such a column is proven to hold no value
+/// twice in it, a value of that column picks out one row, and with it a value of every other
+/// column the scan passes on. Returns whether it added any.
+bool add_columns_of_unique_row(duckdb::ClientContext& context,
+                               LogicalOperator& side,
+                               duckdb::column_binding_set_t& fixed)
+{
+  auto const columns = side.GetColumnBindings();
+  if (!std::ranges::any_of(columns, [&](auto const& column) {
+        if (!fixed.contains(column)) { return false; }
+        auto const behind = scan_column_behind(side, column, /*rows_only=*/true);
+        return behind && never_repeats(context, *behind);
+      })) {
     return false;
   }
+  auto added = false;
+  for (auto const& column : columns) {
+    // Filters and projections lead to one scan, so a column that reaches a scan reaches that one.
+    if (scan_column_behind(side, column, /*rows_only=*/true)) {
+      added = fixed.insert(column).second || added;
+    }
+  }
+  return added;
 }
 
 /// The rows of @p source that one group of @p keys is estimated to combine, at least: its row
@@ -789,27 +815,36 @@ void analyze(duckdb::ClientContext& context,
   }
   if (result.keys.size() >= aggregate.groups.size()) { why.add("keys:not-fewer-than-groups"); }
   if (result.keys.size() - join_keys > options.max_extra_keys) { why.add("keys:too-many-extra"); }
-  // It pays when the aggregate above groups as finely as it does: by each of its keys, or by a
-  // column an inner join on the way up equates with the key. Every key counts, a join's further
-  // up included. An outer join's equality does not: it pads the other side's column with NULL
-  // where a key finds no match, so grouping by that column folds those keys into one group.
-  duckdb::column_binding_set_t groups;
+  // It pays when the aggregate above groups as finely as it does: when the columns it groups by
+  // fix the value of each of its keys. A key it groups by is fixed. So is a column that an inner
+  // join on the way up equates with a fixed one, and every column of a joined table's row once a
+  // fixed column picks that row out, being proven unique in the table: TPC-DS q11 groups by
+  // c_customer_id, which fixes c_customer_sk and through the join ss_customer_sk. Every key
+  // counts, a join's further up included. An outer join's equality does not: it pads the other
+  // side's column with NULL where a key finds no match, so grouping by that column folds those
+  // keys into one group.
+  duckdb::column_binding_set_t grouped;
   for (auto const& group : result.groups) {
-    groups.insert(binding_of(*group));
+    grouped.insert(binding_of(*group));
   }
-  auto grouped = groups;
-  for (auto const& step : result.path) {
-    for (auto const& condition : step.join->conditions) {
-      if (step.preserves || !condition.IsComparison() ||
-          (condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL &&
-           condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) ||
-          !is_column(condition.GetLHS()) || !is_column(condition.GetRHS())) {
-        continue;
+  for (auto added = true; added;) {
+    added = false;
+    for (auto const& step : result.path) {
+      if (step.preserves) { continue; }
+      added =
+        add_columns_of_unique_row(context, *step.join->children[1 - step.side], grouped) || added;
+      for (auto const& condition : step.join->conditions) {
+        if (!condition.IsComparison() ||
+            (condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL &&
+             condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) ||
+            !is_column(condition.GetLHS()) || !is_column(condition.GetRHS())) {
+          continue;
+        }
+        auto const left  = binding_of(condition.GetLHS());
+        auto const right = binding_of(condition.GetRHS());
+        if (grouped.contains(right)) { added = grouped.insert(left).second || added; }
+        if (grouped.contains(left)) { added = grouped.insert(right).second || added; }
       }
-      auto const left  = binding_of(condition.GetLHS());
-      auto const right = binding_of(condition.GetRHS());
-      if (groups.contains(right)) { grouped.insert(left); }
-      if (groups.contains(left)) { grouped.insert(right); }
     }
   }
   // Failing that, it pays when the scan statistics show that its keys repeat often enough. A

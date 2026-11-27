@@ -66,7 +66,8 @@ struct partial_aggregate_pushdown_result {
 /// whose combined result has the original type, so nothing above the aggregate changes.
 ///
 /// Pushed only where that pays: where the aggregate above groups by the pushed aggregate's keys,
-/// or by columns that inner joins equate with them, or where the scan statistics show at least
+/// or by columns that fix them (one an inner join equates with a key, or one proven unique in the
+/// joined table that holds such a column), or where the scan statistics show at least
 /// `min_rows_per_key` rows per key. Never where a key is proven unique, since such an aggregate
 /// would combine nothing.
 ///

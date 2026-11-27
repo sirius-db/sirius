@@ -171,7 +171,13 @@ struct pushdown_fixture {
           "INSERT INTO visits SELECT range % 300 + 1, range % 5, range % 100 FROM range(30000)",
           // One account per customer key.
           "CREATE TABLE accounts (a_custkey BIGINT PRIMARY KEY, a_balance DECIMAL(15, 2))",
-          "INSERT INTO accounts SELECT range, range * 2.5 FROM range(1, 301)"}) {
+          "INSERT INTO accounts SELECT range, range * 2.5 FROM range(1, 301)",
+          // One member per customer key, known by an id of its own: the PRIMARY KEY, where the
+          // key the orders join on is declared nothing.
+          "CREATE TABLE members (m_custkey BIGINT, m_id VARCHAR PRIMARY KEY, m_name VARCHAR, "
+          "m_tier INTEGER)",
+          "INSERT INTO members SELECT range, 'M' || range, 'Member#' || range, range % 3 "
+          "FROM range(1, 301)"}) {
       auto result = con->Query(sql);
       INFO(sql);
       REQUIRE_FALSE(result->HasError());
@@ -531,6 +537,51 @@ TEST_CASE_METHOD(pushdown_fixture,
         reasons{"keys:unique"});
   // The statistics cannot outvote it: they show one account per key as well.
   CHECK(pushed(per_account, {.min_rows_per_key = 0.5}) == 0);
+}
+
+TEST_CASE_METHOD(pushdown_fixture,
+                 "partial aggregate pushdown follows a grouped column proven unique to the key",
+                 "[partial_agg_pushdown][plan]")
+{
+  // The shape of TPC-DS q11 and q74. The aggregate above groups by the members' id and not by
+  // the key the orders join on. The id is the members' PRIMARY KEY, so one id is one member and
+  // one join key: each group above still comes from one group below.
+  auto const per_member = [](std::string const& groups,
+                             std::string const& from =
+                               "orders, members WHERE o_custkey = "
+                               "m_custkey",
+                             std::string const& aggregate = "sum(o_totalprice)") {
+    return "SELECT " + groups + ", " + aggregate + " FROM " + from + " GROUP BY " + groups;
+  };
+  CHECK(pushed(per_member("m_id, m_name")) == 1);
+  CHECK(shape(per_member("m_id, m_name"), true) == "AGG[2](JOIN(AGG[1](orders),members))");
+  // A floating-point sum is pushed on the same grounds.
+  CHECK(pushed(per_member(
+          "m_id, m_name", "orders, members WHERE o_custkey = m_custkey", "sum(o_weight)")) == 1);
+  // A filter on the members keeps the proof.
+  CHECK(
+    pushed(per_member("m_id, m_name", "orders, members WHERE o_custkey = m_custkey AND m_tier = 1"),
+           {.min_kept_share = 0.0, .min_rows_per_key = 0}) == 1);
+  // A second key the aggregate above groups by itself, as q11 does by the year.
+  CHECK(pushed(per_member("m_id, m_name, o_region")) == 1);
+
+  // A grouped column that is not proven unique fixes nothing, whatever its values.
+  CHECK(why(per_member("m_name, m_tier")) == reasons{"keys:not-grouped"});
+  // Nor does the id fix a key the aggregate above does not group by.
+  CHECK(why(per_member("m_id, m_name, m_tier",
+                       "(orders JOIN members ON o_custkey = m_custkey) JOIN lineitem "
+                       "ON o_orderkey = l_orderkey")) == reasons{"keys:not-grouped"});
+  // An outer join pads the id with NULL where an order finds no member, so the orders without
+  // one share a group above.
+  CHECK(why(per_member("m_id, m_name", "orders LEFT JOIN members ON o_custkey = m_custkey")) ==
+        reasons{"keys:not-grouped"});
+
+  // The id fixes the members' key, which a join further up equates with the customers', which
+  // the join below equates with the orders'.
+  CHECK(shape(per_member("m_id, c_name",
+                         "(orders JOIN customer ON o_custkey = c_custkey) JOIN members "
+                         "ON c_custkey = m_custkey"),
+              true) == "AGG[2](JOIN(JOIN(AGG[1](orders),customer),members))");
 }
 
 TEST_CASE_METHOD(pushdown_fixture,
