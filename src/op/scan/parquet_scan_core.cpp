@@ -17,6 +17,7 @@
 
 // sirius
 #include "cudf/cudf_utils.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "io/path_utils.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
@@ -2447,6 +2448,44 @@ std::unique_ptr<cudf::table> normalize_provenance(
   return std::make_unique<cudf::table>(std::move(output));
 }
 
+/// Which reader columns (D order) the plan carries as DICTIONARY32, or empty when none is.
+std::vector<bool> dictionary_reader_positions(scan_plan const& plan,
+                                              std::vector<std::size_t> const& dictionary_outputs)
+{
+  std::vector<bool> positions;
+  for (auto const output_idx : dictionary_outputs) {
+    if (output_idx >= plan.output_layout.size()) { continue; }
+    auto const& entry = plan.output_layout[output_idx];
+    if (entry.source != scan_plan::output_entry::DATA || entry.idx >= plan.data_columns.size()) {
+      continue;
+    }
+    if (positions.empty()) { positions.assign(plan.data_columns.size(), false); }
+    positions[entry.idx] = true;
+  }
+  return positions;
+}
+
+/// The reader returns every flat string column as a dictionary once asked for one; decode those the
+/// plan does not carry, before the scan's filter or projection reads them as strings, and those
+/// whose keys exceed the carrier cap.
+std::unique_ptr<cudf::table> decode_uncarried_dictionaries(std::unique_ptr<cudf::table> table,
+                                                           std::vector<bool> const& carried,
+                                                           ::cuda::stream_ref stream,
+                                                           rmm::device_async_resource_ref mr)
+{
+  auto columns = table->release();
+  for (std::size_t idx = 0; idx < columns.size(); ++idx) {
+    if (columns[idx]->type().id() != cudf::type_id::DICTIONARY32 ||
+        (idx < carried.size() && carried[idx] &&
+         sirius::dictionary_keys_bytes(*columns[idx]) <=
+           sirius::dictionary_carrier_max_keys_bytes)) {
+      continue;
+    }
+    columns[idx] = sirius::decode_dictionary_carrier(columns[idx]->view(), stream, mr);
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 }  // namespace
 
 filtered_table parquet_scan_core::materialize_metadata_to_table(
@@ -2769,6 +2808,16 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
       sources.push_back(
         parquet_source{slice.datasource, slice.file_metadata, slice.row_group_indices});
     }
+    // Under a row filter (static or a run-time join filter) or a field mapping cuDF skips the
+    // page-level transcode and would hash-encode every string column, so the read stays on strings;
+    // a carrier's consumers accept its STRING form.
+    // TODO: request dictionaries per column once cuDF supports it (NVIDIA/cudf#24798), so a plainly
+    // stored string column no longer blocks the carriers of the others.
+    auto const dictionary_positions =
+      split.field_mapping || reader_filter_root
+        ? std::vector<bool>{}
+        : dictionary_reader_positions(*split.plan, _info->dictionary_outputs);
+    if (!dictionary_positions.empty()) { opts.enable_output_dict_columns(true); }
     if (!all_slices_pruned && _info->profiles->counters)
       for (auto const& slice : split.rg_slices)
         _info->profiles->counters->reader_call(slice.file_path);
@@ -2796,6 +2845,9 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
       table = std::move(
         cudf::io::read_parquet(std::move(cudf_sources), std::move(metadatas), opts, stream, mr_ref)
           .tbl);
+    }
+    if (!dictionary_positions.empty()) {
+      table = decode_uncarried_dictionaries(std::move(table), dictionary_positions, stream, mr_ref);
     }
     if (split.field_mapping) {
       auto rows = table->num_rows();

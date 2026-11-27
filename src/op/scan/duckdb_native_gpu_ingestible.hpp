@@ -70,6 +70,9 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   duckdb::ClientContext* context = nullptr;
   std::vector<projected_column> projected_cols;
   std::vector<sirius::logical_type> projected_types;
+  /// Parallel to @ref projected_types: the plan carries the column as DICTIONARY32, so a split
+  /// whose segments all hold dictionaries decodes it to codes and merged keys instead of strings.
+  std::vector<bool> dictionary_projected;
   duckdb::vector<sirius::logical_type> output_types;
   std::string db_path;
   /// Qualified table reference (catalog / schema / table) derived from the resolved

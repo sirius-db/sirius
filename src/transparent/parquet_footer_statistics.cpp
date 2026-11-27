@@ -813,10 +813,132 @@ std::size_t parquet_files_row_count(duckdb::ClientContext& context,
   return rows;
 }
 
+namespace {
+
+bool is_dictionary_encoding(duckdb_parquet::Encoding::type encoding)
+{
+  return encoding == duckdb_parquet::Encoding::PLAIN_DICTIONARY ||
+         encoding == duckdb_parquet::Encoding::RLE_DICTIONARY;
+}
+
+/// The on-disk size of the chunk's dictionary page, or nullopt when the chunk is not a
+/// dictionary-encoded string chunk.
+std::optional<std::size_t> chunk_dictionary_bytes(duckdb_parquet::ColumnMetaData const& meta)
+{
+  if (meta.type != duckdb_parquet::Type::BYTE_ARRAY || !meta.__isset.dictionary_page_offset ||
+      meta.data_page_offset <= meta.dictionary_page_offset) {
+    return std::nullopt;
+  }
+  bool const dictionary_encoded =
+    meta.__isset.encoding_stats
+      ? std::ranges::all_of(
+          meta.encoding_stats,
+          [](auto const& stats) {
+            bool const data_page = stats.page_type == duckdb_parquet::PageType::DATA_PAGE ||
+                                   stats.page_type == duckdb_parquet::PageType::DATA_PAGE_V2;
+            return !data_page || stats.count == 0 || is_dictionary_encoding(stats.encoding);
+          })
+      : std::ranges::any_of(meta.encodings, is_dictionary_encoding);
+  if (!dictionary_encoded) { return std::nullopt; }
+  return static_cast<std::size_t>(meta.data_page_offset - meta.dictionary_page_offset);
+}
+
+struct dictionary_columns_entry {
+  std::string version;
+  std::unordered_map<std::string, std::size_t> columns;
+};
+
+std::mutex dictionary_columns_mutex;
+std::unordered_map<std::string, dictionary_columns_entry> dictionary_columns_cache;
+
+}  // namespace
+
+std::unordered_map<std::string, std::size_t> parquet_dictionary_string_columns(
+  duckdb::ClientContext& context, duckdb::LogicalGet const& get)
+{
+  auto const& name = get.function.GetName().GetIdentifierName();
+  if (name != "read_parquet" && name != "parquet_scan") { return {}; }
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
+  if (!bind || !bind->file_list) { return {}; }
+  try {
+    auto const file = bind->file_list->GetFirstFile();
+    auto const* base =
+      bind->initial_reader
+        ? dynamic_cast<duckdb::TableFunctionFileReader const*>(bind->initial_reader.get())
+        : nullptr;
+    auto const options = base && base->bind_data
+                           ? duckdb::ParquetScanFunction::GetFileOptions(*base->bind_data)
+                           : duckdb::ParquetOptions(context);
+
+    std::optional<std::string> version;
+    if (auto const listed = listed_metadata(file)) { version = version_of(file.path, *listed); }
+    if (!version) {
+      auto& fs = duckdb::FileSystem::GetFileSystem(context);
+      if (auto const metadata = fs.GetStatsIfExists(file)) {
+        version = version_of(file.path, *metadata);
+      }
+    }
+    if (version) {
+      std::lock_guard guard(dictionary_columns_mutex);
+      auto const found = dictionary_columns_cache.find(file.path);
+      if (found != dictionary_columns_cache.end() && found->second.version == *version) {
+        return found->second.columns;
+      }
+    }
+
+    duckdb::ParquetReader reader(context, file, options);
+    auto const* metadata = reader.GetFileMetadata();
+    // A chunk without metadata names no column, so it leaves the whole file undecided.
+    bool all_chunks_described = !metadata->row_groups.empty();
+    // The largest dictionary page per column, or nullopt once a chunk is not dictionary-encoded.
+    std::unordered_map<std::string, std::optional<std::size_t>> verdicts;
+    for (auto const& row_group : metadata->row_groups) {
+      for (auto const& chunk : row_group.columns) {
+        if (!chunk.__isset.meta_data) {
+          all_chunks_described = false;
+          continue;
+        }
+        auto const& meta = chunk.meta_data;
+        if (meta.path_in_schema.size() != 1) { continue; }
+        auto [entry, inserted] =
+          verdicts.emplace(meta.path_in_schema.front(), std::optional<std::size_t>{0});
+        if (!entry->second) { continue; }
+        auto const bytes = chunk_dictionary_bytes(meta);
+        entry->second    = bytes ? std::optional{std::max(*entry->second, *bytes)} : std::nullopt;
+      }
+    }
+    std::unordered_map<std::string, std::size_t> columns;
+    if (all_chunks_described) {
+      for (auto const& [column, bytes] : verdicts) {
+        if (bytes) { columns.emplace(column, *bytes); }
+      }
+    }
+    if (version) {
+      std::lock_guard guard(dictionary_columns_mutex);
+      // A miss only costs a footer read, so any entry may make room for a new file.
+      if (!dictionary_columns_cache.contains(file.path) &&
+          dictionary_columns_cache.size() >= detail::dictionary_columns_cache_capacity) {
+        dictionary_columns_cache.erase(dictionary_columns_cache.begin());
+      }
+      dictionary_columns_cache[file.path] = {std::move(*version), columns};
+    }
+    return columns;
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_DEBUG("No dictionary columns for a Parquet scan: {}", e.what());
+    return {};
+  }
+}
+
 std::size_t detail::merged_statistics_cache_size()
 {
   std::lock_guard guard(cache_mutex);
   return merges.size();
+}
+
+std::size_t detail::dictionary_columns_cache_size()
+{
+  std::lock_guard guard(dictionary_columns_mutex);
+  return dictionary_columns_cache.size();
 }
 
 std::size_t detail::row_count_cache_size()

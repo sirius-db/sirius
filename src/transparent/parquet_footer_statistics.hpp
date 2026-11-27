@@ -24,6 +24,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace duckdb {
@@ -117,6 +118,23 @@ std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
 [[nodiscard]] std::size_t parquet_files_row_count(duckdb::ClientContext& context,
                                                   std::vector<std::string> const& paths);
 
+/// The largest on-disk dictionary page a column chunk may have and still be carried as a
+/// dictionary: a low-cardinality column's dictionary is tiny, while a high-cardinality one gains
+/// little from codes.
+inline constexpr std::size_t parquet_dictionary_carrier_max_bytes = 256 * 1024;
+
+/// \brief The flat string columns of \p get, a Parquet scan, that its first file dictionary-encodes
+/// in every row group, each mapped to the largest on-disk dictionary page among its chunks: every
+/// chunk has a dictionary page, and every data page its encoding statistics list uses a dictionary
+/// encoding.
+///
+/// The first file stands for the scan: cuDF still returns a dictionary for a column some other file
+/// stores plainly, by encoding the decoded strings. Empty when \p get is not a plain Parquet scan
+/// or its first footer cannot be read. Cached per file version like the footer statistics, for at
+/// most detail::dictionary_columns_cache_capacity files.
+[[nodiscard]] std::unordered_map<std::string, std::size_t> parquet_dictionary_string_columns(
+  duckdb::ClientContext& context, duckdb::LogicalGet const& get);
+
 namespace detail {
 /// What the caches keep once no planning is running.
 struct cache_capacities {
@@ -132,6 +150,10 @@ inline constexpr std::size_t unbounded = std::numeric_limits<std::size_t>::max()
 inline constexpr cache_capacities default_cache_capacities{unbounded, 128, unbounded};
 /// The most sets of scan paths whose merged statistics are kept.
 inline constexpr std::size_t merged_statistics_cache_capacity = default_cache_capacities.merges;
+/// The most files whose dictionary-encoded string columns are kept.
+inline constexpr std::size_t dictionary_columns_cache_capacity = 128;
+/// The number of files whose dictionary-encoded string columns are cached, for tests.
+std::size_t dictionary_columns_cache_size();
 /// The number of scans whose merged statistics are cached, for tests.
 std::size_t merged_statistics_cache_size();
 /// The number of scans of live plans that have a row count, a plan's copies counted once; for

@@ -4168,8 +4168,9 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
 
   config.AddExtensionOption(
     "enable_dictionary_carrier",
-    "Keep VARCHAR columns whose Simpatico pin is dictionary-encoded as DICTIONARY32 carriers past "
-    "the scan, so grouped aggregates group on the codes (off by default)",
+    "Keep dictionary-encoded VARCHAR columns (Simpatico pins, Parquet, DuckDB-native storage) as "
+    "DICTIONARY32 carriers past the scan, so grouped aggregates group on the codes (off by "
+    "default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_dictionary_carrier),
     SetEnableDictionaryCarrier);

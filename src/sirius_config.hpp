@@ -328,10 +328,12 @@ struct operator_params {
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
 
-  /// Keep a VARCHAR column whose Simpatico pin is dictionary-encoded as a cuDF DICTIONARY32 carrier
-  /// (keys plus codes) past the scan, so a grouped aggregate groups on its codes instead of decoded
-  /// strings. Independent of `enable_compressed_materialization`. A column the scan filters on
-  /// keeps its native carrier.
+  /// Keep a dictionary-encoded VARCHAR column as a cuDF DICTIONARY32 carrier (keys plus codes) past
+  /// the scan, so a grouped aggregate groups on its codes instead of decoded strings. Covers
+  /// Simpatico pins, Parquet columns dictionary-encoded in every row group, and DuckDB-native
+  /// columns stored as dictionaries. Independent of `enable_compressed_materialization`. A column
+  /// the scan filters on keeps its native carrier, and a Parquet scan with any reader filter
+  /// carries no dictionaries.
   bool enable_dictionary_carrier = false;
 
   /// Prove pinned parquet columns distinct at pin time and let the join planner treat a build key

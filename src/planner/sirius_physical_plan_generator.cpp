@@ -951,6 +951,7 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
       t = scan_op.returned_types.at(col_idx.GetPrimaryIndex());
     }
     info->projected_types.push_back(t);
+    info->dictionary_projected.push_back(scan_op.carries_source_dictionary(k));
   }
 
   // Filters drive row-group pruning in the metadata walk and post-decode filtering.
@@ -1034,6 +1035,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
     info->physical_contract.host_export_available = scan.host_export_available;
     info->bound_types      = info->physical_contract.view->identity->bound_types;
     info->semantic_columns = scan.read_views->entry(scan.contract_id).eligibility.semantic_columns;
+    for (std::size_t output_idx = 0; output_idx < scan.types.size(); ++output_idx) {
+      if (scan.carries_source_dictionary(output_idx)) {
+        info->dictionary_outputs.push_back(output_idx);
+      }
+    }
   }
 
   auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
