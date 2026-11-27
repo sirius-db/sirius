@@ -177,7 +177,9 @@ class E2ERunnerTests(unittest.TestCase):
         self.assertEqual(
             report["process"]["cleanup"]["state"], "GROUP_SIGNALLED_ANCHOR_REAPED"
         )
-        self.assertIn(f"[Errno {errno.EACCES}]", (self.attempt / "stderr.log").read_text())
+        self.assertIn(
+            f"[Errno {errno.EACCES}]", (self.attempt / "stderr.log").read_text()
+        )
         self.assertFalse((self.attempt / "launched").exists())
 
     def test_executable_mutation_during_run_fails(self):
