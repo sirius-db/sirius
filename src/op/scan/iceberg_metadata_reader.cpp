@@ -32,6 +32,7 @@
 #include <cucascade/io/io_context.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/file_system.hpp>
+#include <duckdb/common/path.hpp>
 #include <duckdb/common/types/value_map.hpp>
 #include <duckdb/common/vector/map_vector.hpp>
 #include <duckdb/common/vector/struct_vector.hpp>
@@ -54,7 +55,6 @@
 #include <algorithm>
 #include <atomic>
 #include <deque>
-#include <filesystem>
 #include <map>
 #include <numeric>
 #include <set>
@@ -527,9 +527,10 @@ using key_bounds_sink =
 /// manifest may not have, and is streamed, so the stream's buffer is held and not every entry.
 /// It can still fail, and a failed query aborts the connection's transaction: nothing may
 /// follow it. `file_index` is the position of a row's manifest in the list, whatever the
-/// spelling `read_avro` reports it under; the caller passes no name with pattern characters,
-/// which could open several files and shift the positions. @p before_fetch, when set, is
-/// called before each chunk is fetched, with the number fetched so far.
+/// spelling `read_avro` reports it under; the caller passes only names `read_avro` opens as
+/// they are written, since any other could open several files and shift the positions.
+/// @p before_fetch, when set, is called before each chunk is fetched, with the number fetched
+/// so far.
 bool read_key_bounds(iceberg_metadata_connection& connection,
                      std::vector<std::string_view> const& manifests,
                      std::vector<int32_t> const& ids,
@@ -543,19 +544,8 @@ bool read_key_bounds(iceberg_metadata_connection& connection,
   std::string sql =
     "SELECT data_file.file_path, file_index, data_file, "
     "COLUMNS('(?i)^(status|file_index)$') FROM read_avro([";
-  for (auto const manifest : manifests) {
-    // DuckDB looks a relative name up in the directories of `file_search_path` when the working
-    // directory has no such file, and opens one file in each that does. An absolute name opens
-    // the file it spells or none, so a relative one is made absolute here.
-    std::string name(manifest);
-    if (name.find("://") == std::string::npos && !name.starts_with("file:/") &&
-        !std::filesystem::path(name).is_absolute()) {
-      std::error_code failed;
-      name = std::filesystem::absolute(name, failed).string();
-      if (failed) return false;
-    }
-    sql += (sql.back() == '[' ? "'" : ", '") + escape_sql_string(name) + "'";
-  }
+  for (auto const manifest : manifests)
+    sql += (sql.back() == '[' ? "'" : ", '") + escape_sql_string(std::string(manifest)) + "'";
   sql += "]) WHERE status <> 2";
   try {
     auto result = connection.get().Submit(sql);
@@ -745,19 +735,29 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
     bounds_bytes += bytes;
     return true;
   };
-  // A manifest name `read_avro` would expand as a pattern may be read from another file than
-  // the one the inventory names, and in a list it may shift the positions rows are attributed
-  // by. The bounds of a table with such a name are not used.
-  auto const named_by_pattern = [](std::unordered_map<std::string_view, listed> const& files) {
-    return std::any_of(files.begin(), files.end(), [](auto const& file) {
-      return duckdb::FileSystem::HasGlob(std::string(file.second.manifest));
+  // Whether `read_avro` opens every manifest as its name is written: a name without pattern
+  // characters that DuckDB's own path parser calls absolute, a path from the root or a URI. A
+  // pattern may be read from another file than the inventory names. Any other name DuckDB
+  // resolves against the working directory, the home directory or the directories of
+  // `file_search_path`, where it opens a file in each that has one. In a list either shifts
+  // the positions rows are attributed by. Every read below passes the names as they are
+  // written, so all of them read the same files while this holds; the bounds of a table with
+  // another name are not used.
+  auto const named_literally = [](std::unordered_map<std::string_view, listed> const& files) {
+    return std::all_of(files.begin(), files.end(), [](auto const& file) {
+      auto const name = std::string(file.second.manifest);
+      try {
+        return !duckdb::FileSystem::HasGlob(name) && duckdb::Path::FromString(name).IsAbsolute();
+      } catch (std::exception const&) {
+        // The parser rejects a `file://` name of another host.
+        return false;
+      }
     });
   };
   // Bounds are read and compared while this holds. When it stops holding, for whatever reason,
   // no bounds are used and both sets are released.
   bool pruning = key_types && limits.max_bytes > 0 && limits.max_comparisons > 0 &&
-                 limits.max_bound_length > 0 && !named_by_pattern(deletes) &&
-                 !named_by_pattern(data);
+                 limits.max_bound_length > 0 && named_literally(deletes) && named_literally(data);
   auto const stop_pruning = [&] {
     pruning = false;
     decltype(delete_bounds)().swap(delete_bounds);

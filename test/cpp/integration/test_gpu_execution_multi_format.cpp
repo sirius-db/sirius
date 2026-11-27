@@ -2235,23 +2235,24 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
       fs::remove(copy);
     }
   }
-  {
-    INFO("a relative manifest name that file_search_path finds in two directories");
+  // Both sort before an absolute path, so each is the first name of its list. DuckDB takes a
+  // scheme of one character for a directory, which makes the second name relative as well.
+  for (auto const relative : {std::string{"./sirius_eq_search_path/m-data.avro"},
+                              std::string{"+://sirius_eq_search_path/m-data.avro"}}) {
+    INFO("a relative manifest name that file_search_path finds in two directories: " << relative);
     // The inventory lists data files a and b in a manifest without a live entry, and a third
     // file under a relative name that file_search_path finds twice: as that same manifest and
     // as the one with the entries of a and b. Given the relative name, read_avro opens both
     // and reports those entries at the position after the relative name's, which is the
     // manifest the inventory lists them in. Taking their bounds takes the delete off both
-    // lists; they were read from another file. The name is passed as an absolute path, which
-    // the working directory does not have, so no bounds are read.
+    // lists; they were read from another file. A name DuckDB does not take for absolute is
+    // not read for bounds.
     auto inventory = key_ranges();
     auto const listed_in =
       fs::path(
         std::find_if(inventory.entries.begin(), inventory.entries.end(), is_data)->manifest_path)
         .parent_path();
     auto const without_entries = (listed_in / "m%20data.avro").string();
-    // Sorts before an absolute path, so it is the first name of the list.
-    auto const relative = std::string{"./sirius_eq_search_path/m-data.avro"};
     REQUIRE_FALSE(fs::exists(relative));
     sirius::test::scratch_dir first("iceberg_eq_search_first");
     sirius::test::scratch_dir second("iceberg_eq_search_second");
@@ -2276,12 +2277,6 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
                  sirius::test::sql_literal(first.path().string() + "," + second.path().string()));
     REQUIRE_FALSE(set->HasError());
     CHECK(listed(plan_of(inventory), "data-a.parquet") == 1);
-    // A relative name that the working directory resolves is read as before.
-    auto under_cwd = key_ranges();
-    for (auto& entry : under_cwd.entries)
-      if (is_data(entry))
-        entry.manifest_path = fs::relative(entry.manifest_path, fs::current_path()).string();
-    CHECK(listed(plan_of(under_cwd), "data-a.parquet") == 0);
   }
   {
     INFO("a data manifest with a column of its own named file_index");
