@@ -2466,7 +2466,8 @@ std::vector<bool> dictionary_reader_positions(scan_plan const& plan,
 }
 
 /// The reader returns every flat string column as a dictionary once asked for one; decode those the
-/// plan does not carry, before the scan's filter or projection reads them as strings.
+/// plan does not carry, before the scan's filter or projection reads them as strings, and those
+/// whose keys exceed the carrier cap.
 std::unique_ptr<cudf::table> decode_uncarried_dictionaries(std::unique_ptr<cudf::table> table,
                                                            std::vector<bool> const& carried,
                                                            ::cuda::stream_ref stream,
@@ -2475,7 +2476,9 @@ std::unique_ptr<cudf::table> decode_uncarried_dictionaries(std::unique_ptr<cudf:
   auto columns = table->release();
   for (std::size_t idx = 0; idx < columns.size(); ++idx) {
     if (columns[idx]->type().id() != cudf::type_id::DICTIONARY32 ||
-        (idx < carried.size() && carried[idx])) {
+        (idx < carried.size() && carried[idx] &&
+         sirius::dictionary_keys_bytes(*columns[idx]) <=
+           sirius::dictionary_carrier_max_keys_bytes)) {
       continue;
     }
     columns[idx] = sirius::decode_dictionary_carrier(columns[idx]->view(), stream, mr);
