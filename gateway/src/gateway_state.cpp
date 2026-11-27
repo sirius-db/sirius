@@ -530,6 +530,12 @@ void gateway_state::stop(ClientContext& context)
 void gateway_state::restart(ClientContext& context)
 {
   turn t{*this, context};
+  {
+    // No start yet (registered ranks, before the first statement): take the settings, as
+    // auto_start_locked does. read_settings always sets log_dir.
+    std::lock_guard lock{state_mutex_};
+    if (options_.log_dir.empty()) { read_settings(context, options_); }
+  }
   recover_locked(context);
 }
 
