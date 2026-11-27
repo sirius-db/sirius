@@ -19,6 +19,7 @@
 #include "cuda/scan/gpu_decode_strings.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"
 #include "cudf/cudf_utils.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/scan/duckdb_block_layout.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -1152,7 +1153,7 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
     auto const ci = vc_to_final_idx[vi];
     if (ci < scan_info.dictionary_projected.size() && scan_info.dictionary_projected[ci]) {
       if (auto dictionary = ::sirius::cuda::scan::gpu_decode_strings_dictionary_column(
-            vc_inputs[vi], stream, mr_ref)) {
+            vc_inputs[vi], ::sirius::dictionary_carrier_max_keys_bytes, stream, mr_ref)) {
         vc_cols.push_back(std::move(dictionary));
         continue;
       }

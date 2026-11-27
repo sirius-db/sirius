@@ -428,6 +428,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
 
 std::unique_ptr<cudf::column> gpu_decode_strings_dictionary_column(
   gpu_string_column_decode_input const& col,
+  std::size_t max_keys_bytes,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
@@ -505,6 +506,11 @@ std::unique_ptr<cudf::column> gpu_decode_strings_dictionary_column(
   stacked.reset();
   auto contents = encoded->release();
   auto keys     = std::move(contents.children[cudf::dictionary_column_view::keys_column_index]);
+  if (keys->alloc_size() > max_keys_bytes) {
+    keys.reset();
+    contents.children.clear();
+    return decode_strings_column(col, std::move(prep), stream, mr);
+  }
   auto slot_to_key =
     std::move(contents.children[cudf::dictionary_column_view::indices_column_index]);
 

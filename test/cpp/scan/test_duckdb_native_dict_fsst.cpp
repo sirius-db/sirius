@@ -34,11 +34,14 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <set>
 
 namespace {
 
 using namespace sirius::test::dict_fsst;
+
+constexpr auto no_cap = std::numeric_limits<std::size_t>::max();
 
 void check_decode(segment const& seg,
                   std::vector<std::optional<std::string>> const& expected,
@@ -203,7 +206,8 @@ void check_dictionary_decode(std::vector<segment> const& segments,
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   auto staged = stage(segments, expected, run_per_segment, stream);
-  auto column = sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, stream, mr);
+  auto column =
+    sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, no_cap, stream, mr);
   REQUIRE(column);
   REQUIRE(column->type().id() == cudf::type_id::DICTIONARY32);
   REQUIRE(column->size() == static_cast<cudf::size_type>(staged.input.total_rows));
@@ -369,7 +373,8 @@ TEST_CASE("DuckDB-written DICT_FSST without a dictionary decodes to strings inst
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   auto staged = stage(segments, expected, false, stream);
-  auto column = sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, stream, mr);
+  auto column =
+    sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, no_cap, stream, mr);
   REQUIRE(column);
   REQUIRE(column->type().id() == cudf::type_id::STRING);
   REQUIRE(column->size() == static_cast<cudf::size_type>(staged.input.total_rows));
@@ -394,7 +399,7 @@ TEST_CASE("DuckDB-written DICT_FSST mixed with other codecs or modes decodes to 
     staged.input.data.push_back(
       {duckdb::CompressionType::COMPRESSION_UNCOMPRESSED, staged.input.data.front().segments});
     REQUIRE_FALSE(
-      sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, stream, mr));
+      sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, no_cap, stream, mr));
   }
 
   SECTION("an FSST_ONLY segment turns the column into strings")
@@ -411,7 +416,17 @@ TEST_CASE("DuckDB-written DICT_FSST mixed with other codecs or modes decodes to 
     auto staged = stage(segments, expected, true, stream);
     REQUIRE(staged.input.total_rows == expected.size());
     auto column =
-      sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, stream, mr);
+      sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, no_cap, stream, mr);
+    REQUIRE(column);
+    REQUIRE(column->type().id() == cudf::type_id::STRING);
+    check_strings(*column, expected, 0, stream);
+  }
+
+  SECTION("keys past the cap turn the column into strings")
+  {
+    auto staged = stage(segments, expected, false, stream);
+    auto column =
+      sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, 1, stream, mr);
     REQUIRE(column);
     REQUIRE(column->type().id() == cudf::type_id::STRING);
     check_strings(*column, expected, 0, stream);
@@ -441,7 +456,7 @@ TEST_CASE("DuckDB-written DICT_FSST rejects corrupt entry lengths and indices",
     auto staged = stage(segments, expected, false, stream);
     CHECK_THROWS(sirius::cuda::scan::gpu_decode_strings_column(staged.input, stream, mr));
     CHECK_THROWS(
-      sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, stream, mr));
+      sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, no_cap, stream, mr));
   }
 
   SECTION("indices past the dictionary")
@@ -450,6 +465,6 @@ TEST_CASE("DuckDB-written DICT_FSST rejects corrupt entry lengths and indices",
     std::fill(seg.bytes.begin() + seg.indices_offset(), seg.bytes.end(), uint8_t{0xff});
     auto staged = stage(segments, expected, false, stream);
     CHECK_THROWS(
-      sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, stream, mr));
+      sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, no_cap, stream, mr));
   }
 }

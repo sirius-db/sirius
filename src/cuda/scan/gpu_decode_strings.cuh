@@ -78,8 +78,10 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
 /// then each row's code is remapped onto the merged keys. Null when a run is not DICT_FSST, so the
 /// caller decodes strings instead. A STRING column when a segment stores no dictionary (FSST_ONLY):
 /// it is decoded from the state already prepared rather than leaving the caller to prepare again.
+/// Also a STRING column when the merged keys take more than @p max_keys_bytes.
 std::unique_ptr<cudf::column> gpu_decode_strings_dictionary_column(
   gpu_string_column_decode_input const& col,
+  std::size_t max_keys_bytes,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
