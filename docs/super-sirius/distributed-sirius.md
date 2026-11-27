@@ -250,7 +250,9 @@ before the stream's source is planned, and replays it when the source attaches.
 ### Collectives (`src/exchange/all_gather.*`)
 
 `all_gather()` sends one small table from every rank to every rank and blocks until all have
-arrived. It is used three ways:
+arrived. Its tables are queued without waiting for room in the send queue (`max_queued_bytes`),
+where exchange sinks' smaller batches can otherwise hold a join's filter back until the scan it is
+for has sent everything. It is used three ways:
 
 - **`SORT_SAMPLE` in distributed mode.** Each rank shares up to 1024 evenly spaced rows of its
   sorted sample, and every rank merges them all in rank order. From the same global sample each
@@ -455,8 +457,9 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 - **Unspillable buffers:** an unordered `EXCHANGE_SOURCE` queues arrivals in its port's
   repository, where they spill like any port's batches. Arrivals before the port is wired, an
   ordered gather's batches, and batches held for a stream not yet attached stay outside any
-  repository and cannot spill. Sends block once a rank's queued sends exceed 1 GiB
-  (`transport::options::max_queued_bytes`; #2376).
+  repository and cannot spill. Exchange sinks' sends block once a rank's queued sends exceed
+  1 GiB (`transport::options::max_queued_bytes`; #2376); an all-gather's tables are queued over
+  it.
 - **Blocking collectives:** `SORT_SAMPLE` and Bloom merges block a GPU worker thread until every
   rank's contribution arrives (#2375).
 - **Failures:** a query that fails on one rank (an error, an exhausted retry) is aborted on every

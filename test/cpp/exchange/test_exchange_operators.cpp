@@ -18,6 +18,7 @@
 // hash, range, broadcast and gather routing, ordered gather, early arrivals, and failure.
 
 #include "catch.hpp"
+#include "exchange/all_gather.hpp"
 #include "exchange/exchange_service.hpp"
 #include "exchange/exchange_test_utils.hpp"
 #include "exchange/loopback_fabric.hpp"
@@ -559,6 +560,43 @@ TEST_CASE("a peer's abort wakes a sender waiting for room, which fails with the 
   REQUIRE(blocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
   CHECK_THROWS_WITH(blocked.get(),
                     Catch::Matchers::ContainsSubstring("failed on rank 1: injected failure"));
+}
+
+TEST_CASE("an all-gather goes on while a sender of its rank waits for room",
+          "[exchange][operators]")
+{
+  // As above: rank 0's first batch stays queued over the cap and its second send waits for room.
+  ranks c(2, loopback_hub::options{}, /*host=*/nullptr, {.max_queued_bytes = 64 * KiB});
+  stream_id const stream = sirius::exchange::make_stream_id(5, 1);
+  stream_id const gather = sirius::exchange::make_stream_id(5, 2);
+  auto& service          = *c.all[0].service;
+  auto first             = gpu_batch(sample_table(30'000));
+  auto second            = gpu_batch(sample_table(30'001));
+  auto mine              = gpu_batch(sample_table(1'000));
+  // Rank 1 gathers nothing, so rank 0 needs only rank 1's end, which takes no room.
+  sirius::exchange::leave_all_gather(*c.all[1].service, gather);
+  // Declared before the hold: whatever still waits for room is joined once the hold is released.
+  std::future<void> blocked;
+  std::future<std::vector<std::shared_ptr<cucascade::data_batch>>> gathered;
+  {
+    auto const hold = hold_gpu();
+    service.send(stream, 1, std::move(first));
+    blocked = std::async(std::launch::async, [&] { service.send(stream, 1, std::move(second)); });
+    CHECK(blocked.wait_for(std::chrono::milliseconds{500}) == std::future_status::timeout);
+    gathered = std::async(std::launch::async, [&] {
+      return sirius::exchange::all_gather(
+        service, gather, mine, *env().gpu, utils::default_stream(), std::chrono::seconds{30});
+    });
+    CHECK(gathered.wait_for(std::chrono::seconds{10}) == std::future_status::ready);
+    CHECK(blocked.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout);
+  }
+  REQUIRE(gathered.wait_for(std::chrono::seconds{60}) == std::future_status::ready);
+  auto const got = gathered.get();
+  REQUIRE(got.size() == 2);
+  CHECK(got[0] != nullptr);
+  CHECK(got[1] == nullptr);
+  REQUIRE(blocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+  blocked.get();
 }
 
 TEST_CASE("a receiver that throws aborts its query on every rank, and the next query runs",

@@ -209,7 +209,8 @@ void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receive
 
 void exchange_service::send(stream_id stream,
                             rank_t to,
-                            std::shared_ptr<cucascade::data_batch> batch)
+                            std::shared_ptr<cucascade::data_batch> batch,
+                            bool wait_for_room)
 {
   auto const bytes = to != _rank && batch ? bytes_of(*batch) : 0;
   std::shared_ptr<transport> running;
@@ -228,7 +229,7 @@ void exchange_service::send(stream_id stream,
     }
     running = _transport;
   }
-  running->send(stream, to, std::move(batch));
+  running->send(stream, to, std::move(batch), wait_for_room);
   // An abort that arrived meanwhile may have woken this sender without queueing its batch: it
   // fails like one that started after the abort.
   std::lock_guard lock{_mutex};

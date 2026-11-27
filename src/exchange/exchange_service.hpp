@@ -75,7 +75,10 @@ class exchange_service {
   [[nodiscard]] rank_t world_size() const noexcept { return _world_size; }
 
   /// @throws the exchange's error once it has failed, or the query's once it was aborted.
-  void send(stream_id stream, rank_t to, std::shared_ptr<cucascade::data_batch> batch);
+  void send(stream_id stream,
+            rank_t to,
+            std::shared_ptr<cucascade::data_batch> batch,
+            bool wait_for_room = true);
   /// @throws the exchange's error once it has failed.
   void close(stream_id stream, rank_t to);
 
