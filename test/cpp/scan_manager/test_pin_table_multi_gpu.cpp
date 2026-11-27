@@ -415,6 +415,123 @@ TEST_CASE("pin_table - a compressed GPU pin is served on the admitted GPU under 
 }
 
 //===----------------------------------------------------------------------===//
+// GPU-tier cached serve — DISPATCH ON AN ADMITTED SUBSET.
+//
+// Three GPUs, two of them admitted. The excluded GPU's chunks are shared out evenly between the
+// admitted GPUs, and the excluded GPU runs nothing.
+//===----------------------------------------------------------------------===//
+TEST_CASE("pin_table - GPU-tier cached scan spreads an excluded GPU's chunks under gpus_per_query",
+          "[pin_mgpu][scan_manager][multi_gpu][admission]")
+{
+  if (!sirius::test::has_gpus(3)) return;
+
+  auto tmp = make_tmp("gpu-dispatch-admission");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  // 12 files, so each of the three GPUs holds at least four chunks.
+  generate_parquet_surface(
+    tmp, "SELECT range AS k, range * 2 AS v FROM range(100000)", /*num_files=*/12);
+
+  // gpus_per_query: 2 admits every query onto the first two GPUs.
+  mgpu_env_params params;
+  params.num_gpus             = 3;
+  params.gpus_per_query       = 2;
+  params.scan_task_batch_size = 1'000'000;
+  auto yaml_path              = tmp / "pin_mgpu_gpu_dispatch_admission.yaml";
+  write_mgpu_yaml(yaml_path, params);
+
+  auto env = std::make_unique<scoped_mgpu_env>(yaml_path);
+  {
+    auto con          = env->make_connection();
+    auto const run_ok = [&con](std::string const& sql) {
+      auto result = con.Query(sql);
+      REQUIRE(result);
+      if (result->HasError()) { UNSCOPED_INFO(sql << " failed: " << result->GetError()); }
+      REQUIRE_FALSE(result->HasError());
+      return result;
+    };
+
+    run_ok("SET enable_duckdb_fallback = false;");
+    auto const glob = parquet_glob(tmp);
+    run_ok("CALL pin_table('" + glob + "', tier='gpu', name='gpu_dispatch_admission');");
+
+    auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx != nullptr);
+
+    // Where the pin put its chunks.
+    std::map<int, std::size_t> chunks_per_owner;
+    sirius_ctx->get_scan_manager().visit_pinned_entries(
+      [&](std::string_view name, const auto& entry) {
+        if (name != "gpu_dispatch_admission") { return true; }  // keep looking
+        for (auto* space : entry.chunk_memory_spaces) {
+          if (space != nullptr) { ++chunks_per_owner[space->get_device_id()]; }
+        }
+        return false;  // found
+      });
+
+    auto const tasks_per_gpu = [&] {
+      std::map<int, std::size_t> out;
+      env->get_task_scheduler(con).visit_executors(
+        [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+          out[device_id] = exec.get_metrics().tasks_executed;
+        });
+      return out;
+    };
+
+    // Admission keeps the first two of the process's GPUs.
+    auto const executors = tasks_per_gpu();
+    REQUIRE(executors.size() == 3u);
+    std::set<int> admitted;
+    for (auto const& [device, executed] : executors) {
+      if (admitted.size() < 2u) { admitted.insert(device); }
+    }
+
+    // The excluded GPU has to hold enough chunks to give each admitted GPU at least one.
+    std::size_t excluded_chunks = 0;
+    for (auto const& [owner, owned] : chunks_per_owner) {
+      INFO("owner gpu=" << owner << " chunks=" << owned);
+      if (!admitted.contains(owner)) { excluded_chunks += owned; }
+    }
+    REQUIRE(chunks_per_owner.size() == 3u);
+    REQUIRE(excluded_chunks >= admitted.size());
+
+    auto const query = "SELECT max(k), sum(v) FROM read_parquet('" + glob + "');";
+    // Repeated, since the round-robin cursor carries over from one query to the next.
+    for (int iteration = 0; iteration < 3; ++iteration) {
+      auto before       = tasks_per_gpu();
+      auto const result = run_ok(query);
+      auto after        = tasks_per_gpu();
+
+      // 12 files of range(100000): max(k) = 99999, sum(v) = 12 * 2 * 4999950000.
+      REQUIRE(result->RowCount() == 1);
+      CHECK(result->Collection().GetValue(0, 0).ToString() == "99999");
+      CHECK(result->Collection().GetValue(1, 0).ToString() == "119998800000");
+
+      // One scan task per chunk: an admitted GPU scans its own chunks and at least an even
+      // share (rounded down) of the excluded GPU's.
+      INFO("iteration=" << iteration << " excluded chunks=" << excluded_chunks);
+      for (auto const& [device, executed] : after) {
+        auto const ran = executed - before[device];
+        auto const own = chunks_per_owner[device];
+        INFO("gpu=" << device << " tasks run=" << ran << " own chunks=" << own);
+        if (admitted.contains(device)) {
+          CHECK(ran >= own + excluded_chunks / admitted.size());
+        } else {
+          CHECK(ran == 0u);
+        }
+      }
+    }
+
+    run_ok("CALL unpin_table('gpu_dispatch_admission');");
+  }
+
+  env.reset();
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
 // Host-tier distribution gate (PR #732 review feedback — high-1):
 //
 // `CALL pin_table(..., tier='host')` round-robins files across GPUs the same

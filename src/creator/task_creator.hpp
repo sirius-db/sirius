@@ -26,6 +26,7 @@
 #include "exec/query_lifecycle_registry.hpp"
 #include "exec/queue_priority.hpp"
 #include "memory/numa_affinity.hpp"
+#include "memory/resident_gpu_placement.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -432,6 +433,8 @@ class task_creator {
   /// Rotate independently within each NUMA node, including interleaved host-pin inputs, and
   /// within each admitted set of that node's GPUs.
   sirius::memory::numa_affinity _numa_affinity;
+  /// Keeps tasks with GPU-resident input on the query's admitted GPUs.
+  sirius::memory::resident_gpu_placement _resident_placement;
   /// Separate from NUMA affinity. A task can take a NUMA pick and then be clamped, so
   /// sharing one counter advances it twice per task: against an even subset size the stride
   /// never changes parity and every clamped task lands on the same GPU.
