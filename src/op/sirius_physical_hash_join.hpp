@@ -179,7 +179,7 @@ struct build_probe_decision {
   std::optional<uint64_t> resident_bytes = std::nullopt,
   bool kept_build_streaming              = false,
 
-  bool right_may_stream                  = false);
+  bool right_may_stream = false);
 
 /**
  * @brief Select never-probed build slots that can be reclaimed after the probe producer closes.
@@ -364,7 +364,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   /// A kept-build join holds each partition's build in its slot after the ports drain, so the
-  /// operator stays nonempty until every slot has issued its emit task.
+  /// operator stays nonempty until every slot has issued its emit task. A streamed RIGHT join stays
+  /// nonempty until every partition has emitted its unmatched rows.
   [[nodiscard]] bool all_ports_empty() override;
 
   /// STANDARD / MIXED_JOIN only. Re-poll both input ports for newly-arrived batch IDs, extend
@@ -387,9 +388,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void reclaim_build_only_slots_if_probe_complete(bool probe_finished);
 
   std::optional<task_creation_hint> get_next_task_hint() override;
-
-  /// A streamed RIGHT join is not drained until every partition has emitted its unmatched rows.
-  [[nodiscard]] bool all_ports_empty() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
@@ -684,7 +682,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// Kept-build: issue the emit task for the first slot whose probe stream is complete. Must be
   /// called with op_state_mutex held.
   std::unique_ptr<operator_data> next_kept_build_emit_task();
-  bool _right_may_stream    = false;
+  bool _right_may_stream = false;
   std::optional<build_count_spec> _build_counts;
 };
 
