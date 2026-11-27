@@ -92,24 +92,42 @@ statement ok
 SET GLOBAL sirius_gateway_exchange_frame_bytes = 1048576;
 
 statement ok
+SET GLOBAL sirius_gateway_exchange_host_staging = 'never';
+
+statement ok
+SET GLOBAL sirius_gateway_exchange_send_frames = 32;
+
+statement ok
+SET GLOBAL sirius_gateway_exchange_recv_frames_per_peer = 4;
+
+statement ok
 SET GLOBAL sirius_gateway_rank_init = 'SET threads = 2';
 
 query IT
 FROM sirius_gateway_test_rank_setup('10.0.0.1:27000,10.0.0.2:27001', 1);
 ----
 1	SET enable_duckdb_fallback = false
-2	SET sirius_exchange_host_staging = 'auto'
+2	SET sirius_exchange_host_staging = 'never'
 3	SET sirius_exchange_tcp_lanes = 4
 4	SET sirius_exchange_mnnvl = 'off'
 5	SET sirius_exchange_frame_bytes = 1048576
-6	SET sirius_exchange_send_frames = 16
-7	SET sirius_exchange_recv_frames_per_peer = 8
+6	SET sirius_exchange_send_frames = 32
+7	SET sirius_exchange_recv_frames_per_peer = 4
 8	SET sirius_exchange_peers = '10.0.0.1:27000,10.0.0.2:27001'
 9	SET sirius_exchange_rank = 1
 10	SET threads = 2
 
 statement ok
 RESET GLOBAL sirius_gateway_rank_init;
+
+statement ok
+RESET GLOBAL sirius_gateway_exchange_recv_frames_per_peer;
+
+statement ok
+RESET GLOBAL sirius_gateway_exchange_send_frames;
+
+statement ok
+RESET GLOBAL sirius_gateway_exchange_host_staging;
 
 statement ok
 RESET GLOBAL sirius_gateway_exchange_frame_bytes;
@@ -305,6 +323,16 @@ set on every rank by the gateway
 
 statement error con2
 SET sirius_exchange_recv_frames_per_peer = 16;
+----
+set on every rank by the gateway
+
+statement error con2
+SET sirius_exchange_frame_bytes = 1048576;
+----
+set on every rank by the gateway
+
+statement error con2
+SET sirius_exchange_send_frames = 32;
 ----
 set on every rank by the gateway
 
