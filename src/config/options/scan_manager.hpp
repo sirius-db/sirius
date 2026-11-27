@@ -9,10 +9,12 @@
 #include "scan_manager/preparation_options.hpp"
 
 #include <cucascade/io/cache/config.hpp>
+#include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/tls/config.hpp>
 #include <cucascade/io/uring/config.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -77,6 +79,95 @@ struct uring_options : block_base<uring_options> {
       .build();
 
   auto fields() { return field_list(n_max_concurrent_scans, slices_per_pass, range_batch_slices); }
+};
+
+/// `sirius.executor.scan_manager.cufile`: the cuFile lanes local reads go through with
+/// `backend: cufile`.
+struct cufile_options : block_base<cufile_options> {
+  static const cucascade::io::cufile::config& defaults()
+  {
+    return detail::scan_manager_defaults().cufile;
+  }
+
+  config_option<std::size_t> lanes = option<std::size_t>("lanes")
+                                       .validate(positive<std::size_t>{})
+                                       .fallback(defaults().lanes)
+                                       .describe("cuFile read lanes of a GPU")
+                                       .build();
+  config_option<ubytes> lane_bytes =
+    option<ubytes>("lane_bytes")
+      .validate([](ubytes v) -> parse_status {
+        if (v.count() > 0 && v.count() % cucascade::io::IO_BLOCK_SIZE == 0) { return {}; }
+        return parse_status::failure("must be a positive multiple of 4 KiB");
+      })
+      .fallback(ubytes(defaults().lane_bytes))
+      .describe("registered GPU memory of a lane slot, the most one cuFile call moves")
+      .build();
+  config_option<ubytes> coalesce_gap_bytes =
+    option<ubytes>("coalesce_gap_bytes")
+      .fallback(ubytes(defaults().coalesce_gap_bytes))
+      .describe("largest gap between device reads served by one cuFile read")
+      .build();
+  config_option<double> coalesce_gap_ratio =
+    option<double>("coalesce_gap_ratio")
+      .validate(fraction{})
+      .fallback(defaults().coalesce_gap_ratio)
+      .describe("most of a coalesced read that may be gaps")
+      .build();
+  config_option<std::size_t> read_slots_per_lane = option<std::size_t>("read_slots_per_lane")
+                                                     .validate(positive<std::size_t>{})
+                                                     .fallback(defaults().read_slots_per_lane)
+                                                     .describe("arena read slots per read lane")
+                                                     .build();
+  config_option<bool> register_per_slot =
+    option<bool>("register_per_slot")
+      .fallback(defaults().register_per_slot)
+      .describe("register every arena slot with cuFile instead of the arena as one buffer")
+      .build();
+  /// Empty: the GPUs Sirius reads into.
+  config_option<std::vector<int>> devices =
+    option<std::vector<int>>("devices")
+      .validate([](const std::vector<int>& ids) -> parse_status {
+        if (std::ranges::any_of(ids, [](int id) { return id < 0; })) {
+          return parse_status::failure("must contain only non-negative device ids");
+        }
+        auto sorted = ids;
+        std::ranges::sort(sorted);
+        if (std::ranges::adjacent_find(sorted) != sorted.end()) {
+          return parse_status::failure("must not contain duplicate device ids");
+        }
+        return {};
+      })
+      .fallback(defaults().devices)
+      .describe("GPUs the cuFile lanes serve")
+      .build();
+
+  auto fields()
+  {
+    return field_list(removed("n_max_concurrent_scans",
+                              "not configurable; cuFile cannot use fs_cache or scan readahead "
+                              "(use cufile.lanes for read concurrency)"),
+                      lanes,
+                      lane_bytes,
+                      coalesce_gap_bytes,
+                      coalesce_gap_ratio,
+                      read_slots_per_lane,
+                      register_per_slot,
+                      devices);
+  }
+
+  void validate(std::string_view path) const
+  {
+    auto cfg                = defaults();
+    cfg.lanes               = lanes.get();
+    cfg.lane_bytes          = lane_bytes.get().count();
+    cfg.read_slots_per_lane = read_slots_per_lane.get();
+    if (!scan_manager::cufile_arena_fits(cfg)) {
+      throw config_error("'" + join_path(path, read_slots_per_lane.key()) +
+                         "': the arena ((read_slots_per_lane + 1) x lanes x lane_bytes) is larger "
+                         "than the address space");
+    }
+  }
 };
 
 /// `sirius.executor.scan_manager.rest.tls`: TLS for object-store connections. Trust settings belong
@@ -760,6 +851,15 @@ struct scan_manager_options : block_base<scan_manager_options> {
       .fallback(detail::scan_manager_defaults().httpfs_external_file_cache)
       .describe("let DuckDB's external file cache keep bytes read through sirius_httpfs")
       .build();
+  /// `auto` is kept as a spelling of `on`.
+  config_option<scan_manager::cufile_bulk_read_mode> cufile_bulk_read =
+    option<scan_manager::cufile_bulk_read_mode>("cufile_bulk_read")
+      .choices({{"on", scan_manager::cufile_bulk_read_mode::on},
+                {"off", scan_manager::cufile_bulk_read_mode::off},
+                {"auto", scan_manager::cufile_bulk_read_mode::on}})
+      .fallback(detail::scan_manager_defaults().cufile_bulk_read)
+      .describe("Parquet read route of cuFile scans")
+      .build();
   /// Unset: the cache and the backend decide; 0 turns readahead off.
   config_option<std::size_t> max_readahead_scans =
     option<std::size_t>("max_readahead_scans")
@@ -774,6 +874,7 @@ struct scan_manager_options : block_base<scan_manager_options> {
 
   uring_options uring;
   rest_options rest;
+  cufile_options cufile;
   cache_options cache;
   memory_prefetcher_options memory_prefetcher;
   preparation_options preparation;
@@ -792,10 +893,12 @@ struct scan_manager_options : block_base<scan_manager_options> {
       rest_n_reactors,
       reserve_rest_reactor_cpus,
       httpfs_external_file_cache,
+      cufile_bulk_read,
       max_readahead_scans,
       readahead_strategy,
       sub("uring", uring),
       sub("rest", rest),
+      sub("cufile", cufile),
       sub("cache", cache),
       sub("memory_prefetcher", memory_prefetcher),
       sub("preparation", preparation));

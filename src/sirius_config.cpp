@@ -512,6 +512,7 @@ try {
   impl->disk_cfg.id                  = disk.disk_id.get();
   impl->disk_cfg.capacity_bytes      = disk.capacity_bytes.get().count();
   impl->disk_cfg.downgrade_root_dirs = disk.downgrade_root_dirs.get();
+  impl->disk_cfg.allow_gds           = disk.allow_gds.get();
   settings._max_concurrent_queries   = user.max_concurrent_queries.get();
 
   // -- executors
@@ -542,6 +543,7 @@ try {
   assign_if_set(sm.rest_n_reactors, sm_cfg.rest_n_reactors);
   sm_cfg.reserve_rest_reactor_cpus  = sm.reserve_rest_reactor_cpus.get();
   sm_cfg.httpfs_external_file_cache = sm.httpfs_external_file_cache.get();
+  sm_cfg.cufile_bulk_read           = sm.cufile_bulk_read.get();
   if (auto const* scans = sm.max_readahead_scans.get_if()) { sm_cfg.max_readahead_scans = *scans; }
   if (auto const* strategy = sm.readahead_strategy.get_if()) {
     sm_cfg.readahead_strategy = *strategy;
@@ -558,6 +560,16 @@ try {
   }
   uring.slices_per_pass    = sm.uring.slices_per_pass.get();
   uring.range_batch_slices = sm.uring.range_batch_slices.get();
+
+  auto const& f              = sm.cufile;
+  auto& cufile               = sm_cfg.cufile;
+  cufile.lanes               = f.lanes.get();
+  cufile.lane_bytes          = f.lane_bytes.get().count();
+  cufile.coalesce_gap_bytes  = f.coalesce_gap_bytes.get().count();
+  cufile.coalesce_gap_ratio  = f.coalesce_gap_ratio.get();
+  cufile.read_slots_per_lane = f.read_slots_per_lane.get();
+  cufile.register_per_slot   = f.register_per_slot.get();
+  cufile.devices             = f.devices.get();
 
   auto const& r = sm.rest;
   auto& rest    = sm_cfg.rest;

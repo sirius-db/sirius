@@ -1927,9 +1927,9 @@ TEST_CASE("sirius_config reads scan_manager.cufile_bulk_read",
       "sirius_cufile_bulk_read_invalid.yaml",
       single_gpu_scan_manager_yaml(std::string{"      cufile_bulk_read: "} + bad + "\n"));
     sirius::sirius_config cfg;
-    REQUIRE_THROWS_WITH(
-      cfg.load_from_file(yaml.path()),
-      Catch::Matchers::ContainsSubstring("'scan_manager.cufile_bulk_read': invalid enum value") &&
-        Catch::Matchers::ContainsSubstring("(expected auto, on, off)"));
+    REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring(
+                          "'sirius.executor.scan_manager.cufile_bulk_read': invalid enum value") &&
+                          Catch::Matchers::ContainsSubstring("(expected on, off, auto)"));
   }
 }
