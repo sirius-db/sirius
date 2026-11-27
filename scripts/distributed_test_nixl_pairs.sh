@@ -23,6 +23,12 @@ if [[ ${1:-} == --rank ]]; then
   # One task of the job step: this rank's environment, then the test.
   out=$2
   rank=$SLURM_PROCID
+  # Slurm orders the nodes of -w itself: this rank must run on the host its peers entry names.
+  mine=$(cut -d, -f$((rank + 1)) <<< "$SIRIUS_EXCHANGE_PEERS")
+  [[ $(ip -o -4 addr show) == *" ${mine%:*}/"* ]] || {
+    echo "rank $rank runs on $(hostname), not at ${mine%:*}: give the nodes in Slurm's order" >&2
+    exit 1
+  }
   export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$SLURM_LOCALID
   export SIRIUS_EXCHANGE_RANK=$rank
   # Sirius writes its log to ./log: one folder per rank.
@@ -35,14 +41,14 @@ if [[ ${1:-} == --rank ]]; then
 fi
 
 nodes=${1:?usage: distributed_test_nixl_pairs.sh <node1>,<node2> [out dir]}
-out=${2:-/scratch/prestouser/$USER/mnnvl/pairs-$(date +%Y%m%d-%H%M%S)}
+out=${2:-nixl-pairs-$(date +%Y%m%d-%H%M%S)}
 per_node=${RANKS_PER_NODE:-4}
 IFS=, read -r -a hosts <<< "$nodes"
 if ((${#hosts[@]} != 2)); then echo "give two nodes, not '$nodes'" >&2; exit 2; fi
 peers=""
 r=0
 for host in "${hosts[@]}"; do
-  ip=$(getent hosts "$host" | awk '{print $1; exit}')
+  ip=$(getent hosts "$host" | awk '{print $1; exit}') || ip=
   [[ -n $ip ]] || { echo "cannot resolve $host" >&2; exit 2; }
   for ((i = 0; i < per_node; i++, r++)); do peers+="${peers:+,}$ip:$((27000 + r))"; done
 done
