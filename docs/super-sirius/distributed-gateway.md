@@ -209,7 +209,7 @@ abandoned.
 | `sirius_gateway_drop_rank(name)` | Unregisters a registered rank, likewise |
 | `sirius_gateway_restart()` | Restarts every rank and replays the DDL log |
 | `sirius_gateway_stop()` | Stops spawned ranks and disconnects registered ones |
-| `sirius_gateway_run(sql)` | Runs `sql` on every rank; what the router rewrites statements to |
+| `sirius_gateway_run(sql)` | Runs `sql`, one statement, on every rank; what the router rewrites statements to. A text of several statements is refused |
 | `sirius_gateway_status()` | One row per rank: process, name, state, cluster state and its `error` (why it is stopped or failed, what it waits for, or a note while it is `ready`: a skipped saved entry, or a log it could not save), `last_error` (the rank's last failure to join, to answer, or to keep running), query numbers, queue |
 | `sirius_gateway_log()` | The DDL log. A statement that carries credentials shows as `-- not shown: this statement carries credentials` |
 | `sirius_gateway_route(user, sql)` | Quack's authorization callback that routes each client statement: `SET GLOBAL quack_authorization_function = 'sirius_gateway_route'` |
