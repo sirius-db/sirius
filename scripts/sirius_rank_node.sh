@@ -128,13 +128,13 @@ case $host in
     # One key pair for every restart, so the fingerprint the gateway pins stays valid.
     # -init /dev/null: output a ~/.duckdbrc prints (.timer on) would end up in the fingerprint.
     fingerprint=$("$duckdb" -no-agent -init /dev/null -noheader -list \
-      -c "SELECT fingerprint FROM quack_generate_keys(directory := '$dir/tls')")
+      -c "SELECT fingerprint FROM quack_generate_keys(directory := $(sirius_sql_quote "$dir/tls"))")
     [[ $fingerprint =~ ^[0-9A-F]{2}(:[0-9A-F]{2})+$ ]] || {
       echo "unexpected TLS fingerprint from quack_generate_keys: '$fingerprint'" >&2
       exit 1
     }
-    serve+=", allow_other_hostname := true, ssl_cert_file := '$dir/tls/server.pem'"
-    serve+=", ssl_key_file := '$dir/tls/private_key.pem'"
+    serve+=", allow_other_hostname := true, ssl_cert_file := $(sirius_sql_quote "$dir/tls/server.pem")"
+    serve+=", ssl_key_file := $(sirius_sql_quote "$dir/tls/private_key.pem")"
     pin=", fingerprint := '$fingerprint'"
     ;;
 esac
@@ -143,7 +143,7 @@ esac
 (
   umask 077
   cat > "$dir/init.sql" <<SQL
-LOAD '$build/extension/sirius/sirius.duckdb_extension';
+LOAD $(sirius_sql_quote "$build/extension/sirius/sirius.duckdb_extension");
 SET pin_threads = 'off';
 SET threads = 1;
 SET threads = $rank_threads;
@@ -265,7 +265,9 @@ first=1
 while :; do
   taskset -c "$rank_cpus" "$duckdb" -unsigned -init "$dir/init.sql" <> "$dir/stdin" >> "$dir/rank.log" 2>&1 &
   child=$!
-  announce "$child" "$first" &
+  # Without fd 8: only the rank may outlive this script with the directory's lock. The
+  # announcer's background sleeps would hold it for up to 30 s after a stop.
+  announce "$child" "$first" 8>&- &
   announcer=$!
   first=0
   rc=0
@@ -280,7 +282,7 @@ while :; do
   fi
   echo "rank exited with $rc; starting it again in ${backoff}s" >&2
   # In the background, so that the TERM trap runs at once, not after the sleep.
-  sleep "$backoff" &
+  sleep "$backoff" 8>&- &
   wait $! || true
   backoff=$((backoff < 30 ? backoff * 2 : 30))
 done

@@ -227,7 +227,7 @@ abandoned.
 | `sirius_gateway_drop_rank(name)` | Unregisters a registered rank, likewise |
 | `sirius_gateway_restart()` | Restarts every rank and replays the DDL log |
 | `sirius_gateway_stop()` | Stops spawned ranks and disconnects registered ones |
-| `sirius_gateway_run(sql)` | Runs `sql` on every rank; what the router rewrites statements to |
+| `sirius_gateway_run(sql)` | Runs `sql`, one statement, on every rank; what the router rewrites statements to. A text of several statements is refused |
 | `sirius_gateway_status()` | One row per rank: process, name, state, cluster state and its `error` (why it is stopped or failed, what it waits for, or a note while it is `ready`: a skipped saved entry, or a log it could not save), `last_error` (the rank's last failure to join, to answer, or to keep running), query numbers, queue |
 | `sirius_gateway_log()` | The DDL log. A statement that carries credentials shows as `-- not shown: this statement carries credentials` |
 | `sirius_gateway_route(user, sql)` | Quack's authorization callback that routes each client statement: `SET GLOBAL quack_authorization_function = 'sirius_gateway_route'` |
@@ -240,7 +240,7 @@ the gateway set it up as its only rank), and `sirius_rank_exit()`
 
 The gateway reads these settings when `sirius_gateway_start` runs, or when the first
 statement starts the registered ranks. `sirius_gateway_restart` and the gateway's own
-restarts reuse what it read then.
+restarts reuse what it read then; a restart before any start reads them.
 
 | Setting | Default | What |
 |---|---|---|
@@ -253,7 +253,7 @@ restarts reuse what it read then.
 | `sirius_gateway_exchange_frame_bytes` | 8388608 | `sirius_exchange_frame_bytes` for every rank |
 | `sirius_gateway_exchange_send_frames` | 16 | `sirius_exchange_send_frames` for every rank |
 | `sirius_gateway_exchange_recv_frames_per_peer` | 8 | `sirius_exchange_recv_frames_per_peer` for every rank; over TCP lanes, one frame in flight per lane |
-| `sirius_gateway_log_dir` | temporary | Rank init files and logs |
+| `sirius_gateway_log_dir` | temporary | Rank init files and logs. One gateway per directory: the default is per process, so a program that opens two gateway databases must set it for each |
 | `sirius_gateway_allow_join` | false | Lets clients call `sirius_gateway_add_rank` and `sirius_gateway_drop_rank`, for nodes to register their ranks |
 | `sirius_gateway_min_ranks` | 1 | Registered ranks the first statement waits for before it starts them |
 | `sirius_gateway_join_wait` | 600 | Seconds a statement waits for `sirius_gateway_min_ranks` ranks to register before it fails; 0 fails at once. Capped at one year |
@@ -261,7 +261,7 @@ restarts reuse what it read then.
 | `sirius_gateway_statement_timeout` | 3600 | Seconds before a statement is cancelled; 0 is none. A rank waiting on a peer that never ran the query has no bound of its own |
 | `sirius_gateway_cancel_grace` | 30 | Seconds a cancelled statement may keep running before its ranks are killed |
 | `sirius_gateway_rank_boot_id_sql` | `SELECT boot_id FROM sirius_rank_info()` | Names a registered rank's process |
-| `sirius_gateway_rank_joined_sql` | `SELECT joined FROM sirius_rank_info()` | Says whether that process has joined a set of ranks, so must restart to join another; empty restarts it every time |
+| `sirius_gateway_rank_joined_sql` | `SELECT joined FROM sirius_rank_info()` | Says whether that process has joined a set of ranks, so must restart to join another; empty restarts it every time, which needs a `sirius_gateway_rank_exit_sql` that a process that has not joined accepts: `sirius_rank_exit()` refuses there |
 | `sirius_gateway_rank_exit_sql` | `CALL sirius_rank_exit()` | Ends it, for its launcher to restart it |
 | `sirius_gateway_query_id_setting` | `sirius_distributed_query_id` | Setting that carries K to each rank; empty sends none |
 
@@ -310,7 +310,10 @@ restarts reuse what it read then.
 - **Dead ranks:** a spawned rank that exits is found by its process. Before each statement, while
   the ranks are ready, the gateway probes every registered rank's Quack port in parallel, for up
   to 2 s; a port that takes no connection makes it restart every rank and replay the DDL log
-  before the statement runs. The probe only checks that the port takes a TCP connection. It
+  before the statement runs. The 2 s cover every address of a rank's host, but not the lookup of
+  a host name: a rank that registers under a name is looked up by the system's resolver, with
+  its timeout. `sirius_node.sh` registers an IP address unless the gateway itself was given a
+  name. The probe only checks that the port takes a TCP connection. It
   misses a rank that hangs with its port open, which only the statement timeout finds, and a rank
   that its launcher has already started again on the same port. The gateway cannot kill a
   registered rank; a cancel it ignores holds the gateway's turn for up to the grace period plus

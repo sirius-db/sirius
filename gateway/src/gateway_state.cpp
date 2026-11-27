@@ -99,6 +99,18 @@ bool changes_state(std::string const& sql)
   });
 }
 
+/// The number of statements in @p sql; 0 for a text that does not parse, which every rank refuses.
+duckdb::idx_t statement_count(std::string const& sql)
+{
+  duckdb::Parser parser{duckdb::ParserOptions::Builtin()};
+  try {
+    parser.ParseQuery(sql);
+  } catch (std::exception&) {
+    return 0;
+  }
+  return parser.statements.size();
+}
+
 /// Whether @p sql carries credentials (CREATE SECRET, a secret-like setting, an ATTACH token),
 /// which the gateway keeps out of the DDL log file.
 bool holds_credentials(std::string const& sql)
@@ -562,11 +574,24 @@ void gateway_state::stop(ClientContext& context)
 void gateway_state::restart(ClientContext& context)
 {
   turn t{*this, context};
+  {
+    // No start yet (registered ranks, before the first statement): take the settings, as
+    // auto_start_locked does. read_settings always sets log_dir.
+    std::lock_guard lock{state_mutex_};
+    if (options_.log_dir.empty()) { read_settings(context, options_); }
+  }
   recover_locked(context);
 }
 
 std::shared_ptr<rank_result> gateway_state::run(ClientContext& context, std::string const& sql)
 {
+  // A rank commits each statement of a text on its own. If a later one failed, the earlier ones
+  // would stay on the ranks, not always the same ones on each, and nothing would log them.
+  if (auto const count = statement_count(sql); count > 1) {
+    throw InvalidInputException(
+      "sirius_gateway_run takes one statement, and this text holds %d: call it once for each",
+      count);
+  }
   wait_for_ranks(context, sql);
   turn t{*this, context};
   return run_locked(context, sql, false);
@@ -980,6 +1005,7 @@ void gateway_state::add_rank(ClientContext& context, rank_spec spec)
 void gateway_state::drop_rank(ClientContext& context, std::string const& name)
 {
   turn t{*this, context};
+  bool none_left = false;
   {
     std::lock_guard lock{state_mutex_};
     auto* spec = find_registered(name);
@@ -989,7 +1015,12 @@ void gateway_state::drop_rank(ClientContext& context, std::string const& name)
       fail_locked("membership changed: dropped " + name +
                   ", so the gateway restarts the ranks before the next statement");
     }
+    none_left = registered_.empty() && options_.ranks == 0;
   }
+  // No rank is left to start: the next statement's restart would be refused before it ended
+  // these sessions, and so would every statement after it, also the catalog reads of an ATTACH,
+  // which a node needs to register its rank.
+  if (none_left) { stop_locked(); }
   ranks_cv_.notify_all();
 }
 
