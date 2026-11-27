@@ -75,11 +75,15 @@ std::optional<ordinal_origin> join_origin(duckdb::LogicalJoin const& join,
       return left();
     case duckdb::JoinType::RIGHT_SEMI:
     case duckdb::JoinType::RIGHT_ANTI:
+      // The target walk stops here: the join filters its own right side with a build filter.
+      if (policy == origin_policy::filter_route) { return std::nullopt; }
       return mapped_origin(1, join.right_projection_map, ordinal, right_width);
     case duckdb::JoinType::SINGLE:
       // At most one match per left row: the left side is a row subset, the right is padded, and
       // a left row that matches two right rows throws.
-      if (policy == origin_policy::row_wise) { return std::nullopt; }
+      if (policy == origin_policy::row_wise || policy == origin_policy::filter_route) {
+        return std::nullopt;
+      }
       if (ordinal < left_block) { return left(); }
       if (policy == origin_policy::row_subset) { return std::nullopt; }
       return right();
@@ -140,11 +144,14 @@ std::optional<ordinal_origin> step_origin(duckdb::LogicalOperator const& op,
       return mapped_origin(
         0, op.Cast<duckdb::LogicalFilter>().projection_map, ordinal, child_width);
     case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY:
+      if (policy == origin_policy::filter_route) { return std::nullopt; }
       return mapped_origin(0, op.Cast<duckdb::LogicalOrder>().projection_map, ordinal, child_width);
     case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
     case duckdb::LogicalOperatorType::LOGICAL_TOP_N:
     case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:
-      if (policy == origin_policy::row_wise) { return std::nullopt; }
+      if (policy == origin_policy::row_wise || policy == origin_policy::filter_route) {
+        return std::nullopt;
+      }
       return mapped_origin(0, {}, ordinal, child_width);
     case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
       auto const& aggregate = op.Cast<duckdb::LogicalAggregate>();
@@ -165,7 +172,10 @@ std::optional<ordinal_origin> step_origin(duckdb::LogicalOperator const& op,
       if (policy != origin_policy::value_preserving) { return std::nullopt; }
       return join_origin(op.Cast<duckdb::LogicalJoin>(), ordinal, policy);
     case duckdb::LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
-      if (policy == origin_policy::row_subset || op.children.size() != 2) { return std::nullopt; }
+      if (policy == origin_policy::row_subset || policy == origin_policy::filter_route ||
+          op.children.size() != 2) {
+        return std::nullopt;
+      }
       if (ordinal < child_width) { return ordinal_origin{0, ordinal}; }
       return mapped_origin(1, {}, ordinal - child_width, op.children[1]->types.size());
     }
