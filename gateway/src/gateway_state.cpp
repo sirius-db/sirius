@@ -449,9 +449,9 @@ std::vector<std::string> rank_setup_sql(start_options const& options,
   std::vector<std::string> sql;
   if (!options.sirius_extension.empty()) {
     sql.push_back("SET enable_duckdb_fallback = false");
-    // The same on every rank: a rank refuses a peer that reaches it another way. With 'auto',
-    // ranks tell other hosts apart by boot id and reach them over TCP lanes, one frame in flight
-    // per lane.
+    // The same on every rank: two ranks that would reach each other in different ways never
+    // finish connecting. With 'auto', ranks tell other hosts apart by boot id and reach them
+    // over the NVLink fabric where it reaches, else over TCP lanes.
     sql.push_back("SET sirius_exchange_host_staging = " +
                   KeywordHelper::WriteQuoted(options.host_staging));
     sql.push_back("SET sirius_exchange_tcp_lanes = " + std::to_string(options.tcp_lanes));
