@@ -221,6 +221,17 @@ root=/tmp/sirius_node_${USER:-$(id -un)}_$cluster
 mkdir -p "$root"
 chmod 700 "$root"
 pids=()
+stop()
+{
+  trap - INT TERM EXIT
+  [ "${#pids[@]}" -gt 0 ] || return 0
+  kill "${pids[@]}" 2> /dev/null || true
+  wait "${pids[@]}" 2> /dev/null || true
+}
+# Set before the first rank starts, and on EXIT too: a start that fails part-way (set -e) must
+# not leave the ranks it already started.
+trap 'stop; exit 0' INT TERM
+trap stop EXIT
 for i in "${!ranks[@]}"; do
   quack_port=$((quack_base + i))
   rank_conf=$root/rank_$quack_port.conf
@@ -239,13 +250,6 @@ for i in "${!ranks[@]}"; do
   pids+=($!)
 done
 
-stop()
-{
-  trap - INT TERM
-  kill "${pids[@]}" 2> /dev/null || true
-  wait "${pids[@]}" 2> /dev/null || true
-}
-trap 'stop; exit 0' INT TERM
 echo "node: ${#ranks[@]} rank(s) for gateway $cluster, on GPU(s) ${ranks[*]}; logs in $root/rank_<port>/rank.log; Ctrl-C stops them" >&2
 # A rank's script only returns on an error it cannot retry: stop the others too.
 rc=0
