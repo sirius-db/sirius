@@ -50,10 +50,12 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
                                      rmm::device_async_resource_ref mr);
 
 //! @brief Pass 1: write each row's decoded length (from the per-dict decoded offsets) into
-//! @p d_lengths. No-op when @p n_chunks is 0.
+//! @p d_lengths. A row whose index is past its segment's dictionary gets length 0 and sets
+//! @p d_out_of_range to 1; the gather skips it. No-op when @p n_chunks is 0.
 void launch_dict_fsst_lengths(dict_fsst_desc const* d_chunks,
                               uint32_t* d_lengths,
                               uint32_t const* d_decoded_offsets,
+                              int32_t* d_out_of_range,
                               uint32_t n_chunks,
                               ::cuda::stream_ref stream);
 

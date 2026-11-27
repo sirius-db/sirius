@@ -89,6 +89,7 @@ struct dict_fsst_pre_desc {
   uint32_t off_slens;
   uint32_t base_off;
   uint32_t dict_count;
+  uint32_t dict_size;
   uint8_t mode;
   uint8_t string_lengths_width;
   uint8_t valid;  ///< 0 for a zero-row segment
@@ -284,13 +285,15 @@ __global__ __launch_bounds__(STRINGS_BLOCK_DIM) void kernel_build_dict_fsst_data
     // FSST modes: walk each dict entry's compressed bytes, sum decoded lengths.
     // Entry k = 0 is the reserved NULL slot (decoded length = 0); per host
     // contract decoded_offsets[base+1] = decoded_offsets[base] regardless of
-    // entry_lens[0].
+    // entry_lens[0]. The entry lengths are not validated yet, so the walk stays
+    // inside the dictionary region; the host rejects lengths that leave it.
     if (threadIdx.x == 0) my_dec_off[0] = 0;
     if (threadIdx.x == 0 && d.dict_count >= 1) my_dec_off[1] = 0;  // entry 0 is NULL
     auto const* dict_bytes_base = d.d_bytes + d.off_dict;
     for (int k = threadIdx.x + 1; k < d.dict_count; k += blockDim.x) {
-      auto const comp_start = my_byte_off[k];
-      auto const comp_len   = my_byte_off[k + 1] - comp_start;
+      auto const entry_end  = ::cuda::std::min(my_byte_off[k + 1], d.dict_size);
+      auto const comp_start = ::cuda::std::min(my_byte_off[k], entry_end);
+      auto const comp_len   = entry_end - comp_start;
       auto const* cp        = dict_bytes_base + comp_start;
       int decomp_len        = 0;
       int pos               = 0;
@@ -339,6 +342,7 @@ __global__ __launch_bounds__(STRINGS_BLOCK_DIM) void kernel_build_dict_fsst_data
 __global__ void kernel_compute_lengths_dict_fsst(dict_fsst_desc const* __restrict__ descs,
                                                  uint32_t* __restrict__ d_lengths,
                                                  uint32_t const* __restrict__ d_decoded_offsets,
+                                                 int32_t* __restrict__ d_out_of_range,
                                                  int num_segments)
 {
   int seg_idx = blockIdx.x;
@@ -355,6 +359,7 @@ __global__ void kernel_compute_lengths_dict_fsst(dict_fsst_desc const* __restric
       fsst_only ? (seg_i + 1) : unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
     int len = 0;
     if (idx != 0 && idx < desc.dict_count) { len = dec_off[idx + 1] - dec_off[idx]; }
+    if (idx >= desc.dict_count) { *d_out_of_range = 1; }
     d_lengths[desc.global_row_start + i] = len;
   }
 }
@@ -463,7 +468,8 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
     for (int i = warp_id; i < desc.row_count; i += warps_per_cta) {
       int seg_i = desc.seg_row_start + i;
       int idx   = unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
-      if (idx == 0) continue;  // NULL — pass-1 emitted length 0
+      // NULL, or an index past the dictionary that the lengths pass flagged — length 0 either way.
+      if (idx == 0 || idx >= desc.dict_count) continue;
       int op          = d_offsets[desc.global_row_start + i];
       int entry_start = memcpy_off[idx];
       int entry_len   = memcpy_off[idx + 1] - entry_start;
@@ -621,6 +627,7 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
     p.off_symtab           = layout.off_symtab;
     p.off_slens            = layout.off_slens;
     p.dict_count           = hdr.dict_count;
+    p.dict_size            = hdr.dict_size;
     p.mode                 = hdr.mode;
     p.string_lengths_width = hdr.string_lengths_width;
     p.base_off             = static_cast<uint32_t>(total_dict_entries);
@@ -762,12 +769,13 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
 void launch_dict_fsst_lengths(dict_fsst_desc const* d_chunks,
                               uint32_t* d_lengths,
                               uint32_t const* d_decoded_offsets,
+                              int32_t* d_out_of_range,
                               uint32_t n_chunks,
                               ::cuda::stream_ref stream)
 {
   if (n_chunks == 0) return;
   kernel_compute_lengths_dict_fsst<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
-    d_chunks, d_lengths, d_decoded_offsets, n_chunks);
+    d_chunks, d_lengths, d_decoded_offsets, d_out_of_range, n_chunks);
 }
 
 void launch_dict_fsst_predecode(dict_fsst_desc const* d_descs,

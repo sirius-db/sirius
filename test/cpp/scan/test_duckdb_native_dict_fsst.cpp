@@ -198,7 +198,8 @@ void check_strings(cudf::column const& decoded,
 }
 
 // Decode @p segments to a DICTIONARY32 column and check every row against the CPU's value, and
-// that the keys are exactly the distinct non-null values.
+// that the keys are exactly the distinct non-null values. A column of only NULLs has no keys, so it
+// comes back as strings.
 void check_dictionary_decode(std::vector<segment> const& segments,
                              std::vector<std::optional<std::string>> const& expected,
                              bool run_per_segment)
@@ -209,19 +210,24 @@ void check_dictionary_decode(std::vector<segment> const& segments,
   auto column =
     sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, no_cap, stream, mr);
   REQUIRE(column);
-  REQUIRE(column->type().id() == cudf::type_id::DICTIONARY32);
   REQUIRE(column->size() == static_cast<cudf::size_type>(staged.input.total_rows));
+  CAPTURE(run_per_segment);
 
-  cudf::dictionary_column_view dictionary(column->view());
   std::set<std::string> distinct;
   for (uint64_t row = segments.front().start; row < segments.front().start + column->size();
        ++row) {
     if (expected[row]) { distinct.insert(*expected[row]); }
   }
+  if (distinct.empty()) {
+    REQUIRE(column->type().id() == cudf::type_id::STRING);
+    check_strings(*column, expected, segments.front().start, stream);
+    return;
+  }
+  REQUIRE(column->type().id() == cudf::type_id::DICTIONARY32);
+  cudf::dictionary_column_view dictionary(column->view());
   REQUIRE(dictionary.keys_size() == static_cast<cudf::size_type>(distinct.size()));
 
   auto decoded = cudf::dictionary::decode(dictionary, stream, mr);
-  CAPTURE(run_per_segment);
   check_strings(*decoded, expected, segments.front().start, stream);
 }
 
@@ -436,13 +442,16 @@ TEST_CASE("DuckDB-written DICT_FSST mixed with other codecs or modes decodes to 
 TEST_CASE("DuckDB-written DICT_FSST rejects corrupt entry lengths and indices",
           "[integration][scan][decode][strings][dict_fsst][dictionary_carrier]")
 {
+  // A raw dictionary (mode 0) and an FSST-compressed one (mode 1), whose entries the prep walks.
+  auto const mode = GENERATE(uint8_t{0}, uint8_t{1});
+  CAPTURE(unsigned(mode));
   fixture disk;
-  disk.create(candidate_shapes().at(0));
+  disk.create(candidate_shapes().at(mode));
   auto segments = disk.read_segments();
   auto expected = disk.cpu_rows();
   REQUIRE(segments.size() == 1);
   auto& seg = segments.front();
-  REQUIRE(seg.mode == 0);
+  REQUIRE(seg.mode == mode);
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
 
@@ -464,7 +473,11 @@ TEST_CASE("DuckDB-written DICT_FSST rejects corrupt entry lengths and indices",
     REQUIRE((1u << seg.indices_width) - 1 >= seg.dict_count);
     std::fill(seg.bytes.begin() + seg.indices_offset(), seg.bytes.end(), uint8_t{0xff});
     auto staged = stage(segments, expected, false, stream);
+    CHECK_THROWS(sirius::cuda::scan::gpu_decode_strings_column(staged.input, stream, mr));
     CHECK_THROWS(
       sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, no_cap, stream, mr));
+    // Keys over the cap take the string path, which checks the indices as well.
+    CHECK_THROWS(
+      sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, 1, stream, mr));
   }
 }

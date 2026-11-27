@@ -292,9 +292,12 @@ std::unique_ptr<cudf::column> decode_strings_column(
   auto* d_predecode_p = static_cast<uint8_t*>(d_predecode_buf.data());
 
   // Lengths chunk for SM-fill; predecode stays per-segment (one decode/dict).
+  rmm::device_scalar<int32_t> d_dict_fsst_out_of_range(stream, mr);
+  d_dict_fsst_out_of_range.set_value_to_zero_async(stream);
   launch_dict_fsst_lengths(d_dict_fsst_chunks_p,
                            d_lengths.data(),
                            d_decoded_off_p,
+                           d_dict_fsst_out_of_range.data(),
                            static_cast<uint32_t>(dict_fsst_chunks.size()),
                            stream);
   launch_dict_fsst_predecode(d_dict_fsst_p,
@@ -379,6 +382,9 @@ std::unique_ptr<cudf::column> decode_strings_column(
                           d_dict_fsst_decs_p,
                           static_cast<uint32_t>(dict_fsst_chunks.size()),
                           stream);
+  if (!dict_fsst_chunks.empty() && d_dict_fsst_out_of_range.value(stream) != 0) {
+    throw std::runtime_error("DICT_FSST: dictionary index past the segment's dictionary");
+  }
 
   // All-valid → overlay UNCOMPRESSED validity → fold in DICT_FSST inline NULLs.
   auto null_mask             = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
@@ -459,6 +465,16 @@ std::unique_ptr<cudf::column> gpu_decode_strings_dictionary_column(
         prep.descs, [](dict_fsst_desc const& d) { return d.mode == DICT_FSST_MODE_FSST_ONLY; })) {
     return decode_strings_column(col, std::move(prep), stream, mr);
   }
+  // A segment's dictionary entries are distinct, so its decoded bytes are a lower bound on the
+  // merged keys: a column whose largest segment dictionary exceeds the cap needs no stacking.
+  std::size_t largest_dictionary_bytes = 0;
+  for (auto const& d : prep.descs) {
+    largest_dictionary_bytes = std::max<std::size_t>(
+      largest_dictionary_bytes, prep.decoded_offsets[d.seg_dict_offset_base + d.dict_count]);
+  }
+  if (largest_dictionary_bytes > max_keys_bytes) {
+    return decode_strings_column(col, std::move(prep), stream, mr);
+  }
 
   auto upload = [&](void const* src, size_t bytes) {
     rmm::device_buffer buf(bytes, stream, mr);
@@ -506,7 +522,8 @@ std::unique_ptr<cudf::column> gpu_decode_strings_dictionary_column(
   stacked.reset();
   auto contents = encoded->release();
   auto keys     = std::move(contents.children[cudf::dictionary_column_view::keys_column_index]);
-  if (keys->alloc_size() > max_keys_bytes) {
+  // Without keys (every row NULL) the codes would index none, so the column stays strings.
+  if (keys->size() == 0 || keys->alloc_size() > max_keys_bytes) {
     keys.reset();
     contents.children.clear();
     return decode_strings_column(col, std::move(prep), stream, mr);

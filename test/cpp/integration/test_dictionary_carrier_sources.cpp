@@ -340,5 +340,9 @@ TEST_CASE_METHOD(DictionaryCarrierFixture,
                  "dictionary carrier - queries over DuckDB-native carriers match DuckDB",
                  "[integration][gpu_execution][dictionary_carrier]")
 {
+  run_ok("SET enable_duckdb_fallback = false;");
+  auto const before = sirius::test::get_compressed_materialization_stats(*con);
   compare_all("t");
+  auto const after = sirius::test::get_compressed_materialization_stats(*con);
+  CHECK(after.scan_dictionary_carriers > before.scan_dictionary_carriers);
 }
