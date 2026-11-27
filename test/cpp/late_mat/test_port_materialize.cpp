@@ -60,6 +60,7 @@
 #include <typeinfo>
 #include <vector>
 
+using sirius::late_mat::check_port_batch_is_not_orphaned;
 using sirius::late_mat::column_origin;
 using sirius::late_mat::make_defer_pair;
 using sirius::late_mat::materialize_at_port;
@@ -226,6 +227,48 @@ TEST_CASE("a batch of another shape is declined, not materialized", "[late_mat][
   REQUIRE_FALSE(port_directive_matches(pair.port, stranger.view()));
   REQUIRE_THROWS(materialize_at_port(
     pair.port, stranger.view(), stream, rmm::mr::get_current_device_resource_ref()));
+  REQUIRE_NOTHROW(check_port_batch_is_not_orphaned(pair.port, stranger.view(), 0));
+}
+
+TEST_CASE("a batch narrower than declared outside the deferral is still restored",
+          "[late_mat][port]")
+{
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  fake_entry pin({64}, stream);
+
+  auto const pair = make_defer_pair(
+    riding_schema(), {1, 2}, riding_schema(), {1, 2}, {pin.origin(0), pin.origin(1)});
+  REQUIRE(pair.valid());
+
+  // The untouched column arrives as INT16 where INT32 was declared, as a grouped SUM's DECIMAL64
+  // arrives where DECIMAL128 was. Declining here would hand the rowids on as the values.
+  std::vector<std::uint64_t> const rowids{5, 63, 0};
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(upload(std::vector<std::int16_t>{7, 8, 9}, cudf::type_id::INT16, stream));
+  columns.push_back(upload(rowids, cudf::type_id::UINT64, stream));
+  columns.push_back(upload(std::vector<std::int8_t>(3, 0), cudf::type_id::INT8, stream));
+  cudf::table const narrow(std::move(columns));
+
+  REQUIRE(port_directive_matches(pair.port, narrow.view()));
+  REQUIRE_NOTHROW(check_port_batch_is_not_orphaned(pair.port, narrow.view(), 0));
+  auto const restored = materialize_at_port(pair.port, narrow.view(), stream, mr);
+  cudaStreamSynchronize(stream.get());
+  REQUIRE(read_back<std::int32_t>(restored->get_column(1).view()) ==
+          std::vector<std::int32_t>{5, 63, 0});
+  REQUIRE(restored->get_column(0).type().id() == cudf::type_id::INT16);
+  REQUIRE(read_back<std::int16_t>(restored->get_column(0).view()) ==
+          std::vector<std::int16_t>{7, 8, 9});
+
+  // Wider than declared is not a carrier the plan produces. The batch still carries the rowid,
+  // so it is an orphan: the port must fail rather than decline it.
+  std::vector<std::unique_ptr<cudf::column>> wide_columns;
+  wide_columns.push_back(upload(std::vector<std::int64_t>{7, 8, 9}, cudf::type_id::INT64, stream));
+  wide_columns.push_back(upload(rowids, cudf::type_id::UINT64, stream));
+  wide_columns.push_back(upload(std::vector<std::int8_t>(3, 0), cudf::type_id::INT8, stream));
+  cudf::table const wide(std::move(wide_columns));
+  REQUIRE_FALSE(port_directive_matches(pair.port, wide.view()));
+  REQUIRE_THROWS(check_port_batch_is_not_orphaned(pair.port, wide.view(), 0));
 }
 
 TEST_CASE(

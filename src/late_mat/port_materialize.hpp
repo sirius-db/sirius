@@ -47,6 +47,7 @@
 
 #include <cuda/stream>
 
+#include <cstddef>
 #include <memory>
 
 namespace sirius::late_mat {
@@ -54,6 +55,13 @@ namespace sirius::late_mat {
 /// Whether @p batch is the one @p directive was installed for.
 [[nodiscard]] bool port_directive_matches(port_materialize_directive const& directive,
                                           cudf::table_view const& batch);
+
+/// Throws when @p batch carries @p directive's rowid and placeholders but does not match it: that
+/// is a deferred batch the port would hand on unmaterialized, its rowids read as values. Returns
+/// normally for a matching batch and for a batch of another shape, which the port declines.
+void check_port_batch_is_not_orphaned(port_materialize_directive const& directive,
+                                      cudf::table_view const& batch,
+                                      std::size_t operator_id);
 
 /// Restore @p directive's columns into @p batch.
 ///

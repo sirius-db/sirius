@@ -24,6 +24,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <map>
 #include <stdexcept>
@@ -120,6 +121,25 @@ bool port_directive_matches(port_materialize_directive const& directive,
                             cudf::table_view const& batch)
 {
   return directive.matches(schema_of(batch));
+}
+
+void check_port_batch_is_not_orphaned(port_materialize_directive const& directive,
+                                      cudf::table_view const& batch,
+                                      std::size_t operator_id)
+{
+  auto const schema = schema_of(batch);
+  if (!directive.carries_substitutions(schema) || directive.matches(schema)) { return; }
+  std::string mismatches;
+  for (std::size_t i = 0; i < schema.size(); ++i) {
+    if (schema[i] == directive.expected_schema[i]) { continue; }
+    mismatches += " column " + std::to_string(i) + ": got " + cudf::type_to_name(schema[i]) +
+                  ", expected " + cudf::type_to_name(directive.expected_schema[i]) + ";";
+  }
+  throw std::runtime_error(
+    "late_mat: operator " + std::to_string(operator_id) +
+    " received a batch carrying its deferral's rowids whose other columns do not match the "
+    "directive, so its values would never be restored:" +
+    mismatches);
 }
 
 std::unique_ptr<cudf::table> materialize_at_port(port_materialize_directive const& directive,

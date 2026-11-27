@@ -57,7 +57,16 @@ operator in between sees the shape it expected and needs to know nothing about a
 both halves carry their own schema and positions, and the consumer matches a batch by its WHOLE
 schema — materializing against the wrong batch would read arbitrary rows of the pinned table.
 `port_materialize_directive` (`defer_directive.hpp`) carries only that schema and the origins it
-was installed for — no producer or operator id. Schema equality is the entire identity check.
+was installed for — no producer or operator id. The schema match is the entire identity check.
+
+The match is exact at the deferred positions: the rowid and placeholder types. Everywhere else a
+column may also arrive in a strictly narrower carrier of its expected type (`can_restore_to`). The
+expected schema is the port input's DECLARED one, and batches legitimately arrive narrower than
+declared. A grouped SUM over `DECIMAL(7,2)` emits `DECIMAL64` partials where DuckDB declares
+`DECIMAL(38,2)`, and a pin narrows integer columns chunk by chunk. Exact equality there declined the
+deferral's own batch, and TPC-DS q68 returned `c_first_name` as its rowid. A batch that carries the
+rowid and placeholders but still does not match is a deferred batch nobody will restore, so the
+port throws (`check_port_batch_is_not_orphaned`) instead of declining it.
 
 That sounds thinner than it is. Two structurally identical batches from different producers can
 only collide at a PORT that has more than one producer feeding it — and `trace_through`'s switch

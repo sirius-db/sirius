@@ -62,9 +62,30 @@ bool deferred_scan_output::defers(std::size_t position) const noexcept
          output_positions.end();
 }
 
+bool port_materialize_directive::carries_substitutions(
+  std::vector<cudf::data_type> const& schema) const
+{
+  if (empty() || schema.size() != expected_schema.size()) { return false; }
+  auto const substituted = [&](std::vector<std::size_t> const& positions) {
+    return std::all_of(positions.begin(), positions.end(), [&](std::size_t position) {
+      return position < schema.size() && schema[position] == expected_schema[position];
+    });
+  };
+  return substituted(output_positions) &&
+         std::all_of(riders.begin(), riders.end(), [&](rider_bundle const& rider) {
+           return substituted(rider.output_positions);
+         });
+}
+
 bool port_materialize_directive::matches(std::vector<cudf::data_type> const& schema) const
 {
-  return !empty() && schema == expected_schema;
+  if (!carries_substitutions(schema)) { return false; }
+  for (std::size_t i = 0; i < schema.size(); ++i) {
+    if (schema[i] != expected_schema[i] && !sirius::can_restore_to(schema[i], expected_schema[i])) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool port_materialize_directive::valid() const

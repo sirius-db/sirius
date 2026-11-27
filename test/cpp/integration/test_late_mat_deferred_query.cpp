@@ -85,11 +85,25 @@ constexpr char const* kQuery =
   "GROUP BY c.c_custkey, c.c_name, c.c_address, c.c_comment "
   "ORDER BY c.c_custkey";
 
+/// The same ride beside a SUM over DECIMAL(7,2), TPC-DS q68's shape. DuckDB declares the SUM
+/// DECIMAL(38,2), so the port expects DECIMAL128 there, while the grouped aggregate emits
+/// DECIMAL64. A port matching its batch by exact schema declines it and returns the rowids as the
+/// names.
+constexpr char const* kDecimalSumQuery =
+  "SELECT c.c_custkey, c.c_name, c.c_address, c.c_comment, count(*) AS n, "
+  "       sum(l.l_amount) AS amount "
+  "FROM read_parquet('{C}') c "
+  "JOIN read_parquet('{O}') o ON c.c_custkey = o.o_custkey "
+  "JOIN read_parquet('{L}') l ON o.o_orderkey = l.l_orderkey "
+  "GROUP BY c.c_custkey, c.c_name, c.c_address, c.c_comment "
+  "ORDER BY c.c_custkey";
+
 std::string query_for(std::string const& customer_glob,
                       fs::path const& orders,
-                      fs::path const& lines)
+                      fs::path const& lines,
+                      char const* query = kQuery)
 {
-  std::string sql = kQuery;
+  std::string sql = query;
   sql.replace(sql.find("{C}"), 3, customer_glob);
   sql.replace(sql.find("{O}"), 3, orders.string());
   sql.replace(sql.find("{L}"), 3, lines.string());
@@ -133,7 +147,8 @@ void generate_parquet(fs::path const& customer_dir, fs::path const& orders, fs::
   REQUIRE_FALSE(r->HasError());
 
   r = gen.Query("COPY (SELECT range AS l_linekey, range % " + std::to_string(kOrders) +
-                " AS l_orderkey "
+                " AS l_orderkey, "
+                "             CAST(range % 100000 AS DECIMAL(7,2)) AS l_amount "
                 "      FROM range(" +
                 std::to_string(kLines) + ")) TO " + sirius::test::sql_literal(lines.string()) +
                 " (FORMAT PARQUET);");
@@ -158,12 +173,13 @@ std::vector<std::string> rows_of(duckdb::QueryResult& r)
 /// The ground truth: the same query on DuckDB with Sirius disabled.
 std::vector<std::string> cpu_answer(std::string const& customer_glob,
                                     fs::path const& orders,
-                                    fs::path const& lines)
+                                    fs::path const& lines,
+                                    char const* query)
 {
   sirius::test::scoped_sirius_disable disable_sirius;
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
-  auto r = con.Query(query_for(customer_glob, orders, lines));
+  auto r = con.Query(query_for(customer_glob, orders, lines, query));
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
   return rows_of(*r);
@@ -305,6 +321,7 @@ struct deferred_query_case {
   /// query must still come back right as an ordinary scan.
   bool compressed_pin              = false;
   bool enable_late_materialization = true;
+  char const* query                = kQuery;
 };
 
 /// Pin, run, compare with the CPU, and prove the deferral did what the case
@@ -329,7 +346,7 @@ void run_deferred_query(deferred_query_case const& c)
   auto const orders        = tmp / "orders.parquet";
   auto const lines         = tmp / "lineitem.parquet";
   generate_parquet(customer_dir, orders, lines);
-  auto const expected = cpu_answer(customer_glob, orders, lines);
+  auto const expected = cpu_answer(customer_glob, orders, lines, c.query);
   REQUIRE_FALSE(expected.empty());
 
   auto yaml_path = tmp / "late_mat_query.yaml";
@@ -384,7 +401,7 @@ void run_deferred_query(deferred_query_case const& c)
   // The installer says why it declined at INFO, and nowhere else.
   std::optional<sirius::test::scoped_recording_log_sink> logs;
   if (c.compressed_pin) { logs.emplace("info"); }
-  auto res = con.Query(query_for(customer_glob, orders, lines));
+  auto res = con.Query(query_for(customer_glob, orders, lines, c.query));
   std::vector<sirius::test::recording_log_sink::record> records;
   if (logs) {
     records = logs->records();
@@ -434,6 +451,15 @@ void run_deferred_query(deferred_query_case const& c)
 TEST_CASE("a deferred payload rides a real plan and comes back right", "[late_mat][deferred_query]")
 {
   run_deferred_query({.num_gpus = 1, .scan_task_batch_size = 100'000'000, .tag = "late_mat_query"});
+}
+
+TEST_CASE("a deferred payload beside a decimal SUM comes back as values and not rowids",
+          "[late_mat][deferred_query]")
+{
+  run_deferred_query({.num_gpus             = 1,
+                      .scan_task_batch_size = 100'000'000,
+                      .tag                  = "late_mat_query_decimal_sum",
+                      .query                = kDecimalSumQuery});
 }
 
 TEST_CASE("a query can disable late materialization after pinning",

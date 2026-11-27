@@ -182,7 +182,9 @@ void log_operator_data(const op::sirius_physical_operator& op,
 /// or the batches are not the ones the directive was installed for. A port can
 /// receive batches from more than one producer, so a decline is ordinary — and
 /// declining is the only safe answer, since materializing against a stranger's
-/// batch reads arbitrary rows of the pinned table.
+/// batch reads arbitrary rows of the pinned table. A batch that carries the
+/// deferral's rowid and placeholders and still does not match throws instead:
+/// declining it would hand the rowids on as values.
 ///
 /// Restoration changes column values, never rows or their order, so the result is built by
 /// `with_batches_preserving_rows`: it keeps the input's dynamic type and everything that type
@@ -205,6 +207,7 @@ std::unique_ptr<op::operator_data> materialize_deferred_input(
   std::size_t matching = 0;
   for (auto const& batch : batches) {
     views.push_back(batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    late_mat::check_port_batch_is_not_orphaned(directive, views.back(), op.get_operator_id());
     matching += late_mat::port_directive_matches(directive, views.back()) ? 1 : 0;
   }
   if (matching == 0) { return nullptr; }

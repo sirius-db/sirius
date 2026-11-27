@@ -146,7 +146,21 @@ struct port_materialize_directive {
   [[nodiscard]] std::size_t rowid_position() const { return rowid_at; }
 
   /// Whether `schema` is the batch this directive was installed for.
+  ///
+  /// The deferred positions must carry exactly the rowid and placeholder types. Every other
+  /// position must carry its expected type or a strictly narrower carrier of it
+  /// (sirius::can_restore_to): the expected schema is the port input's DECLARED one, and a batch
+  /// legitimately arrives narrower than declared — a grouped SUM over DECIMAL(7,2) emits
+  /// DECIMAL64 partials where DuckDB declares DECIMAL(38,2), and a pin narrows integer columns
+  /// per chunk. Exact equality there declines the deferral's own batch, and the reader gets the
+  /// rowid instead of the values.
   [[nodiscard]] bool matches(std::vector<cudf::data_type> const& schema) const;
+
+  /// Whether `schema` has this directive's arity and the rowid and placeholder types at every
+  /// deferred position, primary and riders alike — whatever its other columns carry. Such a batch
+  /// that does not @ref matches is a deferred batch nobody will materialize, so the port must fail
+  /// rather than pass the rowids on.
+  [[nodiscard]] bool carries_substitutions(std::vector<cudf::data_type> const& schema) const;
 
   /// Self-consistency: the parallel vectors agree, the positions are ascending
   /// and in range, and the schema carries a rowid and placeholders exactly

@@ -135,6 +135,40 @@ TEST_CASE("a batch of another shape is declined", "[late_mat][directive]")
   REQUIRE_FALSE(pair.port.matches(shorter));
 }
 
+TEST_CASE("an untouched column arriving in a narrower carrier still matches",
+          "[late_mat][directive]")
+{
+  // TPC-DS q68 in miniature: c_first_name rides to the result collector beside a SUM over
+  // DECIMAL(7,2). DuckDB declares the SUM DECIMAL(38,2), so the port is built expecting DECIMAL128,
+  // but the grouped aggregate emits DECIMAL64. Declining that batch hands the rowids on as names.
+  cudf::data_type const sum_declared{cudf::type_id::DECIMAL128, -2};
+  cudf::data_type const sum_emitted{cudf::type_id::DECIMAL64, -2};
+  std::vector<cudf::data_type> const scan{
+    dt(cudf::type_id::INT64), dt(cudf::type_id::STRING), dt(cudf::type_id::STRING)};
+  std::vector<cudf::data_type> const port{dt(cudf::type_id::STRING),  // c_last_name
+                                          dt(cudf::type_id::STRING),  // c_first_name
+                                          dt(cudf::type_id::INT64),   // ss_ticket_number
+                                          sum_declared};              // extended_price
+  auto const pair = make_defer_pair(scan, {1}, port, {1}, origins(1));
+  REQUIRE(pair.valid());
+
+  auto arrived = pair.port.expected_schema;
+  arrived[3]   = sum_emitted;
+  REQUIRE(pair.port.matches(arrived));
+  arrived[2] = dt(cudf::type_id::INT32);  // a key narrowed by the pin
+  REQUIRE(pair.port.matches(arrived));
+
+  // Narrower than declared, and only that: a different scale is a different value.
+  auto rescaled = pair.port.expected_schema;
+  rescaled[3]   = cudf::data_type{cudf::type_id::DECIMAL64, -4};
+  REQUIRE_FALSE(pair.port.matches(rescaled));
+  // ...and such a batch still carries the rowid, so the port must fail on it rather than decline.
+  REQUIRE(pair.port.carries_substitutions(rescaled));
+
+  // A batch whose deferred positions hold values is not substituted at all; it is declined.
+  REQUIRE_FALSE(pair.port.carries_substitutions(port));
+}
+
 TEST_CASE("unbuildable requests produce no pair at all", "[late_mat][directive]")
 {
   // Each of these would install a half-deferral, which is worse than none.
