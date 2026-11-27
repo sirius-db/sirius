@@ -1098,6 +1098,71 @@ def _run_one(
         workload._save_metadata()
 
 
+def _run_one_or_record(
+    keep_going,
+    writer,
+    con,
+    name,
+    qnum,
+    it,
+    use_gpu,
+    benchmark_dir,
+    query_texts,
+    duckdb_profiling,
+    s3_input,
+):
+    """_run_one; under --keep-going a failure is recorded as NaN and reported as False."""
+    run_args = (writer, con, name, qnum, it, use_gpu, benchmark_dir, query_texts)
+    if not keep_going:
+        _run_one(*run_args, duckdb_profiling, s3_input)
+        return True
+    try:
+        _run_one(*run_args, duckdb_profiling, s3_input)
+        return True
+    except Exception as exc:
+        _record_failure(writer, benchmark_dir, name, qnum, it, exc)
+        return False
+
+
+def _record_failure(writer, benchmark_dir, name, qnum, it, exc, stage="query"):
+    message = " ".join(str(exc).split())
+    log(f"  {query_name(qnum)} iter{it} {stage} FAILED on {name}: {message[:500]}")
+    writer.record(name, qnum, it, float("nan"))
+    error_path = os.path.join(_query_dir(benchmark_dir, name, qnum), "error.txt")
+    with open(error_path, "a") as f:
+        f.write(f"iter{it} {stage}: {type(exc).__name__}: {message}\n")
+
+
+def _pin_sql(writer, qnum, source, data_source, s3_input):
+    workload = getattr(writer, "workload", None)
+    if workload is not None and hasattr(workload, "pin_sql"):
+        return workload.pin_sql(qnum)
+    return emit_pin(
+        qnum, source, data_source, s3_input.pin_globs() if s3_input else None
+    )
+
+
+def _unpin_sql(writer, qnum):
+    workload = getattr(writer, "workload", None)
+    if workload is not None and hasattr(workload, "unpin_sql"):
+        return workload.unpin_sql(qnum)
+    return emit_unpin(qnum)
+
+
+def _pin_all_sql(writer, source, data_source, s3_input):
+    workload = getattr(writer, "workload", None)
+    if workload is not None and hasattr(workload, "pin_all_sql"):
+        return workload.pin_all_sql()
+    return emit_pin_all(source, data_source, s3_input.pin_globs() if s3_input else None)
+
+
+def _unpin_all_sql(writer):
+    workload = getattr(writer, "workload", None)
+    if workload is not None and hasattr(workload, "unpin_all_sql"):
+        return workload.unpin_all_sql()
+    return emit_unpin_all()
+
+
 def _flush_between_runs(con, profile, use_gpu, source, data_source, workload=None):
     """Flush whatever this profile wants gone before a query run, including the
     first -- otherwise the first run would be the odd one out."""
@@ -1129,6 +1194,7 @@ def run_grouped(
     duckdb_profiling=False,
     pin_after_iteration=0,
     s3_input=None,
+    keep_going=False,
 ):
     """Per-query iterations back-to-back; one connection per engine. Pin per query.
 
@@ -1177,16 +1243,21 @@ def run_grouped(
                             log(
                                 f"  Pinning tables for {query_name(qnum)} (from iter{it})"
                             )
-                            _execute_multi(
-                                con,
-                                emit_pin(
-                                    qnum,
-                                    source,
-                                    data_source,
-                                    s3_input.pin_globs() if s3_input else None,
-                                ),
-                            )
                             pinned = True
+                            try:
+                                _execute_multi(
+                                    con,
+                                    _pin_sql(
+                                        writer, qnum, source, data_source, s3_input
+                                    ),
+                                )
+                            except Exception as exc:
+                                if not keep_going:
+                                    raise
+                                _record_failure(
+                                    writer, benchmark_dir, name, qnum, it, exc, "pin"
+                                )
+                                break
                         log(f"--- {query_name(qnum)} iter{it} engine={name} ---")
                         if drop_scope == "run":
                             _flush_between_runs(
@@ -1197,7 +1268,8 @@ def run_grouped(
                                 data_source,
                                 getattr(writer, "workload", None),
                             )
-                        _run_one(
+                        if not _run_one_or_record(
+                            keep_going,
                             writer,
                             con,
                             name,
@@ -1208,11 +1280,17 @@ def run_grouped(
                             query_texts,
                             duckdb_profiling,
                             s3_input,
-                        )
+                        ):
+                            break
                 finally:
                     if pinned:
                         log(f"  Unpinning tables for {query_name(qnum)}")
-                        _execute_multi(con, emit_unpin(qnum))
+                        try:
+                            _execute_multi(con, _unpin_sql(writer, qnum))
+                        except Exception as exc:
+                            if not keep_going:
+                                raise
+                            log(f"  WARNING: unpin after {query_name(qnum)}: {exc}")
         finally:
             log("Closing connection")
             workload = getattr(writer, "workload", None)
@@ -1237,6 +1315,7 @@ def run_sequential(
     duckdb_profiling=False,
     pin_after_iteration=0,
     s3_input=None,
+    keep_going=False,
 ):
     """Round-robin iterations; one connection per engine. Single union-pin at session start.
 
@@ -1258,6 +1337,7 @@ def run_sequential(
             s3_input=s3_input,
             workload=getattr(writer, "workload", None),
         )
+        failed = set()
         try:
             pinned = False
             try:
@@ -1268,16 +1348,9 @@ def run_sequential(
                         and not pinned
                         and it >= pin_after_iteration
                     ):
-                        log(
-                            f"  Union-pinning all referenced TPC-H tables (from iter{it})"
-                        )
+                        log(f"  Union-pinning all referenced tables (from iter{it})")
                         _execute_multi(
-                            con,
-                            emit_pin_all(
-                                source,
-                                data_source,
-                                s3_input.pin_globs() if s3_input else None,
-                            ),
+                            con, _pin_all_sql(writer, source, data_source, s3_input)
                         )
                         pinned = True
                     if drop_scope == "iteration":
@@ -1291,6 +1364,8 @@ def run_sequential(
                             getattr(writer, "workload", None),
                         )
                     for qnum in queries:
+                        if qnum in failed:
+                            continue
                         log(f"--- {query_name(qnum)} iter{it} engine={name} ---")
                         if drop_scope == "run":
                             _flush_between_runs(
@@ -1301,7 +1376,8 @@ def run_sequential(
                                 data_source,
                                 getattr(writer, "workload", None),
                             )
-                        _run_one(
+                        if not _run_one_or_record(
+                            keep_going,
                             writer,
                             con,
                             name,
@@ -1312,11 +1388,12 @@ def run_sequential(
                             query_texts,
                             duckdb_profiling,
                             s3_input,
-                        )
+                        ):
+                            failed.add(qnum)
             finally:
                 if pinned:
-                    log("  Union-unpinning all TPC-H tables")
-                    _execute_multi(con, emit_unpin_all())
+                    log("  Union-unpinning all referenced tables")
+                    _execute_multi(con, _unpin_all_sql(writer))
         finally:
             log("Closing connection")
             workload = getattr(writer, "workload", None)
@@ -2079,11 +2156,11 @@ def validate(sirius_dir, duckdb_dir, queries, workload=None):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Run TPC-H or scale_bench performance tests"
+        description="Run TPC-H, TPC-DS or scale_bench performance tests"
     )
     p.add_argument(
         "--benchmark",
-        choices=("tpch", "scale_bench"),
+        choices=("tpch", "tpcds", "scale_bench"),
         default="tpch",
         help="Benchmark query/table family (default: tpch)",
     )
@@ -2269,7 +2346,16 @@ def parse_args():
         "--queries",
         type=str,
         default=None,
-        help="Comma-separated queries: TPC-H '1,3,6-10', scale_bench 'gb2,workflow' or 'all' (default: all in selected family)",
+        help="Comma-separated queries: TPC-H/TPC-DS '1,3,6-10', scale_bench 'gb2,workflow' or 'all' (default: all in selected family)",
+    )
+    p.add_argument(
+        "--keep-going",
+        action="store_true",
+        help=(
+            "In-process runners: record a failing query as NaN (error in "
+            "<engine>/q<N>/error.txt), skip its remaining iterations, and continue "
+            "with the next query instead of aborting the run"
+        ),
     )
     p.add_argument(
         "--config",
@@ -2507,10 +2593,11 @@ def _main(args, workload=None):
         if not os.path.isdir(plan_dir):
             raise SystemExit(f"--compression-plan-dir not found: {plan_dir}")
         plan_stems = {os.path.splitext(f)[0] for f in os.listdir(plan_dir)}
-        if not any(t in plan_stems for t in TPCH_TABLES):
+        tables = getattr(workload, "tables", TPCH_TABLES)
+        if not any(t in plan_stems for t in tables):
             raise SystemExit(
-                f"No plan file in {plan_dir} names a TPC-H table; plan files "
-                "are <table>.<ext>"
+                f"No plan file in {plan_dir} names a {args.benchmark} table; plan "
+                "files are <table>.<ext>"
             )
         PIN_COMPRESSION_PLAN_DIR = plan_dir
 
@@ -2631,7 +2718,7 @@ def _main(args, workload=None):
         benchmark=args.benchmark,
     )
     if workload is not None:
-        log("Preparing scale_bench inputs outside query timing")
+        log(f"Preparing {args.benchmark} inputs outside query timing")
         workload.prepare(benchmark_dir)
     os.environ["SIRIUS_LOG_DIR"] = log_dir
     if uses_concurrent_runner(args):
@@ -2758,6 +2845,7 @@ def _main(args, workload=None):
                 duckdb_profiling=args.duckdb_profiling,
                 pin_after_iteration=args.pin_after_iteration,
                 s3_input=s3_input,
+                keep_going=args.keep_going,
             )
         writer.write_totals()
 
@@ -2829,7 +2917,10 @@ def _main(args, workload=None):
         if workload is not None and any(
             r["status"] != "success" for r in results.values()
         ):
-            raise SystemExit("scale_bench validation failed; inspect validation.csv")
+            print_runtime_summary(runtime_csv)
+            raise SystemExit(
+                f"{args.benchmark} validation failed; inspect {validation_csv}"
+            )
 
     print_runtime_summary(runtime_csv)
 
@@ -2848,6 +2939,20 @@ def main():
         with ScaleBench(args.input, queries, args.temp_dir) as workload:
             workload.iterations = args.iterations
             return _main(args, workload)
+    if args.benchmark == "tpcds":
+        from tpcds_workload import Tpcds, check_arguments
+
+        if args.temp_dir is not None:
+            raise SystemExit(
+                "--temp-dir currently applies only to --benchmark scale_bench"
+            )
+        try:
+            queries = check_arguments(args)
+            workload = Tpcds(args.input, queries, args.data_source)
+        except (ValueError, FileNotFoundError, RuntimeError) as exc:
+            raise SystemExit(str(exc)) from exc
+        workload.iterations = args.iterations
+        return _main(args, workload)
     if args.temp_dir is not None:
         raise SystemExit("--temp-dir currently applies only to --benchmark scale_bench")
     if args.result_format == "fingerprint":

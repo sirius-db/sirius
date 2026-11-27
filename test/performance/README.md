@@ -1,12 +1,13 @@
-# TPC-H and scale_bench Performance Testing
+# TPC-H, TPC-DS and scale_bench Performance Testing
 
 This directory contains benchmarking, profiling, and performance testing tools for comparing DuckDB (CPU) vs Sirius (GPU) on TPC-H queries at various scale factors.
 
 ## scale_bench
 
 The primary Python runner also supports `--benchmark scale_bench`. Omitting
-`--benchmark` keeps the existing TPC-H behavior. TPC-DS retains its separate
-runner; the legacy shell scripts in this directory remain TPC-H-specific.
+`--benchmark` keeps the existing TPC-H behavior (see [TPC-DS](#tpc-ds) for
+`--benchmark tpcds`); the legacy shell scripts in this directory remain
+TPC-H-specific.
 
 ```bash
 pixi run python test/performance/performance_test.py \
@@ -123,6 +124,25 @@ wrappers and PageRank reference-result reuse are rejected before preparation.
 CPU JSON profiling is available through the existing `--duckdb-profiling` flag.
 For iterative workloads that JSON profile describes the final result SELECT;
 `runtime_s` also includes all preceding graph steps and materialization.
+
+## TPC-DS
+
+`--benchmark tpcds` runs the 99 queries from DuckDB's `tpcds` extension
+(`--queries 1-10,14` selects a subset) with the DuckDB fallback disabled. The
+input is a parquet directory with `<table>.parquet` or `<table>/*.parquet` per
+table (e.g. from `test/tpcds_performance/generate_tpcds_data.sh` or DuckDB's
+`EXPORT DATABASE`), or a `.duckdb` file with `--data-source duckdb`. Profiles
+and `--pin gpu|host|parquet` work as for TPC-H; pins cover the columns each
+query references. `--keep-going` records a failing query as `NaN` with
+`<engine>/q<N>/error.txt` instead of aborting the run (also useful for TPC-H).
+
+`run_tpcds.sh` wraps this with the `bench/sf1000-repro` settings
+(`tpcds_sirius.yaml`, compressed pinning, `ast_jit`):
+
+```bash
+DATA=/path/to/tpcds_sf100 pixi run bash test/performance/run_tpcds.sh \
+  --engine both --validation --keep-going --iterations 2 --pin gpu
+```
 
 ## Prerequisites
 
