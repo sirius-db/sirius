@@ -43,6 +43,7 @@ class ColumnRef(Expr):
     alias: str
     name: str
     type: st.SqlType
+    computed_float: bool = False
 
     @property
     def kind(self) -> str:  # type: ignore[override]
@@ -80,6 +81,16 @@ class Arith(Expr):
 
     def label(self) -> str:
         return f"Arith({self.op})"
+
+
+@dataclass
+class Unary(Expr):
+    op: str
+    child: Expr
+    kind: str
+
+    def sql(self) -> str:
+        return f"({self.op}{self.child.sql()})"
 
 
 @dataclass
@@ -146,6 +157,7 @@ class Cast(Expr):
     child: Expr
     type: st.SqlType
     try_: bool = False
+    family: str | None = None
 
     @property
     def kind(self) -> str:  # type: ignore[override]
@@ -156,7 +168,7 @@ class Cast(Expr):
         return f"{fn}({self.child.sql()} AS {self.type.name})"
 
     def label(self) -> str:
-        return f"Cast({self.type.kind})"
+        return f"Cast({self.family or self.type.kind})"
 
 
 @dataclass
@@ -173,6 +185,22 @@ class Case(Expr):
             parts.append(f"ELSE {self.else_.sql()}")
         parts.append("END")
         return "(" + " ".join(parts) + ")"
+
+
+@dataclass
+class SimpleCase(Expr):
+    operand: Expr
+    whens: list[tuple[Expr, Expr]]
+    else_: Expr | None
+    kind: str
+
+    def sql(self) -> str:
+        parts = ["CASE", self.operand.sql()]
+        for value, result in self.whens:
+            parts.append(f"WHEN {value.sql()} THEN {result.sql()}")
+        if self.else_ is not None:
+            parts.append(f"ELSE {self.else_.sql()}")
+        return "(" + " ".join(parts) + " END)"
 
 
 @dataclass
@@ -229,16 +257,22 @@ class Agg(Expr):
     arg: Expr | None
     distinct: bool = False
     kind: str = "unknown"
+    filter: Expr | None = None
+    family: str | None = None
 
     def sql(self) -> str:
         if self.name == "count_star":
-            return "count(*)"
-        assert self.arg is not None
-        d = "DISTINCT " if self.distinct else ""
-        return f"{self.name}({d}{self.arg.sql()})"
+            body = "count(*)"
+        else:
+            assert self.arg is not None
+            d = "DISTINCT " if self.distinct else ""
+            body = f"{self.name}({d}{self.arg.sql()})"
+        if self.filter is not None:
+            body += f" FILTER (WHERE {self.filter.sql()})"
+        return body
 
     def label(self) -> str:
-        return f"Agg({self.name}{',distinct' if self.distinct else ''})"
+        return f"Agg({self.name}{',distinct' if self.distinct else ''}{',filter' if self.filter else ''}{',expression:' + self.family if self.family else ''})"
 
 
 @dataclass
@@ -280,9 +314,18 @@ class Window(Expr):
     partition_by: list[Expr]
     order_by: list["OrderItem"]
     kind: str = "unknown"
+    frame: str | None = None
+    arg_family: str | None = None
+
+    def label(self) -> str:
+        return f"Window({self.name}{',running' if self.frame else ''}{',arg:' + self.arg_family if self.arg_family else ''})"
 
     def sql(self) -> str:
-        inner = self.arg.sql() if self.arg is not None else ""
+        inner = (
+            self.arg.sql()
+            if self.arg is not None
+            else ("*" if self.name == "count" else "")
+        )
         parts = []
         if self.partition_by:
             parts.append(
@@ -290,6 +333,8 @@ class Window(Expr):
             )
         if self.order_by:
             parts.append("ORDER BY " + ", ".join(o.sql() for o in self.order_by))
+        if self.frame:
+            parts.append(self.frame)
         return f"{self.name}({inner}) OVER ({' '.join(parts)})"
 
 
@@ -371,6 +416,28 @@ class Alias(Expr):
 
     def sql(self) -> str:
         return q(self.name)
+
+
+def output_items(query: "Query") -> list[SelectItem]:
+    """The select list that defines a query's output columns."""
+    node = query
+    while isinstance(node, SetOp):
+        node = node.arms[0]
+    return node.items if isinstance(node, Select) else []
+
+
+def has_computed_float(items: list[SelectItem], names: set[str] | None = None) -> bool:
+    """True when an output column (restricted to ``names`` when given) is a FLOAT/DOUBLE
+    produced by an aggregate or arithmetic rather than read from a table. CPU and GPU agree
+    on such values only within tolerance, so sorting on them can legitimately permute
+    near-ties; they are not usable as ORDER BY keys for a positional comparison or LIMIT.
+    """
+    return any(
+        (names is None or it.alias in names)
+        and it.expr.kind == "float"
+        and (not isinstance(it.expr, ColumnRef) or it.expr.computed_float)
+        for it in items
+    )
 
 
 @dataclass

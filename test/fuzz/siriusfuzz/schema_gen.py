@@ -29,6 +29,7 @@ class Column:
     type: st.SqlType
     null_ratio: float = 0.0
     all_null: bool = False
+    no_null: bool = False
 
     def ddl(self) -> str:
         return f'"{self.name}" {self.type.name}'
@@ -39,12 +40,22 @@ class Table:
     name: str
     columns: list[Column]
     rows: list[tuple[Any, ...]] = field(default_factory=list)
+    insert_select: str | None = None
+    generated_rows: int | None = None
+
+    @property
+    def row_count(self) -> int:
+        return (
+            self.generated_rows if self.generated_rows is not None else len(self.rows)
+        )
 
     def create_sql(self) -> str:
         cols = ", ".join(c.ddl() for c in self.columns)
         return f'CREATE TABLE "{self.name}" ({cols});'
 
     def insert_sql(self, order: list[int] | None = None, batch: int = 500) -> list[str]:
+        if self.insert_select is not None:
+            return [self.insert_select]
         idx = order if order is not None else list(range(len(self.rows)))
         stmts: list[str] = []
         for start in range(0, len(idx), batch):
@@ -67,6 +78,10 @@ class Dataset:
     tables: list[Table]
     seed: int
 
+    @property
+    def has_facts(self) -> bool:
+        return any(t.name.startswith("f") for t in self.tables)
+
     def schema_sql(self) -> str:
         return "\n".join(t.create_sql() for t in self.tables)
 
@@ -75,6 +90,16 @@ class Dataset:
         out: list[str] = []
         rng = random.Random(permutation_seed) if permutation_seed is not None else None
         for t in self.tables:
+            if t.insert_select is not None:
+                if permutation_seed is None:
+                    out.append(t.insert_select)
+                else:
+                    # The source rows stay identical; only their insertion order changes.
+                    order = (
+                        f" ORDER BY ((i * 17 + {permutation_seed % 1000003}) % 1000003)"
+                    )
+                    out.append(t.insert_select.replace(" r(i);", " r(i)" + order + ";"))
+                continue
             order = list(range(len(t.rows)))
             if rng is not None:
                 rng.shuffle(order)
@@ -123,7 +148,15 @@ class DataGenerator:
     def __init__(self, config: FuzzConfig, rng: random.Random):
         self.cfg = config
         self.rng = rng
-        self.types = st.types_from_names(config.features.types)
+        self.types = st.types_from_names(
+            config.features.types, config.types.decimal_widths
+        )
+        if config.types.hugeint:
+            self.types.append(st.HUGEINT)
+        if config.types.uhugeint:
+            self.types.append(st.UHUGEINT)
+        if config.types.array:
+            self.types.append(st.INTEGER_ARRAY_3)
         self._pools: dict[str, list[Any]] = {}
 
     # -- pools -------------------------------------------------------------
@@ -165,8 +198,12 @@ class DataGenerator:
         words = list(_COMMON_WORDS)
         if self.cfg.data.strings.charset == "unicode":
             words += _UNICODE_WORDS
+        elif self.cfg.data.strings.charset == "utf8":
+            words += ["café", "東京", "😀"]
         self._pools["varchar"] = words
         self._pools["bool"] = [True, False]
+        if self.cfg.types.array:
+            self._pools["array"] = [[0, 0, 0], [1, 2, 3], [-1, 0, 1]]
 
     def pool(self, kind: str) -> list[Any]:
         if not self._pools:
@@ -180,7 +217,13 @@ class DataGenerator:
         the value pools it builds stay for the queries generated over it."""
         self.rng = rng = random.Random(seed)
         self._build_pools()
-        lo, hi = self.cfg.data.tables
+        large = (
+            self.cfg.data.large.fraction > 0
+            and rng.random() < self.cfg.data.large.fraction
+        )
+        self._large = large
+        self._long_string_used = False
+        lo, hi = self.cfg.data.large.dims if large else self.cfg.data.tables
         n_tables = rng.randint(lo, hi)
         tables: list[Table] = []
         for ti in range(n_tables):
@@ -201,11 +244,82 @@ class DataGenerator:
             n_rows = rng.randint(rows_lo, rows_hi)
             table = Table(f"t{ti}", cols)
             table.rows = [tuple(self.value(c) for c in cols) for _ in range(n_rows)]
+            if large:
+                table.rows = [(i, *row[1:]) for i, row in enumerate(table.rows)]
             tables.append(table)
+        if large:
+            fact_lo, fact_hi = self.cfg.data.large.fact_tables
+            dims = list(tables)
+            for fi in range(rng.randint(fact_lo, fact_hi)):
+                tables.append(self._fact_table(fi, dims))
         return Dataset(tables, seed)
+
+    def _fact_table(self, index: int, dims: list[Table]) -> Table:
+        rng = self.rng
+        columns = [Column("k", st.BIGINT)]
+        columns += [Column(f"fk_{dim.name}", st.INTEGER) for dim in dims]
+        payload_count = rng.randint(3, 6)
+        forced = [
+            st.VARCHAR,
+            rng.choice([t for t in self.types if t.is_numeric] or [st.INTEGER]),
+        ]
+        for ci in range(payload_count):
+            typ = forced[ci] if ci < len(forced) else rng.choice(self.types)
+            columns.append(Column(f"c{ci}_{_abbrev(typ)}", typ))
+        count = rng.randint(*self.cfg.data.large.fact_rows)
+        select = ["i"]
+        large = self.cfg.data.large
+        null_cut = round(1000 * large.null_fk_ratio)
+        dangling_cut = null_cut + round(1000 * large.dangling_fk_ratio)
+        skew_cut = round(1000 * large.skew)
+        for dim in dims:
+            salt = rng.randrange(1, 100000)
+            odd = rng.randrange(1, 1000) * 2 + 1
+            n = len(dim.rows)
+            valid = f"CASE WHEN ((i * {odd} + {salt}) % 1000) < {skew_cut} THEN ((i * 13 + {salt}) % {min(n, 10)}) ELSE ((i * {odd} + {salt}) % {n}) END"
+            selector = f"((i * 31 + {salt}) % 1000)"
+            select.append(
+                f"CASE WHEN {selector} < {null_cut} THEN NULL "
+                f"WHEN {selector} < {dangling_cut} THEN {n} + ((i + {salt}) % 97) "
+                f"ELSE {valid} END"
+            )
+        for col in columns[1 + len(dims) :]:
+            pool = [self._fit(value, col.type) for value in self.pool(col.type.kind)]
+            odd = rng.randrange(1, 1000) * 2 + 1
+            salt = rng.randrange(1, 100000)
+            arms = " ".join(
+                f"WHEN {j} THEN "
+                + (
+                    f"CAST({st.render_insert_value(value, col.type)} AS {col.type.name})"
+                    if col.type.kind == "decimal"
+                    else st.render_insert_value(value, col.type)
+                )
+                for j, value in enumerate(pool)
+            )
+            select.append(
+                f"CAST(CASE ((i * {odd} + {salt}) % {len(pool)}) {arms} END AS {col.type.name})"
+            )
+        statement = (
+            f'INSERT INTO "f{index}" SELECT '
+            + ", ".join(select)
+            + f" FROM range({count}) r(i);"
+        )
+        return Table(
+            f"f{index}", columns, insert_select=statement, generated_rows=count
+        )
 
     def _assign_nulls(self, col: Column) -> None:
         nulls = self.cfg.nulls
+        if self.cfg.data.null_density_extremes:
+            extreme = self.rng.random()
+            if extreme < 0.02:
+                col.all_null = True
+                col.null_ratio = 1.0
+                return
+            if extreme < 0.04:
+                col.no_null = True
+                col.null_ratio = 0.0
+                return
         if self.rng.random() < nulls.all_null_column_probability:
             col.all_null = True
             col.null_ratio = 1.0
@@ -232,6 +346,9 @@ class DataGenerator:
         if kind == "bool":
             return rng.random() < 0.5
         if kind == "int":
+            if typ.bits == 128 and rng.random() < 0.2:
+                magnitude = (1 << 64) + rng.randint(0, 1000)
+                return magnitude if not typ.signed or rng.random() < 0.5 else -magnitude
             lo, hi = self._int_bounds(typ)
             return rng.randint(lo, hi)
         if kind == "float":
@@ -254,6 +371,8 @@ class DataGenerator:
             )
         if kind == "varchar":
             return self._random_string()
+        if kind == "array":
+            return [rng.randint(-10, 10) for _ in range(3)]
         raise ValueError(kind)
 
     def _fit(self, v: Any, typ: st.SqlType) -> Any:
@@ -262,8 +381,12 @@ class DataGenerator:
             lo, hi = typ.int_range()
             return max(lo, min(hi, int(v)))
         if typ.kind == "decimal":
-            q = decimal.Decimal(1).scaleb(-typ.scale)
-            return decimal.Decimal(v).quantize(q)
+            with decimal.localcontext() as context:
+                context.prec = max(50, typ.precision + 5)
+                q = decimal.Decimal(1).scaleb(-typ.scale)
+                fitted = decimal.Decimal(v).quantize(q)
+                maximum = decimal.Decimal(10) ** (typ.precision - typ.scale) - q
+                return max(-maximum, min(maximum, fitted))
         if typ.kind == "float" and typ.bits == 32:
             return float(f"{float(v):.7g}")
         if typ.kind == "timestamp":
@@ -296,17 +419,37 @@ class DataGenerator:
                 choices.append(-0.0)
             if ev.nan_inf:
                 choices += [float("nan"), float("inf"), float("-inf")]
+            if ev.rounding_ties:
+                choices += [2.5, 0.125, -1.5]
             return rng.choice(choices) if choices else None
         if typ.kind == "date" and ev.date_extremes:
+            # Without date_beyond_ns the extremes stay inside what a
+            # nanosecond timestamp can hold.
             return rng.choice(
                 [dt.date(1970, 1, 1), dt.date(1, 1, 1), dt.date(9999, 12, 31)]
+                if ev.date_beyond_ns
+                else [dt.date(1970, 1, 1), dt.date(1677, 9, 22), dt.date(2262, 4, 11)]
             )
         if typ.kind == "timestamp" and ev.date_extremes:
             return rng.choice(
                 [dt.datetime(1970, 1, 1), dt.datetime(2262, 4, 11, 23, 47, 16)]
             )
         if typ.kind == "varchar":
-            return rng.choice(["", " ", "%", "_", "''", "\\"])
+            choices = ["", " ", "   ", "%", "_", "''", "\\", "a%b", "a_b"]
+            if ev.unicode_case:
+                choices += ["straße", "İstanbul", "ǅ", "😀"]
+            if (
+                ev.long_string
+                and not getattr(self, "_large", False)
+                and not getattr(self, "_long_string_used", False)
+            ):
+                choices.append("a" * 65537)
+            value = rng.choice(choices)
+            if len(value) > 65536:
+                self._long_string_used = True
+            return value
+        if typ.kind == "array":
+            return rng.choice([[0, 0, 0], [1, 2, 3], [-1, 0, 2147483647]])
         return None
 
     def _random_string(self) -> str:
@@ -315,10 +458,26 @@ class DataGenerator:
         if rng.random() < s.empty_string_ratio:
             return ""
         alphabet = string.ascii_letters + string.digits + " _%-."
-        if s.charset == "unicode":
+        if s.charset == "utf8":
+            alphabet += "é日本😀"
+        elif s.charset == "unicode":
             alphabet += "éßΩ日本😀"
-        n = rng.randint(1, max(1, s.max_len))
-        return "".join(rng.choice(alphabet) for _ in range(n))
+        if s.max_len > 40 and rng.random() < 0.01:
+            n = rng.choice(
+                [min(s.max_len, 1024), min(s.max_len, 2048), s.max_len - 1, s.max_len]
+            )
+        else:
+            n = rng.randint(1, max(1, min(40, s.max_len)))
+        chars: list[str] = []
+        used_bytes = 0
+        for _ in range(n):
+            char = rng.choice(alphabet)
+            size = len(char.encode("utf8"))
+            if used_bytes + size > s.max_len:
+                break
+            chars.append(char)
+            used_bytes += size
+        return "".join(chars)
 
 
 def _abbrev(typ: st.SqlType) -> str:
@@ -330,4 +489,5 @@ def _abbrev(typ: st.SqlType) -> str:
         "date": "dt",
         "timestamp": "ts",
         "varchar": "s",
+        "array": "a",
     }[typ.kind]

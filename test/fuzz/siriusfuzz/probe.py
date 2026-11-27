@@ -72,8 +72,12 @@ def execute_probe(payload: dict[str, Any], work: pathlib.Path) -> dict[str, Any]
             )
         else:
             # The shell parses the entire script; quoted semicolons and comments survive.
-            session.execute(pathlib.Path(payload["dataset"]).read_text())
+            from .dataset_variants import from_dataset_sql
+
+            dataset_sql = pathlib.Path(payload["dataset"]).read_text()
+            session.execute(dataset_sql)
             session.execute("CHECKPOINT")
+            session.apply_dataset_variants("replay", from_dataset_sql(dataset_sql))
         if session.gpu_available:
             ok, why = session.check_interception()
             write_json(work / "canary.json", {"ok": ok, "detail": why})
@@ -111,6 +115,7 @@ def execute_probe(payload: dict[str, Any], work: pathlib.Path) -> dict[str, Any]
             ev.timeout = timeout
             ev.forced_variant = payload.get("variant")
             ev.replay_mode = payload.get("comparison", "multiset")
+            ev.forced_tlp = payload.get("tlp")
             ev.variants = {}  # replay only the recorded variant, never a random one
             if ev.forced_variant:
                 for name in ev.forced_variant:
