@@ -242,13 +242,14 @@ TEST_CASE_METHOD(late_join_fixture,
   }
   SECTION("a lookup table with a VARCHAR key, on another branch than the largest table")
   {
-    // Every meter is read in every batch, so each of the three shifts has the five (label, zone)
-    // pairs of the six sites.
+    // The six sites have five (label, zone) pairs. A VARCHAR key is as wide as the columns it
+    // replaces, so the rows carry nothing less: the size bound is off here.
+    request->min_carried_bytes = 0;
     expect_moved(1,
-                 "select shift, label, zone, sum(reading), min(reading) from readings join "
-                 "batches on batch = batch_id join meters on meter = meter_id join sites on site "
-                 "= code group by shift, label, zone order by shift, label, zone",
-                 3 * 5);
+                 "select label, zone, sum(reading), min(reading) from readings join batches on "
+                 "batch = batch_id join meters on meter = meter_id join sites on site = code "
+                 "group by label, zone order by label, zone",
+                 5);
   }
   SECTION("an aggregate estimated at the bound")
   {
@@ -312,4 +313,18 @@ TEST_CASE_METHOD(late_join_fixture,
   expect_moved(1, by_nation_and_year(), names_and_years);
   request->min_carried_bytes = carried + 1;
   expect_moved(0, by_nation_and_year(), names_and_years);
+}
+
+TEST_CASE_METHOD(late_join_fixture,
+                 "a lookup join whose key is as wide as its columns is not moved",
+                 "[planner][join_dimension_after_aggregate]")
+{
+  // Every meter is read in every batch, so each of the three shifts has the five (label, zone)
+  // pairs of the six sites. Neither the batches join (shift for batch) nor the sites join (label
+  // and zone for two copies of the VARCHAR site) leaves the rows narrower.
+  expect_moved(0,
+               "select shift, label, zone, sum(reading), min(reading) from readings join "
+               "batches on batch = batch_id join meters on meter = meter_id join sites on site "
+               "= code group by shift, label, zone order by shift, label, zone",
+               3 * 5);
 }
