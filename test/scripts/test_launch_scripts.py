@@ -1,16 +1,19 @@
 """Tests of scripts/compare_answers.py, sirius_distributed_config.py, launcher_env.sh and
 sirius_net.sh. No GPU."""
 
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import compare_answers  # noqa: E402
+import sirius_rank_cpus  # noqa: E402
 
 TIME = "Run Time (s): real 0.5 user 0.1 sys 0.1"
 
@@ -238,6 +241,46 @@ class RailDevices(unittest.TestCase):
     def test_fewer_than_two_rails_is_none(self):
         done = self.rails([("mlx5_0", 1, "rail0", "4: ACTIVE", 400000, False)])
         self.assertEqual((done.returncode, done.stdout), (1, ""))
+
+
+class RankCpus(unittest.TestCase):
+    # Socket 0: cores 0-3 with hyperthreads 8-11, two GPUs. Socket 1: cores 4-7 and 12-15, one.
+    GPUS = {
+        "0000:03:00.0": "0-3,8-11",
+        "0000:73:00.0": "0-3,8-11",
+        "0000:83:00.0": "4-7,12-15",
+    }
+
+    def share(self, bus_id):
+        def read(path):
+            cpu = re.fullmatch(r"/sys/devices/system/cpu/cpu(\d+)/topology/.*", path)
+            if cpu:
+                return f"{int(cpu[1]) % 8},{int(cpu[1]) % 8 + 8}"
+            device, name = path.rsplit("/", 1)
+            local = self.GPUS[device.rsplit("/", 1)[1]]
+            return {"vendor": "0x10de", "class": "0x030200", "local_cpulist": local}[
+                name
+            ]
+
+        smi = subprocess.CompletedProcess([], 0, f"0000{bus_id.upper()}\n", "")
+        devices = ["/sys/bus/pci/devices/" + gpu for gpu in self.GPUS]
+        with mock.patch.object(sirius_rank_cpus, "read", read), mock.patch.object(
+            sirius_rank_cpus.glob, "glob", return_value=devices
+        ), mock.patch.object(sirius_rank_cpus.subprocess, "run", return_value=smi):
+            return sirius_rank_cpus.gpu_share("0", set(range(16)))
+
+    def test_gpus_on_one_socket_split_its_cores(self):
+        self.assertEqual(self.share("0000:03:00.0"), [0, 8, 1, 9])
+        self.assertEqual(self.share("0000:73:00.0"), [2, 10, 3, 11])
+
+    def test_a_gpu_alone_on_its_socket_takes_it(self):
+        self.assertEqual(
+            sorted(self.share("0000:83:00.0")), [4, 5, 6, 7, 12, 13, 14, 15]
+        )
+
+    def test_ranges(self):
+        self.assertEqual(sirius_rank_cpus.ranges({0, 1, 8, 9, 12}), "0-1,8-9,12")
+        self.assertEqual(sirius_rank_cpus.cpulist("0-1,8-9,12\n"), [0, 1, 8, 9, 12])
 
 
 if __name__ == "__main__":
