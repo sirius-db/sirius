@@ -230,3 +230,64 @@ TEST_CASE("materialize: multiple wirings to the same destination attach distinct
   CHECK(build_port->src_pipeline == build_pipeline_handle);
   CHECK(default_port->repo != build_port->repo);  // Each port has its own repo.
 }
+
+namespace {
+
+class finishable_pipeline : public sirius_pipeline {
+ public:
+  using sirius_pipeline::sirius_pipeline;
+  bool is_pipeline_finished() const override { return finished; }
+  bool finished = false;
+};
+
+}  // namespace
+
+TEST_CASE("spill rank orders repositories by when their consumer can run",
+          "[repository_wiring][materializer]")
+{
+  wiring_test_env env;
+  cucascade::shared_data_repository_manager mgr;
+  std::vector<std::shared_ptr<finishable_pipeline>> p;
+  std::vector<sirius::op::test_physical_operator> sinks(5);
+  sirius::op::test_physical_operator partition_op;
+  sirius::op::test_physical_operator join_op;
+  for (size_t i = 0; i < sinks.size(); ++i) {
+    auto pipeline = std::make_shared<finishable_pipeline>(env.build_ctx);
+    sirius_pipeline_build_state build_state;
+    build_state.set_pipeline_sink(*pipeline, &sinks[i], /*pipeline_idx=*/0);
+    if (i == 1) { build_state.add_pipeline_operator(*pipeline, partition_op); }
+    if (i == 4) { build_state.add_pipeline_operator(*pipeline, join_op); }
+    pipeline->set_pipeline_id(i);
+    p.push_back(pipeline);
+    env.pipelines.push_back(pipeline);
+  }
+  // Scheduled order: 0 scan -> 1 partition (FULL); 2 build and 3 probe producers -> 4 join.
+  std::vector<repository_wiring> wirings = {
+    {std::string_view{"default"}, MemoryBarrierType::FULL, &sinks[0], p[0], p[1]},
+    {std::string_view{"build"}, MemoryBarrierType::PARTIAL, &sinks[2], p[2], p[4]},
+    {std::string_view{"default"}, MemoryBarrierType::PARTIAL, &sinks[3], p[3], p[4]},
+  };
+  env.assign_ids();
+  materialize_repository_wiring(wirings, mgr);
+  auto rank = sirius::pipeline::make_spill_rank(wirings, env.pipelines, mgr);
+
+  auto const* partition_input = partition_op.get_port("default")->repo;
+  auto const* join_build      = join_op.get_port("build")->repo;
+  auto const* join_probe      = join_op.get_port("default")->repo;
+  CHECK(rank(partition_input) == 0);
+  CHECK(rank(join_build) == 3);
+  CHECK(rank(join_probe) == 3);
+
+  // The join still waits for its probe producer once the build side is done.
+  p[2]->finished = true;
+  CHECK(rank(join_build) == 3);
+  p[3]->finished = true;
+  CHECK(rank(join_build) == -1);
+  CHECK(rank(join_probe) == -1);
+
+  p[0]->finished = true;
+  CHECK(rank(partition_input) == -1);
+
+  cucascade::shared_data_repository unknown;
+  CHECK(rank(&unknown) == -1);
+}

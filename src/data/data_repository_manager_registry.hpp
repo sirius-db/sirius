@@ -21,6 +21,7 @@
 #include <cucascade/data/data_repository_manager.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -53,6 +54,12 @@ class data_repository_manager_registry {
   using manager_type           = cucascade::shared_data_repository_manager;
   using manager_ptr            = std::shared_ptr<manager_type>;
   using leaked_repository_info = manager_type::leaked_repository_info;
+  using repository_type        = cucascade::shared_data_repository;
+  /// How far in the future a repository's batches are needed; larger means later. Spill sweeps
+  /// visit a query's repositories in descending rank. Must be safe to call from any thread for
+  /// as long as the query's manager is registered.
+  using spill_rank_fn     = std::function<std::int64_t(repository_type const*)>;
+  using spill_rank_fn_ptr = std::shared_ptr<spill_rank_fn const>;
 
   data_repository_manager_registry()  = default;
   ~data_repository_manager_registry() = default;
@@ -115,6 +122,21 @@ class data_repository_manager_registry {
     return result;
   }
 
+  /// Install @p query_id's spill rank. Ignored if the query has no manager.
+  void set_spill_rank(sirius::query_id_t query_id, spill_rank_fn_ptr rank)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_managers.contains(query_id)) { _spill_ranks[query_id] = std::move(rank); }
+  }
+
+  /// @p query_id's spill rank, or nullptr if none was installed.
+  [[nodiscard]] spill_rank_fn_ptr get_spill_rank(sirius::query_id_t query_id) const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto it = _spill_ranks.find(query_id);
+    return it == _spill_ranks.end() ? nullptr : it->second;
+  }
+
   /// Identity snapshot only. A spill sweep acquires one victim's lifecycle lease before
   /// dereferencing its manager, so a snapshot cannot prolong every query's retirement.
   [[nodiscard]] std::vector<std::pair<query_id_t, manager_ptr>> candidates() const
@@ -140,8 +162,13 @@ class data_repository_manager_registry {
   std::vector<leaked_repository_info> erase(sirius::query_id_t query_id)
   {
     manager_ptr manager;
+    spill_rank_fn_ptr rank;
     {
       std::lock_guard<std::mutex> lock(_mutex);
+      if (auto r = _spill_ranks.find(query_id); r != _spill_ranks.end()) {
+        rank = std::move(r->second);
+        _spill_ranks.erase(r);
+      }
       auto it = _managers.find(query_id);
       if (it == _managers.end()) { return {}; }
       manager = std::move(it->second);
@@ -154,9 +181,11 @@ class data_repository_manager_registry {
   void clear()
   {
     std::map<query_id_t, manager_ptr> drained;
+    std::map<query_id_t, spill_rank_fn_ptr> drained_ranks;
     {
       std::lock_guard<std::mutex> lock(_mutex);
       drained.swap(_managers);
+      drained_ranks.swap(_spill_ranks);
     }
     // Destroyed outside the lock: manager destruction releases data batches, which can run
     // arbitrary deallocation work that must not happen with the registry mutex held.
@@ -173,6 +202,7 @@ class data_repository_manager_registry {
   mutable std::mutex _mutex;
   /// std::map (not unordered_map) so get_all() iteration is ascending by query id.
   std::map<sirius::query_id_t, manager_ptr> _managers;
+  std::map<sirius::query_id_t, spill_rank_fn_ptr> _spill_ranks;
 };
 
 }  // namespace sirius::data

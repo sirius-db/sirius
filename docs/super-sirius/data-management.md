@@ -59,7 +59,7 @@ Data repositories are thread-safe containers managed by a `shared_data_repositor
 - Support partitioned storage (multiple partitions per repository)
 - Provide `add_data_batch()` for producers and `pop_next_data_batch()` for consumers (non-blocking; returns `nullptr` if empty)
 - Track total size and per-partition sizes
-- Registered in the query's `shared_data_repository_manager` for downgrade candidate selection
+- Registered in the query's `shared_data_repository_manager` for downgrade candidate selection; the `data_repository_manager_registry` also holds the query's spill rank, which orders that selection (see [Memory Management](memory-management.md#candidate-selection-strategy))
 
 ### Logical batch positions
 
