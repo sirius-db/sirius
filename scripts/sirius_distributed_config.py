@@ -39,6 +39,8 @@ KEYS = {
     ("ucx", "net_devices"): "UCX_NET_DEVICES",
     ("ucx", "rails"): "SIRIUS_UCX_RAILS",
 }
+# A group may be there with every key commented out; YAML then gives it no value.
+GROUPS = {keys[:-1] for keys in KEYS}
 
 
 def config_path():
@@ -58,6 +60,8 @@ def flatten(node, prefix=()):
     for key, value in node.items():
         if isinstance(value, dict):
             yield from flatten(value, prefix + (key,))
+        elif value is None and prefix + (key,) in GROUPS:
+            continue
         else:
             yield prefix + (key,), value
 

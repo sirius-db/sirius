@@ -103,6 +103,15 @@ class DistributedConfig(unittest.TestCase):
             ],
         )
 
+    def test_group_with_no_keys(self):
+        done = self.read(
+            "sirius:\n  distributed:\n    cluster: x\n    gateway:\n      # port: 1\n"
+        )
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(
+            done.stdout.splitlines(), ["export SIRIUS_CLUSTER=${SIRIUS_CLUSTER:-x}"]
+        )
+
     def test_rails(self):
         done = self.read("sirius:\n  distributed:\n    ucx: { rails: true }\n")
         self.assertEqual(
