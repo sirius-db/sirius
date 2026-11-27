@@ -354,7 +354,6 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "prettyplease 0.2.37",
  "proc-macro2",
  "quote",
  "regex",
@@ -3020,6 +3019,8 @@ name = "sirius-sys"
 version = "0.1.0"
 dependencies = [
  "bindgen 0.73.2",
+ "prettyplease 0.2.37",
+ "syn 2.0.119",
 ]
 
 [[package]]

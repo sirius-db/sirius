@@ -33,14 +33,21 @@ pub fn run(manifest: &Path) {
         .use_core()
         .rust_target(bindgen::RustTarget::stable(85, 0).unwrap())
         .rust_edition(bindgen::RustEdition::Edition2024)
-        .formatter(bindgen::Formatter::Prettyplease);
+        .formatter(bindgen::Formatter::None);
     let generate = |target: &str| {
-        builder
+        let bindings = builder
             .clone()
             .clang_arg(format!("--target={target}"))
             .generate()
             .expect("generate C ABI bindings")
-            .to_string()
+            .to_string();
+        // Bindgen's broad syn and prettyplease ranges can resolve incompatible
+        // major versions. Format its tokens with our paired dependencies instead.
+        let (header, rest) = bindings.split_once("\n\n").expect("bindgen header");
+        let (raw_lines, tokens) = rest.split_once("\n\n").expect("bindgen raw lines");
+        let formatted =
+            prettyplease::unparse(&syn::parse_file(tokens).expect("parse generated bindings"));
+        format!("{header}\n\n{raw_lines}\n\n{formatted}")
     };
     let contents = generate("x86_64-unknown-linux-gnu");
     assert_eq!(
