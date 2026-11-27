@@ -740,6 +740,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                                    build_side_unique_column,
                                                    condition_value_domains);
 
+    // With no other evidence, the filter is worth building only if the expected one arrived.
+    if (build_targeted && !(build_filtered || build_opaque || build_join_filtered)) {
+      for (auto& key : admitted_keys) {
+        key.build_reduction_expected = true;
+      }
+    }
+
     // Prefer scan binding; each key uses one route.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;

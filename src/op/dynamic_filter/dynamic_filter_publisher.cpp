@@ -134,8 +134,13 @@ bool consider_bound_key(dynamic_filter_stats_snapshot& counts,
     if (build_rows > domain.cardinality) { ++counts.keys_build_exceeded_domain; }
   }
   bool const eligible = publishable && key.domain_gate_eligible();
-  bool const gated    = domain_coverage_gate_fires(
-    build_rows, domain.cardinality, eligible, plan.domain_coverage_threshold());
+  bool const gated =
+    domain_coverage_gate_fires(
+      build_rows, domain.cardinality, eligible, plan.domain_coverage_threshold()) ||
+    unreduced_build_gate_fires(build_rows,
+                               key.build_key_value_domain,
+                               publishable && key.build_reduction_expected,
+                               plan.domain_coverage_threshold());
   log::log_noexcept([&] {
     SIRIUS_LOG_DEBUG(
       "[dynamic_filter_domain] path={} condition={} rows={} domain={} provenance={} eligible={} "

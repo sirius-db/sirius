@@ -99,6 +99,9 @@ class dynamic_filter_publish_plan final {
     bool build_key_proven_unique = false;
     // NULL-safe equality: retain probe NULLs as conservative false positives.
     bool preserve_nulls = false;
+    /// The join's only evidence is a dynamic filter expected on its build scan. The key is skipped
+    /// when the build arrives about as large as that scan (`build_key_value_domain`).
+    bool build_reduction_expected = false;
 
     /// Whether the domain gate may judge this key: a uniqueness proof or a backed declaration
     [[nodiscard]] bool domain_gate_eligible() const noexcept

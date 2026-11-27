@@ -733,6 +733,14 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     auto* inner = require_nested_join(plan.get());
     require_single_scan_target(inner);
+    // Only the join that depends on the expected filter is told to check that it arrived.
+    auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    for (auto* join : joins) {
+      auto const& keys =
+        join->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().admitted_keys();
+      REQUIRE_FALSE(keys.empty());
+      CHECK(keys[0].build_reduction_expected == (join == inner));
+    }
     auto* probe_subtree =
       require_join_child_wrap(inner->children[0].get(), inner, /*is_build=*/false);
     REQUIRE(probe_subtree->type == SiriusPhysicalOperatorType::DYNAMIC_FILTER);

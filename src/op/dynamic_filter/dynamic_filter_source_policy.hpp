@@ -111,6 +111,25 @@ struct membership_choice_inputs {
 }
 
 /**
+ * @brief Tests whether a build that was expected to arrive reduced kept its base scan's rows
+ *
+ * A join whose only evidence is a dynamic filter expected on its build scan publishes nothing
+ * when the build holds at least @p threshold of the scan's @p scan_rows: the expected filter then
+ * removed next to nothing, and a filter over nearly every key would keep nearly every probe row.
+ * Unknown scan sizes, empty builds, joins with other evidence, and thresholds above 1 disable the
+ * gate.
+ */
+[[nodiscard]] constexpr bool unreduced_build_gate_fires(std::size_t build_rows,
+                                                        std::size_t scan_rows,
+                                                        bool reduction_expected,
+                                                        double threshold) noexcept
+{
+  if (threshold > 1.0 || !reduction_expected) { return false; }
+  if (build_rows == 0 || scan_rows == 0) { return false; }
+  return static_cast<double>(build_rows) >= threshold * static_cast<double>(scan_rows);
+}
+
+/**
  * @brief Tests whether inclusive `[min_value, max_value]` covers the threshold of a known domain
  *
  * Not yet wired into production; exercised by tests only.
