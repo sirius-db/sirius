@@ -16,10 +16,14 @@
 
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
+#include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
+#include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
 #include "planner/scan_column_origin.hpp"
 #include "sirius_config.hpp"
@@ -112,6 +116,9 @@ std::vector<duckdb::LogicalGet const*> expected_probe_targets(
   if (join.children.size() != 2 || !probe_filter_join_type_admissible(join.join_type)) {
     return targets;
   }
+  // Each rank builds from its share of the rows, so the run-time check on the join that relies on
+  // the prediction has no row count to compare with.
+  if (params.distributed()) { return targets; }
   bool const right_family = join.join_type == duckdb::JoinType::RIGHT_SEMI ||
                             join.join_type == duckdb::JoinType::RIGHT_ANTI;
   if (right_family && !right_family_publication_enabled(params)) { return targets; }
@@ -120,8 +127,22 @@ std::vector<duckdb::LogicalGet const*> expected_probe_targets(
         condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL) {
       continue;
     }
+    // Key admission's shape rule: a cast on either side blocks the scan route. Only a bare probe
+    // column can be traced to a scan; the build key may be computed.
     auto const& probe_side = condition.GetLHS();
-    if (probe_side.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
+    auto const& build_side = condition.GetRHS();
+    if (classify_key_side(probe_side) != op::dynamic_filter_key_shape::direct ||
+        classify_key_side(build_side) == op::dynamic_filter_key_shape::cast) {
+      continue;
+    }
+    // A key no membership filter can be built from, or read by this probe column, publishes none.
+    auto const build_type = sirius::get_cudf_type(build_side.GetReturnType());
+    auto const probe_type = sirius::get_cudf_type(probe_side.GetReturnType());
+    if (!build_type || !probe_type) { continue; }
+    auto const key_domain = op::classify_membership_key(*build_type);
+    if (!key_domain || !op::membership_probe_compatible(*key_domain, *probe_type)) { continue; }
+    // A right semi or anti join publishes only what its pre-partition accumulator can build.
+    if (right_family && !op::detail::accumulated_bloom_builder::supports(*build_type)) { continue; }
     auto const ordinal =
       static_cast<std::size_t>(probe_side.Cast<duckdb::BoundReferenceExpression>().Index());
     auto const origin =
@@ -133,29 +154,25 @@ std::vector<duckdb::LogicalGet const*> expected_probe_targets(
   return targets;
 }
 
-namespace {
-
-void collect_expected_targets(duckdb::LogicalOperator const& op,
-                              std::span<duckdb::LogicalGet const* const> expected,
-                              std::vector<duckdb::LogicalGet const*>& found)
+duckdb::LogicalGet const* expected_target_behind_build(
+  duckdb::LogicalOperator const& build, std::span<duckdb::LogicalGet const* const> expected)
 {
-  if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
-    auto const* get = &op.Cast<duckdb::LogicalGet>();
-    if (std::ranges::find(expected, get) != expected.end()) { found.push_back(get); }
+  if (expected.empty()) { return nullptr; }
+  // A projection keeps every row and a filter only drops rows, so the build holds rows of the
+  // scan and nothing else. A filter also gives the join evidence of its own. These are also the
+  // only operators `origin_policy::filter_route` crosses without a join, so no expected scan sits
+  // behind anything else.
+  auto const* node = &build;
+  while (node->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION ||
+         node->type == duckdb::LogicalOperatorType::LOGICAL_FILTER) {
+    if (node->children.size() != 1 || node->children.front() == nullptr) { return nullptr; }
+    node = node->children.front().get();
   }
-  for (auto const& child : op.children) {
-    if (child) { collect_expected_targets(*child, expected, found); }
+  if (node->type != duckdb::LogicalOperatorType::LOGICAL_GET || !node->children.empty()) {
+    return nullptr;
   }
-}
-
-}  // namespace
-
-std::vector<duckdb::LogicalGet const*> expected_targets_in_build(
-  duckdb::LogicalOperator const& op, std::span<duckdb::LogicalGet const* const> expected)
-{
-  std::vector<duckdb::LogicalGet const*> found;
-  if (!expected.empty()) { collect_expected_targets(op, expected, found); }
-  return found;
+  auto const* get = &node->Cast<duckdb::LogicalGet>();
+  return std::ranges::find(expected, get) != expected.end() ? get : nullptr;
 }
 
 }  // namespace sirius::planner

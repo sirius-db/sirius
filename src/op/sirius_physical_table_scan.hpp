@@ -125,9 +125,6 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Named parameters of the table function
   duckdb::named_argument_map_t named_parameters;
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
-  //! A join counted this scan as build evidence because a join above was expected to bind a
-  //! dynamic filter to it; lowering reports the scan if no producer was bound.
-  bool relied_dynamic_filter_target = false;
   //! Virtual columns
   duckdb::virtual_column_map_t virtual_columns;
 

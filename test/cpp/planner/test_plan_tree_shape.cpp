@@ -146,15 +146,18 @@ class scoped_temp_db_path {
 /// test instead of silently skipping it. `also_disabled` adds case-specific optimizer exclusions.
 /// As in production, the generator gets the CTE reader proofs that Sirius's optimizer hooks
 /// captured with the plan, unless `with_cte_reader_proofs` is false. `inspect_logical`, when set,
-/// sees the optimized logical plan the generator receives.
+/// sees the optimized logical plan the generator receives. `before_planning`, when set, runs on the
+/// generator and that plan just before planning starts.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
   Connection& con,
   const std::string& query,
-  const std::vector<OptimizerType>& also_disabled                    = {},
-  bool pre_resolve                                                   = true,
-  std::string* logical_plan_text                                     = nullptr,
-  bool with_cte_reader_proofs                                        = true,
-  std::function<void(LogicalOperator const&)> const& inspect_logical = {})
+  const std::vector<OptimizerType>& also_disabled                      = {},
+  bool pre_resolve                                                     = true,
+  std::string* logical_plan_text                                       = nullptr,
+  bool with_cte_reader_proofs                                          = true,
+  std::function<void(LogicalOperator const&)> const& inspect_logical   = {},
+  std::function<void(sirius::planner::sirius_physical_plan_generator&,
+                     duckdb::LogicalOperator&)> const& before_planning = {})
 {
   auto& context = *con.context;
 
@@ -207,6 +210,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
     if (inspect_logical) { inspect_logical(*plan); }
     sirius::planner::sirius_physical_plan_generator gen(context);
     if (with_cte_reader_proofs) { gen.cte_reader_proofs = std::move(cte_reader_proofs); }
+    if (before_planning) { before_planning(gen, *plan); }
     result = gen.create_plan(std::move(plan));
   } catch (...) {
     con.Query("ROLLBACK");
@@ -739,13 +743,48 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       auto const& keys =
         join->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().admitted_keys();
       REQUIRE_FALSE(keys.empty());
-      CHECK(keys[0].build_reduction_expected == (join == inner));
+      // The inner join's build is checked against small_right's row count; the outer's is not.
+      CHECK((keys[0].expected_reduced_scan_rows != 0) == (join == inner));
     }
     auto* probe_subtree =
       require_join_child_wrap(inner->children[0].get(), inner, /*is_build=*/false);
     REQUIRE(probe_subtree->type == SiriusPhysicalOperatorType::DYNAMIC_FILTER);
     CHECK(probe_subtree->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
     CHECK(unbound_expected_targets() == unbound_before);
+  }
+
+  SECTION("filter on, a prediction no join confirms is counted")
+  {
+    // Stand in for a join above that predicts a filter on small_right and then binds none: the
+    // join below wires on that prediction alone, and planning reports the scan as unconfirmed.
+    auto expect_filter_on_every_scan = [](sirius::planner::sirius_physical_plan_generator& gen,
+                                          duckdb::LogicalOperator& plan) {
+      std::function<void(duckdb::LogicalOperator&)> visit = [&](duckdb::LogicalOperator& op) {
+        if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+          gen.expected_filter_targets.push_back(&op.Cast<duckdb::LogicalGet>());
+        }
+        for (auto& child : op.children) {
+          visit(*child);
+        }
+      };
+      visit(plan);
+    };
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+    auto const unbound_before = unbound_expected_targets();
+    auto plan                 = generate_sirius_plan(*con,
+                                     "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid",
+                                     keep_shape,
+                                     /*pre_resolve=*/true,
+                                     /*logical_plan_text=*/nullptr,
+                                     /*with_cte_reader_proofs=*/true,
+                                     /*inspect_logical=*/{},
+                                     expect_filter_on_every_scan);
+    INFO(tree_to_string(plan.get()));
+
+    auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(joins.size() == 1);
+    require_single_scan_target(joins[0]);
+    CHECK(unbound_expected_targets() == unbound_before + 1);
   }
 
   SECTION("filter on, three joins: every level publishes")

@@ -27,6 +27,7 @@
 #include <duckdb/function/aggregate/distributive_functions.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
+#include <duckdb/planner/expression/bound_cast_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_aggregate.hpp>
@@ -274,12 +275,12 @@ duckdb::unique_ptr<duckdb::LogicalGet> make_scannable_get()
 
 void add_key(duckdb::LogicalComparisonJoin& join,
              duckdb::idx_t probe_ordinal,
-             duckdb::ExpressionType comparison = duckdb::ExpressionType::COMPARE_EQUAL)
+             duckdb::ExpressionType comparison   = duckdb::ExpressionType::COMPARE_EQUAL,
+             duckdb::LogicalType const& key_type = duckdb::LogicalType::INTEGER)
 {
   join.conditions.emplace_back(
-    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER,
-                                                        probe_ordinal),
-    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(key_type, probe_ordinal),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(key_type, 0),
     comparison);
 }
 
@@ -338,6 +339,60 @@ TEST_CASE("a join expects to filter the scan its probe key comes from",
     join->ResolveOperatorTypes();
     CHECK(expected_probe_targets(*join, params).empty());
   }
+  SECTION("a key type no membership filter supports names none")
+  {
+    auto join = make_join_over(make_scannable_get(), make_scannable_get());
+    add_key(*join, 0, duckdb::ExpressionType::COMPARE_EQUAL, duckdb::LogicalType::DOUBLE);
+    join->ResolveOperatorTypes();
+    CHECK(expected_probe_targets(*join, params).empty());
+  }
+  SECTION("a cast on the probe key names none; a computed build key is fine")
+  {
+    auto join = make_join_over(make_scannable_get(), make_scannable_get());
+    join->conditions.emplace_back(
+      duckdb::BoundCastExpression::AddDefaultCastToType(
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+        duckdb::LogicalType::BIGINT),
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0),
+      duckdb::ExpressionType::COMPARE_EQUAL);
+    join->ResolveOperatorTypes();
+    CHECK(expected_probe_targets(*join, params).empty());
+
+    auto computed = make_join_over(make_scannable_get(), make_scannable_get());
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> operands;
+    operands.push_back(
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0));
+    auto build_key = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
+      duckdb::ExpressionType::OPERATOR_COALESCE, duckdb::LogicalType::INTEGER);
+    build_key->GetChildrenMutable() = std::move(operands);
+    computed->conditions.emplace_back(
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+      std::move(build_key),
+      duckdb::ExpressionType::COMPARE_EQUAL);
+    computed->ResolveOperatorTypes();
+    CHECK(expected_probe_targets(*computed, params).size() == 1);
+  }
+  SECTION("a right semi join names none for a key its accumulator cannot build")
+  {
+    auto join       = make_join_over(make_scannable_get(), make_scannable_get());
+    join->join_type = duckdb::JoinType::RIGHT_SEMI;
+    add_key(*join, 0, duckdb::ExpressionType::COMPARE_EQUAL, duckdb::LogicalType::VARCHAR);
+    join->ResolveOperatorTypes();
+    CHECK(expected_probe_targets(*join, params).empty());
+    // The same key on an inner join publishes from a whole build.
+    join->join_type = duckdb::JoinType::INNER;
+    CHECK(expected_probe_targets(*join, params).size() == 1);
+  }
+  SECTION("a distributed plan names none")
+  {
+    auto join = make_join_over(make_scannable_get(), make_scannable_get());
+    add_key(*join, 0);
+    join->ResolveOperatorTypes();
+    auto distributed           = params;
+    distributed.exchange_peers = {"rank0", "rank1"};
+    REQUIRE(distributed.distributed());
+    CHECK(expected_probe_targets(*join, distributed).empty());
+  }
   SECTION("a key behind a sort names none")
   {
     auto order = make_order_over(make_scannable_get());
@@ -359,23 +414,46 @@ TEST_CASE("a join expects to filter the scan its probe key comes from",
   }
 }
 
-TEST_CASE("an expected filter target in the build side is found anywhere below",
+TEST_CASE("an expected filter target counts when the build side is that scan",
           "[dynamic_filter][evidence]")
 {
-  using sirius::planner::expected_targets_in_build;
-  auto get           = make_get();
-  auto const* target = get.get();
+  using sirius::planner::expected_target_behind_build;
+  auto scan          = make_get();
+  auto const* target = scan.get();
   auto const other   = make_get();
-  auto const build   = make_join_over(make_get(), make_projection_over(std::move(get)));
-
   std::vector<duckdb::LogicalGet const*> const expected{target};
-  auto const found = expected_targets_in_build(*build, expected);
-  REQUIRE(found.size() == 1);
-  CHECK(found[0] == target);
-
-  CHECK(expected_targets_in_build(*build, {}).empty());
   std::vector<duckdb::LogicalGet const*> const unrelated{other.get()};
-  CHECK(expected_targets_in_build(*build, unrelated).empty());
+
+  SECTION("the scan itself")
+  {
+    CHECK(expected_target_behind_build(*scan, expected) == target);
+    CHECK(expected_target_behind_build(*scan, {}) == nullptr);
+    CHECK(expected_target_behind_build(*scan, unrelated) == nullptr);
+  }
+  SECTION("behind a projection and a filter")
+  {
+    auto filter = duckdb::make_uniq<duckdb::LogicalFilter>();
+    filter->children.push_back(make_projection_over(std::move(scan)));
+    CHECK(expected_target_behind_build(*filter, expected) == target);
+  }
+  SECTION("not behind an operator that makes the build's size say nothing")
+  {
+    // After most of these the build can be smaller than the scan, or larger, for a reason other
+    // than the expected filter, so comparing the two sizes would prove nothing. A sort keeps the
+    // size, but no filter is ever predicted for a scan behind one.
+    duckdb::unique_ptr<duckdb::LogicalOperator> build;
+    SECTION("a sort") { build = make_order_over(std::move(scan)); }
+    SECTION("a deduplication") { build = make_dedup_over(std::move(scan)); }
+    SECTION("a limit") { build = make_limit_over(std::move(scan)); }
+    SECTION("an inner join") { build = make_join_over(std::move(scan), make_get()); }
+    SECTION("a semi join")
+    {
+      auto semi       = make_join_over(std::move(scan), make_get());
+      semi->join_type = duckdb::JoinType::SEMI;
+      build           = std::move(semi);
+    }
+    CHECK(expected_target_behind_build(*build, expected) == nullptr);
+  }
 }
 
 TEST_CASE("joins that can keep every row carry no join evidence", "[dynamic_filter][evidence]")
