@@ -985,7 +985,7 @@ statement kind and withholds the text.
 The statement is classified with DuckDB's tokenizer.
 
 Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA
-error reports, and its I/O layer where enabled) go to the same sink, prefixed `[cucascade]`.
+error reports, and its I/O layer) go to the same sink, prefixed `[cucascade]`.
 cuCascade's own gate mirrors what the active sink accepts: `sirius_log_level` under `spdlog`,
 nothing under `noop`, and under `duckdb` every record is handed to DuckDB, which applies its own
 level exactly as it does to Sirius's records.

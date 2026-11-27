@@ -68,9 +68,9 @@ class spdlog_owning_sink final : public sink {
 
   // No destructor deregistration: touching spdlog's registry at process exit
   // risks a static-destruction-order problem with spdlog's own registry
-  // singleton. On destruction the logger stays registered (harmlessly unused);
-  // spdlog flushes and reaps it at shutdown, and the next constructor's
-  // set_default_logger replaces it.
+  // singleton. On destruction the logger stays registered (harmlessly unused)
+  // and the next constructor's set_default_logger replaces it. The last sink is
+  // never destroyed (see log/logging.cpp), so nothing flushes it at exit.
 
   // The level lives in the spdlog logger itself — the single source of truth.
   // spdlog's logger holds its level in an atomic, so this is safe to call

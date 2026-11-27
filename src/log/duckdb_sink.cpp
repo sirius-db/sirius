@@ -70,6 +70,10 @@ class duckdb_sink final : public sink {
     // The sink can outlive the db (process-wide, no teardown hook), so it holds a
     // weak ref and re-locks each call: lock() is a cheap refcount bump, not a db
     // lock, and yields null once the db is gone — making the call a safe no-op.
+    // Known race: if the last other reference is dropped while a call holds this
+    // one, ~DatabaseInstance runs on the logging thread. When that thread is one
+    // the teardown joins (a cuCascade reactor, a Sirius worker), the join fails:
+    // std::terminate or a use-after-free. DuckDB has no close hook to detach first.
     auto db = _db.lock();
     if (!db) { return false; }
     return duckdb::Logger::Get(*db).ShouldLog(log_type, to_duckdb_level(lvl));
