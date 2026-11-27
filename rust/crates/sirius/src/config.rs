@@ -154,6 +154,7 @@ impl ContextConfigBuilder {
     /// # Panics
     ///
     /// Panics if the linked library reports success with a null builder handle.
+    /// Debug builds also panic if it returns a handle on failure.
     ///
     /// # Examples
     ///
@@ -187,6 +188,7 @@ impl ContextConfigBuilder {
     /// # Panics
     ///
     /// Panics if the linked library reports success with a null builder handle.
+    /// Debug builds also panic if it returns a handle on failure.
     ///
     /// # Examples
     ///
@@ -227,6 +229,7 @@ impl ContextConfigBuilder {
     /// # Panics
     ///
     /// Panics if the linked library reports success with a null configuration handle.
+    /// Debug builds also panic if it returns a handle on failure.
     ///
     /// # Examples
     ///
@@ -275,15 +278,6 @@ impl std::fmt::Debug for ContextConfigBuilder {
         f.debug_struct("ContextConfigBuilder")
             .finish_non_exhaustive()
     }
-}
-
-// Keep the public Drop implementations. Each owning field performs the native release.
-impl Drop for ContextConfig {
-    fn drop(&mut self) {}
-}
-
-impl Drop for ContextConfigBuilder {
-    fn drop(&mut self) {}
 }
 
 #[cfg(all(test, not(miri)))]
@@ -385,20 +379,5 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-    }
-
-    #[test]
-    fn missing_diagnostics_and_unknown_statuses_are_supported() {
-        assert!(matches!(
-            configuration_error(Error {
-                status: c_api::SIRIUS_ALLOCATION_FAILURE,
-                message: String::new()
-            }),
-            ConfigError::AllocationFailure
-        ));
-        assert!(
-            matches!(configuration_error(Error { status: 999, message: String::new() }),
-            ConfigError::Unexpected { status: 999, message } if message.is_empty())
-        );
     }
 }

@@ -17,6 +17,7 @@ use std::ptr::{self, NonNull};
 
 /// Native status and optional diagnostic from a failed C API call.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Error {
     /// Status returned by the C API.
     pub status: u32,
@@ -47,12 +48,13 @@ impl Diagnostic {
             let len = c_api::sirius_error_message_size(self.0);
             std::slice::from_raw_parts(ptr.cast(), len)
         };
+        // Reserve fallibly so reporting an allocation failure can still return its status.
         let mut message = String::new();
         for chunk in bytes.utf8_chunks() {
             let replacement = if chunk.invalid().is_empty() {
                 ""
             } else {
-                "�"
+                "\u{FFFD}"
             };
             if message
                 .try_reserve(chunk.valid().len() + replacement.len())
@@ -91,7 +93,13 @@ fn factory<T>(
     call: impl FnOnce(*mut *mut T, *mut *mut c_api::SiriusError) -> u32,
 ) -> Result<NonNull<T>, Error> {
     let mut value = ptr::null_mut();
-    checked(|error| call(&mut value, error))?;
+    if let Err(error) = checked(|error| call(&mut value, error)) {
+        debug_assert!(
+            value.is_null(),
+            "Sirius factory returned an error with a handle"
+        );
+        return Err(error);
+    }
     Ok(NonNull::new(value).expect("Sirius factory returned success with a null handle"))
 }
 
@@ -133,7 +141,8 @@ immutable_handle!(
 );
 
 immutable_handle!(
-    /// Immutable configuration settings that can be built concurrently.
+    /// Clones share immutable native settings and can build configurations concurrently.
+    /// Changing settings requires a new native handle so existing clones retain their settings.
     ConfigBuilderHandle,
     c_api::SiriusContextConfigBuilder,
     c_api::sirius_context_config_builder_retain,
@@ -150,6 +159,7 @@ impl ConfigBuilderHandle {
     /// # Panics
     ///
     /// Panics if the linked library reports success with a null builder handle.
+    /// Debug builds also panic if it returns a handle on failure.
     pub fn new() -> Result<Self, Error> {
         // SAFETY: factory supplies exclusive, empty output slots.
         factory(|out, error| unsafe { c_api::sirius_context_config_builder_create(out, error) })
@@ -167,6 +177,7 @@ impl ConfigBuilderHandle {
     /// # Panics
     ///
     /// Panics if the linked library reports success with a null builder handle.
+    /// Debug builds also panic if it returns a handle on failure.
     pub fn from_yaml(path: &[u8]) -> Result<Self, Error> {
         // Native string constructors need a valid range even for an empty path.
         let data = if path.is_empty() {
@@ -190,6 +201,7 @@ impl ConfigBuilderHandle {
     /// # Panics
     ///
     /// Panics if the linked library reports success with a null configuration handle.
+    /// Debug builds also panic if it returns a handle on failure.
     pub fn build(&self) -> Result<ConfigHandle, Error> {
         // SAFETY: self keeps the builder alive and factory owns both output slots.
         factory(|out, error| unsafe {
@@ -201,6 +213,17 @@ impl ConfigBuilderHandle {
 
 #[cfg(all(test, not(miri)))]
 mod tests {
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Sirius factory returned an error with a handle")]
+    fn failed_factory_rejects_a_populated_output() {
+        let _ = super::factory(|out, _| {
+            // SAFETY: factory supplies an exclusive, live output slot for this call.
+            unsafe { *out = std::ptr::NonNull::<u8>::dangling().as_ptr() };
+            crate::c_api::SIRIUS_INVALID_ARGUMENT
+        });
+    }
+
     #[test]
     fn failed_call_without_native_diagnostic_preserves_status() {
         let error = super::checked(|_| 999).unwrap_err();

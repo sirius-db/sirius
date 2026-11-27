@@ -1,7 +1,8 @@
 //! Rust access to the public Sirius C ABI.
 //!
 //! [`c_api`] exposes the raw declarations. [`handles`] owns native references and
-//! provides safe operations over them. The `sirius` crate provides the end-user API.
+//! provides safe operations over them. Keeping unsafe calls and ownership here lets
+//! the end-user `sirius` crate forbid unsafe code.
 //! Existing C++ FFI bindings live in the `sirius-ffi` crate.
 
 pub mod handles;
