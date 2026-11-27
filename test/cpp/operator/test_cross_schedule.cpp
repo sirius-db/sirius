@@ -42,6 +42,7 @@ using sirius::op::cross_schedule_discard;
 using sirius::op::cross_schedule_kind;
 using sirius::op::cross_schedule_orphan;
 using sirius::op::has_pending_cross_orphan;
+using sirius::op::merge_cross_schedule_batch_ids;
 using sirius::op::next_cross_schedule_orphan;
 using sirius::op::next_cross_schedule_pair;
 using sirius::op::pairing_weighted_probe_bytes;
@@ -226,6 +227,145 @@ TEST_CASE("discards skip the empty-opposite-side case (handled by the orphan pat
   // it; the empty-opposite case is drained by the orphan path instead (tested below).
   std::vector<partition_cross_schedule> cross{make_partition({10}, {})};
   REQUIRE(collect_cross_schedule_discards(cross, true, true).empty());
+}
+
+//===----------------------------------------------------------------------===//
+// collect_cross_schedule_discards — per-partition completion
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// Every discarded batch must already have been paired with every batch of its partition's
+// opposite side; otherwise a later pair would read a freed batch.
+void require_discards_fully_paired(std::vector<partition_cross_schedule> const& cross,
+                                   std::vector<cross_schedule_discard> const& ds)
+{
+  for (auto const& d : ds) {
+    auto const& c   = cross[d.partition];
+    auto const& own = d.is_build ? c.build_ids : c.probe_ids;
+    auto const& opp = d.is_build ? c.probe_ids : c.build_ids;
+    auto const index =
+      static_cast<std::size_t>(std::find(own.begin(), own.end(), d.batch_id) - own.begin());
+    REQUIRE(index < own.size());
+    REQUIRE((d.is_build ? c.probe_complete : c.build_complete));
+    for (std::size_t k = 0; k < opp.size(); ++k) {
+      auto const key = d.is_build ? sirius::op::encode_cross_pair(k, index)
+                                  : sirius::op::encode_cross_pair(index, k);
+      REQUIRE(c.scheduled_pairs.count(key) == 1);
+    }
+  }
+}
+
+}  // namespace
+
+TEST_CASE("a complete build partition frees its paired probe batches while producers run",
+          "[cross_schedule]")
+{
+  std::vector<partition_cross_schedule> cross{make_partition({10, 11}, {20}),
+                                              make_partition({12}, {21})};
+  (void)drain_all_pairs(cross, false, false);
+
+  // Partition 0's build side is complete; partition 1's is not. Neither producer has finished.
+  cross[0].build_complete = true;
+  auto d                  = collect_cross_schedule_discards(cross, false, false);
+  REQUIRE(d.size() == 2);
+  REQUIRE(has_discard(d, 0, /*is_build=*/false, 10));
+  REQUIRE(has_discard(d, 0, false, 11));
+  // The build batch waits for its own partition's probe side, and partition 1 keeps its probe.
+  REQUIRE_FALSE(has_discard(d, 0, /*is_build=*/true, 20));
+  REQUIRE_FALSE(has_discard(d, 1, false, 12));
+
+  cross[0].probe_complete = true;
+  auto d2                 = collect_cross_schedule_discards(cross, false, false);
+  REQUIRE(d2.size() == 1);
+  REQUIRE(has_discard(d2, 0, /*is_build=*/true, 20));
+  REQUIRE(collect_cross_schedule_discards(cross, false, false).empty());
+}
+
+TEST_CASE("an early-complete partition frees each batch only after its last pair",
+          "[cross_schedule]")
+{
+  // INNER grid with both sides streaming: 3 probe x 2 build batches. Both sides complete before
+  // any pair is scheduled.
+  std::vector<partition_cross_schedule> cross{make_partition({10, 11, 12}, {20, 21})};
+  cross[0].probe_complete = true;
+  cross[0].build_complete = true;
+  REQUIRE(collect_cross_schedule_discards(cross, false, false).empty());
+
+  std::size_t freed = 0;
+  for (;;) {
+    auto step = next_cross_schedule_pair(cross, false, false);
+    if (step.kind != cross_schedule_kind::emit_pair) { break; }
+    auto d = collect_cross_schedule_discards(cross, false, false);
+    require_discards_fully_paired(cross, d);
+    freed += d.size();
+  }
+  REQUIRE(freed == 5);
+}
+
+TEST_CASE("a partition completing late frees its already-paired batches at once",
+          "[cross_schedule]")
+{
+  std::vector<partition_cross_schedule> cross{make_partition({10}, {20})};
+  (void)drain_all_pairs(cross, false, false);
+  REQUIRE(collect_cross_schedule_discards(cross, false, false).empty());
+
+  // More batches arrive on both sides before either side completes.
+  merge_cross_schedule_batch_ids(cross[0], {10, 11}, {20, 21});
+  (void)drain_all_pairs(cross, false, false);
+  REQUIRE(collect_cross_schedule_discards(cross, false, false).empty());
+
+  cross[0].build_complete = true;
+  auto d                  = collect_cross_schedule_discards(cross, false, false);
+  require_discards_fully_paired(cross, d);
+  REQUIRE(d.size() == 2);
+  REQUIRE(has_discard(d, 0, /*is_build=*/false, 10));
+  REQUIRE(has_discard(d, 0, false, 11));
+}
+
+TEST_CASE("an incomplete opposite partition keeps a batch for late arrivals", "[cross_schedule]")
+{
+  // The probe side of the partition is complete, the build side is not.
+  std::vector<partition_cross_schedule> cross{make_partition({10, 11}, {20})};
+  cross[0].probe_complete = true;
+  (void)drain_all_pairs(cross, false, false);
+
+  // The build batch has seen every probe batch, so it frees; the probe batches stay.
+  auto d = collect_cross_schedule_discards(cross, false, false);
+  REQUIRE(d.size() == 1);
+  REQUIRE(has_discard(d, 0, /*is_build=*/true, 20));
+
+  // A late build batch still pairs with both retained probe batches.
+  merge_cross_schedule_batch_ids(cross[0], {}, {21});
+  auto pairs = drain_all_pairs(cross, false, false);
+  REQUIRE(pairs.size() == 2);
+  auto d2 = collect_cross_schedule_discards(cross, false, false);
+  REQUIRE(d2.size() == 1);
+  REQUIRE(has_discard(d2, 0, /*is_build=*/true, 21));
+
+  cross[0].build_complete = true;
+  auto d3                 = collect_cross_schedule_discards(cross, false, false);
+  require_discards_fully_paired(cross, d3);
+  REQUIRE(d3.size() == 2);
+}
+
+TEST_CASE("a complete but empty opposite partition leaves survivors to the orphan path",
+          "[cross_schedule]")
+{
+  std::vector<partition_cross_schedule> cross{make_partition({10}, {}), make_partition({}, {20})};
+  cross[0].build_complete = true;
+  cross[1].probe_complete = true;
+  REQUIRE(collect_cross_schedule_discards(cross, false, false).empty());
+  // Orphans still wait for both producers, so per-partition completion changes nothing here.
+  REQUIRE_FALSE(has_pending_cross_orphan(cross, false, false));
+  REQUIRE_FALSE(next_cross_schedule_orphan(cross, true, false).found);
+  REQUIRE(collect_cross_schedule_discards(cross, true, true).empty());
+  auto o1 = next_cross_schedule_orphan(cross, true, true);
+  auto o2 = next_cross_schedule_orphan(cross, true, true);
+  REQUIRE(o1.found);
+  REQUIRE(o2.found);
+  REQUIRE(o1.present_is_build != o2.present_is_build);
+  REQUIRE_FALSE(has_pending_cross_orphan(cross, true, true));
 }
 
 //===----------------------------------------------------------------------===//

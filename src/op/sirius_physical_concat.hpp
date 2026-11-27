@@ -21,6 +21,9 @@
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 
+#include <cstddef>
+#include <vector>
+
 namespace sirius {
 namespace op {
 
@@ -71,6 +74,18 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   //! Whether each partition is released as one group once the source pipeline finishes.
   [[nodiscard]] bool concat_all() const { return _concat_all; }
 
+  /**
+   * @brief Whether this operator will push no further batch for one output partition
+   *
+   * True once the source pipeline has finished, the partition holds no unclaimed input, and every
+   * group claimed from it has been pushed downstream by `sink`. Consumers call this while holding
+   * their own operator mutex, and `sink` calls into consumers, so this never waits for the operator
+   * lock: it reports false when the lock is busy. The result only moves from false to true.
+   *
+   * @param[in] partition_idx Output partition, equal to the input partition it is grouped from
+   */
+  [[nodiscard]] bool partition_output_complete(std::size_t partition_idx);
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
@@ -102,7 +117,20 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   bool _input_claimed = false;
   bool _concat_all;
   uint64_t _concat_batch_bytes;
+  //! Per partition: groups claimed by get_next_task_input_data whose output sink has not pushed.
+  std::vector<std::size_t> _unsunk_groups;
 };
+
+/**
+ * @brief Whether the CONCAT feeding a consumer port will push no further batch for a partition
+ *
+ * Returns false unless the port's source pipeline consists of a single CONCAT that is both its
+ * source and its sink, so that every batch the port receives comes from that operator's claims.
+ * Query this before polling the port's repository: once it returns true, every batch of the
+ * partition is already in the repository.
+ */
+[[nodiscard]] bool concat_partition_output_complete(sirius_physical_operator::port const& port,
+                                                    std::size_t partition_idx);
 
 }  // namespace op
 }  // namespace sirius

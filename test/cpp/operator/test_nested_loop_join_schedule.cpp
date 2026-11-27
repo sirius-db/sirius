@@ -142,6 +142,55 @@ struct fixture {
       p->finished = true;
     }
   }
+
+  // Inputs fed the way the physical plan wires them: each CONCAT is the source and sink of the
+  // pipeline attached to its join port and drains its own upstream repository.
+  std::array<std::shared_ptr<producer_pipeline>, 2> upstream;
+  std::array<cucascade::shared_data_repository, 2> concat_repos;
+
+  sirius_physical_concat& concat(std::size_t side)
+  {
+    return join->children[side]->Cast<sirius_physical_concat>();
+  }
+  void feed_through_concats()
+  {
+    sirius::pipeline::sirius_pipeline_build_state state;
+    for (std::size_t i = 0; i < 2; ++i) {
+      auto& op = concat(i);
+      state.set_pipeline_source(*producers[i], op);
+      state.set_pipeline_sink(*producers[i], &op, 0);
+      upstream[i]        = std::make_shared<producer_pipeline>();
+      auto port          = std::make_unique<sirius_physical_operator::port>();
+      port->type         = MemoryBarrierType::PARTIAL;
+      port->repo         = &concat_repos[i];
+      port->src_pipeline = upstream[i];
+      op.add_port("default", std::move(port));
+      op.set_placement(
+        std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+      op.add_next_port_after_sink({join.get(), i == 0 ? "default" : "build"});
+    }
+  }
+  batch_ptr push_upstream(std::size_t side)
+  {
+    auto b = batch();
+    concat_repos[side].add_data_batch(b, 0);
+    return b;
+  }
+  // The CONCAT task's claim; its sink later pushes every claimed batch to the join unchanged.
+  std::unique_ptr<operator_data> claim(std::size_t side)
+  {
+    auto input = concat(side).get_next_task_input_data();
+    REQUIRE(input);
+    return input;
+  }
+  void sink(std::size_t side, operator_data const& claimed)
+  {
+    concat(side).sink(claimed, ::cuda::stream_ref{cudaStream_t{}});
+  }
+  bool side_complete(std::size_t side)
+  {
+    return concat_partition_output_complete(*join->get_port(side == 0 ? "default" : "build"), 0);
+  }
 };
 
 std::array<uint64_t, 2> pair_ids(operator_data const& data)
@@ -504,4 +553,103 @@ TEST_CASE("NLJ discovers a new batch while an earlier cross pair has pending sli
   }
   CHECK_FALSE(f.join->get_next_task_hint());
   CHECK(f.join->all_ports_empty());
+}
+
+TEST_CASE("CONCAT reports a partition complete only after its last group is pushed",
+          "[nlj_schedule][cross_schedule]")
+{
+  fixture f;
+  // Not a CONCAT-sourced pipeline: the fixture's producers have no source or sink.
+  CHECK_FALSE(f.side_complete(1));
+  f.feed_through_concats();
+
+  CHECK_FALSE(f.side_complete(1));  // upstream still running
+  f.push_upstream(1);
+  f.push_upstream(1);
+  f.upstream[1]->finished = true;
+  CHECK_FALSE(f.side_complete(1));  // unclaimed input
+  auto claimed = f.claim(1);
+  CHECK_FALSE(f.side_complete(1));  // claimed group not yet pushed
+  f.sink(1, *claimed);
+  CHECK(f.side_complete(1));
+  CHECK(f.repos[1].total_size() == 2);
+  // The CONCAT pipeline itself has not been marked finished.
+  CHECK_FALSE(f.producers[1]->is_pipeline_finished());
+  // A busy CONCAT lock reads as not complete rather than blocking the caller.
+  {
+    std::lock_guard<std::mutex> busy(f.concat(1).lock);
+    CHECK_FALSE(f.side_complete(1));
+  }
+}
+
+TEST_CASE("NLJ releases a batch once the opposite CONCAT is done, before its pipeline finishes",
+          "[nlj_schedule][cross_schedule]")
+{
+  fixture f;
+  f.feed_through_concats();
+
+  // Probe batches arrive while the probe side keeps producing.
+  f.push(0);
+  f.push(0);
+  // The build CONCAT claims its only group; its upstream is done.
+  auto b1                 = f.push_upstream(1);
+  f.upstream[1]->finished = true;
+  auto claimed            = f.claim(1);
+  // Nothing pairs, and nothing is released, until the group lands.
+  CHECK_FALSE(f.join->get_next_task_input_data());
+  CHECK(f.repos[0].total_size() == 2);
+  f.sink(1, *claimed);
+
+  std::set<std::array<uint64_t, 2>> pairs;
+  while (auto task = f.join->get_next_task_input_data()) {
+    CHECK(pairs.insert(pair_ids(*task)).second);
+  }
+  CHECK(pairs.size() == 2);
+  (void)f.join->get_next_task_hint();
+  // Build partition complete: both probe batches are released although no producer pipeline
+  // has finished. The build batch stays for later probe batches.
+  CHECK(f.repos[0].total_size() == 0);
+  CHECK(f.repos[1].total_size() == 1);
+
+  auto p3   = f.push(0);
+  auto task = f.join->get_next_task_input_data();
+  REQUIRE(task);
+  CHECK(pair_ids(*task) == std::array<uint64_t, 2>{p3->get_batch_id(), b1->get_batch_id()});
+  (void)f.join->get_next_task_hint();
+  CHECK(f.repos[0].total_size() == 0);
+  CHECK(f.repos[1].total_size() == 1);
+
+  // Probe side done as well: the build batch has met every probe batch and is released.
+  f.upstream[0]->finished = true;
+  (void)f.join->get_next_task_hint();
+  CHECK(f.repos[1].total_size() == 0);
+  CHECK_FALSE(f.join->get_next_task_input_data());
+
+  f.finish();
+  CHECK_FALSE(f.join->get_next_task_hint());
+  CHECK(f.join->all_ports_empty());
+}
+
+TEST_CASE("NLJ keeps batches while the opposite CONCAT still holds an unpushed group",
+          "[nlj_schedule][cross_schedule]")
+{
+  fixture f;
+  f.feed_through_concats();
+  auto p1 = f.push(0);
+  f.push(1);
+  REQUIRE(f.join->get_next_task_input_data());
+
+  // The build upstream is done and its repository drained, but the claimed group is in flight.
+  auto b2                 = f.push_upstream(1);
+  f.upstream[1]->finished = true;
+  auto claimed            = f.claim(1);
+  (void)f.join->get_next_task_hint();
+  CHECK(f.repos[0].total_size() == 1);
+
+  f.sink(1, *claimed);
+  auto task = f.join->get_next_task_input_data();
+  REQUIRE(task);
+  CHECK(pair_ids(*task) == std::array<uint64_t, 2>{p1->get_batch_id(), b2->get_batch_id()});
+  (void)f.join->get_next_task_hint();
+  CHECK(f.repos[0].total_size() == 0);
 }

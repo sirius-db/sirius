@@ -44,6 +44,7 @@
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/join/kept_build_marks.hpp"
 #include "op/key_preparation.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -1337,10 +1338,16 @@ std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
     build_port->src_pipeline && build_port->src_pipeline->is_pipeline_finished();
 
   // Re-poll both ports and merge any newly-arrived batch IDs (first-seen order preserved; the
-  // *_seen sets both dedup and keep already-popped IDs from being re-added).
+  // *_seen sets both dedup and keep already-popped IDs from being re-added). A side's per-partition
+  // completion is read before its IDs, so a complete side's ID list is final.
+  bool any_partition_complete = false;
   for (std::size_t p = 0; p < num_partitions; ++p) {
+    auto& c                = _cross[p];
+    c.probe_complete       = c.probe_complete || concat_partition_output_complete(*probe_port, p);
+    c.build_complete       = c.build_complete || concat_partition_output_complete(*build_port, p);
+    any_partition_complete = any_partition_complete || c.probe_complete || c.build_complete;
     merge_cross_schedule_batch_ids(
-      _cross[p], probe_port->repo->get_batch_ids(p), build_port->repo->get_batch_ids(p));
+      c, probe_port->repo->get_batch_ids(p), build_port->repo->get_batch_ids(p));
   }
 
   // Non-INNER whole-side invariant: whichever side must be seen whole for this join type must stay
@@ -1378,7 +1385,7 @@ std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
 
   // Free every fully-consumed batch from its repository. Borrowers of a batch hold their own live
   // shared_ptr across the pop, so this only drops the repo's owning reference.
-  if (probe_finished || build_finished) {
+  if (probe_finished || build_finished || any_partition_complete) {
     for (auto const& d : collect_cross_schedule_discards(_cross, probe_finished, build_finished)) {
       auto* port = d.is_build ? build_port : probe_port;
       port->repo->pop_data_batch_by_id(d.batch_id, d.partition);
