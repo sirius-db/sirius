@@ -130,11 +130,16 @@ bool accepts_connections(std::string const& host, uint32_t port, std::chrono::mi
   hints.ai_family   = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
   addrinfo* found   = nullptr;
+  // One budget for every address of the host, not one each.
+  auto const deadline = std::chrono::steady_clock::now() + patience;
   if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &found) != 0) {
     return false;
   }
   bool open = false;
   for (auto* a = found; a != nullptr && !open; a = a->ai_next) {
+    auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(
+      deadline - std::chrono::steady_clock::now());
+    if (left.count() <= 0) { break; }
     int const fd = socket(a->ai_family, a->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) { continue; }
     if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) {
@@ -143,7 +148,7 @@ bool accepts_connections(std::string const& host, uint32_t port, std::chrono::mi
       pollfd p{fd, POLLOUT, 0};
       int error       = 0;
       socklen_t bytes = sizeof(error);
-      open            = poll(&p, 1, static_cast<int>(patience.count())) == 1 &&
+      open            = poll(&p, 1, static_cast<int>(left.count())) == 1 &&
              getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &bytes) == 0 && error == 0;
     }
     close(fd);
