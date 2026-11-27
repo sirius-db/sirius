@@ -3212,6 +3212,14 @@ static void SetEnableCompleteGroupHaving(ClientContext& context, SetScope scope,
                    params->enable_complete_group_having);
 }
 
+static void SetEnableLateDimensionJoin(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                       = get_operator_params(context, scope);
+  params->enable_late_dimension_join = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_LATE_DIMENSION_JOIN to {}",
+                   params->enable_late_dimension_join);
+}
+
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
@@ -3850,6 +3858,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_complete_group_having),
                     SetEnableCompleteGroupHaving);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_late_dimension_join",
+                    "runtime override for joining lookup tables after the aggregation",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_late_dimension_join),
+                    SetEnableLateDimensionJoin);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",
