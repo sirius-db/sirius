@@ -300,6 +300,64 @@ TEST_CASE("a non-integer column stays in the running only for a small table",
   REQUIRE(big_probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused});
 }
 
+TEST_CASE("a big table's string column stays in the running while its chunks hold no repeat",
+          "[late_mat][pin_uniqueness]")
+{
+  // A big dimension's second identifier (TPC-DS customer.c_customer_id) is a string that no row
+  // repeats. Past the row cap such a column is left to the exact stage as long as each chunk is
+  // distinct in itself; a column of any other type is refused there, as before.
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+  auto const mr = cudf::get_current_device_resource_ref();
+
+  auto const rows = sirius::late_mat::small_table_max_rows + 1;
+  std::vector<std::string> ids;
+  ids.reserve(rows);
+  for (std::size_t i = 0; i < rows; ++i) {
+    // Descending, so the chunk is unsorted and the probe has to sort it.
+    ids.push_back("ID" + std::to_string(10'000'000 - i));
+  }
+  auto distinct  = sirius::test::operator_utils::make_string_column(ids, stream, mr);
+  auto floats    = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                          static_cast<cudf::size_type>(rows),
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream);
+  ids.back()     = ids.front();
+  auto repeating = sirius::test::operator_utils::make_string_column(ids, stream, mr);
+  std::vector<cudf::column_view> cols{distinct->view(), repeating->view(), floats->view()};
+
+  SECTION("a distinct chunk keeps the column, a repeat or another type ends its chances")
+  {
+    unique_probe probe{std::vector<bool>{true, true, true}};
+    std::vector<std::size_t> asked;
+    probe.observe(cudf::table_view{cols}, stream, [&](std::size_t bytes) {
+      asked.push_back(bytes);
+      return true;
+    });
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided,
+                                                            unique_verdict::refused,
+                                                            unique_verdict::refused});
+    // Each string chunk was sorted, with memory asked for its characters and offsets.
+    REQUIRE(asked.size() == 2);
+    CHECK(asked[0] > rows * sirius::late_mat::sort_scratch_factor);
+  }
+
+  SECTION("without memory for the sort the column is dropped")
+  {
+    unique_probe probe{std::vector<bool>{true, false, false}};
+    probe.observe(cudf::table_view{cols}, stream, [](std::size_t) { return false; });
+    REQUIRE(probe.verdicts()[0] == unique_verdict::refused);
+  }
+
+  SECTION("with the exact stage out of reach nothing can settle it")
+  {
+    unique_probe probe{std::vector<bool>{true, false, false}};
+    probe.exact_unavailable(0);
+    probe.observe(cudf::table_view{cols}, stream);
+    REQUIRE(probe.verdicts()[0] == unique_verdict::refused);
+  }
+}
+
 TEST_CASE("a column is dropped, not the pin, when its sort cannot be reserved",
           "[late_mat][pin_uniqueness]")
 {

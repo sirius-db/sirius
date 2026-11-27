@@ -24,6 +24,7 @@
 #include <cudf/reduction/unique_count.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
@@ -190,6 +191,59 @@ void unique_probe::observe(cudf::table_view const& chunk,
     }
   };
 
+  // The bytes of @p values that a sort reads, or nothing for a type whose size is not known here.
+  auto const value_bytes = [&](cudf::column_view const& values) -> std::optional<std::size_t> {
+    auto const rows = static_cast<std::size_t>(values.size());
+    if (cudf::is_fixed_width(values.type())) { return rows * cudf::size_of(values.type()); }
+    if (values.type().id() != cudf::type_id::STRING) { return std::nullopt; }
+    return static_cast<std::size_t>(cudf::strings_column_view{values}.chars_size(stream)) +
+           (rows + 1) * sizeof(std::int64_t);
+  };
+
+  // Whether column @p i's chunk @p values holds no value twice. The column is dropped where it
+  // does, and where that cannot be told.
+  //
+  // Counted off SORTEDNESS, never off a hash set. cuco's open-addressing
+  // extent is bounded, and a pinned chunk is sized in GIGABYTES: at SF1000 an
+  // `orders` chunk overruns "requested extent divided by load factor exceeds
+  // maximum representable value" and takes the whole pin down with it. Over
+  // sorted values, counting consecutive runs IS the exact distinct count and
+  // costs one pass.
+  auto const chunk_is_distinct = [&](std::size_t i, cudf::column_view const& values) {
+    cudf::size_type distinct = 0;
+    try {
+      std::unique_ptr<cudf::table> sorted_copy;
+      cudf::column_view sorted = values;
+      if (!cudf::is_sorted(cudf::table_view{{values}}, {cudf::order::ASCENDING}, {}, stream)) {
+        // Most columns of a fact table are unsorted and repeat values, so sort this one chunk:
+        // a repeat refuses the column here, before the exact stage retains any of its values.
+        // The sort is optional. A pin that cannot spare the memory for it loses this proof,
+        // never the pin itself.
+        auto const bytes = value_bytes(values);
+        if (!bytes) {
+          drop(i, "the size of a chunk to sort is not known");
+          return false;
+        }
+        if (try_reserve_sort_memory && !try_reserve_sort_memory(*bytes * sort_scratch_factor)) {
+          drop(i, "no GPU memory reserved for sorting a chunk");
+          return false;
+        }
+        sorted_copy = cudf::sort(cudf::table_view{{values}}, {cudf::order::ASCENDING}, {}, stream);
+        sorted      = sorted_copy->view().column(0);
+      }
+      distinct = cudf::unique_count(
+        sorted, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
+    } catch (std::exception const& e) {
+      drop(i, std::string{"the check failed: "} + e.what());
+      return false;
+    }
+    if (distinct != values.size()) {
+      drop(i, "a chunk repeats a value");
+      return false;
+    }
+    return true;
+  };
+
   for (std::size_t i = 0; i < _columns.size() && _live_candidates > 0; ++i) {
     if (!_columns[i].candidate) { continue; }
     auto const col = chunk.column(static_cast<cudf::size_type>(i));
@@ -203,75 +257,57 @@ void unique_probe::observe(cudf::table_view const& chunk,
       continue;
     }
     if (!cudf::is_integral_not_bool(col.type())) {
-      // Out of the cheap stage's reach. Every column of a pin is observed, and the exact stage's
-      // sort is not worth paying on a big table's non-integer columns, so such a column stays in
-      // the running only while its table is small: a dimension's name column, say, which can prove
-      // a group-by-rowid ride (q5, q9 and q10 group by nation.n_name). The cap is on rows seen so
-      // far, so a big table's first chunk ends the column's chances with no sort and no retained
-      // values. A nested column is never worth it: the exact stage cannot judge one.
+      // Out of the cheap stage's reach: only the exact stage can settle such a column. Every
+      // column of a pin is observed, and the exact stage's sort is not worth paying on a big
+      // table's non-integer columns, so one stays in the running without further ado only while
+      // its table is small: a dimension's name column, say, which can prove a group-by-rowid ride
+      // (q5, q9 and q10 group by nation.n_name). The cap is on rows seen so far.
+      //
+      // Past it only a string column stays, and only while each of its chunks holds no value
+      // twice: a big dimension's second identifier, such as TPC-DS customer.c_customer_id. A
+      // fact table's flags and modes repeat within their first chunk, which ends their chances
+      // with one sort and no retained values. A nested column is never worth it: the exact stage
+      // cannot judge one.
       _columns[i].observed_rows += static_cast<std::size_t>(col.size());
-      if (cudf::is_nested(col.type()) || _columns[i].observed_rows > small_table_max_rows) {
-        drop(i, "not an integer, and nested or past the small-table row cap");
+      if (cudf::is_nested(col.type())) {
+        drop(i, "nested");
         continue;
+      }
+      if (_columns[i].observed_rows > small_table_max_rows) {
+        if (col.type().id() != cudf::type_id::STRING) {
+          drop(i, "neither an integer nor a string, and past the small-table row cap");
+          continue;
+        }
+        if (!_columns[i].exact_available) {
+          drop(i, "a string past the small-table row cap that the exact stage cannot settle");
+          continue;
+        }
+        if (!chunk_is_distinct(i, col)) { continue; }
       }
       _columns[i].cheap_undecidable = true;
       continue;
     }
 
-    // Counted off SORTEDNESS, never off a hash set. cuco's open-addressing
-    // extent is bounded, and a pinned chunk is sized in GIGABYTES: at SF1000 an
-    // `orders` chunk overruns "requested extent divided by load factor exceeds
-    // maximum representable value" and takes the whole pin down with it. Over
-    // sorted values, counting consecutive runs IS the exact distinct count and
-    // costs one pass.
-    std::unique_ptr<cudf::table> sorted_copy;
-    cudf::column_view sorted_col = col;
-    cudf::size_type distinct     = 0;
+    // With the exact stage out of reach, a column can only be proven by chunks whose ranges
+    // never overlap, so a chunk that overlaps an earlier one ends its chances and is not worth
+    // sorting.
     std::optional<range> early_range;
-    try {
-      // With the exact stage out of reach, a column can only be proven by chunks whose ranges
-      // never overlap, so a chunk that overlaps an earlier one ends its chances and is not worth
-      // sorting.
-      if (!_columns[i].exact_available) {
-        early_range = chunk_range(col);
-        if (!early_range) {
-          drop(i, "its range cannot be read and the exact stage cannot settle it");
-          continue;
-        }
-        auto const overlaps = std::any_of(
-          _columns[i].ranges.begin(), _columns[i].ranges.end(), [&](range const& earlier) {
-            return earlier.min <= early_range->max && early_range->min <= earlier.max;
-          });
-        if (overlaps) {
-          drop(i, "its chunks overlap in range and the exact stage cannot settle it");
-          continue;
-        }
+    if (!_columns[i].exact_available) {
+      early_range = chunk_range(col);
+      if (!early_range) {
+        drop(i, "its range cannot be read and the exact stage cannot settle it");
+        continue;
       }
-      if (!cudf::is_sorted(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream)) {
-        // Most columns of a fact table are unsorted and repeat values, so sort this one chunk:
-        // a repeat refuses the column here, before the exact stage retains any of its values.
-        // The sort is optional. A pin that cannot spare the memory for it loses this proof,
-        // never the pin itself.
-        if (try_reserve_sort_memory &&
-            !try_reserve_sort_memory(static_cast<std::size_t>(col.size()) *
-                                     cudf::size_of(col.type()) * sort_scratch_factor)) {
-          drop(i, "no GPU memory reserved for sorting a chunk");
-          continue;
-        }
-        sorted_copy = cudf::sort(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream);
-        sorted_col  = sorted_copy->view().column(0);
+      auto const overlaps = std::any_of(
+        _columns[i].ranges.begin(), _columns[i].ranges.end(), [&](range const& earlier) {
+          return earlier.min <= early_range->max && early_range->min <= earlier.max;
+        });
+      if (overlaps) {
+        drop(i, "its chunks overlap in range and the exact stage cannot settle it");
+        continue;
       }
-      distinct = cudf::unique_count(
-        sorted_col, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
-    } catch (std::exception const& e) {
-      drop(i, std::string{"the check failed: "} + e.what());
-      continue;
     }
-    sorted_copy.reset();
-    if (distinct != col.size()) {
-      drop(i, "a chunk repeats a value");
-      continue;
-    }
+    if (!chunk_is_distinct(i, col)) { continue; }
 
     auto const observed_range = early_range ? early_range : chunk_range(col);
     if (!observed_range) {

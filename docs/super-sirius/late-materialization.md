@@ -139,7 +139,7 @@ ranges leave undecided, by sorting the concatenated chunks and counting runs. Th
 load-bearing rather than a fallback, because chunk ranges usually overlap.
 
 The same facts also serve joins: with `pin_table_prove_unique_keys` (on by default), a pinned
-parquet column proven distinct counts as a unique build key. The pin observes every integer column
+parquet column proven distinct counts as a unique build key. The pin observes every integer and string column
 (and every other column of a table under one million rows, such as `nation.n_name`) of a parquet pin (and of a native table's pin when late materialization is on; a native table's
 join takes its PRIMARY KEY instead). An unsorted chunk is sorted on the spot, so a value repeated
 within a chunk refuses the column at once; a repeat across chunks is caught only by the exact
@@ -154,8 +154,8 @@ the former row cap `SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS`. Each retained chunk hol
 reservation. The stage holds the retained chunks, the concatenation of one column and its sorted
 copy at once, so its peak is about three times the cap, on top of the pin itself. When the cap,
 the free GPU memory or a reservation is short, integer columns keep their check ahead of the
-others (a non-integer column is a candidate only while its table is small, so it must not crowd
-out an integer key and then be refused itself), then earlier columns ahead of later ones: a copy
+others (a non-integer column is a candidate only while its table is small or, for a string, while
+no chunk repeats a value, so it must not crowd out an integer key and then be refused itself), then earlier columns ahead of later ones: a copy
 gives up the retained copies of lower priority to make room, and the columns that lose theirs stay
 UNKNOWN. A copy that fails has the same effect, and the pin goes on.
 

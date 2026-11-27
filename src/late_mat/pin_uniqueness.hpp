@@ -108,9 +108,11 @@ enum class unique_verdict : std::uint8_t {
 /// undergo: the sorted copy plus the radix sort's own buffers.
 inline constexpr std::size_t sort_scratch_factor = 3;
 
-/// Rows up to which a non-integer column stays in the running (see unique_probe::observe). A
-/// dimension table's name column fits; a fact table's does not, and its first chunk ends the
-/// column's chances before anything is sorted or retained.
+/// Rows up to which a non-integer column stays in the running whatever it holds (see
+/// unique_probe::observe). A dimension table's name column fits. Past it only a string column
+/// stays, and only while each of its chunks holds no value twice: a big dimension's second
+/// identifier does, and a fact table's string ends its chances at its first chunk, after one sort
+/// and before anything is retained.
 inline constexpr std::size_t small_table_max_rows = 1'000'000;
 
 /// How many batches' worth of free GPU memory the pin keeps beside an optional retained copy: the
@@ -130,8 +132,9 @@ inline constexpr std::size_t retention_headroom_batches = 2;
 
 /// Column positions in the order the exact stage's retained copies claim memory, from @p types
 /// (positional with the pinned columns): integer columns first, then the others, each by position.
-/// A non-integer column is a candidate only while its table is small (see unique_probe::observe),
-/// so it must not crowd out an integer key for good and then be refused itself.
+/// A non-integer column is a candidate only while its table is small or, for a string, while its
+/// chunks hold no repeat (see unique_probe::observe), so it must not crowd out an integer key for
+/// good and then be refused itself.
 [[nodiscard]] std::vector<std::size_t> exact_retention_priority(
   std::span<cudf::data_type const> types);
 
@@ -272,7 +275,7 @@ class unique_probe {
     /// The exact stage may still settle this column. Cleared by exact_unavailable().
     bool exact_available{true};
     std::vector<range> ranges;  ///< one per observed non-empty chunk
-    /// Rows seen so far of a non-integer column, bounded by small_table_max_rows.
+    /// Rows seen so far of a non-integer column, compared with small_table_max_rows.
     std::size_t observed_rows{0};
   };
 
