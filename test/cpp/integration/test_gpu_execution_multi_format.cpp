@@ -2085,6 +2085,62 @@ TEST_CASE("iceberg equality deletes are built on the configured GPU rather than 
   REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{0});
 }
 
+TEST_CASE("iceberg equality deletes are built once on a GPU configured with two memory spaces",
+          "[iceberg][isolated_context]")
+{
+  sirius::test::scratch_dir scratch{"iceberg_equality_two_spaces"};
+  {
+    std::ofstream config(scratch.path() / "two-spaces.yaml");
+    config << R"(sirius:
+  space:
+    gpu:
+      - { device_id: 0, memory_capacity: 512Mi }
+      - { device_id: 0, memory_capacity: 512Mi }
+    host:
+      - { numa_id: 0, memory_capacity: 4Gi, block_size: 1Mi, pool_size: 128 }
+)";
+  }
+  auto db = sirius::test::open_sirius_db(nullptr, scratch.path() / "two-spaces.yaml");
+  duckdb::Connection con(*db);
+  auto run = [&](std::string const& sql) {
+    auto result = con.Query(sql);
+    if (result->HasError()) UNSCOPED_INFO(result->GetError());
+    REQUIRE_FALSE(result->HasError());
+    return result;
+  };
+  run("LOAD iceberg");
+  auto const spaces = sirius::test::get_registered_sirius_context(con)
+                        ->get_memory_manager()
+                        .get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(spaces.size() == 2);
+  REQUIRE(spaces[0]->get_device_id() == spaces[1]->get_device_id());
+  std::array const idle{spaces[0]->get_available_memory(), spaces[1]->get_available_memory()};
+
+  // One DuckDB thread keeps the submitted plan idle: its tables are built and no task has run.
+  run("SET threads=1");
+  run("SET gpu_execution=true");
+  run("SET enable_duckdb_fallback=false");
+  auto const before = sirius::test::get_transparent_execution_stats(con);
+  auto prepared =
+    con.Prepare("SELECT fruit, count FROM iceberg_scan('" +
+                equality_fixture("iceberg_v2_eq_wide_delete_file") + "') ORDER BY count");
+  REQUIRE_FALSE(prepared->HasError());
+  duckdb::vector<duckdb::Value> parameters;
+  auto pending = prepared->Submit(parameters);
+  REQUIRE_FALSE(pending->HasError());
+  // A second set of tables on the same device would be held by the other space and never probed.
+  CHECK((spaces[0]->get_available_memory() < idle[0]) +
+          (spaces[1]->get_available_memory() < idle[1]) ==
+        1);
+  pending->Complete();
+  REQUIRE_FALSE(pending->HasError());
+  sirius::test::require_transparent_execution_delta(
+    before, sirius::test::get_transparent_execution_stats(con), 1, 0, 1, 0);
+  CHECK(
+    MultiFormatFixtureBase::collect_rows(*pending) ==
+    std::vector<std::vector<std::string>>{{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
 TEST_CASE("iceberg equality deletes are applied on every GPU a query can be admitted to",
           "[iceberg][multi_gpu][isolated_context]")
 {

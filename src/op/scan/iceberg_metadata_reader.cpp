@@ -1214,13 +1214,16 @@ IcebergDeleteData::~IcebergDeleteData()
 
 void IcebergDeleteData::release_equality_replicas_outside(std::span<int const> devices) const
 {
-  std::erase_if(equality_replicas, [&](equality_replica& replica) {
-    if (std::find(devices.begin(), devices.end(), replica.device.value()) != devices.end())
-      return false;
+  auto const excluded = [&](equality_replica const& replica) {
+    return std::find(devices.begin(), devices.end(), replica.device.value()) == devices.end();
+  };
+  // Emptied first, each with its device current: the erase moves kept replicas into their slots.
+  for (auto& replica : equality_replicas) {
+    if (!excluded(replica)) continue;
     rmm::cuda_set_device_raii device_guard{replica.device};
     replica.groups.clear();
-    return true;
-  });
+  }
+  std::erase_if(equality_replicas, excluded);
 }
 
 std::vector<EqualityDeleteGroup> const& IcebergDeleteData::equality_groups_on(

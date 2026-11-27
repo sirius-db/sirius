@@ -499,10 +499,12 @@ std::shared_ptr<const sirius::op::scan::IcebergDeleteData> load_scan_delete_payl
   std::vector<sirius::op::scan::equality_build_resources> resources;
   streams.reserve(admissible.size());
   resources.reserve(admissible.size());
-  for (auto const* space : spaces) {
-    if (!space || !std::binary_search(admissible.begin(), admissible.end(), space->get_device_id()))
-      continue;
-    rmm::cuda_device_id const device{space->get_device_id()};
+  // One space per device: a batch looks its tables up by device, so a device configured with
+  // several spaces would hold copies that are never probed.
+  for (auto const device_id : admissible) {
+    auto const* space =
+      sirius_ctx.get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, device_id);
+    rmm::cuda_device_id const device{device_id};
     rmm::cuda_set_device_raii device_guard{device};
     streams.push_back(sirius::memory::runtime_stream_pool::acquire(*space));
     resources.push_back(

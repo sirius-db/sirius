@@ -19,9 +19,12 @@
 // end; these use inputs no table produces cheaply -- an inverted mask, keys paired in the wrong
 // order, a key type the join would compare as raw bytes.
 
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/iceberg_delete_filter.hpp"
 #include "op/scan/iceberg_equality_delete_mask.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
+#include "operator/operator_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
@@ -33,15 +36,22 @@
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
 
+#include <cuda_runtime.h>
+
 #include <catch.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <duckdb.hpp>
 #include <utils/local_ioctx.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -540,15 +550,101 @@ TEST_CASE("iceberg equality delete - a delete file must match its manifest and k
   auto const& groups = data->equality_groups_on(rmm::get_current_cuda_device());
   REQUIRE(groups.size() == 1);
   CHECK(groups[0].delete_table->view().column(0).type().id() == cudf::type_id::INT64);
-  // The second device indexes a copy of the first one's keys. Both entries name this device,
-  // since the machine may have no other: what is covered is the copy and the index over it.
-  auto const twice = load_from(path, 1, duckdb::LogicalTypeId::BIGINT, 1, bytes, 2);
-  REQUIRE(twice->equality_replicas.size() == 2);
-  for (auto const& replica : twice->equality_replicas) {
+  // Every device after the first indexes a copy of the first one's keys. The three entries name
+  // this device, since the machine may have no other: what is covered is that each of them, not
+  // only the first to be copied to, holds the key.
+  auto const thrice = load_from(path, 1, duckdb::LogicalTypeId::BIGINT, 1, bytes, 3);
+  REQUIRE(thrice->equality_replicas.size() == 3);
+  for (auto const& replica : thrice->equality_replicas) {
     REQUIRE(replica.groups.size() == 1);
-    CHECK(replica.groups[0].delete_table->num_rows() == 1);
-    CHECK(replica.groups[0].delete_table->view().column(0).type().id() == cudf::type_id::INT64);
+    auto const keys = replica.groups[0].delete_table->view().column(0);
+    REQUIRE(keys.type().id() == cudf::type_id::INT64);
+    REQUIRE(keys.size() == 1);
+    int64_t key = 0;
+    CUDF_CUDA_TRY(cudaMemcpy(&key, keys.data<int64_t>(), sizeof(key), cudaMemcpyDeviceToHost));
+    CHECK(key == 1);
   }
+}
+
+TEST_CASE("iceberg equality delete - a second device probes keys held in its own memory",
+          "[iceberg][scan][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) SKIP("Requires two visible GPUs");
+  sirius::test::scoped_sirius_disable disable;
+  sirius::test::scratch_dir directory("equality_delete_two_devices");
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto written =
+    con.Query("COPY (SELECT 2::INTEGER AS id) TO " + directory.file_literal("delete.parquet") +
+              " (FORMAT PARQUET, FIELD_IDS {id: 1})");
+  REQUIRE(written);
+  REQUIRE_FALSE(written->HasError());
+  auto const path = directory.file("delete.parquet");
+
+  // What a misplaced allocation looks like depends on the spaces. With pools, memory from the
+  // other device's allocator is on the other GPU. Without, every allocation is a cudaMalloc, so
+  // memory allocated with the other device current is, and no device can read another's.
+  bool const pooled = GENERATE(true, false);
+  sirius::test::operator_utils::memory_manager_options options;
+  if (!pooled) {
+    options.gpu_resource_factory = [](int device, std::size_t) {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+      return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+        rmm::mr::cuda_memory_resource{}};
+    };
+  }
+  auto manager = sirius::test::operator_utils::initialize_memory_manager(2, std::move(options));
+  // The first device's space is left out, so its keys reach the second through HOST staging
+  // whether or not the second could read them where they are.
+  std::vector<equality_build_resources> resources;
+  for (auto const device : {0, 1}) {
+    auto const* space = manager->get_memory_space(cucascade::memory::Tier::GPU, device);
+    REQUIRE(space);
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    resources.push_back({rmm::cuda_device_id{device},
+                         space->acquire_stream(),
+                         space->get_default_allocator(),
+                         {},
+                         device == 0 ? nullptr : space});
+  }
+  auto const* staging =
+    sirius::memory::sirius_memory_reservation_manager::host_staging_space(*resources[1].space);
+  REQUIRE(staging);
+  auto const* staged =
+    staging->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+  REQUIRE(staged);
+  REQUIRE(staged->get_peak_total_allocated_bytes() == 0);
+
+  iceberg_delete_discovery discovery;
+  discovery.equality_delete_entries.emplace_back();
+  auto& plan = discovery.equality_plan.emplace();
+  plan.files.push_back({path, {1}, 1, static_cast<int64_t>(std::filesystem::file_size(path))});
+  plan.by_data_file.emplace("data.parquet", std::vector<uint32_t>{0});
+  plan.keys.emplace(1, iceberg_equality_plan::key{0, duckdb::LogicalTypeId::INTEGER});
+  auto const data = load_delete_payload(
+    *con.context, "table", sirius::test::make_test_local_ioctx(), discovery, resources);
+  REQUIRE(data->equality_replicas.size() == 2);
+  CHECK(staged->get_peak_total_allocated_bytes() > 0);
+
+  rmm::cuda_device_id const second{1};
+  cudaPointerAttributes keys{};
+  REQUIRE(cudaPointerGetAttributes(
+            &keys, data->equality_groups_on(second).at(0).delete_table->view().column(0).head()) ==
+          cudaSuccess);
+  CHECK(keys.device == second.value());
+
+  // With the first device's tables gone, the second still removes the matching row and no other.
+  std::array<int, 1> const kept{second.value()};
+  data->release_equality_replicas_outside(kept);
+  REQUIRE(data->equality_replicas.size() == 1);
+  rmm::cuda_set_device_raii guard{second};
+  std::vector<std::unique_ptr<cudf::column>> batch_cols;
+  batch_cols.push_back(int32_column({1, 2}));
+  equality_delete_filter filter{data, second, 0, {0}};
+  auto out = filter.apply(
+    std::make_unique<cudf::table>(std::move(batch_cols)), {}, resources[1].stream, resources[1].mr);
+  resources[1].stream.sync();
+  REQUIRE(to_host(out->get_column(0).view()) == std::vector<int32_t>{1});
 }
 
 TEST_CASE("Iceberg per-file positional filters preserve multi-file row positions",
