@@ -83,6 +83,8 @@ bool is_float(sirius::logical_type const& type)
 struct value {
   mlir::Value ir;
   sirius::logical_type type;
+  /// Whether it is known not to be a NaN, as a literal of a number is.
+  bool never_nan = false;
 
   [[nodiscard]] bool nullable() const { return mlir::isa<mlir::meld::NullableType>(ir.getType()); }
 };
@@ -273,6 +275,14 @@ class plan_builder {
 
   value comparison(sirius::comparison_type op, value left, value right)
   {
+    if (is_float(left.type) || is_float(right.type)) {
+      return float_comparison(op, std::move(left), std::move(right));
+    }
+    return ieee_comparison(op, std::move(left), std::move(right));
+  }
+
+  value ieee_comparison(sirius::comparison_type op, value left, value right)
+  {
     static std::map<sirius::comparison_type, char const*> const names = {
       {sirius::comparison_type::equal, "equal"},
       {sirius::comparison_type::not_equal, "not_equal"},
@@ -286,6 +296,74 @@ class plan_builder {
     std::vector<value> args{std::move(left), std::move(right)};
     return call(
       comparison_urn, key_of(found->second, args), args, logical_type::make(type_id::BOOLEAN));
+  }
+
+  /// A comparison of floats as DuckDB orders them, where a NaN equals a NaN and is greater than
+  /// every other value; Meld compares them as IEEE 754 does, where a NaN is unordered.
+  value float_comparison(sirius::comparison_type op, value left, value right)
+  {
+    using sirius::comparison_type;
+    switch (op) {
+      case comparison_type::equal: return float_equal(left, right);
+      case comparison_type::not_equal: return negate(float_equal(left, right));
+      case comparison_type::lt: return float_less(left, right, false);
+      case comparison_type::le: return float_less(left, right, true);
+      case comparison_type::gt: return float_less(right, left, false);
+      case comparison_type::ge: return float_less(right, left, true);
+      default: refuse("Meld does not support IS [NOT] DISTINCT FROM");
+    }
+  }
+
+  value float_equal(value const& left, value const& right)
+  {
+    auto equal = ieee_comparison(sirius::comparison_type::equal, left, right);
+    if (left.never_nan || right.never_nan) { return equal; }
+    return logical("or", {equal, logical("and", {is_nan(left), is_nan(right)})});
+  }
+
+  /// `left < right`, or `left <= right` where @p or_equal, with a NaN above every other value.
+  value float_less(value const& left, value const& right, bool or_equal)
+  {
+    auto ordered = ieee_comparison(
+      or_equal ? sirius::comparison_type::le : sirius::comparison_type::lt, left, right);
+    if (right.never_nan) { return ordered; }
+    // Below a NaN is every value but a NaN, and at most a NaN is every value but NULL.
+    auto below_nan = or_equal ? is_not_null(left) : negate(is_nan(left));
+    return logical("or", {ordered, logical("and", {is_nan(right), below_nan})});
+  }
+
+  /// Whether @p v is a NaN, and NULL where it is: a NaN alone is not equal to itself.
+  value is_nan(value const& v)
+  {
+    if (v.never_nan) { return literal_bool(false); }
+    return negate(ieee_comparison(sirius::comparison_type::equal, v, v));
+  }
+
+  value is_not_null(value const& v)
+  {
+    if (!v.nullable()) { return literal_bool(true); }
+    std::vector<value> args{v};
+    auto callee = declare(comparison_urn, key_of("is_not_null", args));
+    auto result = mlir::meld::CallOp::create(_builder,
+                                             _loc,
+                                             _builder.getI1Type(),
+                                             callee,
+                                             mlir_values_of(args),
+                                             nullptr,
+                                             nullptr,
+                                             nullptr);
+    return {result, logical_type::make(type_id::BOOLEAN)};
+  }
+
+  value negate(value const& v)
+  {
+    return call(boolean_urn, "not:bool", {v}, logical_type::make(type_id::BOOLEAN));
+  }
+
+  value literal_bool(bool b)
+  {
+    return {mlir::meld::LiteralOp::create(_builder, _loc, _builder.getBoolAttr(b)),
+            logical_type::make(type_id::BOOLEAN)};
   }
 
   value emit(sirius::ast::node const& node)
@@ -328,7 +406,10 @@ class plan_builder {
     if (!literal) {
       return {mlir::meld::NullOp::create(_builder, _loc, meld_type(type, true)), type};
     }
-    return {mlir::meld::LiteralOp::create(_builder, _loc, literal), type};
+    auto number = mlir::dyn_cast<mlir::FloatAttr>(literal);
+    return {mlir::meld::LiteralOp::create(_builder, _loc, literal),
+            type,
+            !number || !number.getValue().isNaN()};
   }
 
   value emit(sirius::ast::comparison const& cmp)
@@ -355,7 +436,10 @@ class plan_builder {
     auto input = emit(*range.input);
     auto lower = emit(*range.lower);
     auto upper = emit(*range.upper);
-    if (range.lower_inclusive && range.upper_inclusive) {
+    // Between bounds that are not NaN, a NaN is above the upper one, which is where IEEE 754's
+    // unordered NaN falls too.
+    bool const ieee_order = !is_float(input.type) || (lower.never_nan && upper.never_nan);
+    if (range.lower_inclusive && range.upper_inclusive && ieee_order) {
       std::vector<value> args{input, lower, upper};
       return call(
         comparison_urn, key_of("between", args), args, logical_type::make(type_id::BOOLEAN));

@@ -111,6 +111,88 @@ TEST_CASE_METHOD(MeldUnitsFixture,
   run_ok("CALL unpin_table('p_lineitem');");
 }
 
+namespace {
+
+/// Doubles with NaN and NULL among them, and dates, with the filters left above the scan for Meld.
+class MeldSpecialValuesFixture : public MeldUnitsFixture {
+ public:
+  MeldSpecialValuesFixture()
+  {
+    run_ok(
+      "CREATE TABLE special AS SELECT "
+      "CASE WHEN i % 7 = 0 THEN 'NaN'::DOUBLE WHEN i % 13 = 0 THEN NULL "
+      "ELSE ((i % 41) - 20)::DOUBLE END AS p, "
+      "CASE WHEN i % 5 = 0 THEN 'NaN'::DOUBLE ELSE (i % 3)::DOUBLE END AS q, "
+      "DATE '1994-01-01' + (i % 730)::INTEGER AS d "
+      "FROM range(100000) t(i);");
+    run_ok("CHECKPOINT;");
+    run_ok("SET disabled_optimizers = 'filter_pushdown';");
+  }
+
+  ~MeldSpecialValuesFixture() { con->Query("RESET disabled_optimizers;"); }
+};
+
+}  // namespace
+
+TEST_CASE_METHOD(MeldSpecialValuesFixture,
+                 "Meld compares NaN as DuckDB does",
+                 "[meld_units][integration]")
+{
+  auto const condition = GENERATE(as<std::string>{},
+                                  "p > 20",
+                                  "p >= 20",
+                                  "p < 20",
+                                  "p <= 20",
+                                  "p = 'NaN'::DOUBLE",
+                                  "p <> 1",
+                                  "p < 'NaN'::DOUBLE",
+                                  "p > q",
+                                  "p >= q",
+                                  "p < q",
+                                  "p <= q",
+                                  "p = q",
+                                  "p <> q",
+                                  "p BETWEEN -5 AND 5",
+                                  "p BETWEEN q AND 10",
+                                  "q BETWEEN p AND 'NaN'::DOUBLE");
+  CAPTURE(condition);
+  compare_in_meld("SELECT count(*), count(p), sum(q) FROM special WHERE " + condition);
+}
+
+TEST_CASE_METHOD(MeldSpecialValuesFixture,
+                 "Meld orders NaN above every number in MIN and MAX",
+                 "[meld_units][integration]")
+{
+  compare_in_meld("SELECT min(p), max(p), min(q), max(q) FROM special WHERE d > DATE '1994-03-01'");
+  // Only NaN is above every number, so these see only NaNs.
+  compare_in_meld("SELECT min(p), max(p), count(p) FROM special WHERE p > 1e300");
+}
+
+TEST_CASE_METHOD(MeldSpecialValuesFixture,
+                 "Meld skips NULL in aggregates and filters",
+                 "[meld_units][integration]")
+{
+  compare_in_meld("SELECT count(*), count(p), sum(p), avg(p) FROM special WHERE q < 2");
+  compare_in_meld("SELECT count(*), sum(q) FROM special WHERE p < 5 OR p > 10");
+}
+
+TEST_CASE_METHOD(MeldSpecialValuesFixture, "Meld filters on dates", "[meld_units][integration]")
+{
+  compare_in_meld(
+    "SELECT count(*), sum(q), min(p) FROM special "
+    "WHERE d >= DATE '1994-06-01' AND d < DATE '1995-01-01'");
+}
+
+TEST_CASE_METHOD(MeldSpecialValuesFixture,
+                 "Meld answers a filter no row passes",
+                 "[meld_units][integration]")
+{
+  // Only a NaN is above 2, and it is not below 3; DuckDB's statistics do not see that.
+  compare_in_meld(
+    "SELECT count(*), count(p), sum(p), avg(q), min(p), max(q) FROM special "
+    "WHERE q > 2 AND q < 3");
+}
+
 TEST_CASE_METHOD(MeldUnitsFixture,
                  "Meld does not support an integer sum",
                  "[meld_units][integration]")
