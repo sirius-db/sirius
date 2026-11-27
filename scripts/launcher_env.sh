@@ -37,5 +37,11 @@ export UCX_TLS=${UCX_TLS:-cuda_copy,cuda_ipc,tcp,self}
 # but "all" turns the cache off; with a list of your own that has rc, dc or ud in it, export
 # UCX_RCACHE_ENABLE=y.
 [[ $UCX_TLS == all ]] || export UCX_RCACHE_ENABLE=${UCX_RCACHE_ENABLE:-n}
+# A value as a SQL string literal, for the SQL the launchers write: a path may hold an apostrophe.
+sirius_sql_quote()
+{
+  local q="'"
+  printf "'%s'" "${1//$q/$q$q}"
+}
 # DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse it.
 export DUCKDB_AGENT_MODE=${DUCKDB_AGENT_MODE:-0}
