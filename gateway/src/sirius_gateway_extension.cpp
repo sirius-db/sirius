@@ -24,9 +24,17 @@ struct gateway_info : TableFunctionInfo {
   std::shared_ptr<gateway_state> state;
 };
 
+void refuse_null(Value const& parameter)
+{
+  if (parameter.IsNull()) {
+    throw InvalidInputException("a sirius_gateway_exchange setting cannot be NULL: RESET it");
+  }
+}
+
 /// Refuses a value no rank takes, at SET rather than when the ranks start.
 void check_host_staging(ClientContext&, SetScope, Value& parameter)
 {
+  refuse_null(parameter);
   auto const value = StringValue::Get(parameter);
   if (value != "auto" && value != "always" && value != "never" && value != "remote") {
     throw InvalidInputException(
@@ -37,6 +45,7 @@ void check_host_staging(ClientContext&, SetScope, Value& parameter)
 
 void check_tcp_lanes(ClientContext&, SetScope, Value& parameter)
 {
+  refuse_null(parameter);
   auto const lanes = UBigIntValue::Get(parameter);
   if (lanes > 64) {
     throw InvalidInputException(
@@ -46,6 +55,7 @@ void check_tcp_lanes(ClientContext&, SetScope, Value& parameter)
 
 void check_mnnvl(ClientContext&, SetScope, Value& parameter)
 {
+  refuse_null(parameter);
   auto const value = StringValue::Get(parameter);
   if (value != "auto" && value != "require" && value != "off") {
     throw InvalidInputException(
@@ -55,6 +65,7 @@ void check_mnnvl(ClientContext&, SetScope, Value& parameter)
 
 void check_frame_bytes(ClientContext&, SetScope, Value& parameter)
 {
+  refuse_null(parameter);
   auto const bytes = UBigIntValue::Get(parameter);
   if (bytes == 0 || bytes % 256 != 0 || bytes > (1ull << 30)) {
     throw InvalidInputException(
@@ -66,6 +77,7 @@ void check_frame_bytes(ClientContext&, SetScope, Value& parameter)
 
 void check_frames(ClientContext&, SetScope, Value& parameter)
 {
+  refuse_null(parameter);
   auto const frames = UBigIntValue::Get(parameter);
   if (frames == 0 || frames > 1024) {
     throw InvalidInputException("exchange frame counts must be 1 to 1024, not %llu", frames);
