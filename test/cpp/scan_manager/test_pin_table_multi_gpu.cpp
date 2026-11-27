@@ -417,9 +417,8 @@ TEST_CASE("pin_table - a compressed GPU pin is served on the admitted GPU under 
 //===----------------------------------------------------------------------===//
 // GPU-tier cached serve — DISPATCH ON AN ADMITTED SUBSET.
 //
-// Three GPUs, two of them admitted. A GPU-tier pin holds chunks on all three. A chunk on an
-// admitted GPU is scanned there; the chunks of the excluded GPU are shared out evenly between
-// the two admitted GPUs, and the excluded GPU runs nothing.
+// Three GPUs, two of them admitted. The excluded GPU's chunks are shared out evenly between the
+// admitted GPUs, and the excluded GPU runs nothing.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - GPU-tier cached scan spreads an excluded GPU's chunks under gpus_per_query",
           "[pin_mgpu][scan_manager][multi_gpu][admission]")
@@ -431,12 +430,11 @@ TEST_CASE("pin_table - GPU-tier cached scan spreads an excluded GPU's chunks und
   fs::remove_all(tmp, ec);
   fs::create_directories(tmp);
 
-  // 12 files: with one or more chunks per file, each of the three GPUs holds at least four.
+  // 12 files, so each of the three GPUs holds at least four chunks.
   generate_parquet_surface(
     tmp, "SELECT range AS k, range * 2 AS v FROM range(100000)", /*num_files=*/12);
 
-  // 1 MB batches spread the pin's chunks over all three GPUs; gpus_per_query: 2 admits every
-  // query onto the first two of them.
+  // gpus_per_query: 2 admits every query onto the first two GPUs.
   mgpu_env_params params;
   params.num_gpus             = 3;
   params.gpus_per_query       = 2;
@@ -490,8 +488,7 @@ TEST_CASE("pin_table - GPU-tier cached scan spreads an excluded GPU's chunks und
       if (admitted.size() < 2u) { admitted.insert(device); }
     }
 
-    // The case under test: every GPU holds chunks, and the excluded GPU holds enough of them
-    // to give each admitted GPU at least one.
+    // The excluded GPU has to hold enough chunks to give each admitted GPU at least one.
     std::size_t excluded_chunks = 0;
     for (auto const& [owner, owned] : chunks_per_owner) {
       INFO("owner gpu=" << owner << " chunks=" << owned);
@@ -512,9 +509,8 @@ TEST_CASE("pin_table - GPU-tier cached scan spreads an excluded GPU's chunks und
       CHECK(result->Collection().GetValue(0, 0).ToString() == "99999");
       CHECK(result->Collection().GetValue(1, 0).ToString() == "119998800000");
 
-      // One scan task per chunk. An admitted GPU scans its own chunks and its share of the
-      // excluded GPU's; whichever GPU the walk starts on, that share is at least the excluded
-      // count divided by the number of admitted GPUs, rounded down.
+      // One scan task per chunk: an admitted GPU scans its own chunks and at least an even
+      // share (rounded down) of the excluded GPU's.
       INFO("iteration=" << iteration << " excluded chunks=" << excluded_chunks);
       for (auto const& [device, executed] : after) {
         auto const ran = executed - before[device];

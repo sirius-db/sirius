@@ -56,12 +56,11 @@ TEST_CASE("data on an admitted GPU stays on that GPU", "[resident_gpu_placement]
 TEST_CASE("chunks on an excluded GPU spread evenly over the admitted GPUs",
           "[resident_gpu_placement]")
 {
-  // A GPU-tier pin holds its chunks round-robin on four GPUs; the query runs on three of them.
-  // The chunks of GPU 3 have to move, and each admitted GPU takes the same number of them.
+  // Chunks round-robin on four GPUs, three of them admitted: GPU 3's chunks have to move.
   resident_gpu_placement placement;
   std::array<int, 3> const admitted{0, 1, 2};
 
-  // Several queries in a row: the walk carries over, and each query is still balanced.
+  // The walk carries over from one query to the next.
   for (int query = 0; query < 4; ++query) {
     std::map<int, int> tasks;
     for (int chunk = 0; chunk < 24; ++chunk) {
@@ -69,14 +68,14 @@ TEST_CASE("chunks on an excluded GPU spread evenly over the admitted GPUs",
     }
     INFO("query=" << query);
     REQUIRE(tasks.size() == 3u);
-    // 6 chunks of its own plus a third of the 6 chunks of GPU 3.
+    // 6 of its own plus a third of GPU 3's 6.
     REQUIRE(tasks[0] == 8);
     REQUIRE(tasks[1] == 8);
     REQUIRE(tasks[2] == 8);
-    (void)placement.gpu_for_home(3, admitted);  // shift the starting point for the next query
+    (void)placement.gpu_for_home(3, admitted);  // shift the next query's starting point
   }
 
-  // A chunk count that does not divide evenly leaves the admitted GPUs at most one task apart.
+  // An uneven count leaves the admitted GPUs at most one task apart.
   std::map<int, int> moved;
   for (int chunk = 0; chunk < 5; ++chunk) {
     ++moved[placement.gpu_for_home(3, admitted)];
@@ -92,8 +91,7 @@ TEST_CASE("the most-bytes pick counts only the admitted GPUs", "[resident_gpu_pl
   resident_gpu_placement placement;
   std::array<int, 3> const admitted{0, 1, 2};
 
-  // GPU 3 holds the most, but the query does not run there: the admitted GPU with the most
-  // bytes is picked, since part of the data is already on it.
+  // GPU 3 holds the most, but the query does not run there.
   bytes_list const mixed{{3, 1000}, {1, 10}, {2, 40}};
   REQUIRE(placement.gpu_for_bytes(mixed, admitted) == 2);
 
@@ -116,7 +114,7 @@ TEST_CASE("the most-bytes pick counts only the admitted GPUs", "[resident_gpu_pl
   REQUIRE_FALSE(placement.gpu_for_bytes(bytes_list{}, admitted).has_value());
   REQUIRE_FALSE(placement.gpu_for_bytes(bytes_list{}, {}).has_value());
 
-  // None of the picks above moved data off an excluded GPU, so the walk has not started.
+  // None of those picks advanced the walk.
   REQUIRE(placement.gpu_for_home(3, admitted) == 0);
 }
 
@@ -126,8 +124,7 @@ TEST_CASE("data held only by excluded GPUs walks the admitted GPUs", "[resident_
   std::array<int, 2> const admitted{0, 1};
   bytes_list const excluded_only{{2, 100}, {3, 50}};
 
-  // By-bytes picks and single-home picks share one walk: both move data off excluded GPUs
-  // onto the same admitted set.
+  // By-bytes picks and single-home picks share one walk.
   REQUIRE(placement.gpu_for_bytes(excluded_only, admitted) == 0);
   REQUIRE(placement.gpu_for_home(2, admitted) == 1);
   REQUIRE(placement.gpu_for_bytes(excluded_only, admitted) == 0);
@@ -136,8 +133,7 @@ TEST_CASE("data held only by excluded GPUs walks the admitted GPUs", "[resident_
 
 TEST_CASE("queries admitted to different sets walk independently", "[resident_gpu_placement]")
 {
-  // Two queries alternate, one admitted to {0, 1} and one to {0, 1, 2}. On a counter shared by
-  // both sets the first query would only see even values and get GPU 0 every time.
+  // On a counter shared by both sets, the first query would get GPU 0 every time.
   resident_gpu_placement placement;
   std::array<int, 2> const two{0, 1};
   std::array<int, 3> const three{0, 1, 2};

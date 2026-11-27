@@ -765,11 +765,7 @@ void task_creator::manager_loop()
                     }
                   }
                   if (!gpu_bytes.empty()) {
-                    // Data-locality: route to the admitted GPU with the most data by bytes.
-                    // Counting an excluded GPU would name it whenever it holds the most, and
-                    // the clamp below would then move the task to a GPU chosen without regard
-                    // to where the rest of the data is. With no data on any admitted GPU the
-                    // task takes the next GPU of the walk over the admitted set.
+                    // Data-locality: route to the admitted GPU with the most data by bytes
                     preferred_device_id =
                       _resident_placement.gpu_for_bytes(gpu_bytes, query_state->active_gpu_ids);
                   } else if (!host_bytes.empty() && _topology_index) {
@@ -813,10 +809,8 @@ void task_creator::manager_loop()
                       auto* space = ro.get_memory_space();
                       if (space) {
                         if (space->get_tier() == cucascade::memory::Tier::GPU) {
-                          // The chunk's own GPU when the query was admitted to it. A chunk
-                          // on an excluded GPU takes the next GPU of the walk over the
-                          // admitted set, so those chunks spread evenly; the clamp below
-                          // would draw from a counter that other tasks advance too.
+                          // The chunk's own GPU, or the next admitted GPU in rotation
+                          // when the query was not admitted to it.
                           preferred_device_id = _resident_placement.gpu_for_home(
                             space->get_device_id(), query_state->active_gpu_ids);
                         } else if (space->get_tier() == cucascade::memory::Tier::HOST &&
@@ -844,14 +838,12 @@ void task_creator::manager_loop()
                     }
                   }
                 }
-                // Confine the task to the admitted subset. Scan and partition preferences come
-                // from the subset, and the locality picks above choose among the admitted GPUs,
-                // so this is a backstop for a preference that still names an excluded GPU, such
-                // as an operator's own hint. The scheduler treats a preference as binding, so
-                // honouring one would put the query on a GPU it was not admitted to. An
-                // unpreferred task escapes too: the scheduler gives those to whichever executor
-                // asks first. Pin those as well, but only on a real subset, since a pin costs the
-                // scheduler's freedom to place them wherever frees up first.
+                // Confine the task to the admitted subset. The picks above already choose among
+                // the admitted GPUs, so this is a backstop for a preference that still names an
+                // excluded one; the scheduler treats a preference as binding. An unpreferred task
+                // escapes too: the scheduler gives those to whichever executor asks first. Pin
+                // those as well, but only on a real subset, since a pin costs the scheduler's
+                // freedom to place them wherever frees up first.
                 if (!query_state->active_gpu_ids.empty()) {
                   bool const names_excluded_device =
                     preferred_device_id.has_value() &&

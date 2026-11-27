@@ -433,8 +433,7 @@ class task_creator {
   /// Rotate independently within each NUMA node, including interleaved host-pin inputs, and
   /// within each admitted set of that node's GPUs.
   sirius::memory::numa_affinity _numa_affinity;
-  /// Placement of tasks whose input is already in GPU memory. Keeps them on the query's admitted
-  /// GPUs and walks those GPUs for data that sits on an excluded one.
+  /// Keeps tasks with GPU-resident input on the query's admitted GPUs.
   sirius::memory::resident_gpu_placement _resident_placement;
   /// Separate from NUMA affinity. A task can take a NUMA pick and then be clamped, so
   /// sharing one counter advances it twice per task: against an even subset size the stride

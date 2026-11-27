@@ -27,36 +27,22 @@
 
 namespace sirius::memory {
 
-/// Picks the GPU that runs a task whose input is already in GPU memory, for a query that may be
-/// admitted to only some of the GPUs.
-///
-/// Data on an admitted GPU stays there. Data on a GPU the query was not admitted to has to move,
-/// and each such task takes the next GPU of a round-robin walk over the admitted set. The walk
-/// has one cursor per admitted set and nothing else advances it, so the tasks moved off the
-/// excluded GPUs spread evenly over the admitted ones. Leaving the move to the task creator's
-/// clamp does not give that: its counter is shared with every unpreferred task of every query,
-/// so the moved tasks can land on the same GPU again and again.
-///
-/// The walk covers the whole admitted set, not only the GPUs on the excluded GPU's NUMA node.
-/// The data crosses to another GPU either way, and keeping to the node would put an excluded
-/// GPU's whole share on the one admitted GPU next to it.
-///
-/// An empty `admitted` means no admitted set was recorded for the query, and every GPU counts as
-/// admitted.
+/// Picks the GPU for a task whose input is already in GPU memory, when the query may be admitted
+/// to only some of the GPUs. Data on an admitted GPU stays there. Data on an excluded GPU takes
+/// the next GPU of a round-robin walk over the admitted set, so the moved tasks spread evenly.
+/// The walk is not narrowed to the excluded GPU's NUMA node: that would put the excluded GPU's
+/// whole share on the one admitted GPU beside it. An empty `admitted` admits every GPU.
 class resident_gpu_placement {
  public:
-  /// The GPU for data that sits on `home` alone, such as a GPU-tier pinned chunk: `home` when the
-  /// query was admitted to it, otherwise the next GPU of the walk over `admitted`.
+  /// For data on one GPU, such as a GPU-tier pinned chunk.
   [[nodiscard]] int gpu_for_home(int home, std::span<int const> admitted)
   {
     if (admitted.empty() || is_admitted(home, admitted)) { return home; }
     return next_admitted(admitted);
   }
 
-  /// The GPU for data spread over several GPUs. `bytes_per_gpu` is a range of (GPU, bytes held
-  /// there) pairs. The result is the admitted GPU that holds the most bytes, the first such GPU
-  /// in range order on a tie. When no admitted GPU holds any of the data, it is the next GPU of
-  /// the walk over `admitted`. An empty range gives no GPU.
+  /// For data spread over GPUs, given as (GPU, bytes) pairs: the admitted GPU with the most
+  /// bytes, the first one in range order on a tie. An empty range gives no GPU.
   template <typename BytesPerGpu>
   [[nodiscard]] std::optional<int> gpu_for_bytes(BytesPerGpu const& bytes_per_gpu,
                                                  std::span<int const> admitted)
@@ -92,8 +78,7 @@ class resident_gpu_placement {
   }
 
   std::mutex _mutex;
-  /// One entry per distinct admitted set seen. Admission keeps a prefix of the sorted GPU list,
-  /// so there are at most as many sets as GPUs.
+  /// One cursor per admitted set, so queries on different sets do not disturb each other.
   std::map<std::vector<int>, std::uint64_t> _cursors;
 };
 
