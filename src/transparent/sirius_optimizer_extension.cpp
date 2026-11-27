@@ -25,6 +25,7 @@
 #include "planner/sirius_plan_partial_aggregate_pushdown.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "transparent/narrow_outer_join_counts.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 
 #include <duckdb/common/enums/statement_type.hpp>
@@ -481,6 +482,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
         exists_rewrites = rewrite_subqueries(copy);
       }
     }
+    narrow_outer_join_counts(*copy, input.optimizer.binder);
     // Recorded once the plan is final, so the counts describe the plan that is captured.
     ctx->record_exists_minmax_rewrites(exists_rewrites);
     ctx->record_partial_aggregate_pushdowns(pushed_aggregates);
