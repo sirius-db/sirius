@@ -2843,14 +2843,34 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(build == MemoryBarrierType::FULL);
   }
 
-  SECTION("RIGHT join: the probe drives partition sizing and arrives whole")
+  SECTION("RIGHT join on equalities: the probe streams and the build arrives whole")
   {
+    // stream_right_joins is on by default: the build side sizes the partitions.
     auto plan = generate_sirius_plan(
       *con, "SELECT * FROM big_left l RIGHT JOIN small_right r ON l.id = r.rid", keep_shape);
     INFO(tree_to_string(plan.get()));
     auto* join = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
     REQUIRE(join != nullptr);
     REQUIRE(join->Cast<sirius::op::sirius_physical_hash_join>().is_right_family());
+    auto const [probe, build] = barriers(join);
+    CHECK(probe == MemoryBarrierType::PARTIAL);
+    CHECK(build == MemoryBarrierType::FULL);
+  }
+
+  SECTION(
+    "RIGHT join with a non-equality condition: the probe drives partition sizing and "
+    "arrives whole")
+  {
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT * FROM big_left l RIGHT JOIN small_right r ON l.id = r.rid AND l.val < r.other",
+      keep_shape);
+    INFO(tree_to_string(plan.get()));
+    auto* join = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(join != nullptr);
+    auto const& hash_join = join->Cast<sirius::op::sirius_physical_hash_join>();
+    REQUIRE(hash_join.is_right_family());
+    REQUIRE(hash_join.is_mixed_join());
     auto const [probe, build] = barriers(join);
     CHECK(probe == MemoryBarrierType::FULL);
     CHECK(build == MemoryBarrierType::FULL);
