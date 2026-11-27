@@ -38,6 +38,7 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/utils/cleanup_utils.hpp>
 #include <roaring/roaring.hh>
 
 #include <algorithm>
@@ -50,6 +51,7 @@
 #include <functional>
 #include <future>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <string>
 #include <vector>
@@ -202,12 +204,17 @@ class memory_ioctx final : public cucascade::io::ioctx {
     auto fan_in = std::make_shared<cucascade::io::grouped_coordinator>(bytes, slices.size());
     auto future = fan_in->get_future();
     fan_in->report_error(std::make_exception_ptr(std::runtime_error("range read failed")));
-    held_ = [this, fan_in, slices = std::move(slices)] {
+    std::function<void()> finish = [this, fan_in, slices = std::move(slices)] {
       for (size_t i = 1; i < slices.size(); ++i) {
         fill(slices[i]);
         fan_in->on_complete();
       }
     };
+    {
+      std::lock_guard lock(mutex_);
+      if (!released_) held_ = std::exchange(finish, {});
+    }
+    if (finish) finish();  // released before it arrived, so nothing would finish it later
     issued_.set_value();
     return future;
   }
@@ -216,10 +223,17 @@ class memory_ioctx final : public cucascade::io::ioctx {
   {
     return issued_.get_future().wait_for(limit) == std::future_status::ready;
   }
-  /// The ranges still in flight write their bytes and complete.
+  /// The ranges still in flight write their bytes and complete, and so does a failed_and_held
+  /// request that arrives later.
   void finish_held()
   {
-    if (auto held = std::exchange(held_, {})) held();
+    std::function<void()> held;
+    {
+      std::lock_guard lock(mutex_);
+      released_ = true;
+      held.swap(held_);
+    }
+    if (held) held();
   }
   std::vector<std::uint8_t*> destinations;  // of the request for several ranges
 
@@ -247,6 +261,8 @@ class memory_ioctx final : public cucascade::io::ioctx {
   std::vector<std::byte> bytes_;
   vectored answer_;
   std::promise<void> issued_;
+  std::mutex mutex_;  // guards released_ and held_
+  bool released_ = false;
   std::function<void()> held_;
 };
 
@@ -1410,7 +1426,9 @@ TEST_CASE("A datasource read fills non-adjacent host pool blocks that outlive a 
       std::make_shared<memory_ioctx>(std::move(bytes), memory_ioctx::vectored::failed_and_held);
     auto source  = make_puffin_byte_source(cucascade::io::open_datasource(io, ref.puffin_path));
     auto reading = std::async(std::launch::async, [&] { (void)read(*source); });
-    CHECK(io->issued_within(5s));
+    // Destroyed before `reading`, so no exit from this section joins a worker that is still held.
+    cucascade::utils::on_scope_exit release{[&]() noexcept { io->finish_held(); }};
+    REQUIRE(io->issued_within(5s));
     // One range has failed and the other is in flight. A reader that returned now would hand
     // that range's block back to the pool while the backend can still write to it.
     CHECK(reading.wait_for(100ms) == std::future_status::timeout);
