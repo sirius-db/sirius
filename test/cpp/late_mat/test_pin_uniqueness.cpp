@@ -270,7 +270,7 @@ TEST_CASE("a non-integer column stays in the running only for a small table",
 {
   // A dimension's name column (nation.n_name) can prove a group-by-rowid ride, so a non-integer
   // column is left to the exact stage while its table is small, whatever its type. Past the row cap
-  // it is refused at the chunk that crosses it.
+  // a column that is not a string is refused at the chunk that crosses it.
   ::cuda::stream_ref const stream{cudaStream_t{}};
   using sirius::late_mat::unique_verdict;
   auto const mr = cudf::get_current_device_resource_ref();
@@ -290,10 +290,13 @@ TEST_CASE("a non-integer column stays in the running only for a small table",
   REQUIRE(probe.candidate(1));
 
   // At exactly the cap the column is still in the running; the next chunk pushes it over.
-  std::vector<std::string> big(sirius::late_mat::small_table_max_rows, "x");
-  auto big_names = sirius::test::operator_utils::make_string_column(big, stream, mr);
+  auto big_floats =
+    cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                              static_cast<cudf::size_type>(sirius::late_mat::small_table_max_rows),
+                              cudf::mask_state::UNALLOCATED,
+                              stream);
   unique_probe big_probe{std::vector<bool>{true}};
-  std::vector<cudf::column_view> big_cols{big_names->view()};
+  std::vector<cudf::column_view> big_cols{big_floats->view()};
   big_probe.observe(cudf::table_view{big_cols}, stream);
   REQUIRE(big_probe.candidate(0));
   big_probe.observe(cudf::table_view{big_cols}, stream);
@@ -317,17 +320,18 @@ TEST_CASE("a big table's string column stays in the running while its chunks hol
     // Descending, so the chunk is unsorted and the probe has to sort it.
     ids.push_back("ID" + std::to_string(10'000'000 - i));
   }
-  auto distinct  = sirius::test::operator_utils::make_string_column(ids, stream, mr);
-  auto floats    = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
-                                          static_cast<cudf::size_type>(rows),
-                                          cudf::mask_state::UNALLOCATED,
-                                          stream);
-  ids.back()     = ids.front();
-  auto repeating = sirius::test::operator_utils::make_string_column(ids, stream, mr);
-  std::vector<cudf::column_view> cols{distinct->view(), repeating->view(), floats->view()};
+  auto distinct = sirius::test::operator_utils::make_string_column(ids, stream, mr);
+  std::vector<cudf::column_view> const only_distinct{distinct->view()};
 
   SECTION("a distinct chunk keeps the column, a repeat or another type ends its chances")
   {
+    auto floats    = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                            static_cast<cudf::size_type>(rows),
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream);
+    ids.back()     = ids.front();
+    auto repeating = sirius::test::operator_utils::make_string_column(ids, stream, mr);
+    std::vector<cudf::column_view> cols{distinct->view(), repeating->view(), floats->view()};
     unique_probe probe{std::vector<bool>{true, true, true}};
     std::vector<std::size_t> asked;
     probe.observe(cudf::table_view{cols}, stream, [&](std::size_t bytes) {
@@ -344,16 +348,16 @@ TEST_CASE("a big table's string column stays in the running while its chunks hol
 
   SECTION("without memory for the sort the column is dropped")
   {
-    unique_probe probe{std::vector<bool>{true, false, false}};
-    probe.observe(cudf::table_view{cols}, stream, [](std::size_t) { return false; });
+    unique_probe probe{std::vector<bool>{true}};
+    probe.observe(cudf::table_view{only_distinct}, stream, [](std::size_t) { return false; });
     REQUIRE(probe.verdicts()[0] == unique_verdict::refused);
   }
 
   SECTION("with the exact stage out of reach nothing can settle it")
   {
-    unique_probe probe{std::vector<bool>{true, false, false}};
+    unique_probe probe{std::vector<bool>{true}};
     probe.exact_unavailable(0);
-    probe.observe(cudf::table_view{cols}, stream);
+    probe.observe(cudf::table_view{only_distinct}, stream);
     REQUIRE(probe.verdicts()[0] == unique_verdict::refused);
   }
 }

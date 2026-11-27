@@ -474,61 +474,79 @@ std::optional<double> most_distinct_values(duckdb::ClientContext& context,
   }
 }
 
-/// Whether @p column is proven to hold no value twice, and no NULL, in its scan: its pinned copy
-/// found it distinct, or it is a native table's PRIMARY KEY.
-bool never_repeats(duckdb::ClientContext& context, scan_column const& column)
+/// The columns of @p get that are proven to hold no value twice, and no NULL: those its pinned
+/// copy found distinct, or a native table's PRIMARY KEY.
+std::vector<ColumnBinding> unique_columns(duckdb::ClientContext& context, duckdb::LogicalGet& get)
 {
+  std::vector<ColumnBinding> unique;
   try {
-    auto const outputs = column.get->GetColumnBindings();
-    return std::ranges::any_of(
-      proven_unique_scan_outputs(context, *column.get), [&](auto position) {
-        return position < outputs.size() && outputs[position] == column.binding;
-      });
+    auto const outputs = get.GetColumnBindings();
+    for (auto const position : proven_unique_scan_outputs(context, get)) {
+      if (position < outputs.size()) { unique.push_back(outputs[position]); }
+    }
   } catch (...) {
     // A scan whose facts cannot be read proves nothing.
-    return false;
+    unique.clear();
   }
+  return unique;
 }
 
-/// Whether one of @p keys is proven to hold no value twice in @p source, so that an aggregate
-/// grouped by them would have a group for every row and combine nothing. The proof is a scan's:
-/// a column its pinned copy found distinct, or a native table's PRIMARY KEY. It holds only for
-/// the scan's own rows, under filters and projections, since a join below @p source could repeat
-/// them.
+/// The scan that @p op's rows come from through filters and projections alone, with the scan
+/// column behind each of @p columns that it passes on unchanged; a column it computes is left
+/// out. Filters and projections lead to one scan, so every column that reaches a scan reaches
+/// that one.
+struct scanned_columns {
+  duckdb::LogicalGet* get = nullptr;
+  std::vector<std::pair<ColumnBinding, ColumnBinding>> columns;  ///< Of @p op, and of the scan
+};
+scanned_columns scan_columns_behind(LogicalOperator& op, std::vector<ColumnBinding> const& columns)
+{
+  scanned_columns result;
+  for (auto const& column : columns) {
+    if (auto const behind = scan_column_behind(op, column, /*rows_only=*/true)) {
+      result.get = behind->get;
+      result.columns.emplace_back(column, behind->binding);
+    }
+  }
+  return result;
+}
+
+/// Whether one of @p keys is proven to hold no value twice in @p source (see unique_columns), so
+/// that an aggregate grouped by them would have a group for every row and combine nothing. The
+/// proof holds only for the scan's own rows, under filters and projections, since a join below
+/// @p source could repeat them.
 bool key_never_repeats(duckdb::ClientContext& context,
                        LogicalOperator& source,
                        std::vector<ColumnBinding> const& keys)
 {
-  return std::ranges::any_of(keys, [&](auto const& key) {
-    auto const behind = scan_column_behind(source, key, /*rows_only=*/true);
-    return behind && never_repeats(context, *behind);
+  auto const scanned = scan_columns_behind(source, keys);
+  if (!scanned.get) { return false; }
+  auto const unique = unique_columns(context, *scanned.get);
+  return std::ranges::any_of(scanned.columns, [&](auto const& column) {
+    return std::ranges::find(unique, column.second) != unique.end();
   });
 }
 
 /// Adds to @p fixed the columns of @p side that one of its columns in @p fixed determines: where
 /// @p side is a scan under filters and projections, and such a column is proven to hold no value
 /// twice in it, a value of that column picks out one row, and with it a value of every other
-/// column the scan passes on. Returns whether it added any.
-bool add_columns_of_unique_row(duckdb::ClientContext& context,
+/// column the scan passes on.
+void add_columns_of_unique_row(duckdb::ClientContext& context,
                                LogicalOperator& side,
                                duckdb::column_binding_set_t& fixed)
 {
-  auto const columns = side.GetColumnBindings();
-  if (!std::ranges::any_of(columns, [&](auto const& column) {
-        if (!fixed.contains(column)) { return false; }
-        auto const behind = scan_column_behind(side, column, /*rows_only=*/true);
-        return behind && never_repeats(context, *behind);
+  auto const scanned = scan_columns_behind(side, side.GetColumnBindings());
+  if (!scanned.get) { return; }
+  auto const unique = unique_columns(context, *scanned.get);
+  if (!std::ranges::any_of(scanned.columns, [&](auto const& column) {
+        return fixed.contains(column.first) &&
+               std::ranges::find(unique, column.second) != unique.end();
       })) {
-    return false;
+    return;
   }
-  auto added = false;
-  for (auto const& column : columns) {
-    // Filters and projections lead to one scan, so a column that reaches a scan reaches that one.
-    if (scan_column_behind(side, column, /*rows_only=*/true)) {
-      added = fixed.insert(column).second || added;
-    }
+  for (auto const& column : scanned.columns) {
+    fixed.insert(column.first);
   }
-  return added;
 }
 
 /// The rows of @p source that one group of @p keys is estimated to combine, at least: its row
@@ -827,12 +845,12 @@ void analyze(duckdb::ClientContext& context,
   for (auto const& group : result.groups) {
     grouped.insert(binding_of(*group));
   }
-  for (auto added = true; added;) {
-    added = false;
+  // Each pass can fix columns that fix more, so repeat until one adds none.
+  for (std::size_t before = 0; before != grouped.size();) {
+    before = grouped.size();
     for (auto const& step : result.path) {
       if (step.preserves) { continue; }
-      added =
-        add_columns_of_unique_row(context, *step.join->children[1 - step.side], grouped) || added;
+      add_columns_of_unique_row(context, *step.join->children[1 - step.side], grouped);
       for (auto const& condition : step.join->conditions) {
         if (!condition.IsComparison() ||
             (condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL &&
@@ -842,8 +860,8 @@ void analyze(duckdb::ClientContext& context,
         }
         auto const left  = binding_of(condition.GetLHS());
         auto const right = binding_of(condition.GetRHS());
-        if (grouped.contains(right)) { added = grouped.insert(left).second || added; }
-        if (grouped.contains(left)) { added = grouped.insert(right).second || added; }
+        if (grouped.contains(right)) { grouped.insert(left); }
+        if (grouped.contains(left)) { grouped.insert(right); }
       }
     }
   }
