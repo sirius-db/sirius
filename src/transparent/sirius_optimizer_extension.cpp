@@ -26,6 +26,7 @@
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
+#include "transparent/push_narrowing_expressions.hpp"
 
 #include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/common/types/value.hpp>
@@ -480,6 +481,10 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
         copy            = copy_logical_plan(*captured, context);
         exists_rewrites = rewrite_subqueries(copy);
       }
+    }
+    if (plan_optimization_enabled(context,
+                                  &sirius::operator_params::enable_narrowing_expression_pushdown)) {
+      push_narrowing_expressions(*copy, input.optimizer.binder);
     }
     // Recorded once the plan is final, so the counts describe the plan that is captured.
     ctx->record_exists_minmax_rewrites(exists_rewrites);

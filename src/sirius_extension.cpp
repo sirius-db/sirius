@@ -3204,6 +3204,16 @@ static void SetEnableExistsFromAggregate(ClientContext& context, SetScope scope,
                    params->enable_exists_from_aggregate);
 }
 
+static void SetEnableNarrowingExpressionPushdown(ClientContext& context,
+                                                 SetScope scope,
+                                                 Value& parameter)
+{
+  auto* params                                 = get_operator_params(context, scope);
+  params->enable_narrowing_expression_pushdown = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_NARROWING_EXPRESSION_PUSHDOWN to {}",
+                   params->enable_narrowing_expression_pushdown);
+}
+
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
@@ -3835,6 +3845,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_exists_from_aggregate),
     SetEnableExistsFromAggregate);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_narrowing_expression_pushdown",
+                    "runtime override for computing narrowing expressions below inner joins",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_narrowing_expression_pushdown),
+                    SetEnableNarrowingExpressionPushdown);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",
