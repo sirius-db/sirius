@@ -130,7 +130,7 @@ sirius_physical_plan_generator::plan_full_row_dedup(
 {
   duckdb::vector<duckdb::idx_t> key_columns(child->get_types().size());
   std::iota(key_columns.begin(), key_columns.end(), duckdb::idx_t{0});
-  return plan_dedup(std::move(child), key_columns, {}, estimated_cardinality);
+  return plan_dedup(std::move(child), key_columns, {}, {}, estimated_cardinality);
 }
 
 namespace {
@@ -297,7 +297,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sum_tags_per_group(
     std::vector<std::unique_ptr<sirius::ast::node>> arguments;
     arguments.push_back(column_reference(key_count + tag, tinyint));
     sum_list.push_back(std::make_unique<sirius::ast::node>(sirius::ast::aggregate{
-      sirius::aggregate_id::sum, std::move(arguments), bigint, /*distinct=*/false}));
+      sirius::aggregate_id::sum, std::move(arguments), bigint, /*distinct=*/false, /*order=*/{}}));
   }
   auto aggregate_types = key_types;
   aggregate_types.insert(aggregate_types.end(), tag_count, bigint);

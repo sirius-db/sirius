@@ -20,21 +20,26 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/aggregate/carried_columns.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
+#include "op/cudf_sort_order.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/order/gpu_order_impl.hpp"
+#include "operator/operator_test_utils.hpp"
 #include "operator/operator_type_traits.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/data_utils.hpp"
 #include "utils/utils.hpp"
 
+#include <cudf/null_mask.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/bit.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <set>
+#include <tuple>
 
 using namespace sirius;
 using namespace cucascade;
@@ -580,6 +585,7 @@ batches_with_handles create_batches_with_local_grouped_agg_result(
                                                              aggregate_idx,
                                                                 {},
                                                                 {},
+                                                                {},
                                                              cudf::get_default_stream(),
                                                              mem_space);
     result.batches.push_back(std::move(batch));
@@ -728,7 +734,7 @@ TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grou
     ro_batches.push_back(b->to_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
-    ro_batches, group_idx.size(), aggregates, 0, cudf::get_default_stream(), *mem_space);
+    ro_batches, group_idx.size(), aggregates, 0, {}, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(input.batches, *output_batch, group_idx.size(), aggregates);
 }
@@ -760,7 +766,7 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
     }
     REQUIRE_THROWS_AS(
       gpu_merge_impl::merge_grouped_aggregate(
-        ro, group_idx.size(), aggregates, 0, cudf::get_default_stream(), *mem_space),
+        ro, group_idx.size(), aggregates, 0, {}, cudf::get_default_stream(), *mem_space),
       std::runtime_error);
   }
 
@@ -777,7 +783,7 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
     }
     REQUIRE_THROWS_AS(
       gpu_merge_impl::merge_grouped_aggregate(
-        ro, group_idx.size(), aggregates, 0, cudf::get_default_stream(), *mem_space),
+        ro, group_idx.size(), aggregates, 0, {}, cudf::get_default_stream(), *mem_space),
       std::runtime_error);
   }
 }
@@ -814,7 +820,7 @@ TEST_CASE("Grouped merge aggregate with empty local aggregate results",
     ro_batches.push_back(b->to_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
-    ro_batches, group_idx.size(), aggregates, 0, cudf::get_default_stream(), *mem_space);
+    ro_batches, group_idx.size(), aggregates, 0, {}, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(input.batches, *output_batch, group_idx.size(), aggregates);
 }
@@ -853,7 +859,7 @@ TEST_CASE("Grouped merge aggregate with mixed empty and non-empty local aggregat
     ro_batches.push_back(b->to_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
-    ro_batches, group_idx.size(), aggregates, 0, cudf::get_default_stream(), *mem_space);
+    ro_batches, group_idx.size(), aggregates, 0, {}, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(input.batches, *output_batch, group_idx.size(), aggregates);
 }
@@ -933,8 +939,8 @@ TEST_CASE("Carried row selector keeps its identity when another request follows 
     requests.push_back(std::move(request));
   };
   if (preceding_request) { append_auxiliary_request(); }
-  auto selector =
-    sirius::op::detail::append_carried_row_selector(requests, input_view.num_rows(), stream, mr);
+  auto selector = sirius::op::detail::append_carried_row_selector(
+    requests, input_view.select({1, 2}), {}, stream, mr);
   append_auxiliary_request();
   REQUIRE(selector.request_idx == static_cast<std::size_t>(preceding_request));
   REQUIRE(selector.request_idx + 1 < requests.size());
@@ -944,6 +950,7 @@ TEST_CASE("Carried row selector keeps its identity when another request follows 
   auto output_columns = result.first->release();
   auto carried        = sirius::op::detail::gather_carried_columns(
     input_view.select({1, 2}),
+    selector,
     result.second[selector.request_idx].results.front()->view(),
     stream,
     mr);
@@ -991,6 +998,7 @@ TEST_CASE("Grouped aggregate carries columns from one row of each group",
                                                                  aggregate_idx,
                                                                  {},
                                                                  carried_idx,
+                                                                 /*carried_order=*/{},
                                                                  cudf::get_default_stream(),
                                                                  *mem_space));
   }
@@ -1012,6 +1020,7 @@ TEST_CASE("Grouped aggregate carries columns from one row of each group",
                                                                 static_cast<int>(group_idx.size()),
                                                                 aggregates,
                                                                 /*num_carried=*/2,
+                                                                /*carried_order=*/{},
                                                                 cudf::get_default_stream(),
                                                                 *mem_space);
     ro_batches.clear();
@@ -1028,6 +1037,7 @@ TEST_CASE("Grouped aggregate carries columns from one row of each group",
                                                               static_cast<int>(group_idx.size()),
                                                               aggregates,
                                                               /*num_carried=*/1,
+                                                              /*carried_order=*/{},
                                                               cudf::get_default_stream(),
                                                               *mem_space),
                       std::runtime_error);
@@ -1042,6 +1052,7 @@ TEST_CASE("Grouped aggregate carries columns from one row of each group",
                                                                   aggregate_idx,
                                                                   {},
                                                                   {4},
+                                                                  {},
                                                                   cudf::get_default_stream(),
                                                                   *mem_space),
                       std::runtime_error);
@@ -1095,6 +1106,7 @@ TEST_CASE("Grouped aggregate carries columns beside an M2 state",
                                                                  aggregate_idx,
                                                                  {},
                                                                  carried_idx,
+                                                                 /*carried_order=*/{},
                                                                  cudf::get_default_stream(),
                                                                  *mem_space));
   }
@@ -1134,6 +1146,7 @@ TEST_CASE("Grouped aggregate carries columns beside an M2 state",
                                                                 static_cast<int>(group_idx.size()),
                                                                 aggregates,
                                                                 /*num_carried=*/2,
+                                                                /*carried_order=*/{},
                                                                 cudf::get_default_stream(),
                                                                 *mem_space);
     ro_batches.clear();
@@ -1153,8 +1166,15 @@ TEST_CASE("Grouped aggregate with no request keeps one row per key",
   {
     auto input    = make_int64_batch(make_carried_columns(rows_per_batch, 0), *mem_space);
     auto ro_batch = input->to_read_only();
-    auto output   = gpu_aggregate_impl::local_grouped_aggregate(
-      ro_batch, group_idx, aggregates, {}, {}, {2, 2, 0}, cudf::get_default_stream(), *mem_space);
+    auto output   = gpu_aggregate_impl::local_grouped_aggregate(ro_batch,
+                                                              group_idx,
+                                                              aggregates,
+                                                                {},
+                                                                {},
+                                                                {2, 2, 0},
+                                                                {},
+                                                              cudf::get_default_stream(),
+                                                              *mem_space);
 
     cudf::table_view output_table_view = sirius::get_cudf_table_view(*output);
     REQUIRE(output_table_view.num_columns() == 4);
@@ -1186,6 +1206,7 @@ TEST_CASE("Grouped aggregate with no request keeps one row per key",
                                                           static_cast<int>(group_idx.size()),
                                                           aggregates,
                                                           /*num_carried=*/1,
+                                                          /*carried_order=*/{},
                                                           cudf::get_default_stream(),
                                                           *mem_space);
     ro_batches.clear();
@@ -1201,6 +1222,252 @@ TEST_CASE("Grouped aggregate with no request keeps one row per key",
       CHECK(actual[1][r] % 10 == actual[0][r]);
     }
   }
+}
+
+namespace {
+
+/// A single-key ascending row order over carried position @p position, NULLs last.
+carried_row_order ascending_order(cudf::size_type position)
+{
+  return {.positions       = {position},
+          .column_order    = {cudf::order::ASCENDING},
+          .null_precedence = {cudf::null_order::AFTER}};
+}
+
+/// Reads one row per key from `[k, v, ...]`: the map from each key to its carried `v`.
+std::map<int64_t, int64_t> carried_value_by_key(data_batch& output)
+{
+  auto const view = sirius::get_cudf_table_view(output);
+  std::vector<std::vector<int64_t>> actual(2);
+  copy_data_to_host(view.select({0, 1}), actual);
+  std::map<int64_t, int64_t> by_key;
+  for (cudf::size_type r = 0; r < view.num_rows(); ++r) {
+    CHECK(by_key.emplace(actual[0][r], actual[1][r]).second);
+  }
+  return by_key;
+}
+
+}  // namespace
+
+TEST_CASE("Ordered selector maps each group's minimum rank back to its row",
+          "[operator][merge_grouped_agg][distinct]")
+{
+  // Sorted by t the rows are 2, 3, 1, 0, so the minimum ranks are 0 and 1. Read as rows they would
+  // name rows 0 and 1, which the unordered selector also picks; the first rows under t are 2 and 3.
+  auto* space           = get_shared_mem_space();
+  auto const stream     = cudf::get_default_stream();
+  auto const mr         = space->get_default_allocator();
+  auto input            = make_int64_batch({{0, 1, 0, 1}, {10, 11, 12, 13}, {9, 8, 1, 2}}, *space);
+  auto const input_view = sirius::get_cudf_table_view(*input);
+
+  std::vector<cudf::groupby::aggregation_request> requests;
+  auto selector = sirius::op::detail::append_carried_row_selector(
+    requests, input_view.select({1, 2}), ascending_order(1), stream, mr);
+  REQUIRE(selector.permutation != nullptr);
+  cudf::groupby::groupby groupby(input_view.select({0}), cudf::null_policy::INCLUDE);
+  auto result = groupby.aggregate(requests, stream, mr);
+  auto output = result.first->release();
+  for (auto& column : sirius::op::detail::gather_carried_columns(
+         input_view.select({1, 2}),
+         selector,
+         result.second[selector.request_idx].results.front()->view(),
+         stream,
+         mr)) {
+    output.push_back(std::move(column));
+  }
+  auto batch = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(output)),
+                                       *space,
+                                       stream,
+                                       sirius::telemetry::batch_telemetry_info{});
+  CHECK(carried_value_by_key(*batch) == std::map<int64_t, int64_t>{{0, 12}, {1, 13}});
+}
+
+TEST_CASE("Ordered grouped aggregate with no request keeps each group's first row",
+          "[operator][merge_grouped_agg][distinct]")
+{
+  // `t` falls with the row index, so each key's first row under `t` is its last row, which
+  // cudf::distinct and the unordered selector both pass over.
+  auto* mem_space = get_shared_mem_space();
+  std::vector<std::vector<int64_t>> columns(3);
+  for (int64_t r = 0; r < 12; ++r) {
+    columns[0].push_back(r % 3);
+    columns[1].push_back(r);
+    columns[2].push_back(100 - r);
+  }
+  auto input    = make_int64_batch(columns, *mem_space);
+  auto ro_batch = input->to_read_only();
+  auto output   = gpu_aggregate_impl::local_grouped_aggregate(
+    ro_batch, {0}, {}, {}, {}, {1, 2}, ascending_order(1), cudf::get_default_stream(), *mem_space);
+  CHECK(sirius::get_cudf_table_view(*output).num_columns() == 3);
+  CHECK(carried_value_by_key(*output) == std::map<int64_t, int64_t>{{0, 9}, {1, 10}, {2, 11}});
+}
+
+TEST_CASE("Ordered grouped merge keeps each group's first row across partials",
+          "[operator][merge_grouped_agg][distinct]")
+{
+  // Partial b holds v = 10b + k and t = 100 - v, so the third partial wins ascending and the first
+  // descending. The unordered selector picks the first partial's row in both directions.
+  auto* mem_space       = get_shared_mem_space();
+  bool const descending = GENERATE(false, true);
+  CAPTURE(descending);
+  bool const with_request = GENERATE(false, true);
+  CAPTURE(with_request);
+
+  std::vector<std::shared_ptr<data_batch>> partials;
+  for (int64_t b = 0; b < 3; ++b) {
+    std::vector<std::vector<int64_t>> columns(with_request ? 4 : 3);
+    for (int64_t k = 0; k < 3; ++k) {
+      auto const v = 10 * b + k;
+      columns[0].push_back(k);
+      if (with_request) { columns[1].push_back(1); }
+      columns[columns.size() - 2].push_back(v);
+      columns.back().push_back(100 - v);
+    }
+    partials.push_back(make_int64_batch(columns, *mem_space));
+  }
+  std::vector<read_only_data_batch> ro_batches;
+  for (auto& batch : partials) {
+    ro_batches.push_back(batch->to_read_only());
+  }
+  auto order = ascending_order(1);
+  if (descending) {
+    std::tie(order.column_order[0], order.null_precedence[0]) = to_cudf_sort_order(
+      {sirius::ast::sort_direction::descending, sirius::ast::null_placement::last});
+  }
+  auto const aggregates = with_request
+                            ? std::vector<cudf::aggregation::Kind>{cudf::aggregation::Kind::SUM}
+                            : std::vector<cudf::aggregation::Kind>{};
+  auto output           = gpu_merge_impl::merge_grouped_aggregate(
+    ro_batches, 1, aggregates, /*num_carried=*/2, order, cudf::get_default_stream(), *mem_space);
+  ro_batches.clear();
+
+  auto const view = sirius::get_cudf_table_view(*output);
+  std::vector<std::vector<int64_t>> actual(2);
+  copy_data_to_host(view.select({0, view.num_columns() - 2}), actual);
+  std::map<int64_t, int64_t> by_key;
+  for (cudf::size_type r = 0; r < view.num_rows(); ++r) {
+    by_key.emplace(actual[0][r], actual[1][r]);
+  }
+  auto const winner = descending ? 0 : 20;
+  CHECK(by_key == std::map<int64_t, int64_t>{{0, winner}, {1, winner + 1}, {2, winner + 2}});
+}
+
+TEST_CASE("Ordered grouped aggregate honors NULL placement, direction and every sort path",
+          "[operator][merge_grouped_agg][distinct]")
+{
+  auto* mem_space   = get_shared_mem_space();
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = mem_space->get_default_allocator();
+  using sirius::ast::null_placement;
+  using sirius::ast::sort_direction;
+
+  SECTION("two keys, NULLs first under DESC")
+  {
+    // ORDER BY t1 DESC NULLS FIRST, t2: key 0 keeps the NULL t1 row with the lower t2 (v = 2),
+    // key 1 the higher t1 tie with the lower t2 (v = 5). NULLs placed last would keep v = 3.
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    for (auto const& values : std::vector<std::vector<int64_t>>{{0, 0, 0, 0, 1, 1, 1},
+                                                                {0, 1, 2, 3, 4, 5, 6},
+                                                                {5, 0, 0, 9, 4, 4, 2},
+                                                                {1, 7, 3, 0, 2, 1, 0}}) {
+      columns.push_back(
+        sirius::test::vector_to_cudf_column<sirius::test::operator_utils::gpu_type_traits<int64_t>>(
+          values, stream, mr));
+    }
+    columns[2] = sirius::test::operator_utils::with_nulls(
+      std::move(columns[2]), {true, false, false, true, true, true, true}, stream, mr);
+    auto input = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                         *mem_space,
+                                         stream,
+                                         sirius::telemetry::batch_telemetry_info{});
+    auto const [t1_order, t1_nulls] =
+      to_cudf_sort_order({sort_direction::descending, null_placement::first});
+    auto const [t2_order, t2_nulls] =
+      to_cudf_sort_order({sort_direction::ascending, null_placement::last});
+    carried_row_order const order{.positions       = {1, 2},
+                                  .column_order    = {t1_order, t2_order},
+                                  .null_precedence = {t1_nulls, t2_nulls}};
+    auto ro_batch = input->to_read_only();
+    auto output   = gpu_aggregate_impl::local_grouped_aggregate(
+      ro_batch, {0}, {}, {}, {}, {1, 2, 3}, order, stream, *mem_space);
+    CHECK(carried_value_by_key(*output) == std::map<int64_t, int64_t>{{0, 2}, {1, 5}});
+  }
+
+  SECTION("one DOUBLE key without NULLs")
+  {
+    // No NULL and one fixed-width key send cudf::sorted_order down its radix path. NaN sorts after
+    // +inf, as in DuckDB.
+    auto const nan  = std::numeric_limits<double>::quiet_NaN();
+    auto const inf  = std::numeric_limits<double>::infinity();
+    bool const desc = GENERATE(false, true);
+    CAPTURE(desc);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(
+      sirius::test::vector_to_cudf_column<sirius::test::operator_utils::gpu_type_traits<int64_t>>(
+        {0, 0, 0, 0, 0, 1, 1, 1}, stream, mr));
+    columns.push_back(
+      sirius::test::vector_to_cudf_column<sirius::test::operator_utils::gpu_type_traits<int64_t>>(
+        {0, 1, 2, 3, 4, 5, 6, 7}, stream, mr));
+    columns.push_back(
+      sirius::test::vector_to_cudf_column<sirius::test::operator_utils::gpu_type_traits<double>>(
+        {1.5, nan, -inf, inf, 0.0, -1.0, nan, 2.0}, stream, mr));
+    auto input = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                         *mem_space,
+                                         stream,
+                                         sirius::telemetry::batch_telemetry_info{});
+    auto const [d_order, d_nulls] = to_cudf_sort_order(
+      {desc ? sort_direction::descending : sort_direction::ascending, null_placement::last});
+    carried_row_order const order{
+      .positions = {1}, .column_order = {d_order}, .null_precedence = {d_nulls}};
+    auto ro_batch = input->to_read_only();
+    auto output   = gpu_aggregate_impl::local_grouped_aggregate(
+      ro_batch, {0}, {}, {}, {}, {1, 2}, order, stream, *mem_space);
+    auto const expected = desc ? std::map<int64_t, int64_t>{{0, 1}, {1, 6}}
+                               : std::map<int64_t, int64_t>{{0, 2}, {1, 5}};
+    CHECK(carried_value_by_key(*output) == expected);
+  }
+}
+
+TEST_CASE("Ordered grouped aggregate refuses an order position outside the carried columns",
+          "[operator][merge_grouped_agg][distinct]")
+{
+  auto* mem_space = get_shared_mem_space();
+  auto input      = make_int64_batch(make_carried_columns(6, 0), *mem_space);
+  auto ro_batch   = input->to_read_only();
+  REQUIRE_THROWS_AS(gpu_aggregate_impl::local_grouped_aggregate(ro_batch,
+                                                                {0},
+                                                                {},
+                                                                {},
+                                                                {},
+                                                                {2, 3},
+                                                                ascending_order(2),
+                                                                cudf::get_default_stream(),
+                                                                *mem_space),
+                    std::runtime_error);
+}
+
+TEST_CASE("Ordered grouped merge refuses an order position outside the carried columns",
+          "[operator][merge_grouped_agg][distinct]")
+{
+  // Partials `[k, a, b]` with two carried columns; position 2 is past them.
+  auto* mem_space = get_shared_mem_space();
+  std::vector<std::shared_ptr<data_batch>> partials;
+  for (int b = 0; b < 2; ++b) {
+    auto const columns = make_carried_columns(6, 6 * b);
+    partials.push_back(make_int64_batch({columns[0], columns[2], columns[3]}, *mem_space));
+  }
+  std::vector<read_only_data_batch> ro_batches;
+  for (auto& batch : partials) {
+    ro_batches.push_back(batch->to_read_only());
+  }
+  REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(ro_batches,
+                                                            1,
+                                                            {},
+                                                            /*num_carried=*/2,
+                                                            ascending_order(2),
+                                                            cudf::get_default_stream(),
+                                                            *mem_space),
+                    std::runtime_error);
 }
 
 namespace {
@@ -1490,7 +1757,7 @@ TEST_CASE("Grouped merge aggregate of sorted partials that arrive out of order",
     ro_batches.push_back(batch->to_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
-    ro_batches, 1, aggregates, 0, cudf::get_default_stream(), *mem_space);
+    ro_batches, 1, aggregates, 0, {}, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(batches, *output_batch, 1, aggregates);
   REQUIRE(sirius::get_cudf_table_view(*output_batch).num_rows() == 7);
@@ -1513,7 +1780,7 @@ TEST_CASE("Grouped merge aggregate of sorted partials with INT32 keys, ties and 
     ro_batches.push_back(batch->to_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
-    ro_batches, 1, aggregates, 0, cudf::get_default_stream(), *mem_space);
+    ro_batches, 1, aggregates, 0, {}, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(batches, *output_batch, 1, aggregates);
   REQUIRE(sirius::get_cudf_table_view(*output_batch).num_rows() == 6);
@@ -1534,7 +1801,7 @@ TEST_CASE("Grouped merge aggregate of partials that are not sorted",
     ro_batches.push_back(batch->to_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
-    ro_batches, 1, aggregates, 0, cudf::get_default_stream(), *mem_space);
+    ro_batches, 1, aggregates, 0, {}, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(batches, *output_batch, 1, aggregates);
   REQUIRE(sirius::get_cudf_table_view(*output_batch).num_rows() == 4);

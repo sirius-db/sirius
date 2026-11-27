@@ -172,7 +172,7 @@ struct group_by_shape {
   /// Parallel to aggregate_idx: what each aggregate DOES with its input. A
   /// COUNT needs the row, not the value.
   std::vector<cudf::aggregation::Kind> const* aggregate_kinds = nullptr;
-  /// Local group-by only: the inputs its FIRST slots gather.
+  /// Local group-by only: the inputs its FIRST slots gather or order by.
   std::vector<int> carried;
 };
 
@@ -185,7 +185,7 @@ std::optional<group_by_shape> read_group_by(sirius_physical_operator const& node
                           &agg->cudf_aggregate_idx,
                           &agg->cudf_aggregate_struct_col_indices,
                           &agg->cudf_aggregates,
-                          op::carried_inputs(agg->aggregate_slots)};
+                          op::make_carried_block_layout(agg->aggregate_slots).inputs};
   }
   if (auto const* merge = dynamic_cast<op::sirius_physical_grouped_aggregate_merge const*>(&node)) {
     if (merge->num_grouping_set_columns > 0) { return std::nullopt; }

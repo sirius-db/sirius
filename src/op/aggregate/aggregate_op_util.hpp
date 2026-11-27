@@ -20,6 +20,7 @@
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/node.hpp"
 #include "helper/logical_type.hpp"
+#include "op/aggregate/carried_columns.hpp"
 #include "op/aggregate/wide_integer_sum.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -205,10 +206,19 @@ struct stddev_samp_slot {
   std::size_t partial_idx{};  ///< Index in cudf_aggregates
 };
 
+/** @brief One ORDER BY key of an ordered FIRST: the child column and how it sorts. */
+struct order_key {
+  cudf::size_type input_idx{-1};                              ///< Child column of the key
+  cudf::order column_order{cudf::order::ASCENDING};           ///< Direction of the key
+  cudf::null_order null_precedence{cudf::null_order::AFTER};  ///< cuDF null order of the key
+  bool operator==(order_key const&) const = default;
+};
+
 /** @brief FIRST: no cuDF request; child column `input_idx` is carried at `carried_idx`. */
 struct first_slot {
   cudf::size_type input_idx{-1};  ///< Child column whose value this slot carries
   std::size_t carried_idx{};      ///< Position in the carried block that follows the partials
+  std::vector<order_key> order;   ///< Row order that picks the carried row; empty: any row
 };
 
 /**
@@ -224,8 +234,9 @@ using aggregate_slot =
 /**
  * @brief Column positions shared by grouped aggregation, merge, and finalization
  *
- * Partial batches contain group keys, expanded cuDF partials, then carried FIRST columns. Indices
- * passed to `partial_column` and `carried_column` are relative to their respective blocks.
+ * Partial batches contain group keys, expanded cuDF partials, then the carried block that
+ * `make_carried_block_layout` describes. Indices passed to `partial_column` and `carried_column`
+ * are relative to their respective blocks.
  */
 class grouped_aggregate_layout {
  public:
@@ -254,7 +265,8 @@ class grouped_aggregate_layout {
   /**
    * @brief Whether final slot order and types need no post-merge projection
    *
-   * HUGEINT carrier widening is checked separately against the runtime columns.
+   * HUGEINT carrier widening is checked separately against the runtime columns. Order keys after
+   * the FIRST columns make it false.
    */
   [[nodiscard]] bool matches_output(std::span<aggregate_slot const> slots) const noexcept;
 
@@ -281,8 +293,8 @@ struct CudfAggregateDefinitions {
   /// One entry per original DuckDB aggregate expression, mapping to cudf_aggregates positions or,
   /// for a FIRST, to its carried column.
   std::vector<aggregate_slot> aggregate_slots;
-  /// Runtime partial schema: group keys, expanded aggregate carriers, then the FIRST carried
-  /// columns.
+  /// Runtime partial schema: group keys, expanded aggregate carriers, then the carried block that
+  /// `make_carried_block_layout` describes.
   duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;  ///< True if any aggregate is AVG
   bool has_count_distinct = false;  ///< True if any aggregate is COUNT(DISTINCT col)
@@ -311,12 +323,27 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
 
 /**
- * @brief Child column read by each FIRST slot, indexed by its `carried_idx`
+ * @brief The columns a grouped aggregate carries after its partials, and the order that picks them
+ */
+struct carried_block_layout {
+  /// Child column at each carried position: each FIRST input at its `carried_idx`, then the keys of
+  /// `order`
+  std::vector<int> inputs;
+  /// The row order of the ordered FIRSTs, over positions in `inputs`; empty when none is ordered
+  carried_row_order order;
+};
+
+/**
+ * @brief The layout of the carried block of @p aggregate_slots
+ *
+ * Every ordered `first_slot` must carry the same order, whose keys are appended once.
+ *
+ * @throw sirius::internal_exception if two `first_slot`s carry different non-empty orders
  *
  * @param aggregate_slots One entry per aggregate expression
- * @return The columns a grouped aggregate carries after its partials, in carried-block order
+ * @return The carried inputs, in carried-block order, and their row order
  */
-std::vector<int> carried_inputs(std::vector<aggregate_slot> const& aggregate_slots);
+carried_block_layout make_carried_block_layout(std::span<aggregate_slot const> aggregate_slots);
 
 /**
  * @brief Whether every slot in @p aggregate_slots holds a `plain_slot`

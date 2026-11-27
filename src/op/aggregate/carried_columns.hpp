@@ -23,7 +23,8 @@
  *
  * A carried column is the input of a FIRST: each group's output row copies it from one input row of
  * that group, and every carried column of a group comes from the same input row. Each kernel
- * decides which of its columns are carried and where they land in its output.
+ * decides which of its columns are carried and where they land in its output. Under a
+ * `carried_row_order` that row is the group's first row in that order; without one it is any row.
  */
 
 #include <cudf/column/column.hpp>
@@ -39,6 +40,27 @@
 #include <cstddef>
 #include <memory>
 #include <vector>
+
+namespace sirius::op {
+
+/**
+ * @brief The row order under which a grouped aggregate keeps each group's carried row
+ *
+ * Keys are positions in the carried block, so one value serves both kernels:
+ * `gpu_aggregate_impl::local_grouped_aggregate` reads position `p` as input column
+ * `carried_idx[p]`, and `gpu_merge_impl::merge_grouped_aggregate` reads it as the partial's
+ * carried column `p`. The three vectors are parallel.
+ */
+struct carried_row_order {
+  std::vector<cudf::size_type> positions;         ///< Key columns, as carried-block positions
+  std::vector<cudf::order> column_order;          ///< Direction of each key
+  std::vector<cudf::null_order> null_precedence;  ///< cuDF null order of each key
+
+  [[nodiscard]] bool empty() const noexcept { return positions.empty(); }
+  bool operator==(carried_row_order const&) const = default;
+};
+
+}  // namespace sirius::op
 
 namespace sirius::op::detail {
 
@@ -62,32 +84,39 @@ namespace sirius::op::detail {
   rmm::device_async_resource_ref mr);
 
 /**
- * @brief Owned row positions and the identity of their appended aggregation request
+ * @brief The values of the request that picks each group's carried row, and its identity
  *
- * Keep this value alive until the groupby has consumed the request's borrowed values. Sorting
- * request values preserves the original row positions stored in the column.
+ * Keep this value alive until the groupby has consumed the request's borrowed values and
+ * `gather_carried_columns` has read `permutation`. Sorting request values preserves the values
+ * stored in the column.
  */
 struct carried_row_selector {
-  std::unique_ptr<cudf::column> row_positions;
-  std::size_t request_idx;
+  std::unique_ptr<cudf::column> values;       ///< Row positions, or each row's rank under the order
+  std::unique_ptr<cudf::column> permutation;  ///< Row at each sorted position; null when unordered
+  std::size_t request_idx;                    ///< Index of the appended request
 };
 
 /**
  * @brief Appends the request that picks each group's carried row to @p requests
  *
- * The request is a MIN over the row positions `0 .. num_rows - 1`, so its result is the lowest
- * input row of each group. It stays an input position when the caller sorts every request's values
+ * The request is a MIN. Without an order its values are the row positions of @p carried, so its
+ * result is the lowest input row of each group. With @p order its values are each row's rank in
+ * `cudf::sorted_order` of the order's keys, so its result is the sorted position of each group's
+ * first row in that order. Either result survives the caller sorting every request's values
  * together with the keys before the groupby. Subsequent requests do not change its identity.
  *
  * @param requests The groupby's requests
- * @param num_rows Number of rows in the groupby input
+ * @param carried The carried columns, in the row order of the groupby input
+ * @param order The row order; its positions index @p carried
  * @param stream CUDA stream used for device operations
- * @param mr Device memory resource used for the returned column
- * @return The owned row positions and the appended request index
+ * @param mr Device memory resource used for the returned columns
+ * @return The owned request values, the sort permutation under @p order, and the appended request
+ * index
  */
 [[nodiscard]] carried_row_selector append_carried_row_selector(
   std::vector<cudf::groupby::aggregation_request>& requests,
-  cudf::size_type num_rows,
+  cudf::table_view carried,
+  carried_row_order const& order,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
@@ -95,14 +124,16 @@ struct carried_row_selector {
  * @brief Gathers the carried columns of each group's row
  *
  * @param carried The carried columns, in the row order of the groupby input
- * @param row_positions Result of the request identified by `carried_row_selector::request_idx`
+ * @param selector The selector whose request produced @p selected
+ * @param selected Result of the request identified by `carried_row_selector::request_idx`
  * @param stream CUDA stream used for device operations
  * @param mr Device memory resource used for the returned columns
  * @return One column per column of @p carried, with one row per group in the groupby's group order
  */
 [[nodiscard]] std::vector<std::unique_ptr<cudf::column>> gather_carried_columns(
   cudf::table_view carried,
-  cudf::column_view row_positions,
+  carried_row_selector const& selector,
+  cudf::column_view selected,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 

@@ -312,6 +312,81 @@ TEST_CASE_METHOD(DictionaryCarrierFixture,
 }
 
 TEST_CASE_METHOD(DictionaryCarrierFixture,
+                 "dictionary carrier - ordered first and DISTINCT ON over carried columns",
+                 "[integration][gpu_execution][dictionary_carrier][distinct]")
+{
+  auto const tier = GENERATE(as<std::string>{}, "gpu", "host");
+  CAPTURE(tier);
+  pin_compressed(tier);
+  auto const* const keyed =
+    "SELECT low, first(distinct_values ORDER BY x DESC) FROM t GROUP BY low";
+  REQUIRE(carried_dictionaries(keyed) > 0);
+  run_ok("SET enable_duckdb_fallback = false;");
+  auto const before = sirius::test::get_compressed_materialization_stats(*con);
+  compare_gpu_vs_cpu(keyed);
+  CHECK(sirius::test::get_compressed_materialization_stats(*con).scan_dictionary_carriers >
+        before.scan_dictionary_carriers);
+  for (bool const partitioned : {false, true}) {
+    CAPTURE(partitioned);
+    if (partitioned) { run_ok("SET hash_partition_bytes = 1048576;"); }
+    // Every order ends on the unique `x`, so each group has one winner to compare.
+    for (auto const* query : {
+           "SELECT low, first(nullable ORDER BY x) FROM t GROUP BY low",
+           "SELECT \"group\", first(x ORDER BY low DESC, x) FROM t GROUP BY \"group\"",
+           "SELECT \"group\", last(low ORDER BY x) FROM t GROUP BY \"group\"",
+           "SELECT nullable, first(low ORDER BY x DESC) FROM t GROUP BY nullable",
+           "SELECT DISTINCT ON (low) low, nullable, \"group\", x FROM t ORDER BY low, \"group\" "
+           "DESC, x DESC",
+           "SELECT low, first(nullable ORDER BY x) FROM t WHERE x < 0 GROUP BY low",
+           "SELECT DISTINCT ON (low) low, \"group\" FROM t WHERE x < 0 ORDER BY low, x",
+         }) {
+      compare_gpu_vs_cpu(query);
+    }
+  }
+}
+
+TEST_CASE_METHOD(DictionaryCarrierFixture,
+                 "dictionary carrier - ordered first over a key carried in some chunks only",
+                 "[integration][gpu_execution][dictionary_carrier][distinct]")
+{
+  auto const tier = GENERATE(as<std::string>{}, "gpu", "host");
+  CAPTURE(tier);
+  pin_mixed(tier);
+  REQUIRE(carried_dictionaries("SELECT m, first(p ORDER BY x DESC) FROM mixed GROUP BY m") == 1);
+  run_ok("SET enable_duckdb_fallback = false;");
+  compare_gpu_vs_cpu("SELECT m, first(p ORDER BY x DESC) FROM mixed GROUP BY m");
+  compare_gpu_vs_cpu("SELECT m, last(x ORDER BY p) FROM mixed GROUP BY m");
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (m) m, p, x FROM mixed ORDER BY m, x DESC");
+}
+
+TEST_CASE_METHOD(DictionaryCarrierFixture,
+                 "dictionary carrier - ordered first over deferred columns",
+                 "[integration][gpu_execution][dictionary_carrier][distinct][late_mat]")
+{
+  auto const tier = GENERATE(as<std::string>{}, "gpu", "host");
+  CAPTURE(tier);
+  // pin_mixed checkpoints, which would make an earlier pin of `t` stale.
+  pin_mixed(tier);
+  pin_compressed(tier);
+  run_ok("SET enable_duckdb_fallback = false;");
+  run_ok("SET late_materialization_min_boundaries = 0;");
+  run_ok("SET late_materialization_min_value_x_boundaries = 0;");
+  // Only a group-by directly over the scan installs a deferral; a join or filter between stops it.
+  auto const before = sirius::late_mat::deferrals_installed();
+  for (auto const* query : {
+         "SELECT low, first(distinct_values ORDER BY x DESC) FROM t GROUP BY low",
+         "SELECT \"group\", first(nullable ORDER BY low DESC, x) FROM t GROUP BY \"group\"",
+         "SELECT DISTINCT ON (low) low, nullable, distinct_values FROM t ORDER BY low, x DESC",
+         "SELECT m, first(p ORDER BY x DESC) FROM mixed GROUP BY m",
+         "SELECT DISTINCT ON (m) m, p FROM mixed ORDER BY m, x",
+       }) {
+    compare_gpu_vs_cpu(query);
+  }
+  // The host-tier pin installs no deferral for these queries.
+  if (tier == "gpu") { CHECK(sirius::late_mat::deferrals_installed() > before); }
+}
+
+TEST_CASE_METHOD(DictionaryCarrierFixture,
                  "dictionary carrier - a distributed query plans none",
                  "[integration][gpu_execution][dictionary_carrier]")
 {

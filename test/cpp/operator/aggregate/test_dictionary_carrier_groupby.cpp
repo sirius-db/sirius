@@ -143,6 +143,7 @@ std::pair<std::map<std::optional<std::string>, group_row>, cudf::type_id> groupe
     {1, 2, 0},
     {},
     {},
+    {},
     stream,
     *space,
     {},

@@ -241,8 +241,12 @@ std::unique_ptr<sirius::ast::node> make_aggregate_expression(uint32_t input_idx,
 {
   std::vector<std::unique_ptr<sirius::ast::node>> arguments;
   arguments.push_back(make_reference(input_idx));
-  return std::make_unique<sirius::ast::node>(sirius::ast::aggregate{
-    function, std::move(arguments), sirius::logical_type::make(sirius::type_id::BIGINT), distinct});
+  return std::make_unique<sirius::ast::node>(
+    sirius::ast::aggregate{function,
+                           std::move(arguments),
+                           sirius::logical_type::make(sirius::type_id::BIGINT),
+                           distinct,
+                           /*order=*/{}});
 }
 
 // A HASH_GROUP_BY over @p child grouping on @p group_columns with `functions[i]` over

@@ -173,6 +173,7 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   const std::vector<int>& aggregate_idx,
   const std::vector<std::vector<int>>& aggregate_struct_col_indices,
   const std::vector<int>& carried_idx,
+  const carried_row_order& carried_order,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
@@ -217,8 +218,16 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
     std::ranges::for_each(group_idx, require_in_range);
     std::ranges::for_each(carried_idx, require_in_range);
   }
+  for (auto const position : carried_order.positions) {
+    if (position < 0 || static_cast<std::size_t>(position) >= carried_idx.size()) {
+      throw std::runtime_error("local_grouped_aggregate: order position " +
+                               std::to_string(position) + " is out of range for " +
+                               std::to_string(carried_idx.size()) + " carried columns");
+    }
+  }
 
-  if (aggregates.empty() && !carried_idx.empty() && !group_idx.empty()) {
+  // cudf::distinct keeps an arbitrary row, which only an unordered list may take.
+  if (aggregates.empty() && !carried_idx.empty() && !group_idx.empty() && carried_order.empty()) {
     std::vector<cudf::size_type> selected(group_idx.begin(), group_idx.end());
     selected.insert(selected.end(), carried_idx.begin(), carried_idx.end());
     auto deduped = detail::aggregate_carried_columns_only(
@@ -592,10 +601,11 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
 
   // The selector is outside input_col_order, so the result loop skips it.
   // It survives the M2 path below, which sorts every request's values.
+  std::vector<cudf::size_type> const carried(carried_idx.begin(), carried_idx.end());
   std::optional<detail::carried_row_selector> row_selector;
   if (!carried_idx.empty()) {
-    row_selector =
-      detail::append_carried_row_selector(requests, input_table.num_rows(), stream, mr);
+    row_selector = detail::append_carried_row_selector(
+      requests, input_table.select(carried), carried_order, stream, mr);
   }
 
   // cuDF's hash M2 computes sum(x*x) - sum(x)*sum(x)/n, which can catastrophically
@@ -736,13 +746,20 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   }
 
   if (row_selector) {
-    std::vector<cudf::size_type> const carried(carried_idx.begin(), carried_idx.end());
     for (auto& column : detail::gather_carried_columns(
            input_table.select(carried),
+           *row_selector,
            groupby_result.second[row_selector->request_idx].results.front()->view(),
            stream,
            mr)) {
       output_cols.push_back(std::move(column));
+    }
+    if (!carried_order.empty()) {
+      SIRIUS_LOG_DEBUG(
+        "local_grouped_agg: carried row ranked by {} order key(s) ({} rows in, {} groups)",
+        carried_order.positions.size(),
+        input_table.num_rows(),
+        output_cols.back()->size());
     }
   }
 
@@ -988,6 +1005,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   const std::vector<int>& aggregate_idx,
   const std::vector<std::vector<int>>& aggregate_struct_col_indices,
   const std::vector<int>& carried_idx,
+  const carried_row_order& carried_order,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info,
@@ -1003,6 +1021,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
                                               aggregate_idx,
                                               aggregate_struct_col_indices,
                                               carried_idx,
+                                              carried_order,
                                               stream,
                                               memory_space,
                                               aggregate_input_max_abs,
@@ -1051,6 +1070,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouping_sets_a
                                          aggregates,
                                          aggregate_idx,
                                          aggregate_struct_col_indices,
+                                              {},
                                               {},
                                          stream,
                                          memory_space,

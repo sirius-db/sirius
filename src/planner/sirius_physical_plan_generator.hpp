@@ -21,6 +21,7 @@
 #include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "expression/ast/order_modifier.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "planner/delim_cte_proof.hpp"
@@ -260,12 +261,21 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_union(
     duckdb::LogicalSetOperation& op);
 
+  //! One key of the row order under which `plan_dedup` carries each group's row.
+  struct dedup_order_key {
+    duckdb::idx_t column;                  //!< Child column of the key
+    sirius::ast::order_modifier modifier;  //!< Direction and NULL placement
+  };
+
   //! A grouped aggregate over @p child keyed on its @p key_columns, in that order, carrying each of
-  //! @p carried_columns through a FIRST; its output is the keys, then the carried columns.
+  //! @p carried_columns through a FIRST; its output is the keys, then the carried columns. Every
+  //! carried column comes from each group's first row under @p order, or from any row when it is
+  //! empty.
   static duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_dedup(
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
     std::span<duckdb::idx_t const> key_columns,
     std::span<duckdb::idx_t const> carried_columns,
+    std::span<dedup_order_key const> order,
     duckdb::idx_t estimated_cardinality);
 
   //! `plan_dedup` keyed on every column of @p child, in order, with nothing carried: the
@@ -292,6 +302,11 @@ class sirius_physical_plan_generator {
   // @p operation names the context, e.g. "a filter predicate".
   static void reject_nested_column_operation(duckdb::Expression const& expr,
                                              std::string_view operation);
+
+  // Whether @p expression calls a GPU lower() or upper(), directly or through a column of the
+  // projections below @p child, where DuckDB can move it. NOCASE collates a key as lower(key).
+  static bool reads_case_mapping(duckdb::Expression const& expression,
+                                 duckdb::LogicalOperator const& child);
 
   // Same check when only a column type + name are available (e.g. a predicate
   // pushed into LogicalGet::table_filters).

@@ -75,7 +75,8 @@ TEST_CASE("ast_clone - cloning an aggregate deep-clones its reference child", "[
   auto src = std::make_unique<node>(aggregate{sirius::aggregate_id::sum,
                                               std::move(args),
                                               sirius::logical_type::make(sirius::type_id::BIGINT),
-                                              /*distinct=*/true});
+                                              /*distinct=*/true,
+                                              /*order=*/{}});
 
   auto cloned = clone(*src);
 
@@ -93,6 +94,26 @@ TEST_CASE("ast_clone - cloning an aggregate deep-clones its reference child", "[
   REQUIRE(agg.arguments()[0].get() != src_child.get());
   REQUIRE(agg.arguments()[0]->holds<reference>());
   REQUIRE(agg.arguments()[0]->get<reference>().column_index == 3);
+}
+
+TEST_CASE("ast_clone - cloning an aggregate keeps its ORDER BY", "[ast_clone][distinct]")
+{
+  auto const type = sirius::logical_type::make(sirius::type_id::INTEGER);
+  std::vector<std::unique_ptr<node>> args;
+  args.push_back(std::make_unique<node>(reference{/*column_index=*/0, type}));
+  args.push_back(std::make_unique<node>(reference{/*column_index=*/4, type}));
+  std::vector<sirius::ast::order_modifier> const order{
+    {sirius::ast::sort_direction::descending, sirius::ast::null_placement::first}};
+  auto const src = std::make_unique<node>(
+    aggregate{sirius::aggregate_id::first, std::move(args), type, false, order});
+
+  auto const cloned = clone(*src);
+
+  REQUIRE(cloned->holds<aggregate>());
+  auto const& agg = cloned->get<aggregate>();
+  CHECK(agg.order() == order);
+  REQUIRE(agg.arguments().size() == 2);
+  CHECK(agg.arguments()[1]->get<reference>().column_index == 4);
 }
 
 // ============================================================================
@@ -164,7 +185,7 @@ TEST_CASE("native reference traversal covers every child shape without changing 
   roots.emplace_back(function_call{sirius::function_id::add, std::move(args), type});
   args.clear();
   args.push_back(make_ref(17));
-  roots.emplace_back(aggregate{sirius::aggregate_id::sum, std::move(args), type, false});
+  roots.emplace_back(aggregate{sirius::aggregate_id::sum, std::move(args), type, false, {}});
 
   std::vector<uint32_t> indices;
   for (auto const& root : roots) {

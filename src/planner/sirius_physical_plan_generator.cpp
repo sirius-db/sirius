@@ -31,6 +31,7 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
@@ -38,6 +39,7 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "expression/ast/utils.hpp"
+#include "expression/function_id.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "log/logging.hpp"
@@ -1223,8 +1225,8 @@ plan_lineage collect_semantic_lineage(op::sirius_physical_operator& node,
       if (index >= 0) mark_semantic(lineage_at(children[0], index));
     for (auto index : aggregate.cudf_aggregate_idx)
       if (index >= 0) mark_semantic(lineage_at(children[0], index));
-    // FIRST carries its input through cuDF gathers and concatenation before host export.
-    for (auto index : op::carried_inputs(aggregate.aggregate_slots))
+    // FIRST carries its inputs and order keys through cuDF gathers and concatenation.
+    for (auto index : op::make_carried_block_layout(aggregate.aggregate_slots).inputs)
       mark_semantic(lineage_at(children[0], index));
     result.columns.resize(node.types.size());
   } else if (node.type == type::UNGROUPED_AGGREGATE && children.size() == 1) {
@@ -2139,6 +2141,29 @@ void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expr
                              expr.GetReturnType().ToString() + ") is unsupported in " +
                              std::string(operation));
   }
+}
+
+bool sirius_physical_plan_generator::reads_case_mapping(duckdb::Expression const& expression,
+                                                        duckdb::LogicalOperator const& child)
+{
+  if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION) {
+    auto const& function = expression.Cast<duckdb::BoundFunctionExpression>();
+    auto const id        = sirius::from_duckdb_function_name(
+      function.Function().GetName().GetIdentifierName(), function.GetChildren().size());
+    if (id == sirius::function_id::lower || id == sirius::function_id::upper) { return true; }
+  }
+  if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF &&
+      child.type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
+    auto const& projection = child.Cast<duckdb::LogicalProjection>();
+    auto const index       = expression.Cast<duckdb::BoundReferenceExpression>().Index();
+    return index < projection.expressions.size() &&
+           reads_case_mapping(*projection.expressions[index], *projection.children[0]);
+  }
+  bool found = false;
+  duckdb::ExpressionIterator::EnumerateChildren(expression, [&](duckdb::Expression const& term) {
+    found = found || reads_case_mapping(term, child);
+  });
+  return found;
 }
 
 void sirius_physical_plan_generator::reject_nested_column_type(duckdb::LogicalType const& type,
