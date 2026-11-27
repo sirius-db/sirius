@@ -277,6 +277,9 @@ struct physical_check_counters {
   std::function<void(std::string const&)> s3_config_installed_for_testing;
   // Before an equality-delete file is opened.
   std::function<void(std::string const&)> iceberg_equality_open_for_testing;
+  // Before an equality-delete plan fetches a chunk of data-file key bounds, with the number of
+  // chunks it has fetched. Throwing fails that fetch.
+  std::function<void(std::size_t)> iceberg_key_bounds_fetch_for_testing;
   std::function<void(scan_contract_id, bool)> iceberg_preparation_route_for_testing;
   std::function<void(std::string_view, scan_manager::admission_decision const&)>
     iceberg_statement_route_for_testing;

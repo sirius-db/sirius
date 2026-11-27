@@ -54,6 +54,7 @@
 #include <algorithm>
 #include <atomic>
 #include <deque>
+#include <filesystem>
 #include <map>
 #include <numeric>
 #include <set>
@@ -388,7 +389,12 @@ bool spec_partitions(std::string const& spec_json)
 struct key_bounds {
   std::string lower, upper;  // Serialized bounds; empty when not recorded.
   bool no_nulls = false;     // The null count is recorded as zero.
+  // Of a delete file's key once the compared keys are known: its position among them, which is
+  // also its position in a data file's bounds. It takes no room beside `no_nulls`.
+  uint32_t ranged = 0;
 };
+
+static_assert(sizeof(key_bounds) == 2 * sizeof(std::string) + sizeof(std::size_t));
 
 /// The same as views of a manifest chunk: nothing is copied before the caller has room for it.
 struct key_bounds_view {
@@ -521,33 +527,59 @@ using key_bounds_sink =
 /// manifest may not have, and is streamed, so the stream's buffer is held and not every entry.
 /// It can still fail, and a failed query aborts the connection's transaction: nothing may
 /// follow it. `file_index` is the position of a row's manifest in the list, whatever the
-/// spelling `read_avro` reports it under; the caller passes no name it would expand as a
-/// pattern, which could shift the positions.
+/// spelling `read_avro` reports it under; the caller passes no name with pattern characters,
+/// which could open several files and shift the positions. @p before_fetch, when set, is
+/// called before each chunk is fetched, with the number fetched so far.
 bool read_key_bounds(iceberg_metadata_connection& connection,
                      std::vector<std::string_view> const& manifests,
                      std::vector<int32_t> const& ids,
                      std::size_t max_bound_length,
-                     key_bounds_sink const& sink)
+                     key_bounds_sink const& sink,
+                     std::function<void(std::size_t)> const& before_fetch)
 {
-  std::string sql = "SELECT data_file.file_path, data_file, file_index FROM read_avro([";
-  for (auto const manifest : manifests)
-    sql += (sql.back() == '[' ? "'" : ", '") + escape_sql_string(std::string(manifest)) + "'";
+  // The pattern selects `status` again and, with it, any column of the manifests themselves
+  // named `file_index`. No other column is asked for: one that a later manifest lacks, as a
+  // format version 1 manifest lacks the sequence numbers, would fail the read.
+  std::string sql =
+    "SELECT data_file.file_path, file_index, data_file, "
+    "COLUMNS('(?i)^(status|file_index)$') FROM read_avro([";
+  for (auto const manifest : manifests) {
+    // DuckDB looks a relative name up in the directories of `file_search_path` when the working
+    // directory has no such file, and opens one file in each that does. An absolute name opens
+    // the file it spells or none, so a relative one is made absolute here.
+    std::string name(manifest);
+    if (name.find("://") == std::string::npos && !name.starts_with("file:/") &&
+        !std::filesystem::path(name).is_absolute()) {
+      std::error_code failed;
+      name = std::filesystem::absolute(name, failed).string();
+      if (failed) return false;
+    }
+    sql += (sql.back() == '[' ? "'" : ", '") + escape_sql_string(name) + "'";
+  }
   sql += "]) WHERE status <> 2";
   try {
     auto result = connection.get().Submit(sql);
     if (!result || result->HasError()) return false;
+    // A manifest column named `file_index` is bound before read_avro's own, and what it holds
+    // is the file's to choose.
+    auto const& names = result->GetNames();
+    for (duckdb::idx_t column = 3; column < names.size(); ++column)
+      if (duckdb::StringUtil::CIEquals(names[column].GetIdentifierName(), "file_index"))
+        return false;
     duckdb::QueryResultStream<> stream(std::move(result));
     std::vector<key_bounds_view> keys;
-    while (auto chunk = stream.Fetch()) {
-      if (chunk->size() == 0) break;
+    for (std::size_t fetched = 0;; ++fetched) {
+      if (before_fetch) before_fetch(fetched);
+      auto chunk = stream.Fetch();
+      if (!chunk || chunk->size() == 0) break;
       chunk->Flatten();
-      key_bounds_reader const bounds(chunk->data[1], max_bound_length);
+      key_bounds_reader const bounds(chunk->data[2], max_bound_length);
       for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
         keys.clear();
         for (auto const id : ids)
           keys.push_back(bounds.of(row, id));
         if (!sink(chunk->GetValue(0, row).ToString(),
-                  chunk->GetValue(2, row).GetValue<uint64_t>(),
+                  chunk->GetValue(1, row).GetValue<uint64_t>(),
                   keys))
           return false;
       }
@@ -840,12 +872,26 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
         ranged_types.push_back(std::move(*type));
       }
     }
+    // Each delete file keeps only the keys a data file is looked at for: those whose type is
+    // compared and whose range the file records. A pair of files then costs no more than these
+    // keys, however many the delete file has.
     bool usable = false;
-    for (std::size_t file = 0; file < files.size(); ++file)
-      for (std::size_t key = 0; key < delete_bounds[file].size(); ++key)
-        usable |=
-          std::binary_search(ranged_ids.begin(), ranged_ids.end(), files[file].equality_ids[key]) &&
-          !delete_bounds[file][key].lower.empty() && !delete_bounds[file][key].upper.empty();
+    for (std::size_t file = 0; file < files.size(); ++file) {
+      auto& keys       = delete_bounds[file];
+      std::size_t kept = 0;
+      for (std::size_t key = 0; key < keys.size(); ++key) {
+        auto const id     = files[file].equality_ids[key];
+        auto const ranged = std::lower_bound(ranged_ids.begin(), ranged_ids.end(), id);
+        if (ranged == ranged_ids.end() || *ranged != id || keys[key].lower.empty() ||
+            keys[key].upper.empty())
+          continue;
+        keys[key].ranged = static_cast<uint32_t>(ranged - ranged_ids.begin());
+        if (kept != key) keys[kept] = std::move(keys[key]);
+        ++kept;
+      }
+      keys.resize(kept);
+      usable |= kept != 0;
+    }
     if (!usable) stop_pruning();
   }
   // A data file's bounds are kept with its path, under the same ceiling.
@@ -900,6 +946,7 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
     // its path in the manifest it was read from and no entry of that path came before: two
     // entries may record different bounds, and nothing says which to trust.
     std::vector<std::string_view> const manifests(data_manifests.begin(), data_manifests.end());
+    auto const counters = iceberg_counters(context);
     auto const complete = read_key_bounds(
       metadata_conn,
       manifests,
@@ -912,7 +959,9 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
           return false;
         found->second.read = true;
         return keep_bounds(found->first, keys);
-      });
+      },
+      counters && counters->track_units ? counters->iceberg_key_bounds_fetch_for_testing
+                                        : std::function<void(std::size_t)>{});
     if (!complete) stop_pruning();
   }
   if (auto counters = iceberg_counters(context))
@@ -920,26 +969,22 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
 
   // Whether the bounds prove that delete file @p file matches no row of a data file. One key is
   // enough. A NULL key matches a NULL value and bounds leave NULLs out, so a key decides only
-  // when one of the two files holds no NULL in it and both record a range. Each key compared
-  // counts against the plan's budget; past it nothing is compared, and the file may match.
+  // when one of the two files holds no NULL in it and both record a range. Each usable key
+  // looked at for a data file counts against the plan's budget, whether or not it decides;
+  // past the budget nothing is looked at, and the file may match.
   std::size_t compared = 0;
   auto const ruled_out = [&](uint32_t file, std::vector<key_bounds> const& data_keys) {
-    auto const& delete_keys = delete_bounds[file];
-    for (std::size_t key = 0; key < delete_keys.size(); ++key) {
-      auto const id     = files[file].equality_ids[key];
-      auto const ranged = std::lower_bound(ranged_ids.begin(), ranged_ids.end(), id);
-      if (ranged == ranged_ids.end() || *ranged != id) continue;
-      auto const k         = static_cast<std::size_t>(ranged - ranged_ids.begin());
-      auto const& deleted  = delete_keys[key];
-      auto const& existing = data_keys[k];
-      if (!deleted.no_nulls && !existing.no_nulls) continue;
-      if (deleted.lower.empty() || deleted.upper.empty() || existing.lower.empty() ||
-          existing.upper.empty())
-        continue;
+    for (auto const& deleted : delete_bounds[file]) {
       if (compared == limits.max_comparisons) return false;
       ++compared;
-      if (equality_key_ranges_disjoint(
-            ranged_types[k], deleted.lower, deleted.upper, existing.lower, existing.upper))
+      auto const& existing = data_keys[deleted.ranged];
+      if (!deleted.no_nulls && !existing.no_nulls) continue;
+      if (existing.lower.empty() || existing.upper.empty()) continue;
+      if (equality_key_ranges_disjoint(ranged_types[deleted.ranged],
+                                       deleted.lower,
+                                       deleted.upper,
+                                       existing.lower,
+                                       existing.upper))
         return true;
     }
     return false;
