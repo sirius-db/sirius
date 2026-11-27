@@ -329,7 +329,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/rhash-1.4.6-hb03c661_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/rust-1.99.1-h5387ef0_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/s2n-1.7.5-h7e3ee7f_1.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/sccache-0.18.0-h2d90d6e_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/sccache-0.20.1-h2d90d6e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/seaweedfs-4.48-hfc2019e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/snappy-1.2.2-h34e00bb_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/spdlog-1.17.0-hb6aa676_2.conda
@@ -623,7 +623,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/rhash-1.4.6-he30d5cf_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/rust-1.99.1-h9371fc6_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/s2n-1.7.5-h61cb6f2_1.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/sccache-0.18.0-h9b2e256_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/sccache-0.20.1-h9b2e256_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/seaweedfs-4.48-h22914b5_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/snappy-1.2.2-h7d29b6f_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/spdlog-1.17.0-hb3fff47_2.conda
@@ -925,7 +925,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/rhash-1.4.6-hb03c661_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/rust-1.99.1-h5387ef0_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/s2n-1.7.5-h7e3ee7f_1.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/sccache-0.18.0-h2d90d6e_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/sccache-0.20.1-h2d90d6e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/seaweedfs-4.48-hfc2019e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/snappy-1.2.2-h34e00bb_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/spdlog-1.17.0-hb6aa676_2.conda
@@ -1220,7 +1220,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/rhash-1.4.6-he30d5cf_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/rust-1.99.1-h9371fc6_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/s2n-1.7.5-h61cb6f2_1.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/sccache-0.18.0-h9b2e256_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/sccache-0.20.1-h9b2e256_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/seaweedfs-4.48-h22914b5_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/snappy-1.2.2-h7d29b6f_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/spdlog-1.17.0-hb3fff47_2.conda
@@ -1643,7 +1643,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ruamel.yaml.clib-0.2.15-py315hd4e796c_5.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/rust-1.99.1-h5387ef0_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/s2n-1.7.7-ha5dc4ae_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/sccache-0.18.0-h2d90d6e_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/sccache-0.20.1-h2d90d6e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tbb-2023.1.0-haa8c3ee_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.21.0-h297d835_0.conda
@@ -1876,7 +1876,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ruamel.yaml.clib-0.2.15-py315h161ad5a_5.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/rust-1.99.1-h9371fc6_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/s2n-1.7.7-h4ec5ce7_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/sccache-0.18.0-h9b2e256_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/sccache-0.20.1-h9b2e256_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tbb-2023.1.0-hdaecc9b_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tk-8.6.13-noxft_hf03c496_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.21.0-h96f4cc0_0.conda
@@ -2116,7 +2116,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ruamel.yaml.clib-0.2.15-py315hd4e796c_5.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/rust-1.99.1-h5387ef0_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/s2n-1.7.7-ha5dc4ae_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/sccache-0.18.0-h2d90d6e_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/sccache-0.20.1-h2d90d6e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tbb-2023.1.0-haa8c3ee_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.21.0-h3aa5027_0.conda
@@ -2348,7 +2348,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ruamel.yaml.clib-0.2.15-py315h161ad5a_5.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/rust-1.99.1-h9371fc6_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/s2n-1.7.7-h4ec5ce7_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/sccache-0.18.0-h9b2e256_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/sccache-0.20.1-h9b2e256_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tbb-2023.1.0-hdaecc9b_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tk-8.6.13-noxft_hf03c496_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.21.0-h0499473_0.conda
@@ -7076,9 +7076,9 @@ packages:
     - s2n >=1.7.7,<1.7.8.0a0
   size: 394123
   timestamp: 1785889776393
-- conda: https://conda.anaconda.org/conda-forge/linux-64/sccache-0.18.0-h2d90d6e_1.conda
-  sha256: 90ad0e950bfa2b28d5c426243b8e0a7409f219db0d6628f15ba49e798948b05c
-  md5: 34775df50acc9c04390820cf3044ed43
+- conda: https://conda.anaconda.org/conda-forge/linux-64/sccache-0.20.1-h2d90d6e_0.conda
+  sha256: 51258d60304a29f341f1e1c344f69747b5a33f7d92bbb6e5d96ee9bf221ac46a
+  md5: 93e5d266fff58c3f2e219ad81f7422d3
   depends:
   - __glibc >=2.17,<3.0.a0
   - libgcc >=15
@@ -7086,10 +7086,11 @@ packages:
   constrains:
   - __glibc >=2.17
   license: Apache-2.0
+  license_family: APACHE
   purls: []
   run_exports: {}
-  size: 7690411
-  timestamp: 1793087072168
+  size: 7699123
+  timestamp: 1795601644386
 - conda: https://conda.anaconda.org/conda-forge/linux-64/seaweedfs-4.48-hfc2019e_0.conda
   sha256: 7711c890b88d1ecd3f9479b7c25bd21966b2ba7946deb81f14b1aaa3cd9bced8
   md5: 31e377132e35f3527009554ce97bbc74
@@ -11972,19 +11973,20 @@ packages:
     - s2n >=1.7.7,<1.7.8.0a0
   size: 361343
   timestamp: 1785889791294
-- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/sccache-0.18.0-h9b2e256_1.conda
-  sha256: d1eda6a4e9d70b9379986a0bbb3a708811c0a02294b8bb8f4633da887519ca5e
-  md5: e3c778f9d447215291299b63c6b8f8aa
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/sccache-0.20.1-h9b2e256_0.conda
+  sha256: 975e49dee001ec5cadda8437fa2f8c8eaf6ae5208b340ac6d38c8edd3336e675
+  md5: 7ce3f09d6907bee02703069899d5391f
   depends:
   - libgcc >=15
   - openssl >=3.5.9,<4.0a0
   constrains:
   - __glibc >=2.17
   license: Apache-2.0
+  license_family: APACHE
   purls: []
   run_exports: {}
-  size: 7614302
-  timestamp: 1793087075439
+  size: 7652225
+  timestamp: 1795601661313
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/seaweedfs-4.48-h22914b5_0.conda
   sha256: 2de0161bbe25c3ba597057f94187e38b81a753fa2a466484623fa854fff6f256
   md5: d5858e58f44437cd1d7b503c37835053
