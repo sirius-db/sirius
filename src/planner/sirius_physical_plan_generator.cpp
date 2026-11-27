@@ -969,7 +969,8 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
  *
  * @p mode selects membership-only or AST-plus-membership post-decode filtering. @p sirius_ctx,
  * when not null, observes compressed materialization and receives the dynamic-filter counters.
- * @p context is used to read the scan's GPU admission hint off its table function.
+ * @p context is used to read the scan's GPU admission hint off its table function, where
+ * admission sizes the query.
  */
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> assemble_gpu_scan_leaf(
   std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible,
@@ -1000,8 +1001,13 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> assemble_gpu_scan_leaf(
                                                                   scan.read_views,
                                                                   consumer);
   // GPU admission runs on the converted plan, after the table function and bind data are gone;
-  // take the unfiltered row count and any known column widths from them now.
-  gpu_scan->set_admission_hint(sirius::planner::derive_scan_admission_hint(context, scan));
+  // take the unfiltered row count and any known column widths from them now. Only for a query
+  // admission will size: the hint costs a cardinality callback and a statistics callback per
+  // string column.
+  if (sirius::planner::admission_estimate_needed(context)) {
+    gpu_scan->set_admission_hint(sirius::planner::derive_scan_admission_hint(
+      context, scan, op_params.avg_variable_column_bytes));
+  }
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf = std::move(gpu_scan);
   // Preserve propagated carriers; dynamic-filter targets are already native.
   if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }

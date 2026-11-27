@@ -29,8 +29,9 @@ namespace sirius::op::scan {
  *        place of the planner's filtered cardinality and the configured average string width.
  *
  * Filled by the plan generator from the Parquet footers' row counts and string sizes and the
- * table function's own cardinality and statistics callbacks. Every field is optional: admission
- * falls back to the planner estimate and `avg_variable_column_bytes` wherever a field is absent.
+ * table function's own cardinality and statistics callbacks, and only for a query admission will
+ * size (planner::admission_estimate_needed). Every field is optional: admission falls back to
+ * the planner estimate and `avg_variable_column_bytes` wherever a field is absent.
  */
 struct scan_admission_hint {
   /// Rows of the whole table or file set, before any filter: the Parquet footers' row counts,
@@ -44,13 +45,15 @@ struct scan_admission_hint {
   /// each plus the offset word. Only consulted for variable-width columns; fixed-width carriers
   /// are exact already.
   std::vector<std::optional<uint64_t>> column_widths;
-  /// Types of the columns the scan reads only to evaluate pushed-down filters. The scan decodes
-  /// them like its output columns, so they count towards its size, but they are not part of its
-  /// output: a `NOT LIKE` on a long string column can be most of a scan that outputs two keys.
-  std::vector<sirius::logical_type> filter_only_types;
-  /// Bytes per row of each filter-only column where a source could say, parallel to
-  /// `filter_only_types` and read like `column_widths`.
-  std::vector<std::optional<uint64_t>> filter_only_widths;
+  /// A column the scan reads only to evaluate pushed-down filters. The scan decodes it like an
+  /// output column, so it counts towards the scan's size, but it is not part of the output: a
+  /// `NOT LIKE` on a long string column can be most of a scan that outputs two keys.
+  struct filter_only_column {
+    sirius::logical_type type;
+    /// Bytes per row where a source could say; read like an entry of `column_widths`.
+    std::optional<uint64_t> width;
+  };
+  std::vector<filter_only_column> filter_only_columns;
 };
 
 }  // namespace sirius::op::scan

@@ -79,10 +79,14 @@ std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& p
 
   gpu_ids           = planner::apply_gpu_cap(std::move(gpu_ids), config.gpus_per_query());
   auto const n_gpus = static_cast<int>(gpu_ids.size());
-  if (bpg == 0) { return gpu_ids; }
-  // On a single GPU the estimate cannot change the allocation, but it is still computed and
-  // logged: the `[gpu_alloc] estimated` line is how the estimate is checked against real scan
-  // sizes, and single-GPU hosts are where that check usually runs.
+  // On a single GPU the estimate cannot change the allocation, so it is computed only when DEBUG
+  // logging is on: the `[gpu_alloc] estimated` line is how the estimate is checked against real
+  // scan sizes, and single-GPU hosts are where that check usually runs. The plan generator
+  // collected the scans' admission hints under the same condition.
+  if (!planner::admission_estimate_needed(
+        bpg, gpu_ids.size(), sirius::log::get_sink()->should_log(sirius::log::level::debug))) {
+    return gpu_ids;
+  }
 
   std::vector<const op::sirius_physical_operator*> scans;
   planner::collect_gpu_scans(plan, scans);
@@ -100,19 +104,17 @@ std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& p
     auto const* gpu_scan = dynamic_cast<const op::scan::sirius_gpu_scan_operator*>(scan);
     auto const& hint     = gpu_scan != nullptr ? gpu_scan->admission_hint() : no_hint;
     if (hint.unfiltered_rows.has_value()) { ++scans_with_table_rows; }
-    auto const known = [](auto const& width) { return width.has_value(); };
-    if (std::any_of(hint.column_widths.begin(), hint.column_widths.end(), known) ||
-        std::any_of(hint.filter_only_widths.begin(), hint.filter_only_widths.end(), known)) {
+    if (std::ranges::any_of(hint.column_widths,
+                            [](auto const& width) { return width.has_value(); }) ||
+        std::ranges::any_of(hint.filter_only_columns,
+                            [](auto const& column) { return column.width.has_value(); })) {
       ++scans_with_known_widths;
     }
 
     auto const rows = planner::admission_row_count(
       static_cast<uint64_t>(scan->estimated_cardinality), hint.unfiltered_rows);
-    auto const bytes_per_row = planner::scan_bytes_per_row(scan->types,
-                                                           hint.column_widths,
-                                                           hint.filter_only_types,
-                                                           hint.filter_only_widths,
-                                                           op_params.avg_variable_column_bytes);
+    auto const bytes_per_row =
+      planner::scan_bytes_per_row(scan->types, hint, op_params.avg_variable_column_bytes);
     estimates.push_back({rows, bytes_per_row});
   }
 
@@ -122,11 +124,20 @@ std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& p
   if (!total_bytes.has_value()) { return gpu_ids; }
 
   auto const k = planner::gpu_count_for_bytes(*total_bytes, bpg, n_gpus);
-  SIRIUS_LOG_INFO("[gpu_alloc] estimated {} MiB over {} scan(s) -> {} of {} GPU(s)",
-                  *total_bytes / (1024 * 1024),
-                  scans.size(),
-                  k,
-                  n_gpus);
+  if (n_gpus > 1) {
+    SIRIUS_LOG_INFO("[gpu_alloc] estimated {} MiB over {} scan(s) -> {} of {} GPU(s)",
+                    *total_bytes / (1024 * 1024),
+                    scans.size(),
+                    k,
+                    n_gpus);
+  } else {
+    // Nothing was decided: the same line, as a diagnostic.
+    SIRIUS_LOG_DEBUG("[gpu_alloc] estimated {} MiB over {} scan(s) -> {} of {} GPU(s)",
+                     *total_bytes / (1024 * 1024),
+                     scans.size(),
+                     k,
+                     n_gpus);
+  }
   SIRIUS_LOG_DEBUG(
     "[gpu_alloc] estimate sources: {} of {} scan(s) sized from the table's unfiltered row count, "
     "{} with column widths from Parquet footers or table statistics",

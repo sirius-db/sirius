@@ -860,11 +860,6 @@ The budget is engine-owned: `max_dynamic_filter_bloom_bytes_per_gpu` is no longe
 accepted in YAML or registered as a SQL setting. Remove the old key from existing
 configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulation.
 
-`admission_bytes_per_gpu` has its own memory-derived default, the smallest visible GPU's
-memory / 24 clamped to `[1 GiB, 8 GiB]` (0, i.e. off, with no GPU visible); it is **not**
-narrowed by an explicit GPU capacity, because it is a parallelism dial rather than a memory
-budget. An explicit `operator_params` value overrides it.
-
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks; must be greater than zero |
@@ -898,8 +893,8 @@ budget. An explicit `operator_params` value overrides it.
 | `parquet_footer_statistics_max_local_reads` | 16384 | The same limit for local files. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
-| `admission_bytes_per_gpu` | smallest GPU memory / 24, clamped to [1 GiB, 8 GiB] | Target projected scan bytes per GPU. At admission the engine estimates the bytes a query's scans decode (their output columns, plus the columns read only to evaluate pushed-down filters) and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. The default lands at 7.9 GiB on a GB200 (189 GiB), 8 GiB on a GB300, 3.3 GiB on an 80 GB H100, 1.9 GiB on an L40S, 1 GiB on a 24 GB L4; it was anchored on a 4× GB200, where 8 GiB was the largest value that left no TPC-H query at SF100 or SF1000 more than 5% slower than all GPUs, and it keeps sub-second queries on one GPU while being inert for anything larger. The row count per scan is the larger of the planner's filtered estimate and the scan's unfiltered row count (DuckDB table row count; for Parquet, the sum of the files' footer row counts), because the planner's filter selectivity under-counts range and `LIKE` filters by several times and under-counting admits too few GPUs. A Parquet scan has a footer row count only where the footer-statistics pass covered it: `parquet_footer_statistics` on (its default), no more uncached footers than `parquet_footer_statistics_max_remote_reads` / `parquet_footer_statistics_max_local_reads` allow, and a file list DuckDB did not replace while optimizing. Any other Parquet scan is sized from the planner's filtered estimate alone. |
-| `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output and no source states a width. Parquet scans use the footers' unencoded byte-array size statistics plus a 4-byte offset, averaged over all their files, only when every nonempty row group of every file supplies them and the scan has a footer row count (see `admission_bytes_per_gpu`); incomplete or encoded-only metadata retain the configured width; DuckDB tables take the statistics' maximum string length plus the 4-byte offset. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
+| `admission_bytes_per_gpu` | 0 (off) | Target projected scan bytes per GPU. At admission the engine estimates the bytes a query's scans decode (their output columns, plus the columns read only to evaluate pushed-down filters) and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. The row count per scan is the larger of the planner's filtered estimate and the scan's unfiltered row count, because the planner's filter selectivity under-counts range and `LIKE` filters by several times and under-counting admits too few GPUs. The unfiltered count is the table's row count for a DuckDB table and the sum of the files' footer row counts for a Parquet scan the footer-statistics pass covered: `parquet_footer_statistics` on (its default), no more uncached footers than `parquet_footer_statistics_max_remote_reads` / `parquet_footer_statistics_max_local_reads` allow, and a file list DuckDB did not replace while optimizing. Any other Parquet scan takes DuckDB's own estimate of its unfiltered rows, which is exact for one file and otherwise extrapolated from the first file (or summed from the footers DuckDB has cached). The per-scan facts are collected at plan time only when the setting is non-zero and the query has more than one candidate GPU (or DEBUG logging is on), so a query planned with the setting at `0` costs nothing extra. On a single GPU the estimate decides nothing and is logged at DEBUG. |
+| `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan bytes and no source states a width. A top-level string column of a Parquet scan that has a footer row count (see `admission_bytes_per_gpu`) uses the footers' unencoded byte-array sizes plus a 4-byte offset for the rows of the row groups that state them, and this width for the rows of the files and row groups that state none; encoded sizes are not used. A DuckDB table's string column takes the statistics' maximum string length plus the 4-byte offset. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
 | `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input, or the BIGINT input of a SUM or AVG that DuckDB accumulates in HUGEINT, must be widened before aggregation, or whether a DECIMAL128 SUM input can be summed as DECIMAL64. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
 
@@ -1258,7 +1253,7 @@ GPU task. Its histogram budget is engine-owned and applies per partition task.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `admission_bytes_per_gpu` | smallest GPU memory / 24, clamped to [1 GiB, 8 GiB] | Target projected scan bytes per GPU, counting the columns a scan outputs and those it reads only for filters; `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` |
+| `admission_bytes_per_gpu` | 0 (off) | Target projected scan bytes per GPU, counting the columns a scan outputs and those it reads only for filters; `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns when estimating scan bytes; must be greater than zero |
 
 Both take effect from the next query, since admission runs per query. `topology.gpus_per_query`
@@ -1266,7 +1261,6 @@ is YAML-only — it is read once when the GPU memory spaces are configured.
 
 ```sql
 SET admission_bytes_per_gpu = 34359738368;  -- 32 GiB
-SET admission_bytes_per_gpu = 0;            -- off: every query gets topology.gpus_per_query GPUs
 ```
 
 ### Dynamic Filters

@@ -15,8 +15,8 @@
  */
 
 #include "catch.hpp"
+#include "op/scan/scan_admission_hint.hpp"
 #include "planner/gpu_admission.hpp"
-#include "sirius_config.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 
@@ -28,13 +28,17 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 using sirius::logical_type;
 using sirius::type_id;
+using sirius::op::scan::scan_admission_hint;
 using sirius::planner::accumulate_scan_bytes;
+using sirius::planner::admission_estimate_needed;
 using sirius::planner::admission_row_count;
 using sirius::planner::apply_gpu_cap;
+using sirius::planner::blended_string_width;
 using sirius::planner::estimate_bytes_per_row;
 using sirius::planner::gpu_count_for_bytes;
 using sirius::planner::scan_bytes_per_row;
@@ -208,24 +212,73 @@ TEST_CASE("scan_bytes_per_row counts the columns a scan reads only for its filte
   // TPC-H Q13's scan of orders: two keys out, and a comment column read for a NOT LIKE.
   const std::vector<logical_type> output{logical_type::make(type_id::BIGINT),
                                          logical_type::make(type_id::INTEGER)};
-  const std::vector<logical_type> filter_only{logical_type::make(type_id::VARCHAR)};
+  scan_admission_hint hint;
   // No filter-only columns: the output columns alone.
-  REQUIRE(scan_bytes_per_row(output, {}, {}, {}, k_avg_var) == 8 + 4);
+  REQUIRE(scan_bytes_per_row(output, hint, k_avg_var) == 8 + 4);
   // A filter-only string is charged the configured average ...
-  REQUIRE(scan_bytes_per_row(output, {}, filter_only, {}, k_avg_var) == 8 + 4 + k_avg_var);
+  hint.filter_only_columns = {{logical_type::make(type_id::VARCHAR), std::nullopt}};
+  REQUIRE(scan_bytes_per_row(output, hint, k_avg_var) == 8 + 4 + k_avg_var);
   // ... or its known width.
-  REQUIRE(scan_bytes_per_row(output, {}, filter_only, {uint64_t{53}}, k_avg_var) == 8 + 4 + 53);
+  hint.filter_only_columns = {{logical_type::make(type_id::VARCHAR), uint64_t{53}}};
+  REQUIRE(scan_bytes_per_row(output, hint, k_avg_var) == 8 + 4 + 53);
   // A fixed-width filter column keeps its carrier width.
-  REQUIRE(
-    scan_bytes_per_row(output, {}, {logical_type::make(type_id::DATE)}, {uint64_t{1}}, k_avg_var) ==
-    8 + 4 + 4);
+  hint.filter_only_columns = {{logical_type::make(type_id::DATE), uint64_t{1}}};
+  REQUIRE(scan_bytes_per_row(output, hint, k_avg_var) == 8 + 4 + 4);
+  // Several filter-only columns add up.
+  hint.filter_only_columns = {{logical_type::make(type_id::VARCHAR), uint64_t{53}},
+                              {logical_type::make(type_id::VARCHAR), std::nullopt}};
+  REQUIRE(scan_bytes_per_row(output, hint, k_avg_var) == 8 + 4 + 53 + k_avg_var);
 }
 
 TEST_CASE("scan_bytes_per_row saturates instead of wrapping", "[admission_estimator]")
 {
   constexpr auto k_max = std::numeric_limits<uint64_t>::max();
   const std::vector<logical_type> varchar{logical_type::make(type_id::VARCHAR)};
-  REQUIRE(scan_bytes_per_row(varchar, {k_max - 1}, varchar, {uint64_t{2}}, k_avg_var) == k_max);
+  scan_admission_hint hint;
+  hint.column_widths       = {k_max - 1};
+  hint.filter_only_columns = {{logical_type::make(type_id::VARCHAR), uint64_t{2}}};
+  REQUIRE(scan_bytes_per_row(varchar, hint, k_avg_var) == k_max);
+}
+
+TEST_CASE("blended_string_width charges the average only to the rows without a known size",
+          "[admission_estimator]")
+{
+  // Every row known: decoded bytes per row, rounded up, plus the four-byte offset.
+  CHECK(blended_string_width(1000, 40, 40, k_avg_var) == uint64_t{25 + 4});
+  CHECK(blended_string_width(1001, 40, 40, k_avg_var) == uint64_t{26 + 4});
+  // Empty and all-null strings still need offsets.
+  CHECK(blended_string_width(0, 10, 10, k_avg_var) == uint64_t{4});
+  // 30 of 40 rows known at 30 bytes each: (900 + 30 * 4 + 10 * 32) / 40 = 33.5.
+  CHECK(blended_string_width(900, 30, 40, k_avg_var) == uint64_t{34});
+  // A long column keeps what it knows: 4 GiB over 1M known rows is not priced at 32 bytes a row
+  // because another 1M rows state nothing. (4 GiB + 1M * 4 + 1M * 32) / 2M = 2165.5.
+  constexpr uint64_t million = 1'000'000;
+  CHECK(blended_string_width(4ULL << 30, million, 2 * million, k_avg_var) == uint64_t{2166});
+  // Nothing known: the caller keeps the configured average.
+  CHECK_FALSE(blended_string_width(0, 0, 40, k_avg_var).has_value());
+  // More known rows than the scan is said to have: the known rows stand.
+  CHECK(blended_string_width(1000, 40, 10, k_avg_var) == uint64_t{25 + 4});
+  // Overflowing metadata is rejected rather than wrapped into a small width.
+  constexpr auto k_max = std::numeric_limits<uint64_t>::max();
+  CHECK_FALSE(blended_string_width(k_max, 2, 2, k_avg_var).has_value());
+  CHECK_FALSE(blended_string_width(0, k_max / 2, k_max / 2, k_avg_var).has_value());
+  CHECK_FALSE(blended_string_width(0, 1, k_max, k_avg_var).has_value());
+}
+
+TEST_CASE("admission collects scan facts only for a query it will size", "[gpu_admission]")
+{
+  constexpr uint64_t per_gpu = 1ULL << 30;
+  // Off: nothing is estimated, whatever the host.
+  CHECK_FALSE(admission_estimate_needed(0, 4, false));
+  CHECK_FALSE(admission_estimate_needed(0, 4, true));
+  // On, and the estimate can narrow the GPU set.
+  CHECK(admission_estimate_needed(per_gpu, 2, false));
+  CHECK(admission_estimate_needed(per_gpu, 4, true));
+  // A single GPU: only for the DEBUG line.
+  CHECK_FALSE(admission_estimate_needed(per_gpu, 1, false));
+  CHECK(admission_estimate_needed(per_gpu, 1, true));
+  // No GPU at all.
+  CHECK_FALSE(admission_estimate_needed(per_gpu, 0, true));
 }
 
 TEST_CASE("admission_row_count never goes below the planner estimate", "[admission_estimator]")
@@ -363,24 +416,6 @@ TEST_CASE("estimate_bytes_per_row saturates instead of wrapping", "[admission_es
   CHECK(gpu_count_for_bytes(*total, 1024, 4) == 4);
 }
 
-TEST_CASE("admission default scales with GPU memory between 1 and 8 GiB", "[admission_estimator]")
-{
-  using sirius::config::admission_bytes_per_gpu_for_memory;
-  constexpr uint64_t GiB = 1ULL << 30;
-  constexpr uint64_t MiB = 1ULL << 20;
-  // GB200: 189,471 MiB -> 7.9 GiB, under the cap.
-  CHECK(admission_bytes_per_gpu_for_memory(189'471 * MiB) == (189'471 * MiB) / 24);
-  // GB300 (256 GB) and anything larger hit the 8 GiB cap.
-  CHECK(admission_bytes_per_gpu_for_memory(256 * GiB) == 8 * GiB);
-  CHECK(admission_bytes_per_gpu_for_memory(192 * GiB) == 8 * GiB);
-  // 80 GB H100 class lands in between.
-  CHECK(admission_bytes_per_gpu_for_memory(80 * GiB) == (80 * GiB) / 24);
-  // L4 class (24 GB) and smaller sit on the 1 GiB floor.
-  CHECK(admission_bytes_per_gpu_for_memory(24 * GiB) == 1 * GiB);
-  CHECK(admission_bytes_per_gpu_for_memory(16 * GiB) == 1 * GiB);
-  CHECK(admission_bytes_per_gpu_for_memory(0) == 1 * GiB);
-}
-
 TEST_CASE("admission uses the largest available callback row count", "[gpu_admission]")
 {
   using sirius::planner::detail::reported_row_count;
@@ -400,10 +435,12 @@ TEST_CASE("admission uses the largest available callback row count", "[gpu_admis
 namespace {
 duckdb_parquet::RowGroup admission_string_group(int64_t rows,
                                                 std::optional<int64_t> chars,
-                                                duckdb_parquet::Encoding::type encoding)
+                                                duckdb_parquet::Encoding::type encoding,
+                                                duckdb::vector<std::string> path = {"note"})
 {
   duckdb_parquet::ColumnMetaData meta;
   meta.__set_type(duckdb_parquet::Type::BYTE_ARRAY);
+  meta.__set_path_in_schema(path);
   meta.__set_num_values(rows);
   meta.__set_encodings({encoding});
   meta.__set_total_uncompressed_size(10);  // deliberately smaller than the decoded strings
@@ -456,64 +493,82 @@ TEST_CASE("admission reads a DuckDB table's longest string from its statistics",
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 
-TEST_CASE("Parquet admission requires decoded sizes for the entire scan", "[gpu_admission]")
+TEST_CASE("Parquet admission reads the decoded string sizes a footer states", "[gpu_admission]")
 {
   using duckdb_parquet::Encoding;
-  using sirius::transparent::detail::parquet_string_widths;
+  using sirius::transparent::string_size;
+  using sirius::transparent::detail::parquet_string_sizes;
   duckdb_parquet::FileMetaData metadata;
   metadata.__set_row_groups({admission_string_group(10, 100, Encoding::PLAIN),
                              admission_string_group(30, 900, Encoding::RLE_DICTIONARY)});
-  auto widths = parquet_string_widths(metadata, 1);
-  REQUIRE(widths.size() == 1);
-  CHECK(widths[0] == 29);  // (100 + 900) / 40 chars + four-byte offsets
+  auto sizes = parquet_string_sizes(metadata, 1);
+  REQUIRE(sizes.size() == 1);
+  CHECK(sizes[0] == string_size{1000, 40});
 
-  SECTION("one missing row group invalidates the column width")
+  SECTION("a row group without the size leaves the others counted")
   {
     metadata.row_groups[1] = admission_string_group(30, std::nullopt, Encoding::PLAIN);
-    CHECK_FALSE(parquet_string_widths(metadata, 1)[0].has_value());
+    CHECK(parquet_string_sizes(metadata, 1)[0] == string_size{100, 10});
   }
-  SECTION("encoded-only chunks retain the configured fallback")
+  SECTION("encoded-only chunks state nothing")
   {
     for (auto encoding : {Encoding::PLAIN,
                           Encoding::DELTA_LENGTH_BYTE_ARRAY,
                           Encoding::DELTA_BYTE_ARRAY,
                           Encoding::RLE_DICTIONARY}) {
       metadata.__set_row_groups({admission_string_group(10, std::nullopt, encoding)});
-      CHECK_FALSE(parquet_string_widths(metadata, 1)[0].has_value());
+      CHECK(parquet_string_sizes(metadata, 1)[0] == string_size{});
     }
   }
   SECTION("decoded statistics work for delta-encoded strings")
   {
     metadata.__set_row_groups({admission_string_group(10, 101, Encoding::DELTA_BYTE_ARRAY)});
-    CHECK(parquet_string_widths(metadata, 1)[0] == 15);
+    CHECK(parquet_string_sizes(metadata, 1)[0] == string_size{101, 10});
   }
-  SECTION("empty and all-null strings still require offsets")
+  SECTION("empty and all-null strings are counted with zero bytes")
   {
     metadata.__set_row_groups({admission_string_group(10, 0, Encoding::PLAIN)});
-    CHECK(parquet_string_widths(metadata, 1)[0] == 4);
+    CHECK(parquet_string_sizes(metadata, 1)[0] == string_size{0, 10});
   }
-  SECTION("malformed and nested metadata cannot supply a width")
+  SECTION("a row group without rows says nothing either way")
   {
-    CHECK(parquet_string_widths(metadata, 2).empty());
+    metadata.row_groups.push_back(admission_string_group(0, std::nullopt, Encoding::PLAIN));
+    CHECK(parquet_string_sizes(metadata, 1)[0] == string_size{1000, 40});
+  }
+  SECTION("the single leaf of a nested column is not a string column")
+  {
+    // LIST<VARCHAR> with one element per row, and STRUCT<x VARCHAR>: one leaf, one value per
+    // row, decoded sizes stated.
+    for (auto const& path : {duckdb::vector<std::string>{"tags", "list", "element"},
+                             duckdb::vector<std::string>{"s", "x"}}) {
+      metadata.__set_row_groups({admission_string_group(10, 100, Encoding::PLAIN, path)});
+      auto const nested = parquet_string_sizes(metadata, 1);
+      REQUIRE(nested.size() == 1);
+      CHECK(nested[0] == string_size{});
+    }
+  }
+  SECTION("malformed and multi-leaf metadata cannot supply a size")
+  {
+    CHECK(parquet_string_sizes(metadata, 2).empty());
     metadata.row_groups[1].columns.clear();
-    CHECK(parquet_string_widths(metadata, 1).empty());
+    CHECK(parquet_string_sizes(metadata, 1).empty());
   }
 }
 
-TEST_CASE("Parquet admission sizes a string column over every file of a scan", "[gpu_admission]")
+TEST_CASE("Parquet admission sums a string column's size over every file of a scan",
+          "[gpu_admission]")
 {
-  using sirius::transparent::detail::combined_string_width;
-  using file = std::pair<std::optional<std::uint64_t>, std::size_t>;
-  // Row-weighted and rounded up: (29 * 40 + 15 * 10) / 50 = 26.2.
-  CHECK(combined_string_width({file{29, 40}, file{15, 10}}) == 27);
-  CHECK(combined_string_width({file{29, 40}}) == 29);
-  // One file with rows and no decoded size leaves the column on the configured width.
-  CHECK_FALSE(combined_string_width({file{29, 40}, file{std::nullopt, 10}}).has_value());
-  // A file without rows says nothing either way.
-  CHECK(combined_string_width({file{std::nullopt, 0}, file{29, 40}}) == 29);
-  CHECK_FALSE(combined_string_width({file{std::nullopt, 0}}).has_value());
-  CHECK_FALSE(combined_string_width({}).has_value());
-  // Overflowing metadata is rejected rather than wrapped into a small width.
-  CHECK_FALSE(
-    combined_string_width({file{std::numeric_limits<std::uint64_t>::max(), 2}}).has_value());
+  using sirius::transparent::string_size;
+  using sirius::transparent::detail::combined_string_size;
+  CHECK(combined_string_size({string_size{1000, 40}, string_size{110, 10}}) ==
+        string_size{1110, 50});
+  CHECK(combined_string_size({string_size{1000, 40}}) == string_size{1000, 40});
+  // A file that states no size adds nothing; its rows are the ones admission prices at the
+  // configured average.
+  CHECK(combined_string_size({string_size{1000, 40}, string_size{}}) == string_size{1000, 40});
+  CHECK(combined_string_size({}) == string_size{});
+  // Overflowing metadata is rejected rather than wrapped into a small size.
+  constexpr auto k_max = std::numeric_limits<std::uint64_t>::max();
+  CHECK(combined_string_size({string_size{k_max, 1}, string_size{1, 1}}) == string_size{});
+  CHECK(combined_string_size({string_size{1, k_max}, string_size{1, 1}}) == string_size{});
 }

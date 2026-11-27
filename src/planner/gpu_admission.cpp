@@ -21,8 +21,11 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "sirius_config.hpp"
+#include "sirius_context.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 
+#include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
@@ -32,6 +35,7 @@
 #include <algorithm>
 #include <exception>
 #include <string>
+#include <vector>
 
 namespace sirius::planner {
 
@@ -60,9 +64,19 @@ void collect_gpu_scans(const op::sirius_physical_operator& node,
 namespace {
 
 /// The table function's own row count, before filters; nullopt when it has no cardinality
-/// callback, the callback reports nothing, or it throws. A Parquet scan's callback reports nothing
-/// here: it reads the count off the scan's first open file, and the plan Sirius converts is a
-/// copy whose bind data has no open file (`copy_logical_plan`).
+/// callback, the callback reports nothing or zero rows, or it throws.
+///
+/// A Parquet scan answers here too, although the plan Sirius converts is a copy whose bind data
+/// has no open file (`copy_logical_plan`): `ParquetReadBindData::Copy` keeps the first file's row
+/// count, and `ParquetMultiFileInfo::GetCardinality` returns it for one file and, for several,
+/// the sum of the footers DuckDB has cached, or else an estimate from the first file (its rows
+/// per byte times the files' sizes, or its row count times the number of files, at least 1000 per
+/// file). That is an estimate of the unfiltered rows, so it is the fallback for a Parquet scan
+/// the footer pass did not cover.
+///
+/// Zero is not a count to size from: it is what a callback returns for a provably empty scan and
+/// what it can return when it has nothing to count, and admission treats a scan of zero rows as
+/// unsized either way (total_scan_bytes).
 std::optional<uint64_t> table_function_row_count(duckdb::ClientContext& context,
                                                  const op::sirius_physical_table_scan& scan)
 {
@@ -70,7 +84,9 @@ std::optional<uint64_t> table_function_row_count(duckdb::ClientContext& context,
   try {
     auto stats = scan.function.cardinality(context, scan.bind_data.get());
     if (!stats) { return std::nullopt; }
-    return detail::reported_row_count(*stats);
+    auto const rows = detail::reported_row_count(*stats);
+    if (rows.value_or(0) == 0) { return std::nullopt; }
+    return rows;
   } catch (std::exception const& e) {
     SIRIUS_LOG_DEBUG("gpu_admission: cardinality callback of {} threw: {}",
                      scan.function.GetName().GetIdentifierName(),
@@ -160,28 +176,34 @@ std::optional<uint64_t> table_function_max_string_bytes(duckdb::ClientContext& c
 }  // namespace detail
 
 op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& context,
-                                                         const op::sirius_physical_table_scan& scan)
+                                                         const op::sirius_physical_table_scan& scan,
+                                                         uint64_t avg_var_bytes)
 {
   op::scan::scan_admission_hint hint;
   // A Parquet scan's files were counted from their footers before DuckDB optimized the plan,
   // where the footer statistics pass covered the scan: `parquet_footer_statistics` on and no more
-  // uncached footers than its read limits allow. That count is exact; the callback's is the first
-  // file's times the number of files, and is absent for a copied plan.
-  auto const footer_rows = transparent::parquet_scan_row_count(
-    scan.function.GetName().GetIdentifierName(), scan.bind_data.get());
-  hint.unfiltered_rows = footer_rows.has_value() ? std::optional<uint64_t>{*footer_rows}
-                                                 : table_function_row_count(context, scan);
+  // uncached footers than its read limits allow. That count is exact. Any other Parquet scan has
+  // the callback's estimate (see table_function_row_count).
+  auto const function_name = scan.function.GetName().GetIdentifierName();
+  auto const footer_rows = transparent::parquet_scan_row_count(function_name, scan.bind_data.get());
+  hint.unfiltered_rows   = footer_rows.has_value() ? std::optional<uint64_t>{*footer_rows}
+                                                   : table_function_row_count(context, scan);
   hint.column_widths.assign(scan.types.size(), std::nullopt);
 
-  // String sizes come from the same footer pass, summed over every file of the scan.
-  auto const leaf_widths = transparent::parquet_scan_string_widths(
-    scan.function.GetName().GetIdentifierName(), scan.bind_data.get());
+  // String sizes come from the same footer pass, summed over every file of the scan; they exist
+  // only where the row count does.
+  auto const footer_sizes =
+    transparent::parquet_scan_string_sizes(function_name, scan.bind_data.get());
   // Bytes per row of table column `column`, read as `type`, where a source states one.
   auto const width_of = [&](duckdb::column_t column,
                             sirius::logical_type const& type) -> std::optional<uint64_t> {
     if (type.is_fixed_width()) { return std::nullopt; }
-    if (column < leaf_widths.size() && leaf_widths[column].has_value()) {
-      return leaf_widths[column];
+    if (column < footer_sizes.size() && footer_rows.has_value()) {
+      // The rows of the files and row groups that state no size keep the configured average.
+      if (auto const width = blended_string_width(
+            footer_sizes[column].bytes, footer_sizes[column].rows, *footer_rows, avg_var_bytes)) {
+        return width;
+      }
     }
     if (!type.is_varchar()) { return std::nullopt; }
     // Upper bound: every string fits, plus cuDF's 4-byte offset per row.
@@ -195,27 +217,51 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
     }
   }
   for (auto const column : filter_only_table_columns(scan)) {
-    hint.filter_only_types.push_back(scan.returned_types[column]);
-    hint.filter_only_widths.push_back(width_of(column, scan.returned_types[column]));
+    auto const& type = scan.returned_types[column];
+    hint.filter_only_columns.push_back({type, width_of(column, type)});
   }
   // One line per scan, so a run can show which source each estimate came from and, when the
   // unfiltered row count is missing, whether the callback or the bind data was absent.
-  auto const known = [](auto const& width) { return width.has_value(); };
   SIRIUS_LOG_DEBUG(
     "gpu_admission: scan of {} (cardinality callback {}, bind data {}): unfiltered rows {} ({}), "
     "{} of {} output and {} of {} filter-only column width(s) known",
-    scan.function.GetName().GetIdentifierName(),
+    function_name,
     scan.function.cardinality != nullptr ? "present" : "absent",
     scan.bind_data != nullptr ? "present" : "absent",
     hint.unfiltered_rows.has_value() ? std::to_string(*hint.unfiltered_rows) : "unknown",
     footer_rows.has_value()            ? "from Parquet footers"
     : hint.unfiltered_rows.has_value() ? "from the cardinality callback"
                                        : "no source",
-    std::count_if(hint.column_widths.begin(), hint.column_widths.end(), known),
+    std::ranges::count_if(hint.column_widths, [](auto const& width) { return width.has_value(); }),
     hint.column_widths.size(),
-    std::count_if(hint.filter_only_widths.begin(), hint.filter_only_widths.end(), known),
-    hint.filter_only_widths.size());
+    std::ranges::count_if(hint.filter_only_columns,
+                          [](auto const& column) { return column.width.has_value(); }),
+    hint.filter_only_columns.size());
   return hint;
+}
+
+bool admission_estimate_needed(duckdb::ClientContext& context)
+{
+  if (!context.registered_state) { return false; }
+  auto const sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  // No GPU memory spaces exist before the runtime is initialized, and no query runs on it.
+  if (!sirius_ctx || !sirius_ctx->is_initialized()) { return false; }
+  auto const bytes_per_gpu = duckdb::query_operator_options(context)->admission_bytes_per_gpu;
+  // Off is the common case: answer it before looking at the GPUs.
+  if (bytes_per_gpu == 0) { return false; }
+  // The same candidates sirius_engine admits from: one per GPU memory space, capped by
+  // `topology.gpus_per_query`.
+  std::vector<int> gpu_ids;
+  for (auto const* space :
+       sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (space != nullptr) { gpu_ids.push_back(space->get_device_id()); }
+  }
+  std::ranges::sort(gpu_ids);
+  gpu_ids.erase(std::unique(gpu_ids.begin(), gpu_ids.end()), gpu_ids.end());
+  auto const n_gpus =
+    apply_gpu_cap(std::move(gpu_ids), sirius_ctx->get_config().gpus_per_query()).size();
+  return admission_estimate_needed(
+    bytes_per_gpu, n_gpus, sirius::log::get_sink()->should_log(sirius::log::level::debug));
 }
 
 }  // namespace sirius::planner
