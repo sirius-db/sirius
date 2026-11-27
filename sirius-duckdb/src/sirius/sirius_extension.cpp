@@ -4,6 +4,7 @@
 
 #include "duckdb/storage/object_cache.hpp"
 #include "sirius/duckdb.hpp"
+#include "sirius_licenses.hpp"
 
 #define SIRIUS_STRINGIFY_IMPL(name) #name
 #define SIRIUS_STRINGIFY(name)      SIRIUS_STRINGIFY_IMPL(name)
@@ -34,6 +35,7 @@ static void LoadInternal(ExtensionLoader& loader)
     auto& cache = loader.GetDatabaseInstance().GetObjectCache();
     cache.Put(SiriusBackendInitStarted::KEY, make_shared_ptr<SiriusBackendInitStarted>());
   }
+  sirius_duckdb::third_party_notices::register_function(loader);
   sirius::register_duckdb_extension(loader);
 }
 

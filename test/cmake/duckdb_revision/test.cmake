@@ -123,7 +123,11 @@ unset(ENV{GIT_DIR})
 # only DuckDB's own directory gives the revision the package is compared with.
 function(write_package dir library_revision)
   set(SIRIUS_DUCKDB_SOURCE_REVISION "${library_revision}")
-  set(PACKAGE_INIT "macro(check_required_components)\nendmacro()")
+  set(PACKAGE_INIT
+      "macro(check_required_components)\nendmacro()\nmacro(set_and_check var path)\n  set(\${var} \"\${path}\")\nendmacro()"
+  )
+  set(PACKAGE_SIRIUS_THIRD_PARTY_INSTALL_DIR "${dir}/third_party")
+  file(MAKE_DIRECTORY "${dir}/third_party")
   configure_file("${sirius}/cmake/sirius-config.cmake.in"
                  "${dir}/sirius-config.cmake" @ONLY)
   file(COPY "${sirius}/cmake/sirius-duckdb-revision.cmake" DESTINATION "${dir}")
@@ -154,6 +158,8 @@ endfunction()
 set(EXTENSION_NAME sirius)
 add_subdirectory(\"${sirius}/sirius-duckdb\" wrapper)
 ")
+# The wrapper reads DuckDB's license for the extension's third-party notices.
+file(WRITE "${work}/duckdb/LICENSE" "MIT License\n")
 
 # Configures the wrapper with <linkage> against the package in <package>.
 function(check_wrapper name expected package linkage)

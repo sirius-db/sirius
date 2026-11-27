@@ -279,6 +279,31 @@ jobs:
           done
           echo "duckdb_version=$duckdb_version" >> "$GITHUB_OUTPUT"
 
+      - name: Extract third-party notices
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
+        # Each binary embeds the notices of the third-party code it bundles (SQL:
+        # sirius_licenses()); publish them next to it. The script reads an ELF section, so no
+        # GPU or DuckDB is needed.
+        run: |
+          set -euo pipefail
+          for f in renamed/*.duckdb_extension; do
+            variant=$(basename "$f" .duckdb_extension)
+            out="renamed/THIRD_PARTY_NOTICES-${variant#sirius-}.txt"
+            if ! python3 scripts/extract_third_party_notices.py "$f" -o "$out" \
+                --require Sirius --require DuckDB --require cudf --require nvcomp \
+                --require "GCC runtime libraries (libstdc++, libgcc)"; then
+              # Binaries built before notices were embedded cannot be published (including
+              # stable promotions of such commits); a dry run may still test against them.
+              if [ "$EVENT_NAME" != "pull_request" ]; then
+                exit 1
+              fi
+              echo "::warning::$f has no embedded notices; using a placeholder for this dry run"
+              echo "placeholder" > "$out"
+            fi
+          done
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+
       - name: Compress artifacts
         if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         # GitHub Releases rejects any single asset >= 2 GiB; cuda12 builds land right at that
@@ -319,8 +344,8 @@ jobs:
 
       - name: Copy LICENSE into the release assets
         if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
-        # The repo's own Apache 2.0 LICENSE, bundled with every release. Third-party dependency
-        # attribution (a generated NOTICE) is tracked separately: #1979. Read via `git show` at
+        # The repo's own Apache 2.0 LICENSE, bundled with every release. Third-party notices are
+        # extracted from each binary above. Read via `git show` at
         # TARGET_SHA, not a plain `cp`, so this matches the commit actually being released even
         # when the checked-out ref differs from it (e.g. mode=stable promoting an older commit).
         run: git show "${TARGET_SHA}:LICENSE" > renamed/LICENSE
@@ -335,7 +360,7 @@ jobs:
           {
             echo "# source_sha=${TARGET_SHA}"
             echo "# run_id=${RUN_ID}"
-            sha256sum *.duckdb_extension.gz LICENSE
+            sha256sum *.duckdb_extension.gz THIRD_PARTY_NOTICES-*.txt LICENSE
           } > MANIFEST.sha256
         env:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
@@ -445,7 +470,7 @@ jobs:
         if: (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run') && steps.staleness.outputs.stale != 'true'
         run: |
           gh release upload "$PENDING_TAG" \
-            renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 renamed/LICENSE --clobber
+            renamed/*.duckdb_extension.gz renamed/THIRD_PARTY_NOTICES-*.txt renamed/MANIFEST.sha256 renamed/LICENSE --clobber
         env:
           GH_TOKEN: ${{ secrets.SIRIUS_RELEASE_TOKEN }}
           PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
@@ -479,14 +504,14 @@ jobs:
             # Tag exists - force-move it. gh release edit --target does NOT retarget an
             # existing tag, so this has to go through the git refs API directly.
             gh api -X PATCH "repos/${REPO}/git/refs/tags/$TAG" -f sha="$TARGET_SHA" -F force=true
-            gh release upload "$TAG" renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 renamed/LICENSE --clobber
+            gh release upload "$TAG" renamed/*.duckdb_extension.gz renamed/THIRD_PARTY_NOTICES-*.txt renamed/MANIFEST.sha256 renamed/LICENSE --clobber
             gh release edit "$TAG" --title "${TAG} (${short_sha})" --notes-file NOTES.md --prerelease=true
           else
             # First-ever publish of this tag - no live release exists yet to protect, so create
             # and publish it directly with assets attached, no staging swap needed. --target is
             # required: without it, gh release create would auto-create the tag at whatever main
             # HEAD is right now, not the target SHA.
-            gh release create "$TAG" renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 renamed/LICENSE \
+            gh release create "$TAG" renamed/*.duckdb_extension.gz renamed/THIRD_PARTY_NOTICES-*.txt renamed/MANIFEST.sha256 renamed/LICENSE \
               --target "$TARGET_SHA" --title "${TAG} (${short_sha})" --notes-file NOTES.md --prerelease=true
           fi
           resolved=$(gh api "repos/${REPO}/git/refs/tags/$TAG" --jq .object.sha)
@@ -515,9 +540,9 @@ jobs:
           is_draft=$(echo "$out" | jq -r .isDraft)
           is_pre=$(echo "$out" | jq -r .isPrerelease)
           asset_count=$(echo "$out" | jq '.assets | length')
-          # 6 = 4 .duckdb_extension files + MANIFEST.sha256 + LICENSE
-          if [ "$is_draft" != "false" ] || [ "$is_pre" != "true" ] || [ "$asset_count" -ne 6 ]; then
-            echo "::error::Post-publish state looks wrong: draft=$is_draft prerelease=$is_pre assets=$asset_count (expected draft=false prerelease=true assets=6)" >&2
+          # 10 = 4 .duckdb_extension files + their 4 THIRD_PARTY_NOTICES + MANIFEST.sha256 + LICENSE
+          if [ "$is_draft" != "false" ] || [ "$is_pre" != "true" ] || [ "$asset_count" -ne 10 ]; then
+            echo "::error::Post-publish state looks wrong: draft=$is_draft prerelease=$is_pre assets=$asset_count (expected draft=false prerelease=true assets=10)" >&2
             exit 1
           fi
           resolved=$(gh api "repos/${REPO}/git/refs/tags/$TAG" --jq .object.sha)
