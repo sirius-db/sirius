@@ -155,18 +155,22 @@ endif()
 set(SIRIUS_NVTX_DOMAIN_NAME "${PROJECT_NAME}")
 
 # Meld's execution units in place of a pipeline's operators (src/meld). All of
-# Meld, not just the decoders Simpatico takes, so Simpatico links the
-# MeldDecoderCompiler built here rather than building its own. Off by default;
-# the default pixi environment has the MLIR and Arrow it needs.
+# Meld, not just the decoders Simpatico takes, so it turns Simpatico's Meld
+# decoders on as well, which then link the MeldDecoderCompiler built here rather
+# than building their own. Off by default; the default pixi environment has the
+# MLIR and Arrow it needs.
 option(SIRIUS_ENABLE_MELD_UNITS "Run pipelines through Meld's execution units"
        OFF)
 if(SIRIUS_ENABLE_MELD_UNITS)
-  if(NOT SIMPATICO_ENABLE_MELD)
+  if(NOT EXISTS "${SIMPATICO_MELD_SOURCE_DIR}/CMakeLists.txt")
     message(
       FATAL_ERROR
-        "SIRIUS_ENABLE_MELD_UNITS needs SIMPATICO_ENABLE_MELD and SIMPATICO_MELD_SOURCE_DIR"
-    )
+        "SIRIUS_ENABLE_MELD_UNITS needs SIMPATICO_MELD_SOURCE_DIR to name Meld's "
+        "source tree; '${SIMPATICO_MELD_SOURCE_DIR}' is not one")
   endif()
+  set(SIMPATICO_ENABLE_MELD
+      ON
+      CACHE BOOL "Build Meld's decoders beside the NVRTC JIT" FORCE)
   block(PROPAGATE SIRIUS_MELD_INCLUDE_DIRS)
   # Meld is C++20, and the 17 cached for DuckDB would otherwise win over it.
   set(CMAKE_CXX_STANDARD 20)

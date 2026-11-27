@@ -1258,9 +1258,10 @@ The specialized path applies only to eligible batches and otherwise uses cuDF's 
 
 ### Meld Execution Units
 
-Only in a build with `SIRIUS_ENABLE_MELD_UNITS`, which needs `SIMPATICO_ENABLE_MELD` and Meld's
-source tree in `SIMPATICO_MELD_SOURCE_DIR`; the `release-meld` preset sets all three
-(`pixi run make release-meld`, with Meld checked out beside Sirius).
+Only in a build with `SIRIUS_ENABLE_MELD_UNITS`, which needs Meld's source tree in
+`SIMPATICO_MELD_SOURCE_DIR` and turns on `SIMPATICO_ENABLE_MELD`, Simpatico's Meld decoders, with
+it; the `release-meld` preset sets both (`pixi run make release-meld`, with Meld checked out beside
+Sirius).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -1345,7 +1346,6 @@ When `LOAD sirius` cannot load a CUDA backend, the loader registers `gpu_executi
 | `src/sirius_config.hpp` | Config class, operator_params, thread pool configs |
 | `src/config.hpp` | Static config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
-| `src/meld/meld_units_pass.cpp` | `meld_units` registration, in a build with Meld's execution units |
 | `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
 | `cucascade/include/cucascade/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
 | `cucascade/include/cucascade/io/uring/config.hpp`, `io/rest/config.hpp`, `io/tls/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / TLS / object-store sub-configs (cuCascade) |
