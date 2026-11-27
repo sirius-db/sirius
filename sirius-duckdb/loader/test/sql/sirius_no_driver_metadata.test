@@ -1,0 +1,41 @@
+# name: test/sql/sirius_no_driver_metadata.test
+# description: The loader documents the extension, its functions and the fallback gpu_execution setting
+# group: [sirius]
+# Assumes no usable NVIDIA driver, as on DuckDB's CI runners.
+
+require sirius
+
+statement ok
+LOAD sirius;
+
+query II
+SELECT length(description) > 0,
+       description LIKE 'Runs supported SQL queries on NVIDIA GPUs%sirius_cuda12%sirius_cuda13%CUDA 12.8 or newer%CPU engine%sirius_status()%'
+FROM duckdb_extensions()
+WHERE extension_name = 'sirius';
+----
+true	true
+
+query IIIIIIII
+SELECT function_type, extension_name, len(parameters),
+       description LIKE 'Returns one row describing how LOAD sirius%driver_found%cuda_driver_version%backend%backend_loaded%gpu_execution%fallback_reason%',
+       len(examples), examples[1], examples[2], categories[1]
+FROM duckdb_functions()
+WHERE function_name = 'sirius_status';
+----
+table	sirius	0	true	2	SELECT * FROM sirius_status();	SELECT fallback_reason FROM sirius_status();	diagnostics
+
+query IIIIII
+SELECT function_type, extension_name, parameters[1], parameter_types[1], description,
+       categories[1]
+FROM duckdb_functions()
+WHERE function_name = 'gpu_execution';
+----
+table	sirius	sql	VARCHAR	Runs a SQL query on the GPU when a Sirius CUDA backend is loaded. No backend is loaded in this database, so every call fails with the reason GPU execution is unavailable; sirius_status() shows it too.	execution
+
+query III
+SELECT value, description, input_type
+FROM duckdb_settings()
+WHERE name = 'gpu_execution';
+----
+false	Whether to transparently run supported queries on the GPU. No Sirius CUDA backend is loaded, so it defaults to false and setting it to true fails; sirius_status() shows why.	BOOLEAN
