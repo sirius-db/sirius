@@ -59,8 +59,9 @@ class meld_unit {
   /**
    * @brief Runs the plan over @p batch, which Meld reads where it is, on the current device.
    *
-   * Synchronizes @p stream first, since Meld runs on a stream of its own. The answer comes back
-   * from Meld on the host and is copied to a table allocated from @p mr. Throws
+   * Synchronizes @p stream first, since Meld runs on a stream of its own. The device memory Meld
+   * takes for the run comes from @p mr, and is given back by the time the call returns. The answer
+   * comes back from Meld on the host and is copied to a table allocated from @p mr too. Throws
    * sirius::internal_exception when Meld fails.
    */
   [[nodiscard]] std::unique_ptr<cudf::table> run(cudf::table_view const& batch,

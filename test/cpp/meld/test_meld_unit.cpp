@@ -19,6 +19,7 @@
 
 #include "catch.hpp"
 #include "meld/meld_unit.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
@@ -26,6 +27,9 @@
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/mr/limiting_resource_adaptor.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -150,6 +154,39 @@ TEST_CASE("meld_unit runs a plan over a batch on the GPU", "[meld_unit]")
   // Rows 0, 1 and 3 pass; row 4 is NULL and does not.
   CHECK(scalar_at<double>(answer->view().column(0)) == 0.5 * 2.0 + 1.25 * 4.0 + 3.75 * 0.5);
   CHECK(scalar_at<std::int64_t>(answer->view().column(1)) == 3);
+}
+
+TEST_CASE("meld_unit takes the device memory of a run from the resource it is given", "[meld_unit]")
+{
+  auto unit = checked(filtered_sum_plan);
+  auto x    = doubles({0.5, 1.25, 8.0, 3.75, 2.0, 16.0}, {true, true, true, true, false, true});
+  auto y    = doubles({2.0, 4.0, 1.0, 0.5, 64.0, 1.0});
+  cudf::table_view batch({x->view(), y->view()});
+  rmm::mr::statistics_resource_adaptor allocations{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{cudf::get_current_device_resource_ref()}};
+
+  auto answer =
+    unit->run(batch, cudf::get_default_stream(), rmm::device_async_resource_ref{allocations});
+  CHECK(scalar_at<std::int64_t>(answer->view().column(1)) == 3);
+  answer.reset();
+  // More than the answer's three buffers, and Meld has given its own back.
+  CHECK(allocations.get_allocations_counter().total > 3);
+  CHECK(allocations.get_allocations_counter().value == 0);
+}
+
+TEST_CASE("meld_unit fails a run the resource it is given cannot hold", "[meld_unit]")
+{
+  auto unit = checked(filtered_sum_plan);
+  auto x    = doubles({0.5, 1.25, 8.0});
+  auto y    = doubles({2.0, 4.0, 1.0});
+  cudf::table_view batch({x->view(), y->view()});
+  rmm::mr::limiting_resource_adaptor tiny{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{cudf::get_current_device_resource_ref()},
+    1};
+
+  CHECK_THROWS_AS(
+    unit->run(batch, cudf::get_default_stream(), rmm::device_async_resource_ref{tiny}),
+    sirius::internal_exception);
 }
 
 TEST_CASE("meld_unit reads a sliced batch from its offset", "[meld_unit]")

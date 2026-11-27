@@ -22,14 +22,18 @@
 #include <cudf/interop.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
 
 #include <arrow/api.h>
 #include <arrow/c/abi.h>
 #include <arrow/c/bridge.h>
 #include <meld-builtin/Builtin.h>
 #include <meld/Execution/BoundTable.h>
+#include <meld/Execution/DeviceMemory.h>
 #include <meld/Execution/Dictionary.h>
 #include <meld/Execution/JitEngine.h>
 #include <meld/Execution/PtxCompiler.h>
@@ -124,11 +128,45 @@ std::optional<parsed_plan> parse(session& session, std::string const& plan)
   return parsed;
 }
 
-mlir::meld::RunOptions gpu_options(int device)
+/// Meld's device memory from a resource of Sirius's, so that what a run takes is counted and
+/// pooled with the rest of what Sirius takes.
+class resource_allocator final : public mlir::meld::DeviceAllocator {
+ public:
+  explicit resource_allocator(rmm::device_async_resource_ref const& mr) : _mr(mr) {}
+
+  arrow::Result<void*> allocate(std::int64_t bytes, void* stream) override
+  {
+    try {
+      return _mr.allocate(
+        stream_of(stream), static_cast<std::size_t>(bytes), rmm::CUDA_ALLOCATION_ALIGNMENT);
+    } catch (rmm::out_of_memory const& error) {
+      return arrow::Status::OutOfMemory(error.what());
+    } catch (std::exception const& error) {
+      return arrow::Status::ExecutionError(error.what());
+    }
+  }
+
+  void deallocate(void* pointer, std::int64_t bytes, void* stream) override
+  {
+    _mr.deallocate(
+      stream_of(stream), pointer, static_cast<std::size_t>(bytes), rmm::CUDA_ALLOCATION_ALIGNMENT);
+  }
+
+ private:
+  static ::cuda::stream_ref stream_of(void* stream)
+  {
+    return ::cuda::stream_ref{static_cast<cudaStream_t>(stream)};
+  }
+
+  rmm::device_async_resource_ref _mr;
+};
+
+mlir::meld::RunOptions gpu_options(int device, mlir::meld::DeviceAllocator& memory)
 {
   mlir::meld::RunOptions options;
-  options.target = mlir::meld::Target::Gpu;
-  options.device = device;
+  options.target          = mlir::meld::Target::Gpu;
+  options.device          = device;
+  options.deviceAllocator = &memory;
   // A column the cache kept would keep a batch's memory past the batch, outside what Sirius
   // accounts for.
   options.hostFragmentCacheBytes   = 0;
@@ -244,13 +282,14 @@ std::unique_ptr<meld_unit> meld_unit::check(std::string plan,
     why = "Meld cannot make an empty table: " + empty.status().ToString();
     return nullptr;
   }
+  resource_allocator memory(cudf::get_current_device_resource_ref());
   llvm::StringMap<std::shared_ptr<arrow::Table>> tables;
   tables[parsed->table.tableName] = *empty;
   auto answers                    = mlir::meld::runPlan(*parsed->module,
                                      parsed->inputs,
                                      tables,
                                      mlir::meld::DictionaryMap(),
-                                     gpu_options(rmm::get_current_cuda_device().value()));
+                                     gpu_options(rmm::get_current_cuda_device().value(), memory));
   if (mlir::failed(answers)) {
     why = session.why("Meld cannot run the plan");
     return nullptr;
@@ -278,6 +317,7 @@ std::unique_ptr<cudf::table> meld_unit::run(cudf::table_view const& batch,
   auto parsed = parse(session, _plan);
   if (!parsed) { throw internal_exception(session.why("Meld cannot read a plan it checked")); }
 
+  resource_allocator memory(mr);
   llvm::StringMap<mlir::meld::BoundTable> tables;
   tables[parsed->table.tableName] = bind_batch(batch, parsed->table, _column_names);
   stream.sync();
@@ -287,7 +327,7 @@ std::unique_ptr<cudf::table> meld_unit::run(cudf::table_view const& batch,
                                parsed->inputs,
                                tables,
                                mlir::meld::DictionaryMap(),
-                               gpu_options(rmm::get_current_cuda_device().value()));
+                               gpu_options(rmm::get_current_cuda_device().value(), memory));
   }();
   if (mlir::failed(answers)) {
     throw internal_exception(session.why("Meld could not run the plan"));
