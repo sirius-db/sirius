@@ -323,6 +323,15 @@ bool rank_unreachable(std::string const& message)
          message.find("Invalid connection id") != std::string::npos;
 }
 
+/// Whether @p message is a rank's connect giving up on peers it never heard from: what the other
+/// ranks report when one rank was refused before it listened, so never the cause when another
+/// error is at hand.
+bool waited_for_peers(std::string const& message)
+{
+  return message.find("exchange NIXL: rank ") != std::string::npos &&
+         message.find(" peers in ") != std::string::npos;
+}
+
 /// One fan-out's calls, shared with the threads that run them so a call the gateway gives up on
 /// can finish on its own.
 struct fan_out_shared {
@@ -761,15 +770,20 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
       setup[r.index] = rank_setup_sql(options_, plan.peers, r.index);
     }
     auto const setup_done = fan_out(context, setup, client_policy(context));
+    // A rank refused at connect (several GPUs, no fabric memory under 'require') answers at once
+    // and never listens, so every other rank waits out its connect timeout: report the refusal.
+    std::string earliest;
+    std::string cause;
     for (uint32_t i = 0; i < setup_done.outcomes.size(); ++i) {
-      if (setup_done.outcomes[i].error) {
-        auto const what = "rank " + std::to_string(i) + " failed its session setup: " +
-                          setup_done.outcomes[i].error->RawMessage();
-        std::lock_guard lock{state_mutex_};
-        last_errors_[ranks_[i].name] = what;
-        throw IOException(what);
-      }
+      if (!setup_done.outcomes[i].error) { continue; }
+      auto const& message = setup_done.outcomes[i].error->RawMessage();
+      auto const what     = "rank " + std::to_string(i) + " failed its session setup: " + message;
+      std::lock_guard lock{state_mutex_};
+      last_errors_[ranks_[i].name] = what;
+      if (earliest.empty()) { earliest = what; }
+      if (cause.empty() && !waited_for_peers(message)) { cause = what; }
     }
+    if (!earliest.empty()) { throw IOException(cause.empty() ? earliest : cause); }
     std::lock_guard lock{state_mutex_};
     state_ = cluster_state::ready;
   } catch (std::exception& e) {

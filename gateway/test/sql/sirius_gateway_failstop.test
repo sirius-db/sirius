@@ -215,3 +215,20 @@ query I
 SELECT state FROM sirius_gateway_stop();
 ----
 stopped
+
+# One rank is refused at once and the other only reports that it waited for its peers: the
+# gateway reports the refusal, whichever rank it came from. A spawned rank's
+# CUDA_VISIBLE_DEVICES is its index.
+statement ok
+SET GLOBAL sirius_gateway_rank_init = 'SELECT CASE WHEN getenv(''CUDA_VISIBLE_DEVICES'') = ''0'' THEN error(''exchange NIXL: rank 0 reached 0 of 1 peers in 120000 ms'') ELSE error(''a distributed rank runs on one GPU, but this process has 2'') END';
+
+statement error
+FROM sirius_gateway_start(2, quack_base_port := 19820);
+----
+this process has 2
+
+statement ok
+SET GLOBAL sirius_gateway_rank_init = '';
+
+statement ok
+FROM sirius_gateway_stop();
