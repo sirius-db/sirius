@@ -110,20 +110,20 @@ case $host in
     # One key pair for every restart, so the fingerprint the gateway pins stays valid.
     # -init /dev/null: output a ~/.duckdbrc prints (.timer on) would end up in the fingerprint.
     fingerprint=$("$duckdb" -no-agent -init /dev/null -noheader -list \
-      -c "SELECT fingerprint FROM quack_generate_keys(directory := '$dir/tls')")
+      -c "SELECT fingerprint FROM quack_generate_keys(directory := $(sirius_sql_quote "$dir/tls"))")
     [[ $fingerprint =~ ^[0-9A-F]{2}(:[0-9A-F]{2})+$ ]] || {
       echo "unexpected TLS fingerprint from quack_generate_keys: '$fingerprint'" >&2
       exit 1
     }
-    serve+=", allow_other_hostname := true, ssl_cert_file := '$dir/tls/server.pem'"
-    serve+=", ssl_key_file := '$dir/tls/private_key.pem'"
+    serve+=", allow_other_hostname := true, ssl_cert_file := $(sirius_sql_quote "$dir/tls/server.pem")"
+    serve+=", ssl_key_file := $(sirius_sql_quote "$dir/tls/private_key.pem")"
     pin=", fingerprint := '$fingerprint'"
     ;;
 esac
 (
   umask 077
   cat > "$dir/init.sql" <<SQL
-LOAD '$build/extension/sirius/sirius.duckdb_extension';
+LOAD $(sirius_sql_quote "$build/extension/sirius/sirius.duckdb_extension");
 SELECT listen_uri FROM quack_serve('quack:$host:$port', $serve);
 SQL
 )
