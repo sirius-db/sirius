@@ -16,8 +16,6 @@
 
 #include "meld/meld_plan_writer.hpp"
 
-#include "sirius/exception.hpp"
-
 #include <llvm/Support/raw_ostream.h>
 #include <meld/Dialect/Meld/IR/MeldOps.h>
 #include <mlir/IR/Builders.h>
@@ -72,7 +70,7 @@ std::string key_type_of(sirius::logical_type const& type)
     case type_id::FLOAT: return "fp32";
     case type_id::DOUBLE: return "fp64";
     case type_id::DATE: return "date";
-    default: refuse("Meld is not given a {}", type.to_string());
+    default: refuse("Meld does not support {}", type.to_string());
   }
 }
 
@@ -119,6 +117,7 @@ class plan_builder {
 
   meld_plan build(meld_chain const& chain)
   {
+    if (chain.aggregates.empty()) { refuse("Meld does not support an aggregate of no measures"); }
     meld_plan result;
     mlir::OwningOpRef<mlir::meld::PlanOp> plan = mlir::meld::PlanOp::create(
       _builder, _loc, substrait_major_version, substrait_minor_version, substrait_patch_version);
@@ -129,7 +128,7 @@ class plan_builder {
     std::vector<mlir::Type> field_types;
     for (std::size_t i = 0; i < chain.input_types.size(); ++i) {
       if (chain.input_types[i].id() == type_id::BOOLEAN) {
-        refuse("Meld does not read a batch's BOOLEAN column");
+        refuse("Meld does not support reading a BOOLEAN column of a batch");
       }
       field_types.push_back(meld_type(chain.input_types[i], true));
       result.column_names.push_back(std::format("c{}", i));
@@ -164,7 +163,7 @@ class plan_builder {
       return mlir::success();
     });
     if (mlir::failed(mlir::verify(*plan))) {
-      throw internal_exception("the plan built for Meld is not valid: {}", diagnostics);
+      refuse("Meld does not support the plan built for it, which is not valid: {}", diagnostics);
     }
     llvm::raw_string_ostream stream(result.text);
     plan->print(stream, mlir::OpPrintingFlags().assumeVerified());
@@ -190,7 +189,7 @@ class plan_builder {
       case type_id::FLOAT: scalar = _builder.getF32Type(); break;
       case type_id::DOUBLE: scalar = _builder.getF64Type(); break;
       case type_id::DATE: scalar = mlir::meld::DateType::get(&_context); break;
-      default: refuse("Meld is not given a {}", type.to_string());
+      default: refuse("Meld does not support {}", type.to_string());
     }
     return nullable ? mlir::meld::NullableType::get(&_context, scalar) : scalar;
   }
@@ -283,7 +282,7 @@ class plan_builder {
       {sirius::comparison_type::ge, "gte"},
     };
     auto found = names.find(op);
-    if (found == names.end()) { refuse("Meld does not compare with IS [NOT] DISTINCT FROM"); }
+    if (found == names.end()) { refuse("Meld does not support IS [NOT] DISTINCT FROM"); }
     std::vector<value> args{std::move(left), std::move(right)};
     return call(
       comparison_urn, key_of(found->second, args), args, logical_type::make(type_id::BOOLEAN));
@@ -296,7 +295,9 @@ class plan_builder {
 
   value emit(sirius::ast::reference const& ref)
   {
-    if (ref.column_index >= _scope.size()) { refuse("no column {} to read", ref.column_index); }
+    if (ref.column_index >= _scope.size()) {
+      refuse("Meld does not support reading column {}, which is not there", ref.column_index);
+    }
     return _scope[ref.column_index];
   }
 
@@ -320,7 +321,7 @@ class plan_builder {
                              std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
           return _builder.getIntegerAttr(meld_type(type, false), payload);
         } else {
-          refuse("Meld has no literal of type {}", type.to_string());
+          refuse("Meld does not support a literal of type {}", type.to_string());
         }
       },
       constant.payload);
@@ -340,7 +341,7 @@ class plan_builder {
   value emit(sirius::ast::conjunction const& conj)
   {
     if (conj.op == sirius::ast::conjunction::kind::invalid || conj.children.empty()) {
-      refuse("a conjunction with no operator or no operands");
+      refuse("Meld does not support a conjunction with no operator or no operands");
     }
     std::vector<value> args;
     for (auto const& child : conj.children) {
@@ -381,7 +382,8 @@ class plan_builder {
     };
     auto found = names.find(fn.function());
     if (found == names.end() || fn.arguments().size() != 2 || !is_float(fn.return_type())) {
-      refuse("Meld is not given the function {}", sirius::to_duckdb_function_name(fn.function()));
+      refuse("Meld does not support the function {}",
+             sirius::to_duckdb_function_name(fn.function()));
     }
     std::vector<value> args;
     for (auto const& argument : fn.arguments()) {
@@ -393,7 +395,7 @@ class plan_builder {
   value emit(sirius::ast::cast const& cast)
   {
     if (cast.kind != sirius::ast::cast_kind::semantic) {
-      refuse("Meld does not restore a physical carrier");
+      refuse("Meld does not support restoring a physical carrier");
     }
     auto input = emit(*cast.child);
     if (meld_type(input.type, false) == meld_type(cast.target_type, false)) {
@@ -412,7 +414,7 @@ class plan_builder {
   template <typename Other>
   value emit(Other const&)
   {
-    refuse("Meld is not given this kind of expression");
+    refuse("Meld does not support this kind of expression");
   }
 
   relation build_filter(sirius::ast::node const& condition, relation const& input)
@@ -421,7 +423,9 @@ class plan_builder {
     mlir::OpBuilder::InsertionGuard guard(_builder);
     open_region(filter.getCondition(), input);
     auto kept = emit(condition);
-    if (kept.type.id() != type_id::BOOLEAN) { refuse("a filter on {}", kept.type.to_string()); }
+    if (kept.type.id() != type_id::BOOLEAN) {
+      refuse("Meld does not support a filter on {}", kept.type.to_string());
+    }
     mlir::meld::YieldOp::create(_builder, _loc, kept.ir);
     return {filter, input.types};
   }
@@ -479,10 +483,12 @@ class plan_builder {
 
   void emit_measures(sirius::ast::aggregate const& aggregate, std::vector<value>& measures)
   {
-    if (aggregate.distinct()) { refuse("Meld is not given a DISTINCT aggregate"); }
+    if (aggregate.distinct()) { refuse("Meld does not support DISTINCT aggregates"); }
     std::vector<value> args;
     for (auto const& argument : aggregate.arguments()) {
-      if (!argument->holds<sirius::ast::reference>()) { refuse("an aggregate over an expression"); }
+      if (!argument->holds<sirius::ast::reference>()) {
+        refuse("Meld does not support an aggregate over an expression");
+      }
       args.push_back(emit(*argument));
     }
     auto const count_type = logical_type::make(type_id::BIGINT);
@@ -499,7 +505,7 @@ class plan_builder {
         // An integer sum is accumulated wider than its type in Sirius, to keep it from
         // overflowing.
         if (args.size() != 1 || !is_float(args[0].type)) {
-          refuse("Meld is not given a SUM or AVG that is not of floating point");
+          refuse("Meld does not support SUM or AVG other than of floating point");
         }
         measure(arithmetic_urn, "sum", args, args[0].type, true, measures);
         if (aggregate.function() == sirius::aggregate_id::avg) {
@@ -508,7 +514,9 @@ class plan_builder {
         return;
       case sirius::aggregate_id::min:
       case sirius::aggregate_id::max:
-        if (args.size() != 1) { refuse("MIN or MAX over {} arguments", args.size()); }
+        if (args.size() != 1) {
+          refuse("Meld does not support MIN or MAX over {} arguments", args.size());
+        }
         measure(arithmetic_urn,
                 aggregate.function() == sirius::aggregate_id::min ? "min" : "max",
                 args,
@@ -517,7 +525,7 @@ class plan_builder {
                 measures);
         return;
       default:
-        refuse("Meld is not given the aggregate {}",
+        refuse("Meld does not support the aggregate {}",
                sirius::to_duckdb_aggregate_name(aggregate.function()));
     }
   }

@@ -1264,7 +1264,7 @@ source tree in `SIMPATICO_MELD_SOURCE_DIR`; the `release-meld` preset sets all t
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `meld_units` | false | Hand an ungrouped aggregate whose input is filters and projections over a table scan to Meld, which computes its per-batch partial over each scanned batch as one compiled unit in place of those operators. Takes effect when a plan is built. Meld is not given decimals, integer sums, or columns in other physical carriers; what it refuses runs as before, with the reason logged at debug level. |
+| `meld_units` | false | Hand an ungrouped aggregate whose input is filters and projections over a table scan to Meld, which computes its per-batch partial over each scanned batch as one compiled unit in place of those operators. Takes effect when a plan is built. Meld does not support decimals, integer sums, or columns in other physical carriers; what it refuses runs as before, with the reason logged at debug level. |
 
 ### Fused Scan Filtering
 

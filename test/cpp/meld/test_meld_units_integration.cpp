@@ -52,7 +52,7 @@ class MeldUnitsFixture : public sirius::test::GpuExecutionFixture {
     CHECK(sirius::meld::meld_unit::batches_run() > before);
   }
 
-  /// The same, for a query Meld is not given.
+  /// The same, for a query Meld does not support.
   void compare_without_meld(std::string const& query)
   {
     auto const before = sirius::meld::meld_unit::batches_run();
@@ -111,13 +111,15 @@ TEST_CASE_METHOD(MeldUnitsFixture,
   run_ok("CALL unpin_table('p_lineitem');");
 }
 
-TEST_CASE_METHOD(MeldUnitsFixture, "Meld is not given an integer sum", "[meld_units][integration]")
+TEST_CASE_METHOD(MeldUnitsFixture,
+                 "Meld does not support an integer sum",
+                 "[meld_units][integration]")
 {
   compare_without_meld("SELECT sum(l_quantity::INTEGER) FROM lineitem WHERE l_discount > 0.03");
 }
 
 TEST_CASE_METHOD(MeldUnitsFixture,
-                 "Meld is not given an aggregate when meld_units is off",
+                 "Meld is not used when meld_units is off",
                  "[meld_units][integration]")
 {
   run_ok("SET meld_units = false;");
