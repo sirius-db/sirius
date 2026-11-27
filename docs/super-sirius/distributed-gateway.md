@@ -225,7 +225,7 @@ the gateway set it up as its only rank), and `sirius_rank_exit()`
 | `sirius_gateway_duckdb_binary` | | DuckDB that runs each spawned rank |
 | `sirius_gateway_sirius_extension` | | Sirius extension the ranks load; empty runs CPU ranks, for tests |
 | `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings |
-| `sirius_gateway_log_dir` | temporary | Rank init files and logs |
+| `sirius_gateway_log_dir` | temporary | Rank init files and logs. One gateway per directory: the default is per process, so a program that opens two gateway databases must set it for each |
 | `sirius_gateway_allow_join` | false | Lets clients call `sirius_gateway_add_rank` and `sirius_gateway_drop_rank`, for nodes to register their ranks |
 | `sirius_gateway_min_ranks` | 1 | Registered ranks the first statement waits for before it starts them |
 | `sirius_gateway_join_wait` | 600 | Seconds a statement waits for `sirius_gateway_min_ranks` ranks to register before it fails; 0 fails at once. Capped at one year |
@@ -233,7 +233,7 @@ the gateway set it up as its only rank), and `sirius_rank_exit()`
 | `sirius_gateway_statement_timeout` | 3600 | Seconds before a statement is cancelled; 0 is none. A rank waiting on a peer that never ran the query has no bound of its own |
 | `sirius_gateway_cancel_grace` | 30 | Seconds a cancelled statement may keep running before its ranks are killed |
 | `sirius_gateway_rank_boot_id_sql` | `SELECT boot_id FROM sirius_rank_info()` | Names a registered rank's process |
-| `sirius_gateway_rank_joined_sql` | `SELECT joined FROM sirius_rank_info()` | Says whether that process has joined a set of ranks, so must restart to join another; empty restarts it every time |
+| `sirius_gateway_rank_joined_sql` | `SELECT joined FROM sirius_rank_info()` | Says whether that process has joined a set of ranks, so must restart to join another; empty restarts it every time, which needs a `sirius_gateway_rank_exit_sql` that a process that has not joined accepts: `sirius_rank_exit()` refuses there |
 | `sirius_gateway_rank_exit_sql` | `CALL sirius_rank_exit()` | Ends it, for its launcher to restart it |
 | `sirius_gateway_query_id_setting` | `sirius_distributed_query_id` | Setting that carries K to each rank; empty sends none |
 
