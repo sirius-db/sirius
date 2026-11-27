@@ -34,6 +34,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <set>
 
@@ -241,19 +242,21 @@ TEST_CASE("Concatenate tables in groups", "[operator][merge_concat]")
     views.push_back(sirius::get_cudf_table_view(ro_batches.back()));
   }
 
-  // Limits far below the data: the strings pass the limit, and a group holds a few inputs.
-  auto const first_chars =
-    cudf::strings_column_view(views.front().column(1)).chars_size(cudf::get_default_stream());
+  auto const stream      = cudf::get_default_stream();
+  auto const mr          = mem_space->get_default_allocator();
+  auto const first_chars = cudf::strings_column_view(views.front().column(1)).chars_size(stream);
   REQUIRE(first_chars > 0);
-  auto table = gpu_merge_impl::concat_tables(views,
-                                             cudf::get_default_stream(),
-                                             mem_space->get_default_allocator(),
-                                             first_chars,
-                                             4 * first_chars);
+  // Limits far below the data: the strings pass the limit and count as small inputs, and a
+  // group holds a few inputs.
+  auto grouped = gpu_merge_impl::concat_tables(
+    views, stream, mr, first_chars, std::numeric_limits<std::int64_t>::max(), 4 * first_chars);
+  // The same limit with inputs that do not count as small: one cudf::concatenate.
+  auto plain = gpu_merge_impl::concat_tables(views, stream, mr, first_chars, 1, 4 * first_chars);
   ro_batches.clear();
-  auto output_batch =
-    sirius::make_data_batch(std::move(table), *mem_space, cudf::get_default_stream(), {});
-  validate_concat(input.batches, *output_batch);
+  validate_concat(input.batches,
+                  *sirius::make_data_batch(std::move(grouped), *mem_space, stream, {}));
+  validate_concat(input.batches,
+                  *sirius::make_data_batch(std::move(plain), *mem_space, stream, {}));
 }
 
 TEST_CASE("Concatenate with invalid input", "[operator][merge_concat]")

@@ -71,23 +71,27 @@ class gpu_merge_impl {
     const telemetry::batch_telemetry_info& telemetry_info = {});
 
   /**
-   * @brief Concatenate tables, in groups where one cudf::concatenate gives wrong strings.
+   * @brief Concatenate tables, keeping cudf::concatenate off the strings input it gets wrong.
    *
-   * cudf::concatenate (libcudf 26.10) returns wrong characters for a strings column when the
-   * concatenated characters pass 2^31 bytes and the inputs are many small columns: the offsets
-   * are right and the characters are not. TPC-H Q12 at SF300000 hit this with about 10,600
-   * inputs of 330 KB each; the same total in about 3,500 inputs was concatenated correctly.
-   * When a strings column would pass @p string_chars_limit, the inputs are therefore
-   * concatenated in groups of at most @p group_chars characters first, and the groups are
-   * concatenated last. Otherwise this is one cudf::concatenate.
+   * cudf::concatenate (libcudf 26.10) copies the characters of a strings column with one
+   * kernel when the inputs are small on average, and that kernel returns wrong characters once
+   * the concatenated characters pass 2^31 bytes: the offsets are right and the characters are
+   * not. TPC-H Q12 at SF300000 hit this with about 10,600 inputs of 330 KB each. Larger inputs
+   * are copied one by one, correctly. A strings column that would pass @p string_chars_limit
+   * from inputs under @p small_input_chars on average is therefore concatenated in groups of at
+   * most @p group_chars characters first, and the groups are concatenated last. Every other
+   * column, and every table without such a column, is one cudf::concatenate.
    *
    * @param input The tables to concatenate, all with the same schema.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param mr Device memory resource of the output table and of the groups.
-   * @param string_chars_limit Characters of one strings column above which the inputs are
+   * @param string_chars_limit Characters of one strings column above which its inputs may be
    *                           grouped.
-   * @param group_chars Most characters of one strings column in a group; a single input
-   *                    with more is a group of its own.
+   * @param small_input_chars Average characters per input under which a strings column is
+   *                          grouped. The default leaves a wide margin above the sizes at
+   *                          which libcudf switches to copying input by input.
+   * @param group_chars Most characters in a group; a single input with more is a group of its
+   *                    own.
    *
    * @return The concatenated table.
    */
@@ -96,6 +100,7 @@ class gpu_merge_impl {
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     std::int64_t string_chars_limit = std::numeric_limits<cudf::size_type>::max(),
+    std::int64_t small_input_chars  = std::int64_t{4} << 20,
     std::int64_t group_chars        = std::int64_t{1} << 30);
 
   /**
