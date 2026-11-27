@@ -21,6 +21,7 @@
 #include <cuda/stream>
 
 #include <memory>
+#include <string>
 
 namespace sirius::meld {
 
@@ -39,6 +40,8 @@ class meld_ungrouped_aggregate final : public op::sirius_physical_ungrouped_aggr
   /// are set, and for an aggregate whose columns are in their native carriers.
   meld_ungrouped_aggregate(op::sirius_physical_ungrouped_aggregate&& aggregate,
                            std::shared_ptr<meld_unit const> unit);
+
+  std::string get_name() const override;
 
   std::unique_ptr<op::operator_data> execute(const op::operator_data& input_data,
                                              ::cuda::stream_ref stream) override;

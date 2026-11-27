@@ -17,6 +17,7 @@
 #include "meld/meld_unit.hpp"
 
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/interop.hpp>
 #include <cudf/null_mask.hpp>
@@ -104,6 +105,7 @@ struct parsed_plan {
 
 std::optional<parsed_plan> parse(session& session, std::string const& plan)
 {
+  nvtx_scoped_range nvtx_range{"meld_unit::parse"};
   parsed_plan parsed;
   parsed.module = mlir::parseSourceString<mlir::ModuleOp>(plan, &session.context());
   if (!parsed.module) { return std::nullopt; }
@@ -191,6 +193,7 @@ std::unique_ptr<cudf::table> to_cudf(arrow::Table const& answer,
                                      ::cuda::stream_ref stream,
                                      rmm::device_async_resource_ref const& mr)
 {
+  nvtx_scoped_range nvtx_range{"meld_unit::to_cudf"};
   auto batch = answer.CombineChunksToBatch();
   if (!batch.ok()) {
     throw internal_exception("Meld's answer is not one batch: {}", batch.status().ToString());
@@ -221,6 +224,7 @@ std::unique_ptr<meld_unit> meld_unit::check(std::string plan,
                                             std::vector<std::string> column_names,
                                             std::string& why)
 {
+  nvtx_scoped_range nvtx_range{"meld_unit::check"};
   register_once();
   session session;
   auto parsed = parse(session, plan);
@@ -269,6 +273,7 @@ std::unique_ptr<cudf::table> meld_unit::run(cudf::table_view const& batch,
                                             ::cuda::stream_ref stream,
                                             rmm::device_async_resource_ref const& mr) const
 {
+  nvtx_scoped_range nvtx_range{"meld_unit::run"};
   session session;
   auto parsed = parse(session, _plan);
   if (!parsed) { throw internal_exception(session.why("Meld cannot read a plan it checked")); }
@@ -276,11 +281,14 @@ std::unique_ptr<cudf::table> meld_unit::run(cudf::table_view const& batch,
   llvm::StringMap<mlir::meld::BoundTable> tables;
   tables[parsed->table.tableName] = bind_batch(batch, parsed->table, _column_names);
   stream.sync();
-  auto answers = mlir::meld::runPlan(*parsed->module,
-                                     parsed->inputs,
-                                     tables,
-                                     mlir::meld::DictionaryMap(),
-                                     gpu_options(rmm::get_current_cuda_device().value()));
+  auto answers = [&] {
+    nvtx_scoped_range run_plan_range{"meld_unit::run_plan"};
+    return mlir::meld::runPlan(*parsed->module,
+                               parsed->inputs,
+                               tables,
+                               mlir::meld::DictionaryMap(),
+                               gpu_options(rmm::get_current_cuda_device().value()));
+  }();
   if (mlir::failed(answers)) {
     throw internal_exception(session.why("Meld could not run the plan"));
   }

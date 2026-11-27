@@ -41,6 +41,8 @@ meld_ungrouped_aggregate::meld_ungrouped_aggregate(
   children = std::move(aggregate.children);
 }
 
+std::string meld_ungrouped_aggregate::get_name() const { return "MELD_UNGROUPED_AGGREGATE"; }
+
 std::unique_ptr<op::operator_data> meld_ungrouped_aggregate::execute(
   const op::operator_data& input_data, ::cuda::stream_ref stream)
 {
