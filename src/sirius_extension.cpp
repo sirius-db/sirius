@@ -109,6 +109,10 @@ extern "C" int cudaProfilerStop();
 #include "sirius_interface.hpp"
 #include "sirius_registration.hpp"
 #include "sirius_sql_rewrite.hpp"
+
+#ifdef SIRIUS_WITH_MELD_UNITS
+#include "meld/meld_units_pass.hpp"
+#endif
 #include "util/segfault_backtrace.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
@@ -4043,6 +4047,9 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value::BOOLEAN(true),
     SetEnableGpuExecution);
 
+#ifdef SIRIUS_WITH_MELD_UNITS
+  sirius::meld::add_meld_units_option(config);
+#endif
   config.AddExtensionOption(
     "pin_table_compression",
     "Default for pin_table calls that omit the compression named "

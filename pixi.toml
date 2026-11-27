@@ -83,6 +83,8 @@ snappy = "*"
 fastavro = "1.*"
 # For Meld's decode backend; in lockstep with `clang` above.
 mlir = "22.*"
+# For Meld to assemble the PTX nvcc writes with the same toolkit, not the driver.
+libnvjitlink-dev = "*"
 
 [feature.dev-libs.pypi-dependencies]
 # Local TPC-H Iceberg dataset writer; reuses the existing Python and PyArrow.

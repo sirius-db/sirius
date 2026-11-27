@@ -63,6 +63,18 @@ set(SIRIUS_LINK_LIBRARIES
     utf8proc::utf8proc
     # NVML: the NIXL fabric checks peer access between GPUs other processes own.
     CUDA::nvml)
+if(SIRIUS_ENABLE_MELD_UNITS)
+  list(
+    APPEND
+    SIRIUS_LINK_LIBRARIES
+    $<BUILD_INTERFACE:MLIRMeldDialect>
+    $<BUILD_INTERFACE:MLIRMeldExecution>
+    $<BUILD_INTERFACE:MLIRIR>
+    $<BUILD_INTERFACE:MLIRParser>
+    $<BUILD_INTERFACE:MLIRSupport>
+    $<BUILD_INTERFACE:MeldBuiltinLowering>
+    $<BUILD_INTERFACE:MeldBuiltinExecution>)
+endif()
 
 foreach(_target sirius_objects sirius_core sirius_shared)
   set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
@@ -88,6 +100,9 @@ foreach(_target sirius_objects sirius_core sirius_shared)
   target_compile_definitions(
     ${_target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN
                        CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+  if(SIRIUS_ENABLE_MELD_UNITS)
+    target_compile_definitions(${_target} PRIVATE SIRIUS_WITH_MELD_UNITS)
+  endif()
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)

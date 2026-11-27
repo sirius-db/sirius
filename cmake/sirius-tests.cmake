@@ -122,6 +122,14 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/src>
 )
 
+if(SIRIUS_ENABLE_MELD_UNITS)
+  target_sources(
+    sirius_unittest
+    PRIVATE test/cpp/meld/test_meld_plan_writer.cpp
+            test/cpp/meld/test_meld_unit.cpp
+            test/cpp/meld/test_meld_units_integration.cpp)
+endif()
+
 target_link_libraries(
   sirius_unittest
   sirius_core

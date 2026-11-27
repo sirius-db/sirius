@@ -202,12 +202,15 @@ if(SIMPATICO_ENABLE_MELD)
         "SIMPATICO_ENABLE_MELD needs SIMPATICO_MELD_SOURCE_DIR to name Meld's "
         "source tree; '${SIMPATICO_MELD_SOURCE_DIR}' is not one")
   endif()
-  # Only Meld's codec library, which needs MLIR and nothing else of Meld.
-  block()
-  set(MELD_CODEC_ONLY ON)
-  add_subdirectory("${SIMPATICO_MELD_SOURCE_DIR}"
-                   "${CMAKE_CURRENT_BINARY_DIR}/meld" EXCLUDE_FROM_ALL)
-  endblock()
+  # Only Meld's codec library, which needs MLIR and nothing else of Meld, unless
+  # the engine building Simpatico has built all of Meld already.
+  if(NOT TARGET MeldDecoderCompiler)
+    block()
+    set(MELD_CODEC_ONLY ON)
+    add_subdirectory("${SIMPATICO_MELD_SOURCE_DIR}"
+                     "${CMAKE_CURRENT_BINARY_DIR}/meld" EXCLUDE_FROM_ALL)
+    endblock()
+  endif()
   # Meld sets its include directories per directory, not per target.
   get_directory_property(
     simpatico_meld_include_dirs DIRECTORY "${SIMPATICO_MELD_SOURCE_DIR}"

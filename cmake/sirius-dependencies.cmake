@@ -154,6 +154,40 @@ endif()
 # the SIRIUS_NVTX_DOMAIN_NAME compile definition both include trees consume.
 set(SIRIUS_NVTX_DOMAIN_NAME "${PROJECT_NAME}")
 
+# Meld's execution units in place of a pipeline's operators (src/meld). All of
+# Meld, not just the decoders Simpatico takes, so it turns Simpatico's Meld
+# decoders on as well, which then link the MeldDecoderCompiler built here rather
+# than building their own. Off by default; the default pixi environment has the
+# MLIR and Arrow it needs.
+option(SIRIUS_ENABLE_MELD_UNITS "Run pipelines through Meld's execution units"
+       OFF)
+if(SIRIUS_ENABLE_MELD_UNITS)
+  if(NOT EXISTS "${SIMPATICO_MELD_SOURCE_DIR}/CMakeLists.txt")
+    message(
+      FATAL_ERROR
+        "SIRIUS_ENABLE_MELD_UNITS needs SIMPATICO_MELD_SOURCE_DIR to name Meld's "
+        "source tree; '${SIMPATICO_MELD_SOURCE_DIR}' is not one")
+  endif()
+  set(SIMPATICO_ENABLE_MELD
+      ON
+      CACHE BOOL "Build Meld's decoders beside the NVRTC JIT" FORCE)
+  block(PROPAGATE SIRIUS_MELD_INCLUDE_DIRS)
+  # Meld is C++20, and the 17 cached for DuckDB would otherwise win over it.
+  set(CMAKE_CXX_STANDARD 20)
+  set(MELD_INCLUDE_TESTS OFF)
+  set(MELD_BUILD_APPS OFF)
+  add_subdirectory("${SIMPATICO_MELD_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/meld"
+                   EXCLUDE_FROM_ALL)
+  # Meld names its headers, and MLIR's, for the whole of its tree rather than
+  # for its targets.
+  get_directory_property(
+    SIRIUS_MELD_INCLUDE_DIRS DIRECTORY "${SIMPATICO_MELD_SOURCE_DIR}"
+                                       INCLUDE_DIRECTORIES)
+  endblock()
+  message(
+    STATUS "Sirius: Meld's execution units from ${SIMPATICO_MELD_SOURCE_DIR}")
+endif()
+
 # Simpatico GPU compression engine Tests disabled here — run them via the
 # standalone simpatico_codegen build. Benchmark harness
 # (compress_with_plan_benchmark) is built by default.

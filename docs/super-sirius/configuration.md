@@ -1276,6 +1276,17 @@ The specialized path applies only to eligible batches and otherwise uses cuDF's 
 |----------|---------|-------------|
 | `enable_low_cardinality_groupby` | true | Grouped aggregation with at most 64 groups over one or two one-character string keys uses a dedicated kernel instead of cuDF's hash group-by. |
 
+### Meld Execution Units
+
+Only in a build with `SIRIUS_ENABLE_MELD_UNITS`, which needs Meld's source tree in
+`SIMPATICO_MELD_SOURCE_DIR` and turns on `SIMPATICO_ENABLE_MELD`, Simpatico's Meld decoders, with
+it; the `release-meld` preset sets both (`pixi run make release-meld`, with Meld checked out beside
+Sirius).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `meld_units` | false | Hand an ungrouped aggregate whose input is filters and projections over a table scan to Meld, which computes its per-batch partial over each scanned batch as one compiled unit in place of those operators. Takes effect when a plan is built. Meld does not support decimals, integer sums, or columns in other physical carriers; what it refuses runs as before, with the reason logged at debug level. |
+
 ### Fused Scan Filtering
 
 | Variable | Default | Description |
