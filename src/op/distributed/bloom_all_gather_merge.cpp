@@ -126,6 +126,16 @@ void bloom_all_gather_merge::merge(std::span<std::shared_ptr<sirius_dynamic_filt
         stream.sync();
         mergeable =
           std::all_of(heads.begin(), heads.end(), [&](auto const& h) { return h == head; });
+        if (!mergeable && std::any_of(heads.begin(), heads.end(), [&](auto const& h) {
+              return h[3] != head[3];
+            })) {
+          SIRIUS_LOG_WARN(
+            "[publish_dynamic_filters] key {}: the ranks sized their Blooms differently ({} bytes "
+            "here), so nothing is published for it; their Bloom budgets (4x scan_task_batch_size) "
+            "differ",
+            k,
+            head[3]);
+        }
       }
       if (!mergeable) {
         SIRIUS_LOG_DEBUG(
