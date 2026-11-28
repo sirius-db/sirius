@@ -62,6 +62,8 @@
 #ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #endif
+#include <rmm/cuda_device.hpp>
+
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
@@ -4608,7 +4610,8 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
 
 void reserve_cufile_arenas(scan_manager_config const& config,
                            std::span<int const> gpu_ids,
-                           bool spills_through_cufile)
+                           bool spills_through_cufile,
+                           std::span<std::size_t const> pool_bytes)
 {
 #ifdef CUCASCADE_HAS_CUFILE
   namespace cufile = cucascade::io::cufile;
@@ -4640,8 +4643,26 @@ void reserve_cufile_arenas(scan_manager_config const& config,
       "takes one, or spills through io_uring)");
     return;
   }
-  for (int const gpu : gpu_ids) {
+  for (std::size_t i = 0; i < gpu_ids.size(); ++i) {
+    int const gpu = gpu_ids[i];
     try {
+      // Native scans want no arena: the spills' own one is only worth taking while the GPU's
+      // pool, primed with its whole capacity once the arenas are taken, still fits beside it.
+      if (config.backend != io_backend::cufile && i < pool_bytes.size()) {
+        rmm::cuda_set_device_raii const device{rmm::cuda_device_id{gpu}};
+        auto const free = rmm::available_device_memory().first;
+        if (free < pool_bytes[i] || free - pool_bytes[i] < spill.arena_bytes()) {
+          SIRIUS_LOG_WARN(
+            "[sirius_scan_manager] no cuFile arena is reserved for spills on GPU {}: its {} MiB "
+            "would leave {} MiB free, less than its memory pool's {} MiB (the first spill through "
+            "cuFile tries again, and spills through io_uring if that fails)",
+            gpu,
+            spill.arena_bytes() >> 20,
+            (free > spill.arena_bytes() ? free - spill.arena_bytes() : 0) >> 20,
+            pool_bytes[i] >> 20);
+          continue;
+        }
+      }
       cufile::reserve_arena(gpu, spill);
       SIRIUS_LOG_INFO(
         "[sirius_scan_manager] the cuFile arena on GPU {} serves spills too (at least {} MiB "
@@ -4661,6 +4682,7 @@ void reserve_cufile_arenas(scan_manager_config const& config,
   (void)config;
   (void)gpu_ids;
   (void)spills_through_cufile;
+  (void)pool_bytes;
 #endif
 }
 

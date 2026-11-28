@@ -683,6 +683,31 @@ TEST_CASE("a spill arena registered differently from the scan arena is not reser
   scans.shutdown();
 }
 
+// [whole_gpu]: it sizes the pool from the GPU's free memory, which tests running beside it move.
+TEST_CASE("native scans reserve no spill arena the GPU's pool would then not fit beside",
+          "[cufile][scan][scan_manager][whole_gpu]")
+{
+  if (!cufile_usable()) { SKIP("the cuFile arena requires a CUDA device and a cuFile driver"); }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  std::vector<int> const gpu_0{0};
+  fresh_arenas const fresh;
+  counting_cufile_api const api;
+  auto const native = reader_config(io_backend::native);
+  auto const spill  = cucascade::io::io_config{}.cufile.arena_bytes();
+  REQUIRE(free_device_bytes(0) > 4 * spill);
+
+  // The pool is primed with its whole capacity right after: with the arena taken first, it
+  // would not fit.  The spills do without the arena rather than fail startup.
+  std::vector<std::size_t> const crowded{free_device_bytes(0) - spill / 2};
+  sirius::scan_manager::reserve_cufile_arenas(
+    native, gpu_0, /*spills_through_cufile=*/true, crowded);
+  CHECK(buffer_registrations == 0);
+
+  std::vector<std::size_t> const roomy{free_device_bytes(0) - 2 * spill};
+  sirius::scan_manager::reserve_cufile_arenas(native, gpu_0, /*spills_through_cufile=*/true, roomy);
+  CHECK(buffer_registrations > 0);
+}
+
 TEST_CASE("cufile_bulk_read picks the Parquet read route of cuFile scans",
           "[cufile][scan][scan_manager][bulk_read]")
 {

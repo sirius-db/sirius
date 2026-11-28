@@ -1063,10 +1063,12 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   // context (it allows GDS on a GDS mount), which would otherwise take them at the first spill.
   {
     std::vector<int> gpu_ids;
+    std::vector<std::size_t> pool_bytes;
     bool spills_through_cufile = false;
     for (auto const& space : config_.get_memory_space_configs()) {
       if (auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
         gpu_ids.push_back(gpu->device_id);
+        pool_bytes.push_back(gpu->memory_capacity);
       }
       auto const* disk = std::get_if<cucascade::memory::disk_memory_space_config>(&space);
       if (disk == nullptr || disk->io_context != nullptr || !disk->allow_gds ||
@@ -1084,7 +1086,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
       }
     }
     sirius::scan_manager::reserve_cufile_arenas(
-      config_.get_scan_manager_config(), gpu_ids, spills_through_cufile);
+      config_.get_scan_manager_config(), gpu_ids, spills_through_cufile, pool_bytes);
   }
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(

@@ -1438,9 +1438,13 @@ class sirius_scan_manager {
  * @param gpu_ids The GPUs Sirius reads into (the default for @c cufile.devices).
  * @param spills_through_cufile Whether a DISK space adopts the shared cuFile context
  *        (it allows GDS and its mount serves GDS: @c cucascade::disk_mount_uses_gds).
+ * @param pool_bytes The capacity of each GPU's memory pool, in @p gpu_ids' order, which is
+ *        primed whole once the arenas are taken.  For native scans the spills' arena is
+ *        optional: it is not reserved on a GPU whose free memory would no longer hold its pool.
  */
 void reserve_cufile_arenas(scan_manager_config const& config,
                            std::span<int const> gpu_ids,
-                           bool spills_through_cufile = false);
+                           bool spills_through_cufile              = false,
+                           std::span<std::size_t const> pool_bytes = {});
 
 }  // namespace sirius::scan_manager
