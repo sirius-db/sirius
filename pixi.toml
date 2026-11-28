@@ -192,6 +192,7 @@ vcpkg-cuda12 = ["vcpkg", "cuda12"]
 nightly-runner = { features = ["nightly-runner"], no-default-feature = true }
 docs = { features = ["docs"], no-default-feature = true }
 bindings = { features = ["bindings"], no-default-feature = true }
+browser = { features = ["browser"], no-default-feature = true }
 
 [feature.docs]
 platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
@@ -249,3 +250,28 @@ rust = "1.95.*"
 description = "Regenerate checked-in Rust C ABI declarations."
 cmd = "cargo check --locked --manifest-path rust/Cargo.toml -p sirius-sys --features generate-bindings"
 env = { DOCS_RS = "1" }
+
+# The Quent browser analyzer (rust/crates/telemetry/browser) compiled to WASM. Builds only
+# the browser crate and its telemetry dependencies, so it needs no GPU, CUDA, or libclang.
+[feature.browser]
+platforms = ["linux-64", "linux-aarch64"]
+
+[feature.browser.dependencies]
+cxx-compiler = "*"
+rust = "1.*"
+rust-std-wasm32-unknown-unknown = "1.*"
+# Must equal the `wasm-bindgen` crate version in rust/Cargo.lock; the build task checks.
+wasm-bindgen-cli = "=0.2.130"
+
+[feature.browser.tasks.quent-browser-bundle]
+description = "Convert Sirius telemetry (a directory or Quent ZIP) into a .quent-browser file."
+cmd = "cargo run --release --manifest-path rust/Cargo.toml -p sirius-telemetry-browser --features generate --bin sirius-quent-browser-bundle -- {{ input }} --output {{ output }}"
+args = [
+  { arg = "input", default = "telemetry_data" },
+  { arg = "output", default = "trace.quent-browser" },
+]
+
+[feature.browser.tasks.build-quent-browser]
+description = "Build the Quent browser analyzer for the web into out_dir (JS + WASM)."
+cmd = "bash scripts/build_quent_browser.sh {{ out_dir }}"
+args = [{ arg = "out_dir", default = "build/quent-browser" }]

@@ -5,6 +5,7 @@ members = [
     "crates/telemetry/model",
     "crates/telemetry/store",
     "crates/telemetry/analyzer",
+    "crates/telemetry/browser",
     "crates/telemetry/server",
     "crates/sirius-sys",
     "crates/sirius",
@@ -21,3 +22,29 @@ edition = "2024"
 cxx = "1"
 cxx-build = "1"
 sirius-sys = { path = "crates/sirius-sys" }
+
+# Every Quent crate resolves from one revision. `quent-open` and the hosted browser
+# viewer select compatible builds from this revision, so bump all crates together.
+nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+nvtx-server = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-browser-bundle = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-browser-bundle-build = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-instrumentation-build = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099", default-features = false }
+quent-nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-nvtx-events = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-query-engine-browser = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-schema-codegen-cpp = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099", default-features = false }
+quent-store-build = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }
+quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "3829e73e413b0dbf42d0a0c034b7a4bcae88f099" }

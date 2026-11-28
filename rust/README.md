@@ -12,7 +12,8 @@ Before [#2436](https://github.com/sirius-db/sirius/pull/2436), `sirius` and
 `sirius-sys` referred to the C++ bridge. These names now refer to the public C ABI
 crates; the existing C++ bridge lives in `sirius-ffi`.
 
-The `telemetry/*` crates are unrelated: CMake links those into the engine.
+The `telemetry/*` crates are unrelated: CMake links those into the engine (excluding
+`browser`, which is for exposing the Sirius analyzer to a static Quent viewer).
 
 ## Configuration
 

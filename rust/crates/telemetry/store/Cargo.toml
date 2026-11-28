@@ -3,14 +3,20 @@ name = "sirius-telemetry-store"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["filesystem"]
+# Native-only loading of collector output; disable for `wasm32-unknown-unknown`.
+filesystem = ["quent-store/io-ndjson"]
+
 [dependencies]
-quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
-quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae", features = ["serde"] }
-quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae", default-features = false, features = ["io-ndjson"] }
+quent-analyzer = { workspace = true }
+quent-events = { workspace = true, features = ["serde"] }
+quent-store = { workspace = true, features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 smallvec = "1"
 
 [build-dependencies]
-quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
-quent-store-build = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
-quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "4fe7336c03c7fc7ba26b435041f24ad63ec70eae" }
+quent-build-info = { workspace = true }
+quent-store-build = { workspace = true }
+quent-yaml = { workspace = true }
+sha2 = "0.11"

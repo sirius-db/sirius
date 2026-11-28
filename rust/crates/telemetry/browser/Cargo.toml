@@ -1,0 +1,47 @@
+[package]
+name = "sirius-telemetry-browser"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+# Native bundle generation from collector output (`sirius-quent-browser-bundle`).
+generate = [
+    "sirius-telemetry-store/filesystem",
+    "dep:clap",
+    "dep:quent-browser-bundle-build",
+]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "sirius-quent-browser-bundle"
+path = "src/main.rs"
+required-features = ["generate"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+quent-browser-bundle = { workspace = true }
+quent-browser-bundle-build = { workspace = true, optional = true }
+quent-events = { workspace = true, features = ["serde"] }
+quent-query-engine-analyzer = { workspace = true }
+quent-query-engine-browser = { workspace = true, features = ["wasm"] }
+sirius-telemetry-analyzer = { path = "../analyzer", default-features = false }
+sirius-telemetry-store = { path = "../store", default-features = false }
+uuid = "1"
+# Must match the `wasm-bindgen` selected by Cargo.lock: the export macro names
+# `wasm_bindgen_futures` in this crate.
+wasm-bindgen-futures = "=0.4.80"
+
+[build-dependencies]
+quent-build-info = { workspace = true }
+
+[dev-dependencies]
+quent-io = { workspace = true, features = ["ndjson"] }
+sirius-telemetry-instrumentation = { package = "instrumentation-model", path = "../model" }
+sirius-telemetry-store = { path = "../store" }
+tempfile = "3"
+uuid = { version = "1", features = ["v7"] }
+zip = { version = "9", default-features = false }

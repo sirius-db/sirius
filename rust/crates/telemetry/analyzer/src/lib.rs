@@ -1,11 +1,9 @@
-#[cfg(target_arch = "wasm32")]
-compile_error!("sirius-telemetry-analyzer does not support wasm32");
-
 use quent_dynamic_attributes::DynamicValue;
 use quent_events::Event;
 pub use quent_query_engine_analyzer::QueryEngineModel;
 use quent_query_engine_analyzer::entities;
 use quent_query_engine_analyzer::ui::UiAnalyzer;
+#[cfg(feature = "filesystem")]
 use quent_query_engine_analyzer::ui::{QuentViewer, ViewerEventStream};
 use quent_query_engine_analyzer::{
     EngineEntity, OperatorEntity, PlanEntity, PortEntity, QueryEntity, WorkerEntity,
@@ -13,6 +11,7 @@ use quent_query_engine_analyzer::{
 use quent_query_engine_ui::{
     DataFlowTimelineBinned, EntityRef, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
 };
+#[cfg(feature = "filesystem")]
 use quent_store::{
     context::ContextSet,
     event::{CombinedEventLoader, EventLoader, filesystem::Loader},
@@ -39,12 +38,14 @@ use quent_ui::{
     },
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+#[cfg(feature = "filesystem")]
 use sirius_telemetry_store::Sirius;
 use sirius_telemetry_store::{self as schema, SiriusEvent};
 use std::collections::HashMap as StdHashMap;
 use std::sync::Arc;
 use tracing::debug;
 
+#[cfg(feature = "filesystem")]
 use quent_analyzer::context::ContextInventory;
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Span,
@@ -361,8 +362,10 @@ impl<'a> BatchAttribution<'a, '_> {
 }
 
 /// `quent-open` viewer entry: renders Sirius events with [`SiriusUiAnalyzer`].
+#[cfg(feature = "filesystem")]
 pub struct Viewer;
 
+#[cfg(feature = "filesystem")]
 impl QuentViewer for Viewer {
     type Analyzer = SiriusUiAnalyzer;
 
@@ -409,6 +412,7 @@ impl QuentViewer for Viewer {
     }
 }
 
+#[cfg(feature = "filesystem")]
 fn context_location(dir: &std::path::Path) -> quent_io::ImporterResult<(Uuid, &std::path::Path)> {
     let invalid_path = || {
         quent_io::ImporterError::other(std::io::Error::new(

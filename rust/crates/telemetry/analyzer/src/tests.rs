@@ -821,6 +821,7 @@ fn consumer_view_resolves_foreign_producer_batch() {
     );
 }
 
+#[cfg(feature = "filesystem")]
 #[test]
 fn generated_ndjson_imports_into_analyzer() {
     use quent_io::{
