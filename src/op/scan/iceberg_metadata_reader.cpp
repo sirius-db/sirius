@@ -19,6 +19,7 @@
 #include "yyjson.hpp"
 
 #include <cudf/concatenate.hpp>
+#include <cudf/contiguous_split.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
@@ -38,6 +39,8 @@
 #include <duckdb/main/query_result_stream.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
 #include <log/logging.hpp>
+#include <memory/device_transfer.hpp>
+#include <memory/sirius_memory_reservation_manager.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/parquet_delete_reader.hpp>
@@ -50,6 +53,7 @@
 #include <map>
 #include <numeric>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -1028,16 +1032,37 @@ void materialize_positional_deletes(duckdb::ClientContext& context,
   }
 }
 
-/// Builds the delete groups the scan probes and records which of them each data file needs.
+/// Indexes a group's distinct @p keys for the probe.
+EqualityDeleteGroup index_equality_group(std::vector<int32_t> key_field_ids,
+                                         std::vector<std::size_t> key_primary_indices,
+                                         std::unique_ptr<cudf::table> keys,
+                                         ::cuda::stream_ref stream,
+                                         rmm::device_async_resource_ref mr)
+{
+  // A NULL delete key matches a NULL data value -- `col IS NULL`, the opposite of a SQL join.
+  auto hash_join = std::make_unique<cudf::distinct_hash_join>(
+    keys->view(), cudf::null_equality::EQUAL, 0.5, stream, mr);
+  stream.sync();
+
+  EqualityDeleteGroup group;
+  group.delete_table        = std::move(keys);
+  group.key_field_ids       = std::move(key_field_ids);
+  group.key_primary_indices = std::move(key_primary_indices);
+  group.hash_join           = std::move(hash_join);
+  return group;
+}
+
+/// Builds the delete groups the scan probes, once on each device of @p resources, and records
+/// which of them each data file needs. The first device reads and decodes the delete files; the
+/// others index a copy of its keys.
 /// A group is the delete files that share their keys and apply to exactly the same data files,
 /// so memory grows with the delete rows, not with the number of distinct applicability sets.
 void materialize_equality_deletes(duckdb::ClientContext& context,
                                   iceberg_equality_plan const& plan,
                                   std::shared_ptr<cucascade::io::ioctx> const& ioctx,
-                                  equality_build_resources const& resources,
+                                  std::span<equality_build_resources const> resources,
                                   IcebergDeleteData& data)
 {
-  data.equality_device = rmm::get_current_cuda_device();
   // One class per distinct applicability list.
   std::map<std::vector<uint32_t>, uint32_t> class_of_list;
   for (auto const& [data_file, files] : plan.by_data_file)
@@ -1069,35 +1094,85 @@ void materialize_equality_deletes(duckdb::ClientContext& context,
   SIRIUS_LOG_INFO("[iceberg] Loading equality deletes: {} file(s) in {} group(s).",
                   plan.files.size(),
                   group_files.size());
-  data.equality_delete_groups.resize(group_files.size());
+  // A scan's batches land on every device of @p resources, and each probes tables in its own
+  // device's memory: whether another device's can be reached depends on the hardware.
+  // Deletes that apply to no data file leave no group, and no replica to hold one.
+  if (group_files.empty()) resources = {};
+  data.equality_replicas.reserve(resources.size());
+  for (auto const& target : resources) {
+    data.equality_replicas.push_back({target.device, {}});
+    data.equality_replicas.back().groups.resize(group_files.size());
+  }
   for (auto const& [key, group_index] : group_of) {
     auto const& ids = key.first;
     std::vector<std::size_t> primary;
     primary.reserve(ids.size());
     for (auto id : ids)
       primary.push_back(plan.keys.at(id).primary_index);
-    std::vector<std::unique_ptr<cudf::table>> tables;
-    std::vector<cudf::table_view> views;
-    for (auto file : group_files[group_index]) {
-      auto const counters = iceberg_counters(context);
-      if (counters) ++counters->iceberg_delete_payload_loads;
-      auto const& path = plan.files[file].file_path;
-      if (counters && counters->track_units && counters->iceberg_equality_open_for_testing)
-        counters->iceberg_equality_open_for_testing(path);
-      auto file_ioctx = ioctx;
-      if (sirius::io::s3::is_s3_path(path)) {
-        file_ioctx = resources.remote_ioctx ? resources.remote_ioctx(path) : nullptr;
-        // Never read as "no deletes": the scan would return the rows this file removes.
-        if (!file_ioctx)
-          throw std::runtime_error(
-            "[iceberg] no S3 backend is available to read equality-delete file '" + path + "'");
+    auto const& origin = resources.front();
+    rmm::cuda_set_device_raii origin_guard{origin.device};
+    {
+      std::vector<std::unique_ptr<cudf::table>> tables;
+      std::vector<cudf::table_view> views;
+      for (auto file : group_files[group_index]) {
+        auto const counters = iceberg_counters(context);
+        if (counters) ++counters->iceberg_delete_payload_loads;
+        auto const& path = plan.files[file].file_path;
+        if (counters && counters->track_units && counters->iceberg_equality_open_for_testing)
+          counters->iceberg_equality_open_for_testing(path);
+        auto file_ioctx = ioctx;
+        if (sirius::io::s3::is_s3_path(path)) {
+          file_ioctx = origin.remote_ioctx ? origin.remote_ioctx(path) : nullptr;
+          // Never read as "no deletes": the scan would return the rows this file removes.
+          if (!file_ioctx)
+            throw std::runtime_error(
+              "[iceberg] no S3 backend is available to read equality-delete file '" + path + "'");
+        }
+        tables.push_back(read_equality_delete_file(
+          plan.files[file], file_ioctx, ids, plan, origin.stream, origin.mr));
+        views.push_back(tables.back()->view());
       }
-      tables.push_back(read_equality_delete_file(
-        plan.files[file], file_ioctx, ids, plan, resources.stream, resources.mr));
-      views.push_back(tables.back()->view());
+      data.equality_replicas.front().groups[group_index] =
+        build_equality_group(ids, primary, views, origin.stream, origin.mr);
     }
-    data.equality_delete_groups[group_index] =
-      build_equality_group(ids, std::move(primary), views, resources.stream, resources.mr);
+    if (resources.size() == 1) continue;
+    // The other devices get the group's keys in one buffer copied from the first, so the files
+    // are read and decoded once.
+    auto const packed =
+      cudf::pack(data.equality_replicas.front().groups[group_index].delete_table->view(),
+                 origin.stream,
+                 origin.mr);
+    origin.stream.sync();
+    for (std::size_t device = 1; device < resources.size(); ++device) {
+      auto const& target = resources[device];
+      rmm::cuda_set_device_raii device_guard{target.device};
+      std::unique_ptr<cudf::table> keys;
+      {
+        rmm::device_buffer copy{packed.gpu_data->size(), target.stream, target.mr};
+        (void)sirius::memory::enqueue_device_copy(
+          {static_cast<std::byte*>(copy.data()), copy.size()},
+          target.device,
+          target.stream,
+          {static_cast<std::byte const*>(packed.gpu_data->data()), copy.size()},
+          origin.device,
+          origin.space,
+          sirius::memory::source_already_complete{},
+          target.space
+            ? sirius::memory::sirius_memory_reservation_manager::host_staging_space(*target.space)
+            : nullptr);
+        // The copy reads the first device's buffer: finish it before either buffer can go.
+        target.stream.sync();
+        keys = std::make_unique<cudf::table>(
+          cudf::unpack(packed.metadata->data(), static_cast<uint8_t const*>(copy.data())),
+          target.stream,
+          target.mr);
+        // The keys are read out of the buffer before it goes, so that the hash table is not
+        // built beside a second copy of them.
+        target.stream.sync();
+      }
+      data.equality_replicas[device].groups[group_index] =
+        index_equality_group(ids, primary, std::move(keys), target.stream, target.mr);
+    }
   }
 
   std::vector<std::shared_ptr<equality_group_list const>> list_of_class(class_of_list.size());
@@ -1131,9 +1206,33 @@ std::optional<cudf::data_type> equality_key_cudf_type(duckdb::LogicalType const&
 
 IcebergDeleteData::~IcebergDeleteData()
 {
-  if (!equality_device) return;
-  rmm::cuda_set_device_raii device_guard{*equality_device};
-  equality_delete_groups.clear();
+  for (auto& replica : equality_replicas) {
+    rmm::cuda_set_device_raii device_guard{replica.device};
+    replica.groups.clear();
+  }
+}
+
+void IcebergDeleteData::release_equality_replicas_outside(std::span<int const> devices) const
+{
+  auto const excluded = [&](equality_replica const& replica) {
+    return std::find(devices.begin(), devices.end(), replica.device.value()) == devices.end();
+  };
+  // Emptied first, each with its device current: the erase moves kept replicas into their slots.
+  for (auto& replica : equality_replicas) {
+    if (!excluded(replica)) continue;
+    rmm::cuda_set_device_raii device_guard{replica.device};
+    replica.groups.clear();
+  }
+  std::erase_if(equality_replicas, excluded);
+}
+
+std::vector<EqualityDeleteGroup> const& IcebergDeleteData::equality_groups_on(
+  rmm::cuda_device_id device) const
+{
+  for (auto const& replica : equality_replicas)
+    if (replica.device == device) return replica.groups;
+  throw std::invalid_argument("[iceberg] no equality-delete tables were built on GPU " +
+                              std::to_string(device.value()));
 }
 
 EqualityDeleteGroup build_equality_group(std::vector<int32_t> key_field_ids,
@@ -1166,17 +1265,8 @@ EqualityDeleteGroup build_equality_group(std::vector<int32_t> key_field_ids,
                   key_field_ids.size(),
                   deduped->num_rows());
 
-  // A NULL delete key matches a NULL data value -- `col IS NULL`, the opposite of a SQL join.
-  auto hash_join = std::make_unique<cudf::distinct_hash_join>(
-    deduped->view(), cudf::null_equality::EQUAL, 0.5, stream, mr);
-  stream.sync();
-
-  EqualityDeleteGroup group;
-  group.delete_table        = std::move(deduped);
-  group.key_field_ids       = std::move(key_field_ids);
-  group.key_primary_indices = std::move(key_primary_indices);
-  group.hash_join           = std::move(hash_join);
-  return group;
+  return index_equality_group(
+    std::move(key_field_ids), std::move(key_primary_indices), std::move(deduped), stream, mr);
 }
 
 namespace {
@@ -1198,7 +1288,7 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
   std::string const& table_path,
   std::shared_ptr<cucascade::io::ioctx> const& metadata_ioctx,
   iceberg_delete_discovery const& discovery,
-  std::optional<equality_build_resources> const& equality_resources)
+  std::span<equality_build_resources const> equality_resources)
 {
   g_uncached_read_count.fetch_add(1, std::memory_order_relaxed);
 
@@ -1233,12 +1323,12 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
       throw std::runtime_error("[iceberg] '" + table_path +
                                "' has live equality deletes but no equality plan; the plan gate "
                                "must plan them or decline the scan");
-    if (!equality_resources)
+    if (equality_resources.empty())
       throw std::invalid_argument("[iceberg] '" + table_path +
                                   "' has live equality deletes but no stream and allocator to "
                                   "build their tables with");
     materialize_equality_deletes(
-      context, *discovery.equality_plan, metadata_ioctx, *equality_resources, *data);
+      context, *discovery.equality_plan, metadata_ioctx, equality_resources, *data);
   }
 
   return data;
@@ -1251,7 +1341,7 @@ std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   std::string const& table_path,
   std::shared_ptr<cucascade::io::ioctx> const& metadata_ioctx,
   iceberg_delete_discovery const& discovery,
-  std::optional<equality_build_resources> equality_resources)
+  std::vector<equality_build_resources> equality_resources)
 {
   return read_iceberg_delete_data_uncached(
     context, table_path, metadata_ioctx, discovery, equality_resources);

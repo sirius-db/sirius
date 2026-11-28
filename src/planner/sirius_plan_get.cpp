@@ -114,21 +114,7 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
                                                  duckdb::SiriusContext& sirius_ctx,
                                                  op::scan::iceberg_delete_inventory& inventory)
 {
-  // The delete hash tables are built once, on one device. A scan task on another device would
-  // probe memory it cannot address.
   auto const counters = sirius_ctx.physical_counters();
-  auto const gpus = counters && counters->track_units && counters->equality_gpu_count_for_testing
-                      ? *counters->equality_gpu_count_for_testing
-                      : sirius_ctx.get_memory_manager()
-                          .get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)
-                          .size();
-  if (gpus > 1) {
-    return iceberg_decline(
-      scan_reason::iceberg_equality_multi_gpu,
-      "this iceberg table has equality deletes, which the GPU scan path applies on a single "
-      "GPU only");
-  }
-
   auto const files_limit =
     counters && counters->track_units && counters->equality_files_per_data_file_limit_for_testing
       ? *counters->equality_files_per_data_file_limit_for_testing

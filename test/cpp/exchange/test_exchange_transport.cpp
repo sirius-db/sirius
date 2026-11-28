@@ -338,6 +338,40 @@ TEST_CASE("send blocks while queued bytes exceed the cap, then delivers everythi
   CHECK(got.batches[{0, 5}].size() == 2);
 }
 
+TEST_CASE("a send that does not wait for room is queued over the cap, ahead of a sender that waits",
+          "[exchange][transport]")
+{
+  cluster c(2, 4, 4, {}, /*host=*/nullptr, {.max_queued_bytes = 64 * KiB});
+  auto& sender = *c.ranks[0].t;
+  auto& got    = *c.ranks[1].got;
+  auto first   = gpu_batch(sample_table(30'000));
+  auto second  = gpu_batch(sample_table(30'001));
+  auto third   = gpu_batch(sample_table(30'002));
+  // Declared before the hold: a send that waits after all is joined once the hold is released.
+  std::future<void> blocked;
+  std::future<void> unblocked;
+  {
+    auto const hold = hold_gpu();
+    sender.send(5, 1, std::move(first));
+    blocked = std::async(std::launch::async, [&] { sender.send(5, 1, std::move(second)); });
+    CHECK(blocked.wait_for(std::chrono::milliseconds{500}) == std::future_status::timeout);
+    unblocked = std::async(std::launch::async, [&] {
+      sender.send(6, 1, std::move(third), /*wait_for_room=*/false);
+      sender.close(6, 1);
+    });
+    REQUIRE(unblocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+    unblocked.get();
+    CHECK(blocked.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout);
+  }
+  REQUIRE(blocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+  blocked.get();
+  sender.close(5, 1);
+  REQUIRE(got.wait_for([&] { return got.ended.size() == 2; }));
+  std::lock_guard lock{got.mutex};
+  CHECK(got.batches[{0, 5}].size() == 2);
+  CHECK(got.batches[{0, 6}].size() == 1);
+}
+
 TEST_CASE("a cancelled query's sender stops waiting for room, and the transport carries on",
           "[exchange][transport]")
 {

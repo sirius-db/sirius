@@ -209,17 +209,13 @@ void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receive
 
 void exchange_service::send(stream_id stream,
                             rank_t to,
-                            std::shared_ptr<cucascade::data_batch> batch)
+                            std::shared_ptr<cucascade::data_batch> batch,
+                            bool wait_for_room)
 {
   auto const bytes = to != _rank && batch ? bytes_of(*batch) : 0;
   std::shared_ptr<transport> running;
   {
     std::lock_guard lock{_mutex};
-    if (bytes > 0) {
-      auto& t = _traffic[query_of(stream)];
-      t.sent_bytes += bytes;
-      ++t.sent_batches;
-    }
     if (_error) { std::rethrow_exception(_error); }
     // A peer failed this query: stop producing for it. close() still goes through, since sinks
     // and all-gathers close their streams on the way out.
@@ -228,13 +224,19 @@ void exchange_service::send(stream_id stream,
     }
     running = _transport;
   }
-  running->send(stream, to, std::move(batch));
+  running->send(stream, to, std::move(batch), wait_for_room);
   // An abort that arrived meanwhile may have woken this sender without queueing its batch: it
   // fails like one that started after the abort.
   std::lock_guard lock{_mutex};
   if (_error) { std::rethrow_exception(_error); }
   if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
     std::rethrow_exception(it->second);
+  }
+  // Counted once the send was not refused; not for a query that retired while it waited.
+  if (bytes > 0 && !retired(query_of(stream))) {
+    auto& t = _traffic[query_of(stream)];
+    t.sent_bytes += bytes;
+    ++t.sent_batches;
   }
 }
 

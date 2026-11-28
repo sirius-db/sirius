@@ -259,6 +259,13 @@ if [ -n "${SIRIUS_RANK_LOG_ROOT:-}" ]; then
   export SIRIUS_LOG_DIR=$SIRIUS_RANK_LOG_ROOT/$(hostname -s)-$port
   mkdir -p "$SIRIUS_LOG_DIR"
 fi
+# A rank killed together with its launcher leaves its mirrors too: remove those whose process is
+# gone.
+for f in /dev/shm/sirius-exchange-*; do
+  [ -e "$f" ] || continue
+  owner=${f#/dev/shm/sirius-exchange-}
+  [ -d "/proc/${owner%%-*}" ] || rm -f "$f" 2> /dev/null || true
+done
 # SIRIUS_GDS=1 (set it with scan_manager.backend: gds): give the rank a cuFile configuration
 # that cannot fall back to POSIX reads, with its log in the rank's node-local folder.
 if [ "${SIRIUS_GDS:-0}" = 1 ]; then
