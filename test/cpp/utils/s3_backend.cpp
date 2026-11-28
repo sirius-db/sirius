@@ -402,9 +402,10 @@ void create_edge_types_fixture(fs::path const& fixture_dir)
   }
 }
 
-// Write the SeaweedFS S3 identities file (the -s3.config payload) granting our
-// single test identity full access under the static access/secret keys, so the
-// SigV4-signed requests the [s3] tests issue are actually authenticated.
+// Write the SeaweedFS S3 identities file (the -s3.config payload) granting the
+// test identity full access under the static access/secret keys, so the
+// SigV4-signed requests the [s3] tests issue are actually authenticated. Each of
+// s3_prefix_readers may only read the objects under its own prefix.
 void write_s3_identities_config(fs::path const& path)
 {
   std::ofstream out(path, std::ios::trunc);
@@ -417,7 +418,22 @@ void write_s3_identities_config(fs::path const& path)
       << kAccessKey << "\", \"secretKey\": \"" << kSecretKey
       << "\"}],\n"
          "      \"actions\": [\"Admin\", \"Read\", \"Write\", \"List\", \"Tagging\"]\n"
-         "    }\n"
+         "    }";
+  for (auto const& reader : s3_prefix_readers) {
+    out << ",\n"
+           "    {\n"
+           "      \"name\": \""
+        << reader.access_key
+        << "\",\n"
+           "      \"credentials\": [{\"accessKey\": \""
+        << reader.access_key << "\", \"secretKey\": \"" << reader.secret_key
+        << "\"}],\n"
+           "      \"actions\": [\"Read:"
+        << kBucket << "/" << reader.prefix
+        << "*\"]\n"
+           "    }";
+  }
+  out << "\n"
          "  ]\n"
          "}\n";
   if (!out) throw std::runtime_error("failed writing S3 identities config: " + path.string());

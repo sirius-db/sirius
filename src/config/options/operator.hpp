@@ -244,6 +244,21 @@ struct operator_options : block_base<operator_options> {
       .fallback(ubytes(defaults().unique_exact_max_bytes))
       .describe("value cap for the pin-time exact uniqueness check")
       .build();
+  config_option<ubytes> iceberg_equality_key_bounds_max_bytes =
+    option<ubytes>("iceberg_equality_key_bounds_max_bytes")
+      .fallback(ubytes(defaults().iceberg_equality_key_bounds_max_bytes))
+      .describe("maximum retained Iceberg equality-delete key bounds per scan; 0 disables pruning")
+      .build();
+  config_option<std::uint64_t> iceberg_equality_key_bounds_max_comparisons =
+    option<std::uint64_t>("iceberg_equality_key_bounds_max_comparisons")
+      .fallback(defaults().iceberg_equality_key_bounds_max_comparisons)
+      .describe("maximum Iceberg equality-delete key comparisons per scan; 0 disables pruning")
+      .build();
+  config_option<std::uint64_t> iceberg_equality_key_bound_max_length =
+    option<std::uint64_t>("iceberg_equality_key_bound_max_length")
+      .fallback(defaults().iceberg_equality_key_bound_max_length)
+      .describe("maximum Iceberg equality-delete key bound length in bytes; 0 disables pruning")
+      .build();
   config_option<bool> enable_exists_minmax_rewrite =
     option<bool>("enable_exists_minmax_rewrite")
       .fallback(defaults().enable_exists_minmax_rewrite)
@@ -352,6 +367,9 @@ struct operator_options : block_base<operator_options> {
       enable_delim_aggregate_reuse,
       pin_table_prove_unique_keys,
       pin_table_unique_exact_max_bytes,
+      iceberg_equality_key_bounds_max_bytes,
+      iceberg_equality_key_bounds_max_comparisons,
+      iceberg_equality_key_bound_max_length,
       enable_exists_minmax_rewrite,
       enable_partial_aggregate_below_join,
       enable_subquery_key_carry,

@@ -233,12 +233,62 @@ TEST_CASE("iceberg equality delete - filter removes exactly the matching rows", 
   batch_cols.push_back(int32_column({1, 2, 3, 4, 5}));
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {0}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), {{0, {0}}}};
   std::vector<batch_row_run> runs{{"data-0.parquet", 0, 0, 5}};
 
   auto out = filter.apply(std::move(batch), batch_layout{runs}, test_stream(), test_mr());
   REQUIRE(out->num_rows() == 3);
   REQUIRE(to_host(out->get_column(0).view()) == std::vector<int32_t>{1, 3, 5});
+}
+
+TEST_CASE("iceberg equality delete - several groups mark one batch and compact it once",
+          "[iceberg][scan]")
+{
+  // Two groups keyed on different columns. Row 2 is deleted by both, rows 1 and 4 by one each.
+  // A filter that keeps only the last group's answer returns {1, 2, 3}; one that drops the last
+  // group returns {2, 3, 5}.
+  std::vector<std::unique_ptr<cudf::column>> first;
+  first.push_back(int32_column({10, 20}));
+  cudf::table first_file{std::move(first)};
+  std::vector<std::unique_ptr<cudf::column>> second;
+  second.push_back(int32_column({200, 400}));
+  cudf::table second_file{std::move(second)};
+
+  auto data = std::make_shared<IcebergDeleteData>();
+  add_group(*data, build_group({1}, {0}, {first_file.view()}));
+  add_group(*data, build_group({2}, {1}, {second_file.view()}));
+
+  std::vector<std::unique_ptr<cudf::column>> batch_cols;
+  batch_cols.push_back(int32_column({10, 20, 30, 40, 50}));
+  batch_cols.push_back(int32_column({100, 200, 300, 400, 500}));
+  batch_cols.push_back(int32_column({1, 2, 3, 4, 5}));
+  auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
+
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), {{0, {0}}, {1, {1}}}};
+  auto out = filter.apply(std::move(batch), {}, test_stream(), test_mr());
+  REQUIRE(to_host(out->get_column(2).view()) == std::vector<int32_t>{3, 5});
+}
+
+TEST_CASE("iceberg equality delete - a batch no group deletes from is returned uncopied",
+          "[iceberg][scan]")
+{
+  std::vector<std::unique_ptr<cudf::column>> del;
+  del.push_back(int32_column({7, 9}));
+  cudf::table delete_file{std::move(del)};
+
+  auto data = std::make_shared<IcebergDeleteData>();
+  add_group(*data, build_group({1}, {0}, {delete_file.view()}));
+  add_group(*data, build_group({1}, {0}, {delete_file.view()}));
+
+  std::vector<std::unique_ptr<cudf::column>> batch_cols;
+  batch_cols.push_back(int32_column({1, 2, 3}));
+  auto batch          = std::make_unique<cudf::table>(std::move(batch_cols));
+  auto const* decoded = batch.get();
+
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), {{0, {0}}, {1, {0}}}};
+  auto out = filter.apply(std::move(batch), {}, test_stream(), test_mr());
+  CHECK(out.get() == decoded);
+  REQUIRE(to_host(out->get_column(0).view()) == std::vector<int32_t>{1, 2, 3});
 }
 
 TEST_CASE("iceberg equality delete - a NULL key deletes the NULL rows", "[iceberg][scan]")
@@ -257,7 +307,7 @@ TEST_CASE("iceberg equality delete - a NULL key deletes the NULL rows", "[iceber
   batch_cols.push_back(int32_column({1, 0, 3}, {false, true, false}));
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {0}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), {{0, {0}}}};
   std::vector<batch_row_run> runs{{"data-0.parquet", 0, 0, 3}};
 
   auto out = filter.apply(std::move(batch), batch_layout{runs}, test_stream(), test_mr());
@@ -281,7 +331,7 @@ TEST_CASE("iceberg equality delete - missing key column throws", "[iceberg][scan
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
   equality_delete_filter filter{
-    data, rmm::get_current_cuda_device(), 0, {3}};  // index past the end of the batch
+    data, rmm::get_current_cuda_device(), {{0, {3}}}};  // index past the end of the batch
   std::vector<batch_row_run> runs{{"data-0.parquet", 0, 0, 2}};
 
   REQUIRE_THROWS_AS(filter.apply(std::move(batch), batch_layout{runs}, test_stream(), test_mr()),
@@ -309,7 +359,7 @@ TEST_CASE("iceberg equality delete - a composite key matches on every key column
   batch_cols.push_back(int32_column({1, 1, 2}));     // first key
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {2, 0}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), {{0, {2, 0}}}};
   auto out = filter.apply(std::move(batch), {}, test_stream(), test_mr());
   REQUIRE(out->num_rows() == 2);
   REQUIRE(to_host(out->get_column(1).view()) == std::vector<int32_t>{7, 9});
@@ -333,7 +383,7 @@ TEST_CASE("iceberg equality delete - a composite key with a NULL member matches 
   batch_cols.push_back(int32_column({0, 5, 0}, {true, false, true}));
   auto batch = std::make_unique<cudf::table>(std::move(batch_cols));
 
-  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {0, 1}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), {{0, {0, 1}}}};
   auto out = filter.apply(std::move(batch), {}, test_stream(), test_mr());
   REQUIRE(out->num_rows() == 2);
   REQUIRE(out->get_column(0).view().null_count() == 1);
@@ -357,17 +407,17 @@ TEST_CASE("iceberg equality delete - key count and key type mismatches throw", "
   };
 
   // Two batch columns offered for a one-key group.
-  equality_delete_filter too_many{data, rmm::get_current_cuda_device(), 0, {0, 1}};
+  equality_delete_filter too_many{data, rmm::get_current_cuda_device(), {{0, {0, 1}}}};
   REQUIRE_THROWS_AS(too_many.apply(make_batch(), {}, test_stream(), test_mr()),
                     std::invalid_argument);
   // An INT64 batch column against INT32 delete keys: the join would compare raw bytes.
-  equality_delete_filter wrong_type{data, rmm::get_current_cuda_device(), 0, {1}};
+  equality_delete_filter wrong_type{data, rmm::get_current_cuda_device(), {{0, {1}}}};
   REQUIRE_THROWS_AS(wrong_type.apply(make_batch(), {}, test_stream(), test_mr()),
                     std::invalid_argument);
   // A batch on a device no tables were built on. Another device's tables need not be
   // addressable from it, and passing the batch through would return the deleted row.
   rmm::cuda_device_id const other{rmm::get_current_cuda_device().value() + 1};
-  equality_delete_filter other_device{data, other, 0, {0}};
+  equality_delete_filter other_device{data, other, {{0, {0}}}};
   REQUIRE_THROWS_WITH(
     other_device.apply(make_batch(), {}, test_stream(), test_mr()),
     Catch::Matchers::ContainsSubstring("no equality-delete tables were built on GPU"));
@@ -409,32 +459,81 @@ TEST_CASE("iceberg equality delete - a group retains a bounded number of bytes p
 TEST_CASE("iceberg equality delete - probing a batch stays within the row-group estimate",
           "[iceberg][scan]")
 {
-  // attach_delete_set budgets one copy of the batch plus 9 B/row for a probe. No row matches
-  // here, so the compacted copy is the whole batch: the largest a probe allocates.
+  // attach_delete_set budgets one copy of the batch plus 9 B/row for a probe, however many
+  // groups apply. Each of the two groups here deletes one row, so the compacted copy is all but
+  // the whole batch: the largest a probe allocates.
   constexpr cudf::size_type rows = 1 << 20;
   auto zero                      = cudf::make_fixed_width_scalar<int64_t>(0);
   auto one                       = cudf::make_fixed_width_scalar<int64_t>(1);
-  auto absent                    = cudf::make_fixed_width_scalar<int64_t>(-1);
+  auto last                      = cudf::make_fixed_width_scalar<int64_t>(rows - 1);
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(cudf::sequence(rows, *zero, *one));  // key
   columns.push_back(cudf::sequence(rows, *zero, *one));  // payload
   auto batch             = std::make_unique<cudf::table>(std::move(columns));
   auto const batch_bytes = std::size_t{2} * rows * sizeof(int64_t);
 
-  auto deleted = cudf::sequence(1, *absent, *one);
-  auto data    = std::make_shared<IcebergDeleteData>();
-  add_group(*data, build_group({1}, {0}, {cudf::table_view{{deleted->view()}}}));
+  auto first  = cudf::sequence(1, *zero, *one);
+  auto second = cudf::sequence(1, *last, *one);
+  auto data   = std::make_shared<IcebergDeleteData>();
+  add_group(*data, build_group({1}, {0}, {cudf::table_view{{first->view()}}}));
+  add_group(*data, build_group({1}, {0}, {cudf::table_view{{second->view()}}}));
 
   rmm::mr::statistics_resource_adaptor stats{
     cuda::mr::any_resource<cuda::mr::device_accessible>{cudf::get_current_device_resource_ref()}};
   scoped_device_resource restore{stats};
-  equality_delete_filter filter{data, rmm::get_current_cuda_device(), 0, {0}};
+  equality_delete_filter filter{data, rmm::get_current_cuda_device(), {{0, {0}}, {1, {0}}}};
   auto out =
     filter.apply(std::move(batch), {}, test_stream(), rmm::device_async_resource_ref{stats});
-  REQUIRE(out->num_rows() == rows);
+  REQUIRE(out->num_rows() == rows - 2);
   auto const peak = static_cast<std::size_t>(stats.get_bytes_counter().peak);
   CAPTURE(peak, batch_bytes);
   CHECK(peak <= batch_bytes + std::size_t{9} * rows);
+}
+
+TEST_CASE("iceberg equality delete - key bounds are compared as the manifest serializes them",
+          "[iceberg][scan]")
+{
+  using duckdb::LogicalType;
+  // A value in the little-endian width a manifest writes it in.
+  auto const le = [](int64_t value, std::size_t width) {
+    std::string bytes(width, '\0');
+    for (std::size_t i = 0; i < width; ++i)
+      bytes[i] = static_cast<char>(static_cast<uint64_t>(value) >> (8 * i));
+    return bytes;
+  };
+  auto const ints = [&](LogicalType const& type,
+                        std::size_t width,
+                        std::pair<int64_t, int64_t> a,
+                        std::pair<int64_t, int64_t> b) {
+    return equality_key_ranges_disjoint(
+      type, le(a.first, width), le(a.second, width), le(b.first, width), le(b.second, width));
+  };
+
+  CHECK(ints(LogicalType::INTEGER, 4, {10, 30}, {31, 35}));
+  CHECK_FALSE(ints(LogicalType::INTEGER, 4, {10, 30}, {30, 35}));  // the bounds are inclusive
+  // Unsigned, -5 sorts above 20. Big-endian, 1 sorts above 256.
+  CHECK_FALSE(ints(LogicalType::BIGINT, 8, {-5, 15}, {10, 20}));
+  CHECK_FALSE(ints(LogicalType::INTEGER, 4, {-5, 15}, {10, 20}));
+  CHECK_FALSE(ints(LogicalType::BIGINT, 8, {1, 300}, {256, 256}));
+  CHECK(ints(LogicalType::DATE, 4, {-3, -1}, {0, 2}));
+  CHECK(ints(LogicalType::TIMESTAMP, 8, {1, 2}, {3, 4}));
+  CHECK(ints(LogicalType::TIMESTAMP_NS, 8, {1, 2}, {3, 4}));
+  CHECK(ints(LogicalType::BOOLEAN, 1, {0, 0}, {1, 1}));
+  // A file written before the key was promoted from int records 4-byte bounds.
+  CHECK(
+    equality_key_ranges_disjoint(LogicalType::BIGINT, le(10, 4), le(30, 4), le(40, 8), le(50, 8)));
+  // Any other width is not how the type is serialized, and proves nothing.
+  CHECK_FALSE(ints(LogicalType::BIGINT, 3, {10, 30}, {40, 50}));
+  CHECK_FALSE(ints(LogicalType::INTEGER, 8, {10, 30}, {40, 50}));
+  CHECK_FALSE(ints(LogicalType::TIMESTAMP, 4, {1, 2}, {3, 4}));
+  CHECK_FALSE(ints(LogicalType::DOUBLE, 8, {10, 30}, {40, 50}));
+
+  CHECK(equality_key_ranges_disjoint(LogicalType::VARCHAR, "a", "c", "d", "f"));
+  CHECK_FALSE(equality_key_ranges_disjoint(LogicalType::VARCHAR, "a", "c", "c", "f"));
+  // An empty bound is one the manifest did not record.
+  CHECK_FALSE(equality_key_ranges_disjoint(LogicalType::VARCHAR, "", "", "d", "f"));
+  // Beyond ASCII a writer may order by UTF-16 code units, which bytes do not follow.
+  CHECK_FALSE(equality_key_ranges_disjoint(LogicalType::VARCHAR, "a", "c", "\xC3\xA9", "\xC3\xA9"));
 }
 
 TEST_CASE("iceberg equality delete - each ceiling refuses the charge", "[iceberg][scan]")
@@ -640,7 +739,7 @@ TEST_CASE("iceberg equality delete - a second device probes keys held in its own
   rmm::cuda_set_device_raii guard{second};
   std::vector<std::unique_ptr<cudf::column>> batch_cols;
   batch_cols.push_back(int32_column({1, 2}));
-  equality_delete_filter filter{data, second, 0, {0}};
+  equality_delete_filter filter{data, second, {{0, {0}}}};
   auto out = filter.apply(
     std::make_unique<cudf::table>(std::move(batch_cols)), {}, resources[1].stream, resources[1].mr);
   resources[1].stream.sync();

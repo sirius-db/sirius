@@ -3130,6 +3130,37 @@ static void SetPinTableUniqueExactMaxBytes(ClientContext& context, SetScope scop
                    params->unique_exact_max_bytes);
 }
 
+/// The value of one of the Iceberg key-bound limits, which have no NULL.
+static uint64_t iceberg_key_bound_limit(Value const& parameter, char const* name)
+{
+  if (parameter.IsNull()) { throw InvalidInputException(std::string(name) + " cannot be NULL"); }
+  return UBigIntValue::Get(parameter);
+}
+
+static void SetIcebergEqualityKeyBoundsMaxBytes(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  get_operator_params(context, scope)->iceberg_equality_key_bounds_max_bytes =
+    iceberg_key_bound_limit(parameter, "iceberg_equality_key_bounds_max_bytes");
+}
+
+static void SetIcebergEqualityKeyBoundsMaxComparisons(ClientContext& context,
+                                                      SetScope scope,
+                                                      Value& parameter)
+{
+  get_operator_params(context, scope)->iceberg_equality_key_bounds_max_comparisons =
+    iceberg_key_bound_limit(parameter, "iceberg_equality_key_bounds_max_comparisons");
+}
+
+static void SetIcebergEqualityKeyBoundMaxLength(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  get_operator_params(context, scope)->iceberg_equality_key_bound_max_length =
+    iceberg_key_bound_limit(parameter, "iceberg_equality_key_bound_max_length");
+}
+
 static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                                                SetScope scope,
                                                Value& parameter)
@@ -4119,6 +4150,31 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::UBIGINT,
     Value::UBIGINT(operator_defaults.unique_exact_max_bytes),
     SetPinTableUniqueExactMaxBytes);
+
+  config.AddExtensionOption(
+    "iceberg_equality_key_bounds_max_bytes",
+    "Host bytes of Iceberg equality-delete key bounds one scan's plan keeps; a plan that would "
+    "keep more prunes no delete file. 0 turns the pruning off",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.iceberg_equality_key_bounds_max_bytes),
+    SetIcebergEqualityKeyBoundsMaxBytes);
+
+  config.AddExtensionOption(
+    "iceberg_equality_key_bounds_max_comparisons",
+    "Times one plan compares the bounds of a key between an Iceberg equality-delete file and a "
+    "data file; past it delete files stay on the lists they were not compared for. 0 turns the "
+    "pruning off",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.iceberg_equality_key_bounds_max_comparisons),
+    SetIcebergEqualityKeyBoundsMaxComparisons);
+
+  config.AddExtensionOption(
+    "iceberg_equality_key_bound_max_length",
+    "Longest Iceberg equality-delete key bound, in bytes, a plan keeps and compares; a longer "
+    "one counts as not recorded. 0 turns the pruning off",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.iceberg_equality_key_bound_max_length),
+    SetIcebergEqualityKeyBoundMaxLength);
 
   add_sirius_option(
     config,

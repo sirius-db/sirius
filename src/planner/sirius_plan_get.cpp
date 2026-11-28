@@ -107,6 +107,22 @@ std::optional<std::string> remote_scheme(std::string const& path)
   }
 }
 
+/// The columns of @p columns that field @p id names: the first one, and whether there is another.
+std::pair<duckdb::MultiFileColumnDefinition const*, bool> columns_of_field(
+  duckdb::vector<duckdb::MultiFileColumnDefinition> const& columns, int32_t id)
+{
+  duckdb::MultiFileColumnDefinition const* found = nullptr;
+  for (auto const& column : columns) {
+    if (column.identifier.IsNull() ||
+        column.identifier.type().id() != duckdb::LogicalTypeId::INTEGER ||
+        column.identifier.GetValue<int32_t>() != id)
+      continue;
+    if (found != nullptr) return {found, true};
+    found = &column;
+  }
+  return {found, false};
+}
+
 // Plans the live equality deletes of a snapshot into @p inventory, or says why the GPU path
 // cannot apply them: resolves each key field ID to a bound column and enforces the GPU limits.
 std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
@@ -119,14 +135,31 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
     counters && counters->track_units && counters->equality_files_per_data_file_limit_for_testing
       ? *counters->equality_files_per_data_file_limit_for_testing
       : op::scan::kMaxEqualityDeleteFilesPerDataFile;
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
+  // The bound type of a key this path compares, so that its recorded bounds can rule a delete
+  // file out for a data file. A key the checks below refuse has no type here.
+  auto const key_type = [&](int32_t id) -> std::optional<duckdb::LogicalType> {
+    if (bind == nullptr) return std::nullopt;
+    auto const [column, twice] = columns_of_field(
+      bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema, id);
+    if (column == nullptr || twice || !column->children.empty() ||
+        !op::scan::equality_key_cudf_type(column->type))
+      return std::nullopt;
+    return column->type;
+  };
+  auto const options = duckdb::query_operator_options(context);
+  op::scan::equality_key_bounds_limits const bounds_limits{
+    options->iceberg_equality_key_bounds_max_bytes,
+    options->iceberg_equality_key_bounds_max_comparisons,
+    options->iceberg_equality_key_bound_max_length};
   op::scan::iceberg_equality_plan plan;
   try {
-    plan = op::scan::read_equality_plan(context, inventory, files_limit);
+    plan = op::scan::read_equality_plan(context, inventory, files_limit, key_type, bounds_limits);
   } catch (op::scan::equality_plan_error const& e) {
     return iceberg_decline(scan_reason::iceberg_equality_plan_unproven, e.what());
   }
-  // The plan keeps the delete files that apply to a data file, and only those are opened. A
-  // live delete that applies to none is never read, so its format does not matter, like its URI.
+  // The plan keeps the delete files on a data file's list, and only those are opened. A live
+  // delete on none is never read, so its format does not matter, like its URI.
   //
   // The spec also allows Avro and ORC delete files. The format is in the inventory, so no
   // delete file is opened to find out.
@@ -156,7 +189,6 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
     }
   }
 
-  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
   if (bind == nullptr) {
     return iceberg_decline(scan_reason::iceberg_equality_key_unsupported,
                            "the binding does not expose the table schema, so equality-delete "
@@ -174,15 +206,8 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
       };
       // Top level only. A key the table has since dropped is not in the bound schema at all;
       // the spec still requires it, and this path cannot project it.
-      duckdb::MultiFileColumnDefinition const* found = nullptr;
-      for (auto const& column : columns) {
-        if (column.identifier.IsNull() ||
-            column.identifier.type().id() != duckdb::LogicalTypeId::INTEGER ||
-            column.identifier.GetValue<int32_t>() != id)
-          continue;
-        if (found != nullptr) return unsupported("which the bound schema lists twice");
-        found = &column;
-      }
+      auto const [found, twice] = columns_of_field(columns, id);
+      if (twice) return unsupported("which the bound schema lists twice");
       if (found == nullptr)
         return unsupported(
           "which is not a top-level column of the bound schema (dropped or "

@@ -206,6 +206,19 @@ static std::string equality_fixture(std::string const& name)
   return path.string();
 }
 
+/// Writes a copy of the Avro file @p path whose last record is overwritten, with its block and
+/// sync marker whole: the copy opens, and reading it fails when it gets to that record.
+static std::string damaged_copy(std::string const& path)
+{
+  std::ifstream in(path, std::ios::binary);
+  std::string bytes{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+  REQUIRE(bytes.size() > 24);
+  std::fill_n(bytes.end() - 24, 8, '\xff');
+  auto const copy = path + ".damaged";
+  std::ofstream(copy, std::ios::binary) << bytes;
+  return copy;
+}
+
 struct sirius_config_env_guard {
   sirius_config_env_guard(const std::string& config_path)
   {
@@ -1850,7 +1863,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
     INFO("a data manifest written by format version 1");
     // The table of "respect partitions" as an upgraded table carries it: the data manifest has
     // no `content` field and no sequence numbers. A reader that needs `content` cannot plan the
-    // partition-scoped delete and declines.
+    // partition-scoped delete and declines. The manifest has no bounds fields either, while the
+    // delete in partition A records bounds.
     auto path = table("iceberg_v2_eq_v1_data_manifest");
     require_delete_files(path, 2);
     expect_equality_rows("SELECT id, region, v FROM " + pinned_scan(path) + " ORDER BY v;",
@@ -1984,6 +1998,465 @@ TEST_CASE_METHOD(
   auto v3 = table("iceberg_v3_eq_timestamp_ns_key");
   require_delete_files(v3, 1);
   expect_equality_rows("SELECT id FROM " + pinned_scan(v3) + " ORDER BY id;", {{"1"}, {"3"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - key bounds take equality deletes off a data file",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The manifest records key k of the two data files as [10, 30] without NULLs and [40, 50]
+  // with one. Each sibling snapshot adds deletes; `loads` is how many delete files are opened.
+  auto path = table("iceberg_v2_eq_key_ranges");
+  auto scan = [&](int64_t sequence) {
+    return "SELECT id FROM iceberg_scan('" + path +
+           "', snapshot_from_id = " + std::to_string(8800000000000000 + sequence) +
+           ") ORDER BY id;";
+  };
+  using rows = std::vector<std::vector<std::string>>;
+  struct range_case {
+    char const* what;
+    int64_t sequence;
+    rows expected;
+    uint64_t loads;
+  };
+  rows const all{{"1"}, {"2"}, {"3"}, {"4"}, {"5"}, {"6"}};
+  rows const without_2{{"1"}, {"3"}, {"4"}, {"5"}, {"6"}};
+  for (auto const& c :
+       {range_case{"k in [100, 110] is beside both files", 2, all, 0},
+        range_case{
+          "k in [30, 35] meets a file at its bound", 3, {{"1"}, {"2"}, {"4"}, {"5"}, {"6"}}, 1},
+        range_case{
+          "a NULL key faces a file holding a NULL", 4, {{"1"}, {"2"}, {"3"}, {"4"}, {"5"}}, 1},
+        range_case{"a delete that records no bounds", 5, without_2, 1},
+        range_case{"(k, s) is beside both files in s alone", 6, all, 0},
+        range_case{"a delete manifest without the bounds fields", 8, without_2, 1},
+        // Read as zero, the missing count takes the delete off data-b and keeps id 6.
+        range_case{"a NULL key whose delete file records no null count",
+                   9,
+                   {{"1"}, {"2"}, {"3"}, {"4"}, {"5"}},
+                   1},
+        range_case{"string bounds truncated to 16 characters", 10, all, 0},
+        range_case{"a delete beside both files next to one that meets both",
+                   11,
+                   {{"1"}, {"3"}, {"4"}, {"6"}},
+                   1},
+        // Longer than iceberg_equality_key_bound_max_length, the bounds count as not recorded.
+        range_case{"a delete whose own bounds are 2000 characters long", 12, all, 1},
+        range_case{"six deletes with 61-character bounds", 13, all, 0},
+        range_case{"(k, s) with bounds recorded for s alone", 14, all, 0},
+        range_case{"(k, s) whose k cannot decide for the file holding a NULL", 15, all, 0}}) {
+    INFO(c.what);
+    expect_equality_rows(scan(c.sequence), c.expected, c.loads);
+  }
+  using sirius::test::scoped_setting;
+  {
+    // With bounds that long kept, the delete of sequence 12 is beside both files.
+    scoped_setting length(*con, "iceberg_equality_key_bound_max_length", 4096);
+    expect_equality_rows(scan(12), all, 0);
+  }
+  {
+    // The bounds of sequence 13 are 61 bytes long: kept at a limit of 61, not at 60.
+    scoped_setting length(*con, "iceberg_equality_key_bound_max_length", 61);
+    expect_equality_rows(scan(13), all, 0);
+  }
+  {
+    scoped_setting length(*con, "iceberg_equality_key_bound_max_length", 60);
+    expect_equality_rows(scan(13), all, 6);
+  }
+  {
+    // One comparison is allowed. The pairs past it are not compared, so both delete files of
+    // sequence 11 are opened; leaving those pairs out returns id 2 or id 5.
+    scoped_setting comparisons(*con, "iceberg_equality_key_bounds_max_comparisons", 1);
+    expect_equality_rows(scan(11), {{"1"}, {"3"}, {"4"}, {"6"}}, 2);
+  }
+  for (auto const* limit : {"iceberg_equality_key_bounds_max_bytes",
+                            "iceberg_equality_key_bounds_max_comparisons",
+                            "iceberg_equality_key_bound_max_length"}) {
+    // Zero in any limit turns the pruning off: the delete of sequence 2, beside both files, is
+    // opened.
+    INFO(limit);
+    scoped_setting off(*con, limit, 0);
+    expect_equality_rows(scan(2), all, 1);
+  }
+  {
+    // A key the delete file records no range for is never looked at. Sequence 14 records
+    // bounds for the second of its two keys alone, so two comparisons rule it out for both
+    // data files.
+    scoped_setting comparisons(*con, "iceberg_equality_key_bounds_max_comparisons", 2);
+    expect_equality_rows(scan(14), all, 0);
+  }
+  {
+    // Each key compared counts. Sequence 6 is ruled out for data file a by its second key and
+    // for data file b by its first: three comparisons, and with two allowed it stays on a list.
+    scoped_setting comparisons(*con, "iceberg_equality_key_bounds_max_comparisons", 2);
+    expect_equality_rows(scan(6), all, 1);
+  }
+  {
+    // A key that is looked at counts even when it cannot decide. Sequence 15 holds a NULL in
+    // k, as data file b does, so k decides nothing for b and s rules the delete out: two keys
+    // for each data file. With three allowed, one file is left with the delete on its list.
+    scoped_setting comparisons(*con, "iceberg_equality_key_bounds_max_comparisons", 3);
+    expect_equality_rows(scan(15), all, 1);
+  }
+  {
+    // Sequence 7 deletes k = 20 and k = 45 in two files, one within each data file's bounds.
+    // Counted without the bounds, each data file is subject to two deletes.
+    auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+    auto reset    = reset_after_test(counters->equality_files_per_data_file_limit_for_testing);
+    counters->equality_files_per_data_file_limit_for_testing = 1;
+    expect_equality_rows(scan(7), without_2, 2);
+  }
+  // Bounds above iceberg_equality_key_bounds_max_bytes are not kept, and the deletes are opened.
+  {
+    // 200 bytes hold the bounds of the delete of sequence 2 and not a data file's as well.
+    scoped_setting bytes(*con, "iceberg_equality_key_bounds_max_bytes", 200);
+    expect_equality_rows(scan(2), all, 1);
+  }
+  {
+    // 1000 bytes would hold the data files' bounds; the six deletes of sequence 13 take more.
+    scoped_setting bytes(*con, "iceberg_equality_key_bounds_max_bytes", 1000);
+    expect_equality_rows(scan(13), all, 6);
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - key bounds read data manifests of different shapes",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // One data manifest records every metric map. The other has no null_value_counts field and a
+  // zero NaN count; its data file holds a NULL key outside the bounds of a delete that has a
+  // NULL key. Reading the NaN count for the null count takes the delete off that file and
+  // keeps id 6. The second table lists the two manifests in the other order.
+  for (auto const* name :
+       {"iceberg_v2_eq_manifest_shapes", "iceberg_v2_eq_manifest_shapes_bare_first"}) {
+    INFO(name);
+    auto path = table(name);
+    require_delete_files(path, 1);
+    expect_equality_rows("SELECT id FROM " + pinned_scan(path) + " ORDER BY id;",
+                         {{"1"}, {"2"}, {"3"}, {"4"}, {"5"}});
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - unreliable key bounds are dropped",
+                 "[integration][gpu_execution][iceberg]")
+{
+  using namespace sirius::op::scan;
+  auto const bigint = [](int32_t) -> std::optional<duckdb::LogicalType> {
+    return duckdb::LogicalType::BIGINT;
+  };
+  auto const inventory_of = [&](std::string const& path) {
+    auto read = read_delete_inventory(*con->context, path, current_snapshot_id(path));
+    REQUIRE(read.inventory);
+    return *read.inventory;
+  };
+  auto const plan_of = [&](iceberg_delete_inventory const& inventory) {
+    return read_equality_plan(*con->context, inventory, 64, bigint);
+  };
+  // The delete files on the list of data file @p name.
+  auto const listed = [](iceberg_equality_plan const& plan, std::string const& name) {
+    for (auto const& [data_file, files] : plan.by_data_file)
+      if (fs::path(data_file).filename() == name) return files.size();
+    FAIL("no data file " << name);
+    return std::size_t{0};
+  };
+  auto const is_data = [](iceberg_delete_inventory::entry const& entry) {
+    return entry.content == "DATA";
+  };
+  // Sequence 2 of the key-range table: one manifest lists data files a and b, and the bounds
+  // take the delete off both.
+  auto const key_ranges = [&] {
+    auto read =
+      read_delete_inventory(*con->context, table("iceberg_v2_eq_key_ranges"), 8800000000000002);
+    REQUIRE(read.inventory);
+    return *read.inventory;
+  };
+  CHECK(listed(plan_of(key_ranges()), "data-a.parquet") == 0);
+  {
+    INFO("an entry read from another manifest than the inventory lists");
+    // Data files a and b are listed in one manifest each, and the bounds take the delete off a.
+    auto const inventory = inventory_of(table("iceberg_v2_eq_manifest_shapes"));
+    CHECK(listed(plan_of(inventory), "data-a.parquet") == 0);
+    // A manifest named by a file URI is the same manifest.
+    auto as_uri = inventory;
+    for (auto& entry : as_uri.entries)
+      if (is_data(entry)) entry.manifest_path = "file://" + entry.manifest_path;
+    CHECK(listed(plan_of(as_uri), "data-a.parquet") == 0);
+    // With the two manifests exchanged, each entry is read from the other one.
+    auto exchanged    = inventory;
+    auto const first  = std::find_if(exchanged.entries.begin(), exchanged.entries.end(), is_data);
+    auto const second = std::find_if(first + 1, exchanged.entries.end(), is_data);
+    REQUIRE(second != exchanged.entries.end());
+    std::swap(first->manifest_path, second->manifest_path);
+    CHECK(listed(plan_of(exchanged), "data-a.parquet") == 1);
+  }
+  {
+    INFO("a manifest whose name decodes to another manifest's");
+    // Data file a is expected in a manifest named by a file URI with %20. read_avro takes the
+    // name as it is written, and that manifest has no live entry. Decoded, the name is that of
+    // the manifest with a space, which is read for data file b and lists a as well.
+    auto inventory = key_ranges();
+    auto const dir =
+      fs::path(
+        std::find_if(inventory.entries.begin(), inventory.entries.end(), is_data)->manifest_path)
+        .parent_path();
+    auto const with_space = (dir / "m data.avro").string();
+    fs::copy_file(dir / "m-data-1.avro", with_space, fs::copy_options::overwrite_existing);
+    for (auto& entry : inventory.entries) {
+      if (!is_data(entry)) continue;
+      entry.manifest_path = fs::path(entry.file_path).filename() == "data-a.parquet"
+                              ? "file://" + (dir / "m%20data.avro").string()
+                              : with_space;
+    }
+    CHECK(listed(plan_of(inventory), "data-a.parquet") == 1);
+    fs::remove(with_space);
+  }
+  {
+    INFO("a manifest name read_avro would expand as a pattern");
+    // The manifest is copied under a name with brackets. As a pattern, [1] matches the 1 of
+    // m-data-1.avro and [2] the 2 of m-delete-2.avro, so read_avro opens the original, not the
+    // file of that name; with other files around it may open another manifest, or several.
+    // DuckDB's httpfs takes a backslash in an S3 name for a pattern as well, where \1 is the 1
+    // of m-data-1.avro. The local file system reads that name as it is written, so here its
+    // bounds are those of the copy; they are not used wherever the name is.
+    for (auto const& [content, name, pattern] :
+         {std::tuple{"DATA", "m-data-1.avro", "m-data-[1].avro"},
+          std::tuple{"EQUALITY_DELETES", "m-delete-2.avro", "m-delete-[2].avro"},
+          std::tuple{"DATA", "m-data-1.avro", "m-data-\\1.avro"}}) {
+      INFO(pattern);
+      auto inventory = key_ranges();
+      std::string copy;
+      for (auto& entry : inventory.entries) {
+        if (entry.content != content) continue;
+        auto const original = entry.manifest_path;
+        auto const at       = entry.manifest_path.rfind(name);
+        REQUIRE(at != std::string::npos);
+        entry.manifest_path.replace(at, std::string(name).size(), pattern);
+        copy = entry.manifest_path;
+        fs::copy_file(original, copy, fs::copy_options::overwrite_existing);
+      }
+      CHECK(listed(plan_of(inventory), "data-a.parquet") == 1);
+      fs::remove(copy);
+    }
+  }
+  // Both sort before an absolute path, so each is the first name of its list. DuckDB takes a
+  // scheme of one character for a directory, which makes the second name relative as well.
+  for (auto const relative : {std::string{"./sirius_eq_search_path/m-data.avro"},
+                              std::string{"+://sirius_eq_search_path/m-data.avro"}}) {
+    INFO("a relative manifest name that file_search_path finds in two directories: " << relative);
+    // The inventory lists data files a and b in a manifest without a live entry, and a third
+    // file under a relative name that file_search_path finds twice: as that same manifest and
+    // as the one with the entries of a and b. Given the relative name, read_avro opens both
+    // and reports those entries at the position after the relative name's, which is the
+    // manifest the inventory lists them in. Taking their bounds takes the delete off both
+    // lists; they were read from another file. A name DuckDB does not take for absolute is
+    // not read for bounds.
+    auto inventory = key_ranges();
+    auto const listed_in =
+      fs::path(
+        std::find_if(inventory.entries.begin(), inventory.entries.end(), is_data)->manifest_path)
+        .parent_path();
+    auto const without_entries = (listed_in / "m%20data.avro").string();
+    REQUIRE_FALSE(fs::exists(relative));
+    sirius::test::scratch_dir first("iceberg_eq_search_first");
+    sirius::test::scratch_dir second("iceberg_eq_search_second");
+    for (auto const& [directory, manifest] :
+         {std::pair{first.path(), "m%20data.avro"}, std::pair{second.path(), "m-data-1.avro"}}) {
+      fs::create_directories((directory / relative).parent_path());
+      fs::copy_file(listed_in / manifest, directory / relative);
+    }
+    auto third = *std::find_if(inventory.entries.begin(), inventory.entries.end(), is_data);
+    third.file_path += ".third";
+    third.manifest_path = relative;
+    for (auto& entry : inventory.entries)
+      if (is_data(entry)) entry.manifest_path = without_entries;
+    inventory.entries.push_back(third);
+    // Set for the database: the connection that reads the manifests is not this one.
+    struct search_path_reset {
+      duckdb::Connection& connection;
+      ~search_path_reset() { connection.Query("SET GLOBAL file_search_path = ''"); }
+    } const reset{*con};
+    auto const set =
+      con->Query("SET GLOBAL file_search_path = " +
+                 sirius::test::sql_literal(first.path().string() + "," + second.path().string()));
+    REQUIRE_FALSE(set->HasError());
+    CHECK(listed(plan_of(inventory), "data-a.parquet") == 1);
+  }
+  {
+    INFO("a manifest name with a leading ~ under a home directory with brackets");
+    // DuckDB takes ~x:// for a URI scheme, which makes the name absolute, and replaces the ~
+    // by the home directory before it looks for a pattern. Under a home directory named [h]
+    // the name is one: [h]x: matches the directory hx:, whose manifest has the entries of a
+    // and b, and not the directory of that name, whose manifest has no live entry. Taking the
+    // bounds read from hx: takes the delete off both lists.
+    auto inventory = key_ranges();
+    auto const listed_in =
+      fs::path(
+        std::find_if(inventory.entries.begin(), inventory.entries.end(), is_data)->manifest_path)
+        .parent_path();
+    sirius::test::scratch_dir home("iceberg_eq_home");
+    for (auto const& [directory, manifest] :
+         {std::pair{"[h]x:", "m%20data.avro"}, std::pair{"hx:", "m-data-1.avro"}}) {
+      fs::create_directories(home.path() / directory);
+      fs::copy_file(listed_in / manifest, home.path() / directory / "m-data.avro");
+    }
+    for (auto& entry : inventory.entries)
+      if (is_data(entry)) entry.manifest_path = "~x://m-data.avro";
+    // Set for the database: the connection that reads the manifests is not this one.
+    struct home_directory_reset {
+      duckdb::Connection& connection;
+      ~home_directory_reset() { connection.Query("SET GLOBAL home_directory = ''"); }
+    } const reset{*con};
+    auto const set = con->Query("SET GLOBAL home_directory = " +
+                                sirius::test::sql_literal((home.path() / "[h]").string()));
+    REQUIRE_FALSE(set->HasError());
+    CHECK(listed(plan_of(inventory), "data-a.parquet") == 1);
+  }
+  {
+    INFO("a data manifest with a column of its own named file_index");
+    // The column holds the position read_avro would report, and the entry's bounds are beside
+    // the delete. A column of the manifest is bound before read_avro's own, so the position
+    // would be the file's to choose: the bounds are not used.
+    auto const path = table("iceberg_v2_eq_own_file_index");
+    CHECK(listed(plan_of(inventory_of(path)), "data-a.parquet") == 1);
+    expect_equality_rows("SELECT id FROM " + pinned_scan(path) + " ORDER BY id;",
+                         {{"1"}, {"2"}, {"3"}});
+  }
+  {
+    INFO("a data manifest of format version 1 after one of version 2");
+    // The second manifest of the list has no sequence-number columns. The read asks for none
+    // it does not need, so both manifests give their bounds and the delete is on no list.
+    auto const path = table("iceberg_v2_eq_mixed_manifests");
+    auto const plan = plan_of(inventory_of(path));
+    CHECK(listed(plan, "data-a.parquet") == 0);
+    CHECK(listed(plan, "data-b.parquet") == 0);
+    expect_equality_rows("SELECT id FROM " + pinned_scan(path) + " ORDER BY id;",
+                         {{"1"}, {"2"}, {"3"}, {"4"}, {"5"}, {"6"}},
+                         0);
+  }
+  {
+    INFO("an entry the inventory does not list");
+    // Without data file b, the read returns an entry the inventory lacks.
+    auto inventory = key_ranges();
+    inventory.entries.erase(
+      std::find_if(inventory.entries.begin(), inventory.entries.end(), [](auto const& entry) {
+        return fs::path(entry.file_path).filename() == "data-b.parquet";
+      }));
+    CHECK(listed(plan_of(inventory), "data-a.parquet") == 1);
+  }
+  {
+    INFO("bounds maps that list the key twice");
+    // In the data file's entry, then in the delete's. Both pairs are beside a delete that
+    // matches the file, so taking either takes the delete off the list.
+    for (auto const* name :
+         {"iceberg_v2_eq_repeated_bound", "iceberg_v2_eq_repeated_delete_bound"}) {
+      INFO(name);
+      CHECK(listed(plan_of(inventory_of(table(name))), "data-a.parquet") == 1);
+    }
+  }
+  {
+    INFO("a data file with two live entries");
+    // The first entry records the file's bounds, which meet one delete and rule the other out;
+    // the second records bounds beside both. Neither is used: both deletes stay.
+    auto inventory   = inventory_of(table("iceberg_v2_eq_duplicate_entry"));
+    auto const first = std::find_if(inventory.entries.begin(), inventory.entries.end(), is_data);
+    REQUIRE(first != inventory.entries.end());
+    inventory.entries.erase(std::remove_if(first + 1, inventory.entries.end(), is_data),
+                            inventory.entries.end());
+    CHECK(listed(plan_of(inventory), "data-a.parquet") == 2);
+  }
+  {
+    INFO("a read that fails after handing out entries");
+    // One data manifest, larger than the buffer of a streamed read. The bounds of every entry
+    // rule the delete out.
+    auto const path       = table("iceberg_v2_eq_bounds_stream");
+    auto inventory        = inventory_of(path);
+    auto counters         = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+    auto const taken      = [&] { return counters->iceberg_key_bounds_entries_read.load(); };
+    auto const data_files = static_cast<uint64_t>(
+      std::count_if(inventory.entries.begin(), inventory.entries.end(), is_data));
+    auto before = taken();
+    CHECK(plan_of(inventory).files.empty());
+    CHECK(taken() - before == data_files);
+    auto const every_list_holds_the_delete = [](iceberg_equality_plan const& plan) {
+      CHECK(plan.files.size() == 1);
+      for (auto const& [data_file, files] : plan.by_data_file) {
+        INFO(data_file);
+        CHECK(files.size() == 1);
+      }
+    };
+    {
+      // A read that hands out one chunk and fails when the next is fetched. Sequence 2 of the
+      // key-range table lists its two data files in one manifest, which is one chunk, and
+      // their bounds take the delete off both lists. Both entries are taken, and neither is
+      // used.
+      auto const reset = reset_after_test(counters->iceberg_key_bounds_fetch_for_testing);
+      counters->iceberg_key_bounds_fetch_for_testing = [](std::size_t fetched) {
+        if (fetched == 1) throw std::runtime_error("injected: second fetch");
+      };
+      before          = taken();
+      auto const plan = plan_of(key_ranges());
+      CHECK(taken() - before == 2);
+      CHECK(plan.by_data_file.size() == 2);
+      every_list_holds_the_delete(plan);
+    }
+    // A read that fails by itself: the large manifest with its last entry damaged. How many
+    // entries it hands out before it fails is not determined; none of their bounds is used.
+    auto const manifest = (fs::path(path) / "metadata" / "m-data-1.avro").string();
+    auto const damaged  = damaged_copy(manifest);
+    for (auto& entry : inventory.entries)
+      if (entry.manifest_path == manifest) entry.manifest_path = damaged;
+    every_list_holds_the_delete(plan_of(inventory));
+    fs::remove(damaged);
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - key bounds leave groups and batches as they were",
+                 "[integration][gpu_execution][iceberg]")
+{
+  using namespace sirius::op::scan;
+  auto const bigint = [](int32_t) -> std::optional<duckdb::LogicalType> {
+    return duckdb::LogicalType::BIGINT;
+  };
+  auto const named = [](iceberg_equality_plan const& plan, std::string const& name) {
+    for (auto const& [data_file, files] : plan.by_data_file)
+      if (fs::path(data_file).filename() == name) return data_file;
+    FAIL("no data file " << name);
+    return std::string();
+  };
+  {
+    // Data files a and b of partition A hold ids [1, 3] and [4, 6]. A delete of id 2 is stored
+    // in A and a delete of id 5 under an unpartitioned spec: both apply to both data files, and
+    // the bounds leave each on one list.
+    auto path = table("iceberg_v2_eq_partition_bounds");
+    expect_equality_rows(
+      "SELECT id FROM " + pinned_scan(path) + " ORDER BY id;", {{"1"}, {"3"}, {"4"}, {"6"}}, 2);
+    auto inventory = read_delete_inventory(*con->context, path, current_snapshot_id(path));
+    REQUIRE(inventory.inventory);
+    auto const plan = read_equality_plan(*con->context, *inventory.inventory, 64, bigint);
+    REQUIRE(plan.files.size() == 2);
+    auto const a = named(plan, "data-a.parquet"), b = named(plan, "data-b.parquet");
+    CHECK(plan.by_data_file.at(a).size() == 1);
+    CHECK(plan.by_data_file.at(b).size() == 1);
+    CHECK(plan.by_data_file.at(a) != plan.by_data_file.at(b));
+    // The two deletes apply to the same data files, so they are one group although they are
+    // stored under different specs, and the data files can share a batch.
+    CHECK(plan.files[0].scope == plan.files[1].scope);
+    auto const grouping = group_equality_deletes(plan);
+    CHECK(grouping.files.size() == 1);
+    CHECK(grouping.by_data_file.at(a) == grouping.by_data_file.at(b));
+  }
+  {
+    // Sequence 4 of the key-range table deletes k = NULL and 100 and records one NULL. Data
+    // file a records none, which is enough for the bounds to decide; data file b holds one.
+    auto path      = table("iceberg_v2_eq_key_ranges");
+    auto inventory = read_delete_inventory(*con->context, path, 8800000000000004);
+    REQUIRE(inventory.inventory);
+    auto const plan = read_equality_plan(*con->context, *inventory.inventory, 64, bigint);
+    CHECK(plan.by_data_file.at(named(plan, "data-a.parquet")).empty());
+    CHECK(plan.by_data_file.at(named(plan, "data-b.parquet")).size() == 1);
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
@@ -4466,6 +4939,19 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                                      }),
                                      64),
                   equality_plan_error);
+  // A manifest that opens and then fails while its entries are read.
+  std::string manifest;
+  for (auto const& entry : inventory.inventory->entries)
+    if (entry.content == "EQUALITY_DELETES") manifest = entry.manifest_path;
+  auto const damaged = damaged_copy(manifest);
+  CHECK_THROWS_WITH(read_equality_plan(*con->context,
+                                       mutated([&](auto& entry) {
+                                         if (entry.content == "EQUALITY_DELETES")
+                                           entry.manifest_path = damaged;
+                                       }),
+                                       64),
+                    Catch::Matchers::ContainsSubstring("could not be read"));
+  fs::remove(damaged);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,

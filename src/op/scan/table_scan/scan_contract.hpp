@@ -245,6 +245,9 @@ struct physical_check_counters {
   std::atomic<uint64_t> iceberg_manifest_walks{0};
   std::atomic<uint64_t> iceberg_dv_manifest_reads{0};
   std::atomic<uint64_t> iceberg_delete_payload_loads{0};
+  // Data-file entries whose key bounds an equality-delete plan kept, whether or not its read of
+  // them then completed.
+  std::atomic<uint64_t> iceberg_key_bounds_entries_read{0};
   std::atomic<uint64_t> iceberg_delete_reader_io_failures{0};
   std::atomic<uint64_t> iceberg_delete_identity_failures{0};
   std::atomic<uint64_t> descriptor_mismatches{0};
@@ -274,6 +277,9 @@ struct physical_check_counters {
   std::function<void(std::string const&)> s3_config_installed_for_testing;
   // Before an equality-delete file is opened.
   std::function<void(std::string const&)> iceberg_equality_open_for_testing;
+  // Before an equality-delete plan fetches a chunk of data-file key bounds, with the number of
+  // chunks it has fetched. Throwing fails that fetch.
+  std::function<void(std::size_t)> iceberg_key_bounds_fetch_for_testing;
   std::function<void(scan_contract_id, bool)> iceberg_preparation_route_for_testing;
   std::function<void(std::string_view, scan_manager::admission_decision const&)>
     iceberg_statement_route_for_testing;
@@ -479,13 +485,17 @@ struct iceberg_equality_delete_file {
   std::vector<int32_t> equality_ids;
   int64_t record_count       = 0;
   int64_t file_size_in_bytes = 0;
+  // Files with the same scope apply, by data sequence number and partition, to the same data
+  // files. Key bounds do not enter it, so files that share keys and scope share a delete group.
+  uint32_t scope = 0;
 };
 
 // Which equality-delete files apply to which data file, by data sequence number and partition.
 struct iceberg_equality_plan {
   std::vector<iceberg_equality_delete_file> files;
   // Every data file of the snapshot, keyed as the manifest wrote its path, to the sorted indices
-  // of the `files` that apply. A scanned file absent from this map must be refused.
+  // of the `files` that apply and whose recorded key bounds do not rule out a match. A scanned
+  // file absent from this map must be refused.
   std::unordered_map<std::string, std::vector<uint32_t>> by_data_file;
   struct key {
     std::size_t primary_index;  // Index into the bound schema (P-space).

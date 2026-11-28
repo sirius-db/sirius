@@ -1774,7 +1774,10 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('spill_compression')::BOOLEAN,
       current_setting('pin_table_prove_unique_keys')::BOOLEAN,
       current_setting('pin_table_unique_exact_max_bytes')::UBIGINT,
-      current_setting('enable_dictionary_carrier')::BOOLEAN
+      current_setting('enable_dictionary_carrier')::BOOLEAN,
+      current_setting('iceberg_equality_key_bounds_max_bytes')::UBIGINT,
+      current_setting('iceberg_equality_key_bounds_max_comparisons')::UBIGINT,
+      current_setting('iceberg_equality_key_bound_max_length')::UBIGINT
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1803,6 +1806,18 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->Collection().GetValue(19, 0).GetValue<double>() == Approx(0.4));
   REQUIRE(settings->Collection().GetValue(20, 0).GetValue<bool>());
   REQUIRE(settings->Collection().GetValue(21, 0).GetValue<uint64_t>() == 9 * mib);
+  REQUIRE(settings->Collection().GetValue(26, 0).GetValue<uint64_t>() == 10 * mib);
+  REQUIRE(settings->Collection().GetValue(27, 0).GetValue<uint64_t>() == 1234);
+  REQUIRE(settings->Collection().GetValue(28, 0).GetValue<uint64_t>() == 48);
+  // The three limits have no NULL, and a refused SET leaves the value as it was.
+  for (auto const* name : {"iceberg_equality_key_bounds_max_bytes",
+                           "iceberg_equality_key_bounds_max_comparisons",
+                           "iceberg_equality_key_bound_max_length"}) {
+    CAPTURE(name);
+    REQUIRE(con.Query("SET " + std::string(name) + " = NULL")->HasError());
+  }
+  REQUIRE(duckdb::session_operator_params(*con.context).iceberg_equality_key_bound_max_length ==
+          48);
   REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu() ==
           4 * mib);
   for (auto const* name : {"enable_late_materialization",

@@ -77,6 +77,11 @@ constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES     = 8 * DEFAULT_BATCH_SI
 constexpr uint64_t DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES = 8 * DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE        = 256ULL * 1024 * 1024;  // 256 MiB
 
+/// What one plan may spend on the key bounds of Iceberg equality deletes; see operator_params.
+constexpr uint64_t DEFAULT_ICEBERG_EQUALITY_KEY_BOUNDS_MAX_BYTES       = 256ULL * 1024 * 1024;
+constexpr uint64_t DEFAULT_ICEBERG_EQUALITY_KEY_BOUNDS_MAX_COMPARISONS = 4ULL * 1024 * 1024;
+constexpr uint64_t DEFAULT_ICEBERG_EQUALITY_KEY_BOUND_MAX_LENGTH       = 64;
+
 /// Approximate cuco hash-table bytes per build row: 8-byte hash/index slots at 0.5 occupancy.
 /// Capacity rounding and auxiliary allocations are excluded; this is an admission estimate.
 constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
@@ -349,6 +354,23 @@ struct operator_params {
   /// is about three times the cap. A column that no longer fits stays unproven. 0 = a share
   /// (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the pinning GPU memory space's capacity.
   uint64_t unique_exact_max_bytes{config::DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES};
+
+  /// Host bytes of Iceberg equality-delete key bounds one scan's plan keeps, of delete and data
+  /// files together. A plan that would keep more keeps none and takes no delete file off a
+  /// list. 0 turns the pruning off.
+  uint64_t iceberg_equality_key_bounds_max_bytes{
+    config::DEFAULT_ICEBERG_EQUALITY_KEY_BOUNDS_MAX_BYTES};
+
+  /// Times one plan compares the bounds of a key between an equality-delete file and a data
+  /// file. Past it a delete file stays on the lists it was not compared for. 0 turns the
+  /// pruning off.
+  uint64_t iceberg_equality_key_bounds_max_comparisons{
+    config::DEFAULT_ICEBERG_EQUALITY_KEY_BOUNDS_MAX_COMPARISONS};
+
+  /// Longest key bound, in bytes, a plan keeps and compares. A longer one counts as not
+  /// recorded, so a comparison costs no more than this. 0 turns the pruning off.
+  uint64_t iceberg_equality_key_bound_max_length{
+    config::DEFAULT_ICEBERG_EQUALITY_KEY_BOUND_MAX_LENGTH};
 
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;

@@ -5137,6 +5137,76 @@ TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credenti
       CHECK(sirius_ctx->get_scan_manager().rest_context_count() <= 1);
     }
   }
+  // Key pairs the store does check. Two more copies are each vended an identity that may read
+  // the objects under its own prefix and nothing else. A statement that read one side's files
+  // with what the other side's table vended would be refused by the store.
+  {
+    std::array<std::string, 2> files;
+    for (std::size_t i = 0; i < files.size(); ++i) {
+      auto const& reader = sirius::test::s3_prefix_readers[i];
+      auto const name    = std::string{"fruit_"} + static_cast<char>('a' + i);
+      auto const root    = "s3://" + env->bucket + "/" + std::string{reader.prefix} + "fruit";
+      sirius::test::scratch_dir local("s3_catalog_" + name);
+      REQUIRE(relocate(source, local.path(), root));
+      auto own                    = vended;
+      own["s3.access-key-id"]     = reader.access_key;
+      own["s3.secret-access-key"] = reader.secret_key;
+      own.erase("s3.session-token");
+      catalog.put("ns",
+                  name,
+                  {root + "/metadata/v1.metadata.json",
+                   read_text_file(local.path() / "metadata/v1.metadata.json"),
+                   std::move(own)});
+      files[i] = root + "/data/00000-0-a1b2c3d4-0001-0001-0001-000000000003-00001.parquet";
+    }
+    // The store tells the two apart. Through a static secret for that one file, each key pair
+    // reads its own table's data file and is refused the other's.
+    for (std::size_t file = 0; file < files.size(); ++file) {
+      for (auto const reader : {1 - file, file}) {
+        INFO("file " << file << " read by reader " << reader);
+        auto const& keys = sirius::test::s3_prefix_readers[reader];
+        require_query_ok(con,
+                         "CREATE OR REPLACE SECRET one_reader (TYPE S3, KEY_ID " +
+                           sql_quote(keys.access_key) + ", SECRET " + sql_quote(keys.secret_key) +
+                           ", REGION " + sql_quote(env->region) + ", ENDPOINT " +
+                           sql_quote(env->endpoint) + ", URL_STYLE 'path', USE_SSL " +
+                           (env->endpoint.rfind("https://", 0) == 0 ? "true" : "false") +
+                           ", SCOPE " + sql_quote(files[file]) + ")");
+        // A column's values, which no footer answers.
+        auto const sql = "SELECT sum(count) FROM read_parquet(" + sql_quote(files[file]) + ")";
+        if (reader == file) {
+          expect_gpu(sql, {{"6"}}, 0, files[file]);
+        } else {
+          auto const denied = con.Query(sql);
+          REQUIRE(denied);
+          REQUIRE(denied->HasError());
+          CHECK(denied->GetError().find("403") != std::string::npos);
+        }
+      }
+    }
+    require_query_ok(con, "DROP SECRET one_reader");
+
+    require_query_ok(con, "BEGIN TRANSACTION");
+    auto const before = stats();
+    auto const joined = require_query_ok(
+      con, "SELECT count(*) FROM lake.ns.fruit_a a JOIN lake.ns.fruit_b b USING (fruit)");
+    auto const after = stats();
+    CHECK(collect_rows(*joined) == rows_t{{"3"}});
+    CHECK(after.executions == before.executions + 1);
+    CHECK(after.fallbacks == before.fallbacks);
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    auto const reads_of = [](auto const& snapshot, std::string const& file) {
+      auto const found = snapshot.parquet_reader_calls.find(file);
+      return found == snapshot.parquet_reader_calls.end() ? uint64_t{0} : found->second;
+    };
+    for (std::size_t i = 0; i < files.size(); ++i) {
+      INFO(files[i]);
+      CHECK(reads_of(after, files[i]) > reads_of(before, files[i]));
+      CHECK(sirius::io::s3::resolve_duckdb_s3_secret(*con.context, files[i], {}).access_key ==
+            sirius::test::s3_prefix_readers[i].access_key);
+    }
+    require_query_ok(con, "COMMIT");
+  }
   require_query_ok(con, "SET sirius_s3_header_signing=true");
   expect_gpu(query, fruit, 1, data_file);
   require_query_ok(con, "SET sirius_s3_header_signing=false");
