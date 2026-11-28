@@ -4,6 +4,7 @@ target_sources(
           c_api/context.cpp
           c_api/error.cpp
           c_api/object_store_config.cpp
+          c_api/object_store_registry.cpp
           c_api/plan.cpp
           c_api/version.cpp
           config.cpp
@@ -21,6 +22,7 @@ target_sources(
           sirius_sql_rewrite.cpp)
 
 add_subdirectory(compression)
+add_subdirectory(config)
 add_subdirectory(creator)
 add_subdirectory(cuda)
 add_subdirectory(data)
@@ -34,6 +36,7 @@ add_subdirectory(helper)
 add_subdirectory(io)
 add_subdirectory(late_mat)
 add_subdirectory(log)
+add_subdirectory(meld)
 add_subdirectory(memory)
 add_subdirectory(object_store_scope)
 add_subdirectory(op)

@@ -56,7 +56,9 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
+#include <typeinfo>
 #include <unordered_set>
 
 extern "C" int32_t duckdb_extension_parquet_describe(duckdb_extension_descriptor*);
@@ -150,6 +152,28 @@ op::scan::certification_result supported_iceberg(op::scan::bound_table_scan cons
   }
   result.later_checks |= op::scan::check_bit(op::scan::later_check::schema_per_file);
   return result;
+}
+
+// A path scan carries no function_info, like the registered function. A catalog table's scan
+// carries the extension's scan info: accept that type only, and only on a binding the extension
+// reports as a catalog table. Lookup calls this after the callbacks matched the reference
+// definition, so get_bind_info is the extension's.
+//
+// This is the whole guarantee (see connector::verify_binding): the info's type and the kind of
+// binding it sits on. Two catalog tables carry info of the same type, and nothing here tells
+// one from the other. That is sound because the GPU path takes nothing from the info: the
+// table, its UUID, snapshot, schema and files all come from the bind data, through
+// get_table_entry, get_bind_info and the delete inventory, none of which is handed the info.
+bool verify_iceberg_binding(duckdb::BaseTableFunction const& function,
+                            duckdb::FunctionData const* bind,
+                            duckdb::ClientContext& context)
+{
+  if (!function.function_info) return true;
+  if (!function.get_bind_info || !bind) return false;
+  auto const& info = *function.function_info;
+  if (std::string_view(typeid(info).name()) != "N6duckdb15IcebergScanInfoE") return false;
+  duckdb::TableFunctionGetBindInfoInput input(context, const_cast<duckdb::FunctionData*>(bind));
+  return function.get_bind_info(input).type == duckdb::ScanType::TABLE;
 }
 
 op::scan::certification_result supported_native(op::scan::bound_table_scan const&,
@@ -338,7 +362,8 @@ connector make_iceberg_scan_connector()
           .selector_outside_bind_data = true,
           .decline_reason             = registered_iceberg_decline_reason,
           .provider                   = std::nullopt,
-          .certify                    = supported_iceberg};
+          .certify                    = supported_iceberg,
+          .verify_binding             = verify_iceberg_binding};
 }
 
 connector make_sirius_stream_source_connector()
@@ -518,6 +543,7 @@ struct verified_callbacks {
                     reference.pushdown_expression,
                     reference.get_partition_data,
                     reference.get_bind_info,
+                    reference.get_table_entry,
                     reference.projection_expression_pushdown,
                     reference.get_multi_file_reader,
                     reference.supports_pushdown_type,
@@ -555,6 +581,7 @@ struct verified_callbacks {
                                                        candidate.pushdown_expression,
                                                        candidate.get_partition_data,
                                                        candidate.get_bind_info,
+                                                       candidate.get_table_entry,
                                                        candidate.projection_expression_pushdown,
                                                        candidate.get_multi_file_reader,
                                                        candidate.supports_pushdown_type,
@@ -812,13 +839,15 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
       }
       return {nullptr, lookup_decline::no_trusted_reference};
     }
-    if (entry.verify_binding && !entry.verify_binding(function, bind, context))
-      return {nullptr, lookup_decline::bind_data_mismatch};
     for (auto const& reference : references) {
       verified_callbacks const callbacks(reference);
       if (!callbacks.matches(function, 0, entry.verify_binding != nullptr)) continue;
       for (auto const& registered : catalog_entry->functions.functions) {
-        if (callbacks.matches(*registered)) return {&entry, lookup_decline::none};
+        if (!callbacks.matches(*registered)) continue;
+        // The hook may call the candidate's callbacks: they are the trusted ones by now.
+        if (entry.verify_binding && !entry.verify_binding(function, bind, context))
+          return {nullptr, lookup_decline::bind_data_mismatch};
+        return {&entry, lookup_decline::none};
       }
     }
     return {nullptr, lookup_decline::callback_mismatch};

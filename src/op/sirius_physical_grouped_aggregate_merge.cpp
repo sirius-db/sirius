@@ -300,14 +300,16 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       require_decimal128_partial_sums_in_range(
         partials, stream, input_batches[0].get_memory_space()->get_default_allocator());
     }
-    merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
-                                                     num_group_cols,
-                                                     cudf_aggregates,
-                                                     static_cast<int>(layout.num_carried()),
-                                                     stream,
-                                                     *input_batches[0].get_memory_space(),
-                                                     batch_telemetry(),
-                                                     cudf_aggregate_is_wide_integer_sum);
+    merged =
+      gpu_merge_impl::merge_grouped_aggregate(input_batches,
+                                              num_group_cols,
+                                              cudf_aggregates,
+                                              static_cast<int>(layout.num_carried()),
+                                              make_carried_block_layout(aggregate_slots).order,
+                                              stream,
+                                              *input_batches[0].get_memory_space(),
+                                              batch_telemetry(),
+                                              cudf_aggregate_is_wide_integer_sum);
   }
 
   // If no post-processing needed, return merged result directly

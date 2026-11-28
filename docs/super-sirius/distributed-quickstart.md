@@ -259,7 +259,7 @@ and TPC-H Q12 were correct, and cancelling the gateway's step ended the job with
 | `rank N failed its session setup: ...` | Usually the exchange: the ranks could not connect to each other. Check that the exchange ports are open, and `ucx.tls` and `ucx.net_devices` |
 | `Endpoint timeout` in a rank's log | UCX picked a port that the ranks cannot connect through. Keep the default `ucx.tls` and `ucx.net_devices`, or set `ucx.net_devices` to ports that reach every node |
 | `unknown key sirius.distributed.<key>`, `sirius.distributed.<key> must be a string, a number or a list of them` | Fix that key in `sirius.yaml`; the scripts apply none of the section until it is right. The first message lists the known keys |
-| `topology.num_gpus must be all or a positive count` | `num_gpus: 0` is an error; use `num_gpus: all` or leave the key out |
+| `'sirius.topology.num_gpus': must be all or a positive count` | `num_gpus: 0` is an error; use `num_gpus: all` or leave the key out |
 
 `sirius_gateway_status()` has a `last_error` column with each rank's last failure to join, to
 answer, or to keep running.
