@@ -279,6 +279,12 @@ std::unique_ptr<cudf::table> materialize_bulk(
   std::vector<cudf::device_span<std::uint8_t const>> spans;
   metadatas.reserve(sources.size());
   rg_per_src.reserve(sources.size());
+  // Copied before any read is issued: a copy that threw while reads were in
+  // flight would leave their failures unseen.
+  for (auto const& src : sources) {
+    metadatas.push_back(*src.metadata);
+    rg_per_src.push_back(src.row_group_indices);
+  }
 
   // Reserved before the first read is issued: taking ownership of an issued
   // read cannot throw, so its result is never dropped unread.
@@ -307,8 +313,6 @@ std::unique_ptr<cudf::table> materialize_bulk(
     } catch (...) {
       failures.note(i, std::current_exception());
     }
-    metadatas.push_back(*sources[i].metadata);
-    rg_per_src.push_back(sources[i].row_group_indices);
   }
   failures.rethrow_if_any();
 
