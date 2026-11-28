@@ -2216,9 +2216,13 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
     // The manifest is copied under a name with brackets. As a pattern, [1] matches the 1 of
     // m-data-1.avro and [2] the 2 of m-delete-2.avro, so read_avro opens the original, not the
     // file of that name; with other files around it may open another manifest, or several.
+    // DuckDB's httpfs takes a backslash in an S3 name for a pattern as well, where \1 is the 1
+    // of m-data-1.avro. The local file system reads that name as it is written, so here its
+    // bounds are those of the copy; they are not used wherever the name is.
     for (auto const& [content, name, pattern] :
          {std::tuple{"DATA", "m-data-1.avro", "m-data-[1].avro"},
-          std::tuple{"EQUALITY_DELETES", "m-delete-2.avro", "m-delete-[2].avro"}}) {
+          std::tuple{"EQUALITY_DELETES", "m-delete-2.avro", "m-delete-[2].avro"},
+          std::tuple{"DATA", "m-data-1.avro", "m-data-\\1.avro"}}) {
       INFO(pattern);
       auto inventory = key_ranges();
       std::string copy;
@@ -2275,6 +2279,36 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
     auto const set =
       con->Query("SET GLOBAL file_search_path = " +
                  sirius::test::sql_literal(first.path().string() + "," + second.path().string()));
+    REQUIRE_FALSE(set->HasError());
+    CHECK(listed(plan_of(inventory), "data-a.parquet") == 1);
+  }
+  {
+    INFO("a manifest name with a leading ~ under a home directory with brackets");
+    // DuckDB takes ~x:// for a URI scheme, which makes the name absolute, and replaces the ~
+    // by the home directory before it looks for a pattern. Under a home directory named [h]
+    // the name is one: [h]x: matches the directory hx:, whose manifest has the entries of a
+    // and b, and not the directory of that name, whose manifest has no live entry. Taking the
+    // bounds read from hx: takes the delete off both lists.
+    auto inventory = key_ranges();
+    auto const listed_in =
+      fs::path(
+        std::find_if(inventory.entries.begin(), inventory.entries.end(), is_data)->manifest_path)
+        .parent_path();
+    sirius::test::scratch_dir home("iceberg_eq_home");
+    for (auto const& [directory, manifest] :
+         {std::pair{"[h]x:", "m%20data.avro"}, std::pair{"hx:", "m-data-1.avro"}}) {
+      fs::create_directories(home.path() / directory);
+      fs::copy_file(listed_in / manifest, home.path() / directory / "m-data.avro");
+    }
+    for (auto& entry : inventory.entries)
+      if (is_data(entry)) entry.manifest_path = "~x://m-data.avro";
+    // Set for the database: the connection that reads the manifests is not this one.
+    struct home_directory_reset {
+      duckdb::Connection& connection;
+      ~home_directory_reset() { connection.Query("SET GLOBAL home_directory = ''"); }
+    } const reset{*con};
+    auto const set = con->Query("SET GLOBAL home_directory = " +
+                                sirius::test::sql_literal((home.path() / "[h]").string()));
     REQUIRE_FALSE(set->HasError());
     CHECK(listed(plan_of(inventory), "data-a.parquet") == 1);
   }

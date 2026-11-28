@@ -737,15 +737,18 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
   };
   // Whether `read_avro` opens every manifest as its name is written: a name without pattern
   // characters that DuckDB's own path parser calls absolute, a path from the root or a URI. A
-  // pattern may be read from another file than the inventory names. Any other name DuckDB
-  // resolves against the working directory, the home directory or the directories of
-  // `file_search_path`, where it opens a file in each that has one. In a list either shifts
-  // the positions rows are attributed by. Every read below passes the names as they are
-  // written, so all of them read the same files while this holds; the bounds of a table with
-  // another name are not used.
+  // pattern may be read from another file than the inventory names. So may a name with a
+  // leading `~`, which is replaced by the home directory before the name is looked at for a
+  // pattern, and one with a backslash, which DuckDB's httpfs takes for a pattern in an S3 name.
+  // Any other name DuckDB resolves against the working directory, the home directory or the
+  // directories of `file_search_path`, where it opens a file in each that has one. In a list
+  // either shifts the positions rows are attributed by. Every read below passes the names as
+  // they are written, so all of them read the same files while this holds; the bounds of a
+  // table with another name are not used.
   auto const named_literally = [](std::unordered_map<std::string_view, listed> const& files) {
     return std::all_of(files.begin(), files.end(), [](auto const& file) {
       auto const name = std::string(file.second.manifest);
+      if (name.starts_with('~') || name.find('\\') != std::string::npos) return false;
       try {
         return !duckdb::FileSystem::HasGlob(name) && duckdb::Path::FromString(name).IsAbsolute();
       } catch (std::exception const&) {
