@@ -586,8 +586,16 @@ set_target_properties(
 # Construction uses only host-side libraries; exercise the production sources on
 # CPU CI.
 find_package(Threads REQUIRED)
+add_library(sirius_cpp_plan_test OBJECT test/cpp/plan/test_cpp_plan.cpp)
+target_compile_features(sirius_cpp_plan_test PRIVATE cxx_std_23)
+set_target_properties(sirius_cpp_plan_test PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+target_include_directories(sirius_cpp_plan_test PRIVATE include)
+target_link_libraries(sirius_cpp_plan_test PRIVATE Catch2::Catch2)
+
 add_executable(sirius_plan_unittest test/cpp/plan/test_c_api_plan.cpp
                                     src/c_api/plan.cpp src/c_api/error.cpp)
+target_sources(sirius_plan_unittest
+               PRIVATE $<TARGET_OBJECTS:sirius_cpp_plan_test>)
 target_include_directories(sirius_plan_unittest PRIVATE include src)
 target_link_libraries(
   sirius_plan_unittest PRIVATE Catch2::Catch2WithMain Threads::Threads

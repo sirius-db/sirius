@@ -35,7 +35,7 @@ enum class ErrorCode {
   invalid_configuration,
   /// An allocation failed. The diagnostic may be empty.
   allocation_failure,
-  /// A supplied argument cannot be represented by the C interface.
+  /// A supplied argument is invalid for this operation.
   invalid_argument,
   /// An unexpected implementation failure or unknown status was reported.
   internal_error,
@@ -91,6 +91,10 @@ struct Error {
     }
   }
   friend class ContextConfigBuilder;
+  friend class Schema;
+  friend class Expression;
+  friend class PlanNode;
+  friend class Plan;
   friend class Context;
 };
 
