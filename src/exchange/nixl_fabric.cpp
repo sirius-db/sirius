@@ -421,6 +421,9 @@ struct nixl_fabric::lane {
     std::uint32_t idle = 0;
     std::chrono::steady_clock::time_point stopping{};
     try {
+      // A write holds a send slot until its request is released, so in_flight never grows past
+      // this: a request that is posted is always recorded for release.
+      in_flight.reserve(slot_count);
       while (true) {
         bool progress = false;
         {
