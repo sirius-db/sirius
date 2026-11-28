@@ -1278,6 +1278,27 @@ bool compressed_materialization_enabled(ClientContext& context);
 /// `enable_compressed_materialization`. A distributed connection plans no dictionary carrier.
 bool dictionary_carrier_enabled(ClientContext& context);
 
+/// \brief One operator option as `query_operator_options` resolves it for \p context, read
+/// without creating the session's overrides.
+///
+/// The overrides snapshot the global configuration, so creating them stops the session from seeing
+/// later changes to it. Code that runs for every statement, such as the optimizer extension, reads
+/// its options through here. nullopt when Sirius has no runtime on the connection. Not for
+/// `like_swar_fastpath`, which `query_operator_options` takes from its own setting.
+template <typename T>
+[[nodiscard]] std::optional<T> current_operator_option(ClientContext& context,
+                                                       T sirius::operator_params::* option)
+{
+  auto const state = get_sirius_connection_state(context);
+  if (state && state->execution_options) { return (*state->execution_options).*option; }
+  if (state && state->operator_overrides) { return (*state->operator_overrides).*option; }
+  auto const runtime = context.registered_state
+                         ? context.registered_state->Get<SiriusContext>("sirius_state")
+                         : nullptr;
+  if (!runtime) { return std::nullopt; }
+  return runtime->get_config().get_operator_params().*option;
+}
+
 /// \brief Print the "GPU execution failed, falling back to DuckDB" banner with the GPU error.
 ///
 /// Written to stdout in red (ANSI) when stdout is a TTY, plain text otherwise so

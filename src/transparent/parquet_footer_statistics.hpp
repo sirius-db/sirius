@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <duckdb/function/function.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
@@ -24,11 +25,17 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace duckdb {
 class LogicalGet;
 }  // namespace duckdb
+
+namespace duckdb_parquet {
+class FileMetaData;
+}  // namespace duckdb_parquet
 
 namespace sirius::transparent {
 
@@ -82,6 +89,13 @@ struct footer_read_limits {
 /// are dropped lazily.
 [[nodiscard]] std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get);
 
+/// \brief The same count for a scan that is no longer a LogicalGet: \p function_name and
+/// \p bind_data are the function name and the bind data of the LogicalGet the scan was planned
+/// from. The bind data must be that LogicalGet's own object, not a copy of it: the count is found
+/// through its file list.
+[[nodiscard]] std::optional<std::size_t> parquet_scan_row_count(
+  std::string_view function_name, duckdb::FunctionData const* bind_data);
+
 /// \brief How many values lie from the smallest to the largest that column \p column holds across
 /// all files of \p get (max - min + 1), or nullopt when the footers give it no integer range.
 /// \p get is a Parquet scan add_parquet_footer_statistics covered, a one-file scan too, and
@@ -93,11 +107,34 @@ struct footer_read_limits {
 [[nodiscard]] std::optional<std::uint64_t> parquet_scan_value_span(duckdb::LogicalGet const& get,
                                                                    std::size_t column);
 
-/// \brief Make the row count of every Parquet scan in \p plan unknown, and its value spans.
+/// \brief What Parquet footers state about the decoded size of one string column.
+struct string_size {
+  /// Decoded bytes of the column's strings, offsets excluded, in the rows counted below
+  /// (`unencoded_byte_array_data_bytes`; encoded sizes do not describe decoded strings).
+  std::uint64_t bytes = 0;
+  /// Rows of the row groups that state the column's decoded size; 0 when none does.
+  std::uint64_t rows = 0;
+
+  [[nodiscard]] bool operator==(string_size const&) const = default;
+};
+
+/// \brief The decoded string sizes the footers of a Parquet scan state, indexed by the scan's
+/// bound column (`MultiFileBindData::names`) and summed over all its files. A file or row group
+/// that states no size for a column adds nothing to it, so `rows` can be less than the scan's row
+/// count; GPU admission prices the remaining rows at the configured average. Only top-level
+/// string columns have an entry with rows. Empty when no column has one, the scan has no row
+/// count, or GPU admission was not sizing queries when the scan was planned
+/// (planner::admission_estimate_needed). The arguments are those of parquet_scan_row_count, and
+/// the sizes are kept, copied and forgotten with the row count.
+[[nodiscard]] std::vector<string_size> parquet_scan_string_sizes(
+  std::string_view function_name, duckdb::FunctionData const* bind_data);
+
+/// \brief Make the row count of every Parquet scan in \p plan unknown, and its value spans and
+/// string sizes.
 void forget_parquet_scan_row_counts(duckdb::LogicalOperator const& plan);
 
 /// \brief Give \p to, the copy of the scan \p from in a copy of its plan, the row count of \p from
-/// and its value spans.
+/// and its value spans and string sizes.
 void copy_parquet_scan_row_count(duckdb::LogicalGet const& from, duckdb::LogicalGet const& to);
 
 /// \brief Read the footer statistics of \p paths into the cache add_parquet_footer_statistics uses,
@@ -154,6 +191,16 @@ std::uint64_t inspected_file_count();
 cache_capacities set_cache_capacities_for_testing(cache_capacities replacement);
 /// For tests: drop every cached statistic, merged statistic and row count.
 void clear_caches_for_testing();
+/// The decoded string size one file's footer states for each of its columns, by leaf. A column
+/// has rows only when it is a top-level byte array (the leaf of a LIST<VARCHAR> or of a STRUCT
+/// field is not), and only for the row groups that state its decoded size. Empty when the file
+/// has no row group or not one leaf per bound column (\p bound_columns), as with a STRUCT of
+/// several fields: the leaves then cannot be matched to columns by position.
+std::vector<string_size> parquet_string_sizes(duckdb_parquet::FileMetaData const& metadata,
+                                              std::size_t bound_columns);
+/// One column's size over several files: the sum of what each states. Nothing (zero rows) when
+/// the sum overflows.
+string_size combined_string_size(std::vector<string_size> const& files);
 }  // namespace detail
 
 }  // namespace sirius::transparent

@@ -48,7 +48,9 @@
 
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace sirius {
 
@@ -65,28 +67,53 @@ void finish_scan_preparation(op::sirius_physical_operator const* plan) noexcept
   });
 }
 
-/// Select the GPU subset this query is admitted with: gpus_per_query caps the fleet, and
-/// within that cap a non-zero admission_bytes_per_gpu narrows further by estimated scan
-/// bytes. With neither set, every active GPU is used.
+/// Select the GPU subset this query is admitted with. @p gpu_ids are its candidates
+/// (planner::admission_candidate_gpu_ids: the fleet capped by gpus_per_query); a non-zero
+/// admission_bytes_per_gpu narrows them further by estimated scan bytes. With neither set, every
+/// active GPU is used.
 std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& plan,
                                            std::vector<int> gpu_ids,
-                                           const sirius_config& config,
                                            const operator_params& op_params)
 {
-  auto const bpg = op_params.admission_bytes_per_gpu;
-
-  gpu_ids           = planner::apply_gpu_cap(std::move(gpu_ids), config.gpus_per_query());
+  auto const bpg    = op_params.admission_bytes_per_gpu;
   auto const n_gpus = static_cast<int>(gpu_ids.size());
-  if (bpg == 0 || n_gpus <= 1) { return gpu_ids; }
+  // On a single GPU the estimate cannot change the allocation, so it is computed only when DEBUG
+  // logging is on: the `[gpu_alloc] estimated` line is how the estimate is checked against real
+  // scan sizes, and single-GPU hosts are where that check usually runs. The plan generator
+  // collected the scans' admission hints under the same condition.
+  if (!planner::admission_estimate_needed(
+        bpg, gpu_ids.size(), sirius::log::get_sink()->should_log(sirius::log::level::debug))) {
+    return gpu_ids;
+  }
 
   std::vector<const op::sirius_physical_operator*> scans;
   planner::collect_gpu_scans(plan, scans);
   std::vector<planner::scan_estimate> estimates;
   estimates.reserve(scans.size());
+  std::size_t scans_with_table_rows   = 0;
+  std::size_t scans_with_known_widths = 0;
+  op::scan::scan_admission_hint const no_hint{};
   for (auto const* scan : scans) {
-    estimates.push_back(
-      {static_cast<uint64_t>(scan->estimated_cardinality),
-       planner::estimate_bytes_per_row(scan->types, op_params.avg_variable_column_bytes)});
+    // The plan generator stamped each GPU scan with the table function's unfiltered row count
+    // and any column widths its source could state (see scan_admission_hint). Rows never drop
+    // below the planner estimate; widths only replace the configured variable-width average.
+    // The hint also lists the columns the scan reads only for pushed-down filters, which it
+    // decodes but does not output.
+    auto const* gpu_scan = dynamic_cast<const op::scan::sirius_gpu_scan_operator*>(scan);
+    auto const& hint     = gpu_scan != nullptr ? gpu_scan->admission_hint() : no_hint;
+    if (hint.unfiltered_rows.has_value()) { ++scans_with_table_rows; }
+    if (std::ranges::any_of(hint.column_widths,
+                            [](auto const& width) { return width.has_value(); }) ||
+        std::ranges::any_of(hint.filter_only_columns,
+                            [](auto const& column) { return column.width.has_value(); })) {
+      ++scans_with_known_widths;
+    }
+
+    auto const rows = planner::admission_row_count(
+      static_cast<uint64_t>(scan->estimated_cardinality), hint.unfiltered_rows);
+    auto const bytes_per_row =
+      planner::scan_bytes_per_row(scan->types, hint, op_params.avg_variable_column_bytes);
+    estimates.push_back({rows, bytes_per_row});
   }
 
   // nullopt means at least one scan carried no usable row estimate; admit the full capped
@@ -95,12 +122,27 @@ std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& p
   if (!total_bytes.has_value()) { return gpu_ids; }
 
   auto const k = planner::gpu_count_for_bytes(*total_bytes, bpg, n_gpus);
-  SIRIUS_LOG_INFO("[gpu_alloc] estimated {} MiB over {} scan(s) -> {} of {} GPU(s)",
-                  *total_bytes / (1024 * 1024),
-                  scans.size(),
-                  k,
-                  n_gpus);
-  gpu_ids.resize(static_cast<size_t>(k));
+  if (n_gpus > 1) {
+    SIRIUS_LOG_INFO("[gpu_alloc] estimated {} MiB over {} scan(s) -> {} of {} GPU(s)",
+                    *total_bytes / (1024 * 1024),
+                    scans.size(),
+                    k,
+                    n_gpus);
+  } else {
+    // Nothing was decided: the same line, as a diagnostic.
+    SIRIUS_LOG_DEBUG("[gpu_alloc] estimated {} MiB over {} scan(s) -> {} of {} GPU(s)",
+                     *total_bytes / (1024 * 1024),
+                     scans.size(),
+                     k,
+                     n_gpus);
+  }
+  SIRIUS_LOG_DEBUG(
+    "[gpu_alloc] estimate sources: {} of {} scan(s) sized from the table's unfiltered row count, "
+    "{} with column widths from Parquet footers or table statistics",
+    scans_with_table_rows,
+    scans.size(),
+    scans_with_known_widths);
+  if (static_cast<int>(gpu_ids.size()) > k) { gpu_ids.resize(static_cast<size_t>(k)); }
   return gpu_ids;
 }
 
@@ -355,21 +397,13 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   sirius_physical_plan = &plan;
 
-  std::vector<int> gpu_ids;
-  for (auto const* space : sirius_ctx_ptr->get_memory_manager().get_memory_spaces_for_tier(
-         cucascade::memory::Tier::GPU)) {
-    if (space != nullptr) { gpu_ids.push_back(space->get_device_id()); }
-  }
-  std::sort(gpu_ids.begin(), gpu_ids.end());
-  gpu_ids.erase(std::unique(gpu_ids.begin(), gpu_ids.end()), gpu_ids.end());
-
   // Admit the query here, before anything downstream is built, so that the build context,
   // partition->GPU routing and the scan round-robin all derive from this one list. Order
   // matters: task_creator holds it, and create_query later reads it back for scan_manager.
   auto query_operator_params      = duckdb::query_operator_options(context);
-  auto const full_gpu_count       = gpu_ids.size();
+  auto const full_gpu_count       = planner::runtime_gpu_ids(*sirius_ctx_ptr).size();
   std::vector<int> active_gpu_ids = compute_admission_gpu_ids(
-    plan, std::move(gpu_ids), sirius_ctx_ptr->get_config(), *query_operator_params);
+    plan, planner::admission_candidate_gpu_ids(*sirius_ctx_ptr), *query_operator_params);
   sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(query_id_, active_gpu_ids, full_gpu_count);
   // A scan may have built state at plan time for GPUs the estimate has now left out.
   planner::for_each_gpu_scan(plan, [&](op::sirius_physical_operator const& source) {

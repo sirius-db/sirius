@@ -17,6 +17,7 @@
 #include "transparent/parquet_footer_statistics.hpp"
 
 #include "op/scan/table_scan/bound_read_view.hpp"
+#include "planner/gpu_admission.hpp"
 
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
@@ -71,6 +72,8 @@ struct file_statistics {
   std::uint64_t id;
   std::size_t num_rows = 0;
   std::vector<std::pair<duckdb::Identifier, duckdb::unique_ptr<duckdb::BaseStatistics>>> columns;
+  /// The decoded string size of the columns whose footer states one for some row group.
+  std::vector<std::pair<duckdb::Identifier, string_size>> string_sizes;
 };
 
 bool is_strong_etag(std::string_view tag)
@@ -171,6 +174,9 @@ struct row_count_entry {
   /// The value spans of the scan's columns, shared with the copies of its plan. Null until the
   /// planning that counted the rows has merged the columns.
   std::shared_ptr<value_span_list const> value_spans;
+  /// The decoded sizes of the scan's string columns, by bound column; empty when no column has
+  /// one or GPU admission was not sizing queries at this planning.
+  std::vector<string_size> string_sizes;
 };
 
 /// Keyed by the file list of a scan's bind data, which a plan owns and each plan copy has anew, so
@@ -216,13 +222,16 @@ void sweep_row_counts_locked()
 void keep_row_count_locked(duckdb::shared_ptr<duckdb::MultiFileList> const& list,
                            std::size_t rows,
                            std::uint64_t serial,
+                           std::vector<string_size> string_sizes,
                            std::shared_ptr<value_span_list const> value_spans = nullptr)
 {
   if (row_counts.size() >= row_count_sweep_at) { sweep_row_counts_locked(); }
-  row_counts.insert_or_assign(
-    list.get(),
-    row_count_entry{
-      duckdb::weak_ptr<duckdb::MultiFileList>(list), rows, serial, std::move(value_spans)});
+  row_counts.insert_or_assign(list.get(),
+                              row_count_entry{duckdb::weak_ptr<duckdb::MultiFileList>(list),
+                                              rows,
+                                              serial,
+                                              std::move(value_spans),
+                                              std::move(string_sizes)});
 }
 
 std::string cache_key(std::string const& options_identity, std::string const& path)
@@ -292,6 +301,15 @@ std::shared_ptr<file_statistics const> statistics_of(
   for (auto const& column : reader.columns) {
     auto stats = reader.GetStatistics(context, column.name);
     if (stats) { result->columns.emplace_back(column.name, std::move(stats)); }
+  }
+  if (auto const* metadata = reader.GetFileMetadata()) {
+    // Kept with the footer whatever GPU admission is set to now: the cache outlives the setting.
+    auto const sizes = detail::parquet_string_sizes(*metadata, reader.columns.size());
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+      if (sizes[i].rows != 0) {
+        result->string_sizes.emplace_back(reader.columns[i].name, sizes[i]);
+      }
+    }
   }
   // The version describes the file as listed or opened before this read, so a rewrite between the
   // two leaves an entry that the next sighting of the new version misses.
@@ -421,6 +439,36 @@ duckdb::BaseStatistics const* find(file_statistics const& file, duckdb::Identifi
     if (column == name) { return stats.get(); }
   }
   return nullptr;
+}
+
+/// The decoded size of each of \p bind's columns over \p files: what the files that state one
+/// add up to. Empty when no column has a size.
+std::vector<string_size> string_sizes_of(
+  duckdb::MultiFileBindData const& bind,
+  std::vector<std::shared_ptr<file_statistics const>> const& files)
+{
+  // Most writers leave the size out; then there is nothing to look up.
+  if (std::ranges::all_of(files, [](auto const& file) { return file->string_sizes.empty(); })) {
+    return {};
+  }
+  std::vector<string_size> sizes(bind.names.size());
+  std::vector<string_size> per_file;
+  per_file.reserve(files.size());
+  for (duckdb::idx_t i = 0; i < bind.names.size(); ++i) {
+    if (bind.IsGeneratedColumn(i)) { continue; }
+    per_file.clear();
+    for (auto const& file : files) {
+      for (auto const& [column, size] : file->string_sizes) {
+        if (column == bind.names[i]) {
+          per_file.push_back(size);
+          break;
+        }
+      }
+    }
+    sizes[i] = detail::combined_string_size(per_file);
+  }
+  if (std::ranges::none_of(sizes, [](auto const& size) { return size.rows != 0; })) { return {}; }
+  return sizes;
 }
 
 std::string quoted(std::string const& name)
@@ -581,17 +629,27 @@ void remember_merge(std::string const& key,
   merge_references += scan.files.size();
 }
 
+bool is_parquet_scan(std::string_view function_name)
+{
+  return function_name == "read_parquet" || function_name == "parquet_scan";
+}
+
 bool is_parquet_scan(duckdb::LogicalGet const& get)
 {
-  auto const& name = get.function.GetName().GetIdentifierName();
-  return name == "read_parquet" || name == "parquet_scan";
+  return is_parquet_scan(get.function.GetName().GetIdentifierName());
+}
+
+duckdb::shared_ptr<duckdb::MultiFileList> const* file_list_of(std::string_view function_name,
+                                                              duckdb::FunctionData const* bind_data)
+{
+  if (!is_parquet_scan(function_name)) { return nullptr; }
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
+  return bind && bind->file_list ? &bind->file_list : nullptr;
 }
 
 duckdb::shared_ptr<duckdb::MultiFileList> const* file_list_of(duckdb::LogicalGet const& get)
 {
-  if (!is_parquet_scan(get)) { return nullptr; }
-  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
-  return bind && bind->file_list ? &bind->file_list : nullptr;
+  return file_list_of(get.function.GetName().GetIdentifierName(), get.bind_data.get());
 }
 
 bool answers(row_count_entry const& entry, duckdb::MultiFileList const* list)
@@ -605,10 +663,12 @@ void forget_row_count(duckdb::MultiFileList const* list)
   row_counts.erase(list);
 }
 
-void remember_row_count(duckdb::shared_ptr<duckdb::MultiFileList> const& list, std::size_t rows)
+void remember_row_count(duckdb::shared_ptr<duckdb::MultiFileList> const& list,
+                        std::size_t rows,
+                        std::vector<string_size> string_sizes)
 {
   std::lock_guard guard(cache_mutex);
-  keep_row_count_locked(list, rows, next_row_count_serial++);
+  keep_row_count_locked(list, rows, next_row_count_serial++, std::move(string_sizes));
 }
 
 /// Adds the value spans of its scan's columns to the row count kept for \p list. They belong to
@@ -625,7 +685,8 @@ void remember_value_spans(duckdb::MultiFileList const* list,
 
 bool add_statistics(duckdb::ClientContext& context,
                     duckdb::LogicalGet& get,
-                    footer_read_limits const& limits)
+                    footer_read_limits const& limits,
+                    bool admission_sizes)
 {
   if (!is_parquet_scan(get)) { return false; }
   auto* bind = dynamic_cast<duckdb::MultiFileBindData*>(get.bind_data.get());
@@ -669,7 +730,12 @@ bool add_statistics(duckdb::ClientContext& context,
   for (auto const& file : scan.files) {
     total_rows += file->num_rows;
   }
-  remember_row_count(bind->file_list, total_rows);
+  // Only GPU admission reads the string sizes, and matching them to the scan's columns is a
+  // search of every file's list per column.
+  remember_row_count(
+    bind->file_list,
+    total_rows,
+    admission_sizes ? string_sizes_of(*bind, scan.files) : std::vector<string_size>{});
   if (single_file) {
     // DuckDB has this file's statistics itself; only its value spans are kept.
     value_span_list spans(bind->names.size());
@@ -701,6 +767,7 @@ bool add_statistics(duckdb::ClientContext& context,
 void visit(duckdb::ClientContext& context,
            duckdb::LogicalOperator& op,
            footer_read_limits const& limits,
+           bool admission_sizes,
            std::size_t& added)
 {
   if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
@@ -708,7 +775,7 @@ void visit(duckdb::ClientContext& context,
     auto* bind          = dynamic_cast<duckdb::MultiFileBindData*>(get.bind_data.get());
     bool const supplied = bind && !bind->file_options.column_statistics.IsNull();
     try {
-      if (add_statistics(context, get, limits)) { ++added; }
+      if (add_statistics(context, get, limits, admission_sizes)) { ++added; }
     } catch (std::exception const& e) {
       // Withdraw what this call installed; statistics the caller supplied stay.
       if (bind && !supplied) { bind->file_options.column_statistics = duckdb::Value(); }
@@ -717,7 +784,7 @@ void visit(duckdb::ClientContext& context,
     }
   }
   for (auto& child : op.children) {
-    visit(context, *child, limits, added);
+    visit(context, *child, limits, admission_sizes, added);
   }
 }
 
@@ -727,26 +794,48 @@ std::size_t add_parquet_footer_statistics(duckdb::ClientContext& context,
                                           duckdb::LogicalOperator& plan)
 {
   std::size_t added = 0;
-  visit(context, plan, footer_read_limits_of(context), added);
+  visit(context,
+        plan,
+        footer_read_limits_of(context),
+        planner::admission_estimate_needed(context),
+        added);
   return added;
+}
+
+std::optional<std::size_t> parquet_scan_row_count(std::string_view function_name,
+                                                  duckdb::FunctionData const* bind_data)
+{
+  auto const* list = file_list_of(function_name, bind_data);
+  if (!list) { return std::nullopt; }
+  std::lock_guard guard(cache_mutex);
+  auto const found = row_counts.find(list->get());
+  if (found == row_counts.end() || !answers(found->second, list->get())) { return std::nullopt; }
+  return found->second.rows;
 }
 
 std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get)
 {
-  auto const* list = file_list_of(get);
-  if (!list) { return std::nullopt; }
-  {
-    std::lock_guard guard(cache_mutex);
-    auto const found = row_counts.find(list->get());
-    if (found != row_counts.end() && answers(found->second, list->get())) {
-      return found->second.rows;
-    }
+  if (!file_list_of(get)) { return std::nullopt; }
+  if (auto const rows =
+        parquet_scan_row_count(get.function.GetName().GetIdentifierName(), get.bind_data.get())) {
+    return rows;
   }
   sirius::log::log_noexcept([&] {
     SIRIUS_LOG_DEBUG("No footer row count for the Parquet scan at table index {}",
                      get.table_index.index);
   });
   return std::nullopt;
+}
+
+std::vector<string_size> parquet_scan_string_sizes(std::string_view function_name,
+                                                   duckdb::FunctionData const* bind_data)
+{
+  auto const* list = file_list_of(function_name, bind_data);
+  if (!list) { return {}; }
+  std::lock_guard guard(cache_mutex);
+  auto const found = row_counts.find(list->get());
+  if (found == row_counts.end() || !answers(found->second, list->get())) { return {}; }
+  return found->second.string_sizes;
 }
 
 void forget_parquet_scan_row_counts(duckdb::LogicalOperator const& plan)
@@ -770,10 +859,12 @@ void copy_parquet_scan_row_count(duckdb::LogicalGet const& from, duckdb::Logical
     std::lock_guard guard(cache_mutex);
     auto const found = row_counts.find(source->get());
     if (found == row_counts.end() || !answers(found->second, source->get())) { return; }
+    // Copied out first: keeping the count may drop entries, the source's among them.
     auto const rows   = found->second.rows;
     auto const serial = found->second.serial;
+    auto sizes        = found->second.string_sizes;
     auto value_spans  = found->second.value_spans;
-    keep_row_count_locked(*target, rows, serial, std::move(value_spans));
+    keep_row_count_locked(*target, rows, serial, std::move(sizes), std::move(value_spans));
   } catch (std::bad_alloc const&) {
     // The copy plans without the count.
   }
@@ -811,6 +902,70 @@ std::size_t parquet_files_row_count(duckdb::ClientContext& context,
     rows += file->num_rows;
   }
   return rows;
+}
+
+std::vector<string_size> detail::parquet_string_sizes(duckdb_parquet::FileMetaData const& metadata,
+                                                      std::size_t bound_columns)
+{
+  if (metadata.row_groups.empty()) { return {}; }
+  auto const num_leaves = metadata.row_groups.front().columns.size();
+  // The leaves are matched to the bound columns by position, which takes one leaf per column.
+  if (num_leaves == 0 || num_leaves != bound_columns) { return {}; }
+  constexpr auto k_max = std::numeric_limits<std::uint64_t>::max();
+  std::vector<string_size> sizes(num_leaves);
+  std::vector<bool> usable(num_leaves, true);
+  for (auto const& row_group : metadata.row_groups) {
+    if (row_group.columns.size() != num_leaves) { return {}; }
+    if (row_group.num_rows <= 0) { continue; }
+    for (std::size_t c = 0; c < num_leaves; ++c) {
+      if (!usable[c]) { continue; }
+      auto const& chunk = row_group.columns[c];
+      auto const& meta  = chunk.meta_data;
+      // A top-level byte array only. A nested column can have one leaf too, and that leaf one
+      // value per row (LIST<VARCHAR>, STRUCT<x VARCHAR>), but its bytes are not the bytes of a
+      // string column.
+      if (!chunk.__isset.meta_data || meta.type != duckdb_parquet::Type::BYTE_ARRAY ||
+          meta.path_in_schema.size() != 1) {
+        usable[c] = false;
+        continue;
+      }
+      // Encoded sizes (including DELTA and dictionary encodings) cannot describe decoded
+      // strings. A row group without the decoded size states nothing: its rows are not counted,
+      // and admission prices them at the configured average.
+      if (meta.num_values != row_group.num_rows || !meta.__isset.size_statistics ||
+          !meta.size_statistics.__isset.unencoded_byte_array_data_bytes ||
+          meta.size_statistics.unencoded_byte_array_data_bytes < 0) {
+        continue;
+      }
+      auto const rows = static_cast<std::uint64_t>(row_group.num_rows);
+      auto const bytes =
+        static_cast<std::uint64_t>(meta.size_statistics.unencoded_byte_array_data_bytes);
+      // Reject overflowing metadata rather than turning it into a small admission estimate.
+      if (sizes[c].bytes > k_max - bytes || sizes[c].rows > k_max - rows) {
+        usable[c] = false;
+        continue;
+      }
+      sizes[c].bytes += bytes;
+      sizes[c].rows += rows;
+    }
+  }
+  for (std::size_t c = 0; c < num_leaves; ++c) {
+    if (!usable[c]) { sizes[c] = {}; }
+  }
+  return sizes;
+}
+
+string_size detail::combined_string_size(std::vector<string_size> const& files)
+{
+  constexpr auto k_max = std::numeric_limits<std::uint64_t>::max();
+  string_size total;
+  for (auto const& file : files) {
+    // Reject overflowing metadata rather than turning it into a small admission estimate.
+    if (total.bytes > k_max - file.bytes || total.rows > k_max - file.rows) { return {}; }
+    total.bytes += file.bytes;
+    total.rows += file.rows;
+  }
+  return total;
 }
 
 std::size_t detail::merged_statistics_cache_size()

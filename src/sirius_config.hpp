@@ -407,9 +407,10 @@ struct operator_params {
   /// Share of GPU tier capacity for the histogram when the budget above is 0.
   double dense_count_join_memory_fraction = config::DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION;
 
-  /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
-  /// At query start, the engine estimates total scan output bytes from the plan's
-  /// estimated_cardinality × per-column width, then assigns
+  /// Admission-time GPU allocation: target bytes of projected scan input per GPU.
+  /// At query start, the engine estimates the bytes the query's scans decode from each scan's
+  /// row count (the larger of the planner's estimate and the table's unfiltered count) × the
+  /// width of the columns it reads (output and filter-only), then assigns
   /// ceil(total_bytes / admission_bytes_per_gpu) GPUs, clamped to [1, active_gpu_count].
   /// 0 disables dynamic estimation and falls back to topology.gpus_per_query.
   uint64_t admission_bytes_per_gpu = 0;

@@ -70,17 +70,12 @@ bool parquet_footer_statistics_enabled(const duckdb::ClientContext& context)
   return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
 }
 
-/// Whether a plan optimization is on: its `operator_params` switch as `query_operator_options`
-/// resolves it, without creating the session's overrides. Those snapshot the global
-/// configuration, which would stop the session from seeing later changes to it.
+/// Whether a plan optimization is on: its `operator_params` switch, read without creating the
+/// session's overrides (see current_operator_option). Off when Sirius has no runtime.
 bool plan_optimization_enabled(duckdb::ClientContext& context,
                                bool sirius::operator_params::* option)
 {
-  auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) { return (*state->execution_options).*option; }
-  if (state && state->operator_overrides) { return (*state->operator_overrides).*option; }
-  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().*option;
+  return duckdb::current_operator_option(context, option).value_or(false);
 }
 
 /// The thresholds of the partial aggregate pushdown. They are its defaults unless the test-only

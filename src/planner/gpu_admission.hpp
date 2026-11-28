@@ -17,8 +17,10 @@
 #pragma once
 
 #include "helper/logical_type.hpp"
+#include "op/scan/scan_admission_hint.hpp"
 
 #include <absl/functional/function_ref.h>
+#include <duckdb/function/table_function.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -27,8 +29,15 @@
 #include <optional>
 #include <vector>
 
+namespace duckdb {
+class ClientContext;
+class NodeStatistics;
+class SiriusContext;
+}  // namespace duckdb
+
 namespace sirius::op {
 class sirius_physical_operator;
+class sirius_physical_table_scan;
 }  // namespace sirius::op
 
 namespace sirius::planner {
@@ -91,6 +100,93 @@ inline uint64_t estimate_bytes_per_row(const std::vector<sirius::logical_type>& 
 }
 
 /**
+ * @brief estimate_bytes_per_row with per-column widths where a source could supply them.
+ * `known_widths[i]` replaces @p avg_var_bytes for output column i when it is set and the column
+ * is variable-width. Fixed-width columns keep their cuDF carrier width, which is exact; a
+ * Parquet footer's encoded size would only under-count those. Shorter @p known_widths vectors
+ * leave the remaining columns on the fallback.
+ */
+inline uint64_t estimate_bytes_per_row(const std::vector<sirius::logical_type>& types,
+                                       uint64_t avg_var_bytes,
+                                       const std::vector<std::optional<uint64_t>>& known_widths)
+{
+  constexpr auto k_max = std::numeric_limits<uint64_t>::max();
+  uint64_t total       = 0;
+  for (std::size_t i = 0; i < types.size(); ++i) {
+    const auto& t  = types[i];
+    uint64_t width = avg_var_bytes;
+    if (t.is_fixed_width()) {
+      width = uint64_t{t.fixed_width_byte_size()};
+    } else if (i < known_widths.size() && known_widths[i].has_value()) {
+      width = *known_widths[i];
+    }
+    if (total > k_max - width) { return k_max; }
+    total += width;
+  }
+  return total;
+}
+
+/**
+ * @brief Bytes per row a scan decodes: its output columns plus the columns it reads only to
+ * evaluate pushed-down filters (`hint.filter_only_columns`), each sized as by
+ * estimate_bytes_per_row with the hint's widths. Saturates instead of wrapping.
+ */
+inline uint64_t scan_bytes_per_row(const std::vector<sirius::logical_type>& output_types,
+                                   const op::scan::scan_admission_hint& hint,
+                                   uint64_t avg_var_bytes)
+{
+  constexpr auto k_max = std::numeric_limits<uint64_t>::max();
+  uint64_t total       = estimate_bytes_per_row(output_types, avg_var_bytes, hint.column_widths);
+  for (const auto& column : hint.filter_only_columns) {
+    auto const width = column.type.is_fixed_width() ? uint64_t{column.type.fixed_width_byte_size()}
+                                                    : column.width.value_or(avg_var_bytes);
+    if (total > k_max - width) { return k_max; }
+    total += width;
+  }
+  return total;
+}
+
+/**
+ * @brief Bytes per row of a string column of @p total_rows rows whose source states the decoded
+ * size of only @p known_rows of them (@p known_bytes, offsets excluded).
+ *
+ * The known rows cost their bytes plus cuDF's four-byte offset each; the rest cost
+ * @p avg_var_bytes each, so one file or row group without size statistics does not discard what
+ * the others state. Rounded up. nullopt when no row is known or the sum overflows: the column
+ * then keeps @p avg_var_bytes for every row.
+ */
+inline std::optional<uint64_t> blended_string_width(uint64_t known_bytes,
+                                                    uint64_t known_rows,
+                                                    uint64_t total_rows,
+                                                    uint64_t avg_var_bytes)
+{
+  constexpr auto k_max        = std::numeric_limits<uint64_t>::max();
+  constexpr uint64_t k_offset = 4;
+  if (known_rows == 0) { return std::nullopt; }
+  total_rows              = std::max(total_rows, known_rows);
+  auto const unknown_rows = total_rows - known_rows;
+  if (known_rows > k_max / k_offset) { return std::nullopt; }
+  uint64_t bytes = known_rows * k_offset;
+  if (known_bytes > k_max - bytes) { return std::nullopt; }
+  bytes += known_bytes;
+  if (avg_var_bytes != 0 && unknown_rows > (k_max - bytes) / avg_var_bytes) { return std::nullopt; }
+  bytes += unknown_rows * avg_var_bytes;
+  return bytes / total_rows + (bytes % total_rows != 0);
+}
+
+/**
+ * @brief The row count admission sizes a scan from: the planner's filtered estimate, raised to
+ * the table function's unfiltered count when that is known and larger.
+ * Under-estimating rows puts a large query on too few GPUs; over-estimating only keeps today's
+ * allocation. The planner's filter selectivity under-counts TPC-H range and LIKE filters by
+ * 4-5x, so the unfiltered count is the safer floor.
+ */
+inline uint64_t admission_row_count(uint64_t planner_rows, std::optional<uint64_t> unfiltered_rows)
+{
+  return unfiltered_rows.has_value() ? std::max(planner_rows, *unfiltered_rows) : planner_rows;
+}
+
+/**
  * @brief Add `rows * bytes_per_row` to @p running, saturating instead of wrapping.
  *
  * estimated_cardinality is a planner estimate with no bound, and a wrapped total would read
@@ -114,7 +210,7 @@ struct scan_estimate {
 };
 
 /**
- * @brief Total projected scan-output bytes, or nullopt when the plan cannot be sized.
+ * @brief Total projected bytes the scans decode, or nullopt when the plan cannot be sized.
  *
  * Zero rows is ambiguous — provably empty, or simply unestimated — and the two want
  * opposite treatments. Sirius already reads it as "cannot size" (sirius_physical_sort_sample
@@ -149,5 +245,71 @@ inline int gpu_count_for_bytes(uint64_t total_bytes, uint64_t bytes_per_gpu, int
   auto const required = 1ULL + (total_bytes - 1) / bytes_per_gpu;
   return static_cast<int>(std::min<uint64_t>(required, static_cast<uint64_t>(n_gpus)));
 }
+
+/// @brief Every GPU of @p runtime: one id per GPU memory space, ascending.
+[[nodiscard]] std::vector<int> runtime_gpu_ids(duckdb::SiriusContext& runtime);
+
+/// @brief The GPUs a query can be admitted to: runtime_gpu_ids capped by
+/// `topology.gpus_per_query` (apply_gpu_cap). The engine admits from this list and the plan
+/// generator decides from its size whether to collect admission hints, so the two agree.
+[[nodiscard]] std::vector<int> admission_candidate_gpu_ids(duckdb::SiriusContext& runtime);
+
+/**
+ * @brief Whether admission sizes a query at all, and so whether the per-scan facts it sizes from
+ * are worth collecting at plan time.
+ *
+ * It does when `admission_bytes_per_gpu` is non-zero and the estimate can narrow the query's GPU
+ * set, which takes more than one candidate GPU. With a single GPU the estimate decides nothing;
+ * it is computed only for its DEBUG log line, which is how an estimate is checked against real
+ * scan sizes on a single-GPU host.
+ */
+inline bool admission_estimate_needed(uint64_t bytes_per_gpu,
+                                      std::size_t n_gpus,
+                                      bool debug_logging)
+{
+  return bytes_per_gpu != 0 && (n_gpus > 1 || (n_gpus == 1 && debug_logging));
+}
+
+/// @brief admission_estimate_needed for a query planned in @p context: its
+/// `admission_bytes_per_gpu`, the GPUs `topology.gpus_per_query` leaves it, and whether DEBUG
+/// logging is on. False when Sirius is not registered on the connection.
+[[nodiscard]] bool admission_estimate_needed(duckdb::ClientContext& context);
+
+namespace detail {
+// Metadata-only helpers shared with admission regression tests.
+std::optional<uint64_t> reported_row_count(const duckdb::NodeStatistics& stats);
+
+/// The longest string, in bytes, that the statistics of @p function report for table column
+/// @p column; nullopt when the function has no statistics callback, the column's statistics are
+/// not string statistics or state no maximum length, or the callback throws. Asks
+/// `statistics_extended` first: DuckDB tables (`seq_scan`) register only that one.
+std::optional<uint64_t> table_function_max_string_bytes(duckdb::ClientContext& context,
+                                                        const duckdb::BoundTableFunction& function,
+                                                        const duckdb::FunctionData* bind_data,
+                                                        duckdb::column_t column);
+}  // namespace detail
+
+/**
+ * @brief Derive a GPU scan's admission hint from its DuckDB table function while the plan
+ *        generator still holds the function and bind data.
+ *
+ * Rows, before any filter: for a Parquet scan, the sum of its files' footer row counts
+ * (`transparent::parquet_scan_row_count`, present when the footer statistics pass covered the
+ * scan); otherwise the table function's `cardinality` callback (`TableScanCardinality` for
+ * DuckDB tables, and DuckDB's own estimate for a Parquet scan the footer pass did not cover). A
+ * count of zero from the callback is read as unknown, since a callback can report zero for a
+ * count it does not have. A footer total is exact and is kept, zero included.
+ *
+ * Widths, for variable-width columns only: for a Parquet scan, the decoded byte-array sizes its
+ * footers state (`transparent::parquet_scan_string_sizes`) plus the 4-byte offset word, with
+ * @p avg_var_bytes for the rows of the files and row groups that state none
+ * (blended_string_width); otherwise the maximum string length in the table function's statistics
+ * (`statistics_extended`, or `statistics` where that is the only callback) plus the offset.
+ * Unknown widths retain the configured average. The columns the scan reads only for pushed-down
+ * filters are listed with their widths.
+ */
+op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& context,
+                                                         const op::sirius_physical_table_scan& scan,
+                                                         uint64_t avg_var_bytes);
 
 }  // namespace sirius::planner

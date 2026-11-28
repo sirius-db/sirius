@@ -298,7 +298,7 @@ struct operator_options : block_base<operator_options> {
   config_option<ubytes> admission_bytes_per_gpu =
     option<ubytes>("admission_bytes_per_gpu")
       .fallback(ubytes(defaults().admission_bytes_per_gpu))
-      .describe("target projected scan-output bytes per GPU at admission")
+      .describe("target projected scan bytes per GPU at admission")
       .build();
   config_option<ubytes> avg_variable_column_bytes =
     option<ubytes>("avg_variable_column_bytes")
