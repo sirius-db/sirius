@@ -284,11 +284,12 @@ struct disk_mem_config {
   int id{0};
   std::size_t capacity_bytes{1024UL << 30};  // 1TB
   std::string downgrade_root_dirs;
+  bool allow_gds{true};
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
   {
     if (downgrade_root_dirs.empty() || capacity_bytes == 0) { return; }
-    builder.set_disk_mounting_point(id, capacity_bytes, downgrade_root_dirs);
+    builder.set_disk_mounting_point(id, capacity_bytes, downgrade_root_dirs, nullptr, allow_gds);
   }
 };
 
@@ -511,6 +512,7 @@ try {
   impl->disk_cfg.id                  = disk.disk_id.get();
   impl->disk_cfg.capacity_bytes      = disk.capacity_bytes.get().count();
   impl->disk_cfg.downgrade_root_dirs = disk.downgrade_root_dirs.get();
+  impl->disk_cfg.allow_gds           = disk.allow_gds.get();
   settings._max_concurrent_queries   = user.max_concurrent_queries.get();
 
   // -- executors
@@ -541,6 +543,7 @@ try {
   assign_if_set(sm.rest_n_reactors, sm_cfg.rest_n_reactors);
   sm_cfg.reserve_rest_reactor_cpus  = sm.reserve_rest_reactor_cpus.get();
   sm_cfg.httpfs_external_file_cache = sm.httpfs_external_file_cache.get();
+  sm_cfg.cufile_bulk_read           = sm.cufile_bulk_read.get();
   if (auto const* scans = sm.max_readahead_scans.get_if()) { sm_cfg.max_readahead_scans = *scans; }
   if (auto const* strategy = sm.readahead_strategy.get_if()) {
     sm_cfg.readahead_strategy = *strategy;
@@ -557,6 +560,19 @@ try {
   }
   uring.slices_per_pass    = sm.uring.slices_per_pass.get();
   uring.range_batch_slices = sm.uring.range_batch_slices.get();
+
+  auto const& f               = sm.cufile;
+  auto& cufile                = sm_cfg.cufile;
+  cufile.lanes                = f.lanes.get();
+  cufile.lane_bytes           = f.lane_bytes.get().count();
+  cufile.coalesce_gap_bytes   = f.coalesce_gap_bytes.get().count();
+  cufile.coalesce_gap_ratio   = f.coalesce_gap_ratio.get();
+  cufile.read_slots_per_lane  = f.read_slots_per_lane.get();
+  cufile.register_per_slot    = f.register_per_slot.get();
+  cufile.high_priority_copies = f.high_priority_copies.get();
+  cufile.async_copies         = f.async_copies.get();
+  cufile.copy_poll_us         = static_cast<std::size_t>(f.copy_poll.get().count());
+  cufile.devices              = f.devices.get();
 
   auto const& r = sm.rest;
   auto& rest    = sm_cfg.rest;
@@ -767,6 +783,7 @@ try {
     cfg.disk_id         = space.disk_id.get();
     cfg.mount_paths     = space.mount_path.get();
     cfg.memory_capacity = space.memory_capacity.get().count();
+    cfg.allow_gds       = space.allow_gds.get();
     settings._memory_space_configs.emplace_back(std::move(cfg));
   }
   impl->use_effective_gpu_capacity = settings._memory_space_configs.empty()
@@ -1160,7 +1177,6 @@ void sirius_config::finalize_derived_config()
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
   derive_uring_scan_budget();
-  enforce_native_backend_for_multi_gpu();
   reserve_rest_reactor_cpus();
   _scan_manager_config.worker_startup_cpus = get_worker_startup_cpus();
 }
@@ -1313,21 +1329,6 @@ void sirius_config::derive_uring_scan_budget()
     derived,
     _scan_manager_config.uring.n_max_concurrent_scans);
   _scan_manager_config.uring.n_max_concurrent_scans = derived;
-}
-
-void sirius_config::enforce_native_backend_for_multi_gpu()
-{
-  size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
-    return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
-  });
-  if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::native) {
-    SIRIUS_LOG_WARN(
-      "sirius_config: backend was not 'native' but {} GPUs are configured; "
-      "the native backend is required for multi-GPU IO routing. Overriding "
-      "backend to 'native'.",
-      num_gpus);
-    _scan_manager_config.backend = scan_manager::io_backend::native;
-  }
 }
 
 const std::vector<cucascade::memory::memory_space_config>& sirius_config::get_memory_space_configs()

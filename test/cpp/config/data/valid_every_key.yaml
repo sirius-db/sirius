@@ -22,6 +22,7 @@ sirius:
       disk_id: 1
       capacity_bytes: 2TiB
       downgrade_root_dirs: /tmp
+      allow_gds: false
   max_concurrent_queries: 2
   executor:
     task_creator:
@@ -35,12 +36,24 @@ sirius:
       rest_n_reactors: 6
       reserve_rest_reactor_cpus: false
       httpfs_external_file_cache: true
+      cufile_bulk_read: off
       max_readahead_scans: 5
       readahead_strategy: opportunistic
       uring:
         n_max_concurrent_scans: 7
         slices_per_pass: 8
         range_batch_slices: 4
+      cufile:
+        lanes: 16
+        lane_bytes: 4MiB
+        coalesce_gap_bytes: 256KiB
+        coalesce_gap_ratio: 0.25
+        read_slots_per_lane: 3
+        register_per_slot: false
+        high_priority_copies: false
+        async_copies: false
+        copy_poll_us: 20
+        devices: [0]
       rest:
         n_max_concurrent_scans: 12
         request_timeout_s: 45

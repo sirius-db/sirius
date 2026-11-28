@@ -30,7 +30,7 @@ Every byte of data lives in exactly one **memory tier** at any moment. Tiers, fa
 |------|-----------|-------------------|-----------------|
 | `GPU` | `cuda_async_memory_resource` (one pool per device) | Bounded by GPU device memory × `usage_limit_fraction` | Active query data |
 | `HOST` | NUMA-local pinned host memory | Set by config: `memory.host.capacity_bytes` (per NUMA host memory resource) | Downgrade target when GPU is full |
-| `DISK` | On-disk file pool via cucascade's `idisk_io_backend` | Configured via `set_disk_mounting_point(gpu_id, capacity, path)` | Last-resort downgrade target |
+| `DISK` | Raw and `.hpln` spill files via a per-space `std::shared_ptr<cucascade::io::ioctx>` ([I/O ownership](memory-management.md#disk-io-and-ownership)) | Reservation bound via `set_disk_mounting_point(disk_id, capacity, path)` | Last-resort downgrade target |
 
 `HOST` is partitioned by NUMA node — each GPU has a paired host region on its NUMA-local memory controller for fast downgrade. This is configured via `cucascade::memory::reservation_manager_configurator::use_host_per_gpu()` at startup.
 
@@ -206,7 +206,7 @@ Sirius ordinary dynamic-filter replication and late materialization share `memor
 
 ## Multi-GPU-Safe Parquet I/O
 
-Multi-GPU parquet reads, local and `s3://`, use cuCascade's native I/O stack rather than cuDF's path-based file-source factory, which can bind a file handle to the CUDA context active at construction. A handle bound to GPU 0 must not silently funnel reads through GPU 0 when the consumer is on GPU 1. `sirius_config::enforce_native_backend_for_multi_gpu()` keeps `scan_manager_config::backend = io_backend::native` whenever more than one GPU memory space is configured, with a warning for a non-native selection.
+Multi-GPU parquet reads, local and `s3://`, use cuCascade's native I/O stack rather than cuDF's path-based file-source factory, which can bind a file handle to the CUDA context active at construction. A handle bound to GPU 0 must not silently funnel reads through GPU 0 when the consumer is on GPU 1. Both `scan_manager_config::backend` values read through `cucascade::io::datasource`: `native` routes a device read by the caller's device, and `cufile` runs one reactor group per GPU and routes each read by its destination's device.
 
 The kvikIO backend and the registry catch-all have been removed for every GPU count. `backend: kvikio` and the `scan_manager.kvikio` block are rejected with an error directing users to `native`; neither is an alias or an ignored block.
 
@@ -251,7 +251,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | HYG-02 invariant: 0 new `rmm::cuda_stream_default` in `src/` outside `legacy/` | grep gate | Default-stream usage breaks per-task-device contract under SCHED-RR |
 | Accumulated Bloom contributions fold into an exclusive per-GPU partial stream (`cudaStreamWaitEvent` on a transient event) instead of waiting on the host | `src/cuda/sirius_dynamic_bloom_filter.cu` (`accumulated_bloom_builder::enqueue_add`) | Every later copy out of, or free of, a partial array is ordered after all inserts into it, with no per-task host sync |
 | Accumulated Bloom publication checks actual-pool grants when preparing `finish` to select direct copies or bounded HOST staging | `src/cuda/sirius_dynamic_bloom_filter.cu` (`accumulated_bloom_builder::finish`) | Direct copies require pool capability; unavailable capability selects HOST fallback, while CUDA errors propagate |
-| Multi-GPU parquet reads resolve to `cucascade::io::datasource`, not cuDF's path-based factory | `sirius_config::enforce_native_backend_for_multi_gpu()` forces `backend: native` when >1 GPU is configured | A path-based file source can bind to a single CUDA context; native device reads carry the caller's device |
+| Multi-GPU parquet reads resolve to `cucascade::io::datasource`, not cuDF's path-based factory | Both backends (`native`, `cufile`) mint `cucascade::io::datasource` instances from the scan manager's io context | A path-based file source can bind to a single CUDA context; native device reads carry the caller's device |
 
 ## Hardware Caveats
 

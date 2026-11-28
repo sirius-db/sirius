@@ -16,6 +16,9 @@
 
 #include "op/scan/parquet_materialize.hpp"
 
+#include "cuda/device_health.hpp"
+#include "io/bulk_read.hpp"
+
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
 #include <cudf/utilities/span.hpp>
@@ -25,6 +28,7 @@
 #include <cucascade/io/types.hpp>
 
 #include <algorithm>
+#include <exception>
 #include <future>
 #include <iterator>
 #include <stdexcept>
@@ -79,9 +83,11 @@ bool prefers_bulk_materialize(std::span<parquet_source const> sources,
   // Every source has to qualify: the decode consumes one flattened chunk-data
   // span covering all of them, so a single file that cannot be read this way
   // takes the whole split to the general route.
+  // The backend's own preference (REST), or Sirius's request for it on the context (a cuFile
+  // context with cufile_bulk_read on, so its lanes see the whole split at once).
   return std::all_of(sources.begin(), sources.end(), [](parquet_source const& src) {
     return src.datasource && src.metadata && !src.row_group_indices.empty() &&
-           src.datasource->prefers_bulk_io();
+           sirius::io::prefers_bulk_read(*src.datasource);
   });
 }
 
@@ -186,6 +192,43 @@ fetched_chunks finish_fetch(pending_fetch fetch)
   return out;
 }
 
+/// The failures of one split's reads.  The one that put the GPU's context out of service is
+/// rethrown in preference to an ordinary one, so the device health latch sees it; otherwise the
+/// earliest file's, where reading the files one at a time would have stopped.
+struct fetch_failures {
+  std::exception_ptr earliest;
+  std::size_t earliest_file = 0;
+  std::exception_ptr fatal;
+
+  void note(std::size_t file, std::exception_ptr const& error) noexcept
+  {
+    if (!earliest || file < earliest_file) {
+      earliest      = error;
+      earliest_file = file;
+    }
+    if (!fatal && sirius::fatal_device_status(error)) { fatal = error; }
+  }
+  [[nodiscard]] bool any() const noexcept { return earliest != nullptr; }
+  void rethrow_if_any() const
+  {
+    if (fatal) { std::rethrow_exception(fatal); }
+    if (earliest) { std::rethrow_exception(earliest); }
+  }
+};
+
+/// A cuFile context's lanes order their copies after the work queued on the stream, but a read
+/// holds one of the GPU's shared arena slots until its copies can run.  Let the stream's earlier
+/// work (e.g. the previous split's decode) finish before the first read, so a read never parks
+/// slots behind it.  Other backends (REST) take the reads with the stream still busy.
+void drain_stream_for_cufile(std::span<parquet_source const> sources, ::cuda::stream_ref stream)
+{
+  bool const cufile = std::any_of(sources.begin(), sources.end(), [](parquet_source const& src) {
+    auto const ctx = src.datasource->io_ctx();
+    return ctx && sirius::io::bulk_read_registered(*ctx);
+  });
+  if (cufile) { stream.sync(); }
+}
+
 /// Ranges for source @p i, or an empty span when the caller supplied none.
 std::span<cudf::io::text::byte_range_info const> ranges_for(
   std::span<std::vector<cudf::io::text::byte_range_info> const> ranges, std::size_t i)
@@ -203,6 +246,8 @@ std::unique_ptr<cudf::table> materialize_bulk(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
+  drain_stream_for_cufile(sources, stream);
+
   if (sources.size() == 1) {
     // Single file: the single-source reader, whose chunk data is flat.
     auto const& src   = sources.front();
@@ -234,32 +279,42 @@ std::unique_ptr<cudf::table> materialize_bulk(
   std::vector<cudf::device_span<std::uint8_t const>> spans;
   metadatas.reserve(sources.size());
   rg_per_src.reserve(sources.size());
+  // Copied before any read is issued: a copy that threw while reads were in
+  // flight would leave their failures unseen.
+  for (auto const& src : sources) {
+    metadatas.push_back(*src.metadata);
+    rg_per_src.push_back(src.row_group_indices);
+  }
 
   // Reserved before the first read is issued: taking ownership of an issued
   // read cannot throw, so its result is never dropped unread.
   std::vector<pending_fetch> fetches;
   fetches.reserve(sources.size());
+  // Every outcome is collected: after a failure no further read starts, but each
+  // one already started is still joined.
+  fetch_failures failures;
   for (std::size_t i = 0; i < sources.size(); ++i) {
-    try {
-      for (auto j = fetches.size(); j < sources.size() && j - i < max_pending_fetches; ++j) {
-        fetches.push_back(begin_fetch(sources[j], options, ranges_for(ranges, j), stream, mr));
+    if (!failures.any()) {
+      try {
+        for (auto j = fetches.size(); j < sources.size() && j - i < max_pending_fetches; ++j) {
+          fetches.push_back(begin_fetch(sources[j], options, ranges_for(ranges, j), stream, mr));
+        }
+      } catch (...) {
+        failures.note(fetches.size(), std::current_exception());
       }
-    } catch (...) {
-      // A failed read of an earlier file comes first: reading the files one at
-      // a time would have stopped there.
-      for (auto j = i; j < fetches.size(); ++j) {
-        std::ignore = fetches[j].read.get();
-      }
-      throw;
     }
-    auto chunks = finish_fetch(std::move(fetches[i]));
-    spans.insert(spans.end(), chunks.spans.begin(), chunks.spans.end());
-    // Moving a device_buffer keeps its device pointer, so the spans stay valid;
-    // the buffers just have to outlive the decode.
-    std::move(chunks.buffers.begin(), chunks.buffers.end(), std::back_inserter(buffers));
-    metadatas.push_back(*sources[i].metadata);
-    rg_per_src.push_back(sources[i].row_group_indices);
+    if (i >= fetches.size()) { break; }  // never started
+    try {
+      auto chunks = finish_fetch(std::move(fetches[i]));
+      spans.insert(spans.end(), chunks.spans.begin(), chunks.spans.end());
+      // Moving a device_buffer keeps its device pointer, so the spans stay valid;
+      // the buffers just have to outlive the decode.
+      std::move(chunks.buffers.begin(), chunks.buffers.end(), std::back_inserter(buffers));
+    } catch (...) {
+      failures.note(i, std::current_exception());
+    }
   }
+  failures.rethrow_if_any();
 
   cudf::io::parquet::experimental::hybrid_scan_multifile reader(
     cudf::host_span<cudf::io::parquet::FileMetaData const>(metadatas.data(), metadatas.size()),

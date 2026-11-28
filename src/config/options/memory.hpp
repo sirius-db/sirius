@@ -156,8 +156,13 @@ struct disk_memory_options : block_base<disk_memory_options> {
                                                      .mark_production()
                                                      .describe("directory for disk spill files")
                                                      .build();
+  /// false: the spill files are always read and written through io_uring.
+  config_option<bool> allow_gds = option<bool>("allow_gds")
+                                    .fallback(true)
+                                    .describe("let spills use GPUDirect Storage where it is served")
+                                    .build();
 
-  auto fields() { return field_list(disk_id, capacity_bytes, downgrade_root_dirs); }
+  auto fields() { return field_list(disk_id, capacity_bytes, downgrade_root_dirs, allow_gds); }
 };
 
 /// `sirius.memory`: memory spaces described per tier. Mutually exclusive with non-empty

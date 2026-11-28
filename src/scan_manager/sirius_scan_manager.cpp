@@ -59,6 +59,11 @@
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
+#ifdef CUCASCADE_HAS_CUFILE
+#include <cucascade/io/cufile/cufile_ioctx.hpp>
+#endif
+#include <rmm/cuda_device.hpp>
+
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
@@ -98,6 +103,7 @@ char const* to_string(cucascade::io::io_context_type type) noexcept
   switch (type) {
     case cucascade::io::io_context_type::uring: return "uring";
     case cucascade::io::io_context_type::restful: return "restful";
+    case cucascade::io::io_context_type::cufile: return "cufile";
     case cucascade::io::io_context_type::s3rdma: return "s3rdma";
   }
   return "unknown";
@@ -139,7 +145,8 @@ prefetch_strategy backend_prefetch_strategy(cucascade::io::io_context_type type)
     // s3rdma is an object store too (a placeholder in cuCascade today, never built).
     case cucascade::io::io_context_type::restful:
     case cucascade::io::io_context_type::s3rdma: return prefetch_strategy::eager;
-    case cucascade::io::io_context_type::uring: return prefetch_strategy::opportunistic;
+    case cucascade::io::io_context_type::uring:
+    case cucascade::io::io_context_type::cufile: return prefetch_strategy::opportunistic;
   }
   return prefetch_strategy::eager;
 }
@@ -1470,17 +1477,30 @@ sirius_scan_manager::sirius_scan_manager(
                     cpus);
   }
 
-  // scan_manager always owns the local io_ctx (uring for backend=native), so
-  // the rest of the scan path (split_provider, scan tasks) always has an ioctx
-  // to talk to.  It is built by the ioctx registry, which sources the reactor
-  // staging resource from the reservation manager it was constructed with.  The
-  // registry routes s3:// paths independently to the REST backend; there is no
-  // catch-all backend for other URL schemes.
+  // The configured local context is mandatory: uring for native, cuFile for
+  // cufile.  The registry routes s3:// paths independently to the REST backend;
+  // there is no catch-all backend for other URL schemes.
 
   //
   // The default ioctx is mandatory, so its failure is thrown rather than logged:
   // the cause is explained once, in the exception.
-  auto const make_default_ioctx = [this](cucascade::io::io_context_type type) {
+  auto const make_default_ioctx =
+    [this](cucascade::io::io_context_type type) -> std::shared_ptr<cucascade::io::ioctx> {
+#ifdef CUCASCADE_HAS_CUFILE
+    if (type == cucascade::io::io_context_type::cufile) {
+      // The registry's noexcept factory discards construction exceptions. This
+      // configured local context is mandatory: build it directly so its actual
+      // failure reaches the caller.
+      try {
+        return std::make_shared<cucascade::io::cufile::cufile_ioctx>(
+          _config.resolved_cufile(_topology_index->gpu_ids()));
+      } catch (std::exception const& e) {
+        throw std::runtime_error(std::string{"[sirius_scan_manager] failed to create cufile "
+                                             "io_context: "} +
+                                 e.what());
+      }
+    }
+#endif
     auto io_ctx = _ioctx_registry.make_ioctx(type);
     if (!io_ctx) {
       throw std::runtime_error(std::string{"[sirius_scan_manager] failed to create "} +
@@ -1493,11 +1513,27 @@ sirius_scan_manager::sirius_scan_manager(
     case scan_manager::io_backend::native:
       _io_ctx = make_default_ioctx(cucascade::io::io_context_type::uring);
       SIRIUS_LOG_DEBUG(
-        "[sirius_scan_manager] default io context: uring n_reactors={} slices_per_pass={} "
-        "range_batch_slices={}",
+        "[sirius_scan_manager] default io context: uring read reactors={} (over all GPUs, plus "
+        "a write reactor per GPU) slices_per_pass={} range_batch_slices={}",
         _config.uring_n_reactors,
         _config.uring.slices_per_pass,
         _config.uring.range_batch_slices);
+      break;
+    case scan_manager::io_backend::cufile:
+      _io_ctx = make_default_ioctx(cucascade::io::io_context_type::cufile);
+      SIRIUS_LOG_DEBUG(
+        "[sirius_scan_manager] default io context: cufile lanes={} lane_bytes={} (per GPU)",
+        _config.cufile.lanes,
+        _config.cufile.lane_bytes);
+      // cuCascade's cuFile backend does not ask for the bulk route (prefers_bulk_io is a
+      // compile-time false), but its lanes only coalesce the slices of one request: read
+      // each file's column chunks of a split in one vectored request unless configured off.
+      if (_config.reads_cufile_in_bulk()) {
+        _cufile_bulk_read = sirius::io::bulk_read_registration{*_io_ctx};
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] cuFile Parquet scans take the bulk route: one vectored read per "
+          "file per split");
+      }
       break;
   }
 
@@ -1507,7 +1543,12 @@ sirius_scan_manager::sirius_scan_manager(
 
   // start() spawns one worker thread per reactor (for uring each with its own
   // ring and pinned staging).
-  _io_ctx->start();
+  try {
+    _io_ctx->start();
+  } catch (std::exception const& e) {
+    throw std::runtime_error(std::string{"[sirius_scan_manager] failed to start mandatory "} +
+                             to_string(_io_ctx->type()) + " io_context: " + e.what());
+  }
 
   // The `[uring_gauges]` DEBUG sampler polls the uring reactors' gauges; it only
   // does work while the log sink accepts DEBUG.
@@ -1737,7 +1778,10 @@ void sirius_scan_manager::prepare_for_query(
     auto const backend = select_readahead_backend(backend_policies);
     auto const plan    = _config.resolve_readahead(backend.budget, backend.strategy);
 
-    if (plan.budget > 0) {
+    // A budget override cannot make an ineligible backend fill a cache. Do not
+    // subscribe or start a worker for cuFile-only queries, failed pinned
+    // caches, or queries that advertise no IO backend at all.
+    if (!backend_policies.empty() && plan.budget > 0) {
       // Registers its mailbox for the query's lifetime; unregistered in reset().
       state->readahead = std::make_shared<readahead_scan_manager>(*_query_event_publisher,
                                                                   plan.budget,
@@ -2488,7 +2532,7 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
                                           : std::optional<s3_config_snapshot>{};
   auto const config_id                = snapshot ? snapshot->id : 0;
   auto const cache_key                = routed_ioctx_key{type, config_id};
-  // The local default `_io_ctx` already serves uring; only an off-default
+  // The local default `_io_ctx` already serves uring/cufile; only an off-default
   // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
   if (_io_ctx && _io_ctx->type() == type && !snapshot) { return _io_ctx; }
 
@@ -2541,11 +2585,25 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   auto const failed = _failed_io_ctxs.find(cache_key);
   if (failed != _failed_io_ctxs.end() && failed->second) { return nullptr; }
   ioctx_build build;
+  // A start or cache-allocation failure is transient, unlike a factory decline: log its cause and
+  // rethrow, caching nothing. The partially started context is torn down when it goes out of
+  // scope; the next lookup of this key rebuilds it.
+  auto const log_start_failure = [type](std::exception const& e) {
+    SIRIUS_LOG_ERROR("[sirius_scan_manager] {} backend failed to start or initialize its cache: {}",
+                     to_string(type),
+                     e.what());
+  };
   auto const build_and_start = [&] {
     build = make_ioctx_or_explain(type,
                                   snapshot ? snapshot->config.get() : nullptr,
                                   /*explain=*/failed == _failed_io_ctxs.end());
-    if (build.io_ctx) { build.io_ctx->start(); }
+    if (!build.io_ctx) { return; }
+    try {
+      build.io_ctx->start();
+    } catch (std::exception const& e) {
+      log_start_failure(e);
+      throw;
+    }
   };
   // A REST pool plans its reactor placement from the building thread's mask and its reactors
   // inherit it. First use may come from a pool thread whose mask excludes the CPUs reserved for
@@ -2563,7 +2621,12 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
     return nullptr;
   }
   _failed_io_ctxs.erase(cache_key);
-  init_cache_for(*io_ctx);
+  try {
+    init_cache_for(*io_ctx);
+  } catch (std::exception const& e) {
+    log_start_failure(e);
+    throw;
+  }
   if (!cached) { return std::move(io_ctx); }
   std::shared_ptr<cucascade::io::ioctx> kept;
   {
@@ -2674,6 +2737,13 @@ sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
         return {.cause = "no HOST-tier memory space for pinned staging", .by_configuration = false};
       }
       return {.cause = "invalid uring configuration (check uring.n_max_concurrent_scans)",
+              .by_configuration = false};
+    case cucascade::io::io_context_type::cufile:
+      return {.cause =
+                "cuFile reader could not be constructed (requires cuCascade built with "
+                "CUCASCADE_HAS_CUFILE; check cufile.devices, cufile.lanes and "
+                "cufile.lane_bytes). It requires libcufile with an openable driver and a "
+                "usable io_uring",
               .by_configuration = false};
     case cucascade::io::io_context_type::s3rdma: break;
   }
@@ -4536,6 +4606,88 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
     }
   }
   return std::nullopt;
+}
+
+void reserve_cufile_arenas(scan_manager_config const& config,
+                           std::span<int const> gpu_ids,
+                           bool spills_through_cufile,
+                           std::span<std::size_t const> pool_bytes)
+{
+#ifdef CUCASCADE_HAS_CUFILE
+  namespace cufile = cucascade::io::cufile;
+  if (config.backend == io_backend::cufile) {
+    // Mandatory: the scan context needs it.  Its shape is the scan's alone.
+    auto const cfg = config.resolved_cufile(gpu_ids);
+    for (int const gpu : cfg.devices) {
+      cufile::reserve_arena(gpu, cfg);
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager] reserved the cuFile arena on GPU {} ahead of its memory pool, for "
+        "scans: {} MiB outside RMM",
+        gpu,
+        cfg.arena_bytes() >> 20);
+    }
+  }
+  if (!spills_through_cufile) { return; }
+  // Optional: the DISK tier's shared cuFile context runs with cuCascade's defaults and takes the
+  // GPU's arena when it covers that shape (the scan's does with the default block).  Otherwise
+  // the GPU gets one arena covering both; when that cannot be allocated now, the first spill
+  // tries again and spills through io_uring if it fails too.
+  auto const spill = cucascade::io::io_config{}.cufile;
+  if (config.backend == io_backend::cufile &&
+      config.cufile.register_per_slot != spill.register_per_slot) {
+    // An arena covering both would be registered the spills' way, which the scan arena does not
+    // cover: its replacement would leave the scan context to allocate again after the pools.
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager] cufile.register_per_slot differs from the DISK tier's cuFile context; "
+      "no arena is reserved for spills ahead of the memory pools (the first spill through cuFile "
+      "takes one, or spills through io_uring)");
+    return;
+  }
+  for (std::size_t i = 0; i < gpu_ids.size(); ++i) {
+    int const gpu = gpu_ids[i];
+    try {
+      // The spills' arena is only worth taking while the GPU's pool, primed with its whole
+      // capacity once the arenas are taken, still fits beside what taking it allocates: nothing
+      // when the GPU's arena (the scan's) covers the spills, else an arena covering both, which
+      // is allocated while the GPU still holds the scan's.
+      auto const needed = i < pool_bytes.size() ? cufile::arena_bytes_to_reserve(gpu, spill) : 0;
+      if (needed != 0) {
+        rmm::cuda_set_device_raii const device{rmm::cuda_device_id{gpu}};
+        auto const free = rmm::available_device_memory().first;
+        if (free < pool_bytes[i] || free - pool_bytes[i] < needed) {
+          SIRIUS_LOG_WARN(
+            "[sirius_scan_manager] no cuFile arena is reserved for spills on GPU {}: the {} MiB "
+            "it takes would leave {} MiB free, less than its memory pool's {} MiB (the GPU keeps "
+            "the arena it has; the first spill through cuFile tries again, and spills through "
+            "io_uring if that fails)",
+            gpu,
+            needed >> 20,
+            (free > needed ? free - needed : 0) >> 20,
+            pool_bytes[i] >> 20);
+          continue;
+        }
+      }
+      cufile::reserve_arena(gpu, spill);
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager] the cuFile arena on GPU {} serves spills too (at least {} MiB "
+        "outside RMM)",
+        gpu,
+        spill.arena_bytes() >> 20);
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[sirius_scan_manager] cannot reserve a cuFile arena for spills on GPU {} ahead of its "
+        "memory pool ({}); the first spill through cuFile tries again, and spills through io_uring "
+        "if that fails",
+        gpu,
+        e.what());
+    }
+  }
+#else
+  (void)config;
+  (void)gpu_ids;
+  (void)spills_through_cufile;
+  (void)pool_bytes;
+#endif
 }
 
 }  // namespace sirius::scan_manager

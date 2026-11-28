@@ -24,7 +24,7 @@
 
 namespace sirius::io {
 
-/// Resolves the ioctx that serves a given file path (s3:// -> rest, local -> uring).
+/// Resolves the serving ioctx: local -> uring/cufile; s3:// -> REST.
 /// Returns a valid ioctx or throws if no backend supports the path.
 using ioctx_resolver = std::function<std::shared_ptr<cucascade::io::ioctx>(std::string_view)>;
 

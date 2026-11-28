@@ -442,6 +442,7 @@ TEST_CASE("every key of a configuration reaches its runtime field", "[config][co
       CHECK(k->disk_id == 1);
       CHECK(k->memory_capacity == 2 * TiB);
       CHECK(k->mount_paths == "/tmp");
+      CHECK_FALSE(k->allow_gds);
     }
   }
   CHECK(gpus == 1);
@@ -470,11 +471,23 @@ TEST_CASE("every key of a configuration reaches its runtime field", "[config][co
   CHECK(sm.httpfs_external_file_cache);
   CHECK(sm.max_readahead_scans == 5);
   CHECK(sm.readahead_strategy == sirius::scan_manager::prefetch_strategy::opportunistic);
+  CHECK(sm.cufile_bulk_read == sirius::scan_manager::cufile_bulk_read_mode::off);
 
   CHECK(sm.uring.n_max_concurrent_scans == 7);
   CHECK(sm.uring.n_max_concurrent_scans_explicit);
   CHECK(sm.uring.slices_per_pass == 8);
   CHECK(sm.uring.range_batch_slices == 4);
+
+  CHECK(sm.cufile.lanes == 16);
+  CHECK(sm.cufile.lane_bytes == 4 * MiB);
+  CHECK(sm.cufile.coalesce_gap_bytes == 256 * KiB);
+  CHECK(sm.cufile.coalesce_gap_ratio == 0.25);
+  CHECK(sm.cufile.read_slots_per_lane == 3);
+  CHECK_FALSE(sm.cufile.register_per_slot);
+  CHECK_FALSE(sm.cufile.high_priority_copies);
+  CHECK_FALSE(sm.cufile.async_copies);
+  CHECK(sm.cufile.copy_poll_us == 20);
+  CHECK(sm.cufile.devices == std::vector<int>{0});
 
   auto const& r = sm.rest;
   CHECK(r.n_max_concurrent_scans == 12);

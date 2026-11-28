@@ -19,6 +19,8 @@
 #include "log/logging.hpp"
 
 #include <cucascade/exec/thread_util.hpp>
+#include <sched.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <exception>
@@ -97,5 +99,47 @@ void run_with_affinity(std::span<int const> cpus, F&& work)
   runner.join();
   if (error) { std::rethrow_exception(error); }
 }
+
+/// The CPUs the process may run on: the affinity of its main thread, which is what taskset,
+/// numactl and a container's cpuset set. Empty when it cannot be read.
+[[nodiscard]] inline std::vector<int> process_affinity() noexcept
+{
+  cpu_set_t mask{};
+  if (::sched_getaffinity(::getpid(), sizeof(mask), &mask) != 0) { return {}; }
+  std::vector<int> ids;
+  try {
+    for (int i = 0; i < CPU_SETSIZE; ++i) {
+      if (CPU_ISSET(static_cast<std::size_t>(i), &mask)) { ids.push_back(i); }
+    }
+  } catch (...) {
+    return {};
+  }
+  return ids;
+}
+
+/// Runs the calling thread with the process's affinity for the guard's lifetime, then restores
+/// its own. An embedder may call into Sirius from a thread it pinned to one core (DuckDB pins
+/// its workers on hosts with more than 64 cores); everything planned from, or started on, such
+/// a thread would otherwise inherit that single core.
+class scoped_process_affinity {
+ public:
+  scoped_process_affinity() : _saved(thread_util::get_current_thread_affinity())
+  {
+    auto const wide = process_affinity();
+    if (_saved.empty() || wide.empty() || wide == _saved ||
+        !thread_util::set_current_thread_affinity(wide)) {
+      _saved.clear();
+    }
+  }
+  ~scoped_process_affinity()
+  {
+    if (!_saved.empty()) { std::ignore = thread_util::set_current_thread_affinity(_saved); }
+  }
+  scoped_process_affinity(scoped_process_affinity const&)            = delete;
+  scoped_process_affinity& operator=(scoped_process_affinity const&) = delete;
+
+ private:
+  std::vector<int> _saved;
+};
 
 }  // namespace sirius::exec

@@ -23,12 +23,14 @@
 #include "scan_manager/preparation_options.hpp"
 
 #include <cucascade/io/config.hpp>
+#include <cucascade/io/cufile/config.hpp>
 
 #include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -117,10 +119,23 @@ inline bool enum_to_string(prefetch_strategy s, std::string& out)
   return false;
 }
 
+/// Whether cuFile-backed Parquet scans read each file's column chunks of a split in one
+/// vectored device request (the bulk route of @c materialize_parquet) instead of cuDF's
+/// general reader, which issues one request per contiguous run of chunks.  cuCascade's cuFile
+/// lanes only coalesce the slices of one request, so the bulk route is what lets them coalesce.
+enum class cufile_bulk_read_mode {
+  /// Bulk for cuFile scans (the default).
+  on,
+  /// Never: cuFile scans keep cuDF's general reader.
+  off,
+};
+
 /// IO backend that serves managed reads.
 enum class io_backend {
   /// cuCascade's native IO stack: uring for local paths, REST for @c s3:// URLs.
   native,
+  /// cuFile for local files, REST for @c s3:// URLs.
+  cufile,
 };
 
 /// Parse a @ref io_backend from its lowercase YAML spelling.  @c "sirius" is the
@@ -128,7 +143,9 @@ enum class io_backend {
 inline bool string_to_enum(std::string_view sv, io_backend& out)
 {
   static const std::unordered_map<std::string_view, io_backend> map = {
-    {"native", io_backend::native}, {"sirius", io_backend::native},  // deprecated alias
+    {"native", io_backend::native},
+    {"sirius", io_backend::native},  // deprecated alias
+    {"cufile", io_backend::cufile},
   };
   auto it = map.find(sv);
   if (it != map.end()) {
@@ -143,6 +160,7 @@ inline bool enum_to_string(io_backend b, std::string& s)
 {
   switch (b) {
     case io_backend::native: s = "native"; return true;
+    case io_backend::cufile: s = "cufile"; return true;
   }
   return false;
 }
@@ -212,10 +230,12 @@ struct memory_prefetcher_config {
  *
  * @c backend selects the IO stack: @ref io_backend::native routes local paths
  * to @c uring_ioctx and @c s3:// URLs to the REST backend (cuCascade's native
- * io_uring HTTP/1.1 transport with kTLS or user-space TLS). Object-store LIST
- * and glob use the same REST backend. Reads go through
+ * io_uring HTTP/1.1 transport with kTLS or user-space TLS); @ref io_backend::cufile
+ * uses cuFile for local files and the same REST backend for @c s3://. Object-store
+ * LIST and glob use the REST backend either way. Reads go through
  * @c cucascade::io::datasource. Raw HTTP(S) URLs are unsupported; use @c s3://
- * paths with an object-store endpoint instead.
+ * paths with an object-store endpoint instead. Both backends serve every
+ * configured GPU.
  *
  * The backend sub-configs are cuCascade's own structs; @ref to_io_config hands
  * them to the @c cucascade::io::io_context_registry.
@@ -227,6 +247,7 @@ struct memory_prefetcher_config {
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
+ *  - @c cufile  — local cuFile read tunables (no fs_cache or cache-driven readahead).
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -240,8 +261,10 @@ struct scan_manager_config {
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::native};
 
-  /// Number of uring reactors for the local-disk IO path (each one worker thread
-  /// and one ring; each allocates its pinned staging at @c ioctx::start()).
+  /// Number of uring read reactors for the local-disk IO path, spread over the GPUs Sirius
+  /// reads into: `max(1, uring_n_reactors / #GPUs)` per GPU (each one worker thread and one
+  /// ring; each allocates its pinned staging at @c ioctx::start()).  Every GPU also gets one
+  /// write reactor, started by its first write.
   std::size_t uring_n_reactors{default_uring_n_reactors};
 
   /// Number of REST reactors for the S3/object-store IO path (each one worker
@@ -271,6 +294,11 @@ struct scan_manager_config {
   /// Default CPU mask for lazy control/native workers, excluding reserved reactor CPUs.
   /// Independent of the metadata pool's explicit cpu_affinity override.
   std::vector<int> worker_startup_cpus;
+
+  /// Read route of cuFile-backed Parquet scans (see @ref cufile_bulk_read_mode and
+  /// @ref reads_cufile_in_bulk).  YAML @c cufile_bulk_read: @c on | @c off (@c auto is
+  /// accepted as @c on).
+  cufile_bulk_read_mode cufile_bulk_read{cufile_bulk_read_mode::on};
 
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:
@@ -306,6 +334,10 @@ struct scan_manager_config {
   /// @c min_segment_bytes / @c max_segment_bytes.
   cucascade::io::rest::config rest{};
 
+  /// Local cuFile read tunables. cuFile cannot use fs_cache, so cache-driven
+  /// readahead is disabled independently of cache.mode for these reads.
+  cucascade::io::cufile::config cufile{};
+
   /// The read path's caching configuration: mode, eviction policy and the
   /// prefetching cache's tunables.  One block, rather than a mode here and the
   /// tunables in a sibling one.
@@ -318,6 +350,13 @@ struct scan_manager_config {
   /// Background host->GPU memory prefetcher for queued pinned-cache scan
   /// splits. Disabled by default.
   memory_prefetcher_config memory_prefetcher{};
+
+  /// Whether cuFile-backed Parquet scans take the bulk route (see @ref cufile_bulk_read).
+  /// Only meaningful with @c backend: cufile.
+  [[nodiscard]] bool reads_cufile_in_bulk() const noexcept
+  {
+    return cufile_bulk_read != cufile_bulk_read_mode::off;
+  }
 
   /// Refresh the knobs derived from @ref cache.
   void apply_cache_mode() noexcept
@@ -334,14 +373,48 @@ struct scan_manager_config {
     cucascade::io::io_config out{};
     switch (backend) {
       case io_backend::native: out.backend = cucascade::io::io_backend::native; break;
+      case io_backend::cufile: out.backend = cucascade::io::io_backend::cufile; break;
     }
     out.uring_n_reactors = uring_n_reactors;
     out.rest_n_reactors  = rest_n_reactors;
-    out.uring            = uring;
-    out.rest             = rest;
-    out.cache            = cache;
-    out.object_store     = object_store;
+#ifdef CUCASCADE_HAS_CUFILE
+    out.cufile = cufile;
+#endif
+    out.uring        = uring;
+    out.rest         = rest;
+    out.cache        = cache;
+    out.object_store = object_store;
     out.apply_cache_mode();
+    return out;
+  }
+
+  /// The cuFile configuration the default cufile context is built with: @ref cufile,
+  /// with an empty @c devices list narrowed to @p gpu_ids (the GPUs Sirius reads
+  /// into), so a reactor and its arena exist only on those.
+  ///
+  /// @throws std::invalid_argument when @c cufile.devices is not @p gpu_ids (in any
+  ///         order): a GPU outside them would hold a reactor and arena that serve no
+  ///         read, and scans are placed on every one of them, while a device read on a
+  ///         GPU the context does not serve fails.
+  [[nodiscard]] cucascade::io::cufile::config resolved_cufile(std::span<int const> gpu_ids) const
+  {
+    auto out = cufile;
+    if (out.devices.empty()) {
+      out.devices.assign(gpu_ids.begin(), gpu_ids.end());
+      return out;
+    }
+    for (int const device : out.devices) {
+      if (std::ranges::find(gpu_ids, device) == gpu_ids.end()) {
+        throw std::invalid_argument("'cufile.devices': GPU " + std::to_string(device) +
+                                    " is not one Sirius reads into");
+      }
+    }
+    for (int const device : gpu_ids) {
+      if (std::ranges::find(out.devices, device) == out.devices.end()) {
+        throw std::invalid_argument("'cufile.devices': must list GPU " + std::to_string(device) +
+                                    " too: Sirius places scans on every GPU it reads into");
+      }
+    }
     return out;
   }
 
@@ -395,10 +468,34 @@ inline int resolve_scan_manager_num_threads(scan_manager_config const& config, s
   return std::max(workers, static_cast<int>(domains));
 }
 
+/// Whether the cuFile arena @p cfg asks for ((read_slots_per_lane + 1) x lanes x lane_bytes
+/// bytes) is representable.
+[[nodiscard]] inline bool cufile_arena_fits(cucascade::io::cufile::config const& cfg) noexcept
+{
+  std::size_t slots = 0;
+  std::size_t bytes = 0;
+  return !__builtin_add_overflow(cfg.read_slots_per_lane, std::size_t{1}, &slots) &&
+         !__builtin_mul_overflow(slots, cfg.lanes, &slots) &&
+         !__builtin_mul_overflow(slots, cfg.lane_bytes, &bytes);
+}
+
 // Validate before any pool/reactor starts. Both defaults and explicit C++ overrides use this path.
 inline scan_manager_config validate_scan_manager_config(scan_manager_config config)
 {
   (void)config.preparation.resolve(config.thread_pool.num_threads);
+  if (config.cufile.lanes == 0) { throw std::invalid_argument("'cufile.lanes': must be positive"); }
+  if (config.cufile.read_slots_per_lane == 0) {
+    throw std::invalid_argument("'cufile.read_slots_per_lane': must be positive");
+  }
+  if (config.cufile.lane_bytes == 0 ||
+      config.cufile.lane_bytes % cucascade::io::IO_BLOCK_SIZE != 0) {
+    throw std::invalid_argument("'cufile.lane_bytes': must be a positive multiple of 4 KiB");
+  }
+  if (!cufile_arena_fits(config.cufile)) {
+    throw std::invalid_argument(
+      "'cufile.read_slots_per_lane': the arena ((read_slots_per_lane + 1) x lanes x lane_bytes) "
+      "is larger than the address space");
+  }
   return config;
 }
 }  // namespace sirius::scan_manager

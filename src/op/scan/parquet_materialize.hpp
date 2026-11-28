@@ -88,14 +88,15 @@ class column_chunk_range_cache {
 ///
 /// Takes one of two routes, picked from what the backend says it wants:
 ///
-///   bulk    - when every source's backend reports @c prefers_bulk_io().  One
-///             logical vectored read per source, straight into that source's
-///             own device buffers; the backend may serve it from cache or split
-///             it into physical reads.  The table is decoded from those buffers
-///             by the hybrid scan reader — @c hybrid_scan_reader for one
-///             source, @c hybrid_scan_multifile for several.  Handing over a
-///             source's ranges together is what lets an object-store backend
-///             fuse them and keep its connections busy.
+///   bulk    - when every source's context prefers it (@c sirius::io::prefers_bulk_read:
+///             the backend's @c prefers_bulk_io(), i.e. REST, or a cuFile context with
+///             @c scan_manager.cufile_bulk_read on).  One logical vectored read per
+///             source, straight into that source's own device buffers; the backend
+///             may serve it from cache or split it into physical reads.  The table is
+///             decoded from those buffers by the hybrid scan reader —
+///             @c hybrid_scan_reader for one source, @c hybrid_scan_multifile for
+///             several.  Handing over a source's ranges together is what lets an
+///             object-store backend fuse them and keep its connections busy.
 ///
 ///   general - otherwise.  cudf::io::read_parquet over the datasources and
 ///             their pre-parsed footers, which reads as it decodes.

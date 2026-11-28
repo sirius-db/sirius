@@ -91,6 +91,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
+#include "exec/thread_util.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
@@ -4323,6 +4324,11 @@ static void LoadInternal(ExtensionLoader& loader)
 
   auto& db     = loader.GetDatabaseInstance();
   auto& config = DBConfig::GetConfig(db);
+
+  // DuckDB may run LOAD on a worker it pinned to one core. The configuration plans CPU
+  // placement from the calling thread's mask and every Sirius thread inherits it, so read the
+  // configuration and start the runtime with the process's affinity instead.
+  sirius::exec::scoped_process_affinity const process_affinity;
 
   // SIRIUS_DISABLE means: no Sirius runtime initialization and no mask
   // publication (the extension binary itself may still be loaded).

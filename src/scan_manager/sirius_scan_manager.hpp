@@ -21,6 +21,7 @@
 #include "event/query_event_publisher.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
+#include "io/bulk_read.hpp"
 #include "io/scoped_object_store_configs.hpp"
 #include "late_mat/column_origin.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
@@ -86,6 +87,7 @@ class fixed_size_host_memory_resource;
 namespace cucascade::memory {
 class memory_reservation_manager;
 class topology_index;
+struct system_topology_info;
 }  // namespace cucascade::memory
 
 namespace sirius::memory {
@@ -517,7 +519,7 @@ class sirius_scan_manager {
    * @brief Construct a new scan manager.
    *
    * The scan_manager owns a default ioctx for local paths (@c uring_ioctx with
-   * backend=native), built by the
+   * backend=native, @c cufile_ioctx with backend=cufile), built by the
    * @c cucascade::io::io_context_registry from @p config, plus the backends other
    * paths route to (e.g. the REST ioctx for @c s3://), built lazily on first use.
    * Each ioctx carries its own prefetching cache when @c cache.mode is @c cucs.
@@ -569,8 +571,8 @@ class sirius_scan_manager {
   ///
   /// Registers a NEW per-query state entry keyed by @p query 's id; it does NOT touch any
   /// other query's entry. Call reset(query_id) when the query finishes. A query with no GPU
-  /// scan operators registers no active scan work; it retains only a configured readahead
-  /// subscription, when present, so cleanup can stop it.
+  /// scan operators registers no active scan work or readahead subscription, regardless of
+  /// an explicit readahead budget: no advertised backend can make use of it.
   ///
   /// @param query                           The query whose scan operators must be prepared.
   /// @param enable_pinned_zone_map_pruning  Per-query snapshot of the serve-side pruning flag (the
@@ -930,7 +932,7 @@ class sirius_scan_manager {
                                  std::optional<std::vector<std::string>> const& cols);
 
   /// \brief Process-wide ioctx used to mint @c cucascade::io::datasource instances.
-  ///        Holds the configured local @c uring_ioctx.
+  ///        Holds the configured local @c uring_ioctx or @c cufile_ioctx.
   [[nodiscard]] cucascade::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   /// \brief Shared ownership of the process-wide ioctx (see @ref io_ctx), for callers
@@ -1178,7 +1180,7 @@ class sirius_scan_manager {
   /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
   /// building it once per backend on first use.  Routes by path through the registry
   /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
-  /// is uring.  Returns nullptr when no backend supports the path.
+  /// is uring/cufile.  Returns nullptr when no backend supports the path.
   /// @throws std::invalid_argument for a raw `http://` / `https://` URL (use `s3://`).
   /// Building a REST context may drop idle ones. They go to @p retired when it is set, for a
   /// caller that holds a lock of its own across the call and must destroy them after
@@ -1189,7 +1191,8 @@ class sirius_scan_manager {
 
   /// Resolve the ioctx of @p type, building and caching it on first use (the
   /// by-path routing above resolves to a type and then lands here).  Returns
-  /// nullptr when the registry cannot build that backend.  A REST context is built
+  /// nullptr when the registry cannot build that backend; throws (without caching
+  /// the failure) when a built backend fails to start.  A REST context is built
   /// for @p planned when set, else for the S3 configuration @p path maps to now.
   /// @p retired as in @ref ioctx_for_path.
   std::shared_ptr<cucascade::io::ioctx> ioctx_for_type(cucascade::io::io_context_type type,
@@ -1269,6 +1272,10 @@ class sirius_scan_manager {
   native_reader_executor _native_readers;
   coordinator_pool _coordinators;
   std::shared_ptr<cucascade::io::ioctx> _io_ctx;
+  /// Asks for the bulk Parquet read route on `_io_ctx` when it is the cuFile context and
+  /// `cufile_bulk_read` resolves to on (see sirius::io::prefers_bulk_read).  Declared after
+  /// `_io_ctx`, so it is withdrawn before the context is released.
+  sirius::io::bulk_read_registration _cufile_bulk_read;
   /// `[uring_gauges]` DEBUG sampler of `_io_ctx` when it is a uring ioctx (null
   /// otherwise).  Stopped in @ref stop, before any ioctx is released.
   std::unique_ptr<uring_gauges_sampler> _uring_gauges_sampler;
@@ -1404,5 +1411,40 @@ class sirius_scan_manager {
 
   cucascade::io::io_context_registry _ioctx_registry;
 };
+
+/**
+ * @brief Reserve the registered cuFile arena of each GPU Sirius reads into for the
+ *        default cufile context and for spills through cuCascade's shared cuFile DISK
+ *        context, before the GPU memory pools claim the devices.
+ *
+ * A cuFile reactor's arena is allocated with @c cudaMalloc outside RMM
+ * (@c cufile::config::arena_bytes(): @c cufile.lane_bytes for each of
+ * @c cufile.read_slots_per_lane read slots and one write slot per lane) and kept for the
+ * life of the process.  A context takes it when it starts, which is after the memory
+ * manager's pools took their share of each GPU (for the DISK context: at the first
+ * spill); called first, this takes the arenas for @p gpu_ids while the memory is still
+ * free, and every context on the GPU the arena covers (see @c cufile::reserve_arena) then
+ * shares them.  Does nothing unless @c backend is @c cufile or @p spills_through_cufile.
+ *
+ * The scan reservation is mandatory and throws when it fails.  The spill reservation is
+ * optional: it asks for an arena covering the DISK context's shape (cuCascade's default
+ * @c cufile::config), which the scan arena already is with the default @c cufile block;
+ * when it cannot be had -- or when @c cufile.register_per_slot differs from the DISK
+ * context's, since replacing the scan arena would leave the scan context to allocate again
+ * after the pools -- a warning is logged and the first spill tries again (and spills
+ * through io_uring if that fails too).
+ *
+ * @param config The scan manager configuration the default context is built from.
+ * @param gpu_ids The GPUs Sirius reads into (the default for @c cufile.devices).
+ * @param spills_through_cufile Whether a DISK space adopts the shared cuFile context
+ *        (it allows GDS and its mount serves GDS: @c cucascade::disk_mount_uses_gds).
+ * @param pool_bytes The capacity of each GPU's memory pool, in @p gpu_ids' order, which is
+ *        primed whole once the arenas are taken.  The spills' arena is not reserved (nor the
+ *        scan arena grown for it) on a GPU whose free memory would then no longer hold its pool.
+ */
+void reserve_cufile_arenas(scan_manager_config const& config,
+                           std::span<int const> gpu_ids,
+                           bool spills_through_cufile              = false,
+                           std::span<std::size_t const> pool_bytes = {});
 
 }  // namespace sirius::scan_manager
