@@ -30,6 +30,7 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <algorithm>
 #include <array>
 #include <future>
 #include <limits>
@@ -545,8 +546,8 @@ TEST_CASE("Results keep backing after plan and attempt owners finish", "[scan_pr
   CHECK_THROWS_AS(owner.consume(), std::logic_error);
   attempt->register_unit({1, 1}, 20);
   auto permit = attempt->acquire_permit({1, 1});
-  auto block  = attempt->allocator(permit).allocate_retained(16);
-  auto* p     = reinterpret_cast<int64_t*>(block.data());
+  auto block  = attempt->allocator(permit).allocate_retained_blocks(16);
+  auto* p     = reinterpret_cast<int64_t*>(block.blocks().front());
   p[0]        = 2;
   p[1]        = 9;
   auto result =
@@ -666,6 +667,101 @@ TEST_CASE("HOST adapter allocates real reserved blocks and returns them after th
   retained.release();
   CHECK(manager.get_active_reservation_count() == 0);
   CHECK(resource->get_free_blocks() == initial_free);
+}
+
+TEST_CASE("HOST adapter serves a multi-block request from blocks that are not adjacent",
+          "[scan_preparation][ledger][host]")
+{
+  cucascade::memory::host_memory_space_config config;
+  config.numa_id = 0;
+  // One 16-block pool; the capacity leaves the reservation room beside the blocks held below.
+  config.memory_capacity      = 32 * 1024;
+  config.block_size           = 1024;
+  config.pool_size            = 16;
+  config.initial_number_pools = 1;
+  cucascade::memory::memory_reservation_manager manager({config});
+  auto* resource = manager.get_memory_space(cucascade::memory::Tier::HOST, 0)
+                     ->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  // A pool that has been in use: only four blocks are free and no two of them are neighbours,
+  // whatever order the pool hands them out in.
+  std::vector<decltype(resource->allocate_multiple_blocks(1024))> held;
+  for (auto blocks = resource->get_free_blocks(); blocks > 0; --blocks)
+    held.push_back(resource->allocate_multiple_blocks(1024));
+  REQUIRE(held.size() == 16);
+  std::sort(held.begin(), held.end(), [](auto const& a, auto const& b) {
+    return a->get_blocks().front() < b->get_blocks().front();
+  });
+  for (auto index : {0, 2, 4, 6})
+    held[static_cast<size_t>(index)].reset();
+  auto initial_free = resource->get_free_blocks();
+  REQUIRE(initial_free == 4);
+  host_reservation_provider provider(manager);
+  std::array<scan_envelope, 1> envelope{scan_envelope{{{{2048}, 2048}}, {}, true}};
+  preparation_ledger ledger(provider);
+  REQUIRE(ledger.admit(envelope, host).deferred);
+  ledger.register_unit({1, 1}, 2048);
+  auto permit    = ledger.acquire_permit({1, 1});
+  auto allocator = ledger.allocator(permit);
+  // The contiguous form needs neighbours; it finds none and returns its charge.
+  CHECK_THROWS_AS(allocator.allocate_retained(2048), preparation_resource_error);
+  CHECK(ledger.allocation_failures() == 1);
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
+  auto retained = allocator.allocate_retained_blocks(2048);
+  REQUIRE(retained.blocks().size() == 2);
+  CHECK(retained.block_size() == 1024);
+  CHECK(retained.blocks()[0] + 1024 != retained.blocks()[1]);
+  CHECK(retained.blocks()[1] + 1024 != retained.blocks()[0]);
+  CHECK(ledger.charged_bytes({1, 1}) == 2048);
+  auto temporary = allocator.allocate_blocks(2048);
+  CHECK(temporary.blocks().size() == 2);
+  CHECK(ledger.allocation_failures() == 1);
+  CHECK(resource->get_free_blocks() == initial_free - 4);
+  temporary.release();
+  retained.release();
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
+  CHECK(resource->get_free_blocks() == initial_free);
+}
+
+TEST_CASE("A block allocation that cannot hold the request fails and returns its charge",
+          "[scan_preparation][ledger]")
+{
+  // What the backing hands back for 16 bytes: one block too few, a null block, a zero block
+  // size, no owner.
+  auto fault = GENERATE(0, 1, 2, 3);
+  struct faulty_backing : reservation_backing {
+    explicit faulty_backing(int fault) : fault(fault) {}
+    uint64_t charge_size(uint64_t bytes) const override { return bytes; }
+    backing_allocation allocate(uint64_t) override { return {}; }
+    backing_blocks allocate_blocks(uint64_t) override
+    {
+      auto owner = std::make_shared<std::array<std::byte, 16>>();
+      backing_blocks result{{owner->data(), owner->data() + 8}, 8, owner};
+      if (fault == 0) result.blocks.pop_back();
+      if (fault == 1) result.blocks.back() = nullptr;
+      if (fault == 2) result.block_size = 0;
+      if (fault == 3) result.owner.reset();
+      return result;
+    }
+    int fault;
+  };
+  struct faulty_provider : reservation_provider {
+    std::optional<reservation_grant> request(memory_space_id space, uint64_t bytes) override
+    {
+      return reservation_grant{bytes, space, std::make_shared<faulty_backing>(fault)};
+    }
+    int fault = 0;
+  } provider;
+  provider.fault = fault;
+  preparation_ledger ledger(provider);
+  std::array<scan_envelope, 1> envelope{scan_envelope{{{{16}, 16}}, {}, true}};
+  REQUIRE(ledger.admit(envelope, host).deferred);
+  ledger.register_unit({1, 1}, 16);
+  auto permit    = ledger.acquire_permit({1, 1});
+  auto allocator = ledger.allocator(permit);
+  CHECK_THROWS_AS(allocator.allocate_retained_blocks(16), preparation_resource_error);
+  CHECK_THROWS_AS(allocator.allocate_blocks(16), preparation_resource_error);
+  CHECK(ledger.allocation_failures() == 2);
+  CHECK(ledger.charged_bytes(permit) == 0);
 }
 
 TEST_CASE("Closing during allocation keeps the grant alive until the allocation and result exit",
@@ -1015,8 +1111,8 @@ TEST_CASE("Charged DV descriptor names outlive the plan through the last publish
   auto claim   = attempt->try_claim();
   auto job     = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(std::move(claim));
   job->commit();
-  auto allocation = job->allocator().allocate_retained(16);
-  auto* values    = reinterpret_cast<int64_t*>(allocation.data());
+  auto allocation = job->allocator().allocate_retained_blocks(16);
+  auto* values    = reinterpret_cast<int64_t*>(allocation.blocks().front());
   values[0]       = 1;
   values[1]       = 3;
   auto result     = std::make_shared<iceberg_delete_set const>(

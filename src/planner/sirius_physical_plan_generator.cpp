@@ -81,6 +81,7 @@
 #include "planner/build_side_choice.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/distributed_plan.hpp"
+#include "planner/gpu_admission.hpp"
 #include "planner/mark_join_conversion.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
@@ -446,8 +447,9 @@ void widen_scan_for_equality_keys(sirius::op::scan::parquet_ingestible_table_inf
 
 namespace {
 
-//! Load a scan's delete payload. Equality-delete tables are built here, at plan time, for the one
-//! GPU the plan gate admitted: on its device, from its memory space, on one of its streams.
+//! Load a scan's delete payload. Equality-delete tables are built here, at plan time, once for
+//! each GPU the query can be admitted to: on its device, from its memory space, on one of its
+//! streams. A scan's batches land on any of those GPUs.
 std::shared_ptr<const sirius::op::scan::IcebergDeleteData> load_scan_delete_payload(
   duckdb::ClientContext& context,
   duckdb::SiriusContext& sirius_ctx,
@@ -461,15 +463,21 @@ std::shared_ptr<const sirius::op::scan::IcebergDeleteData> load_scan_delete_payl
     return sirius::op::scan::load_delete_payload(context, table_path, ioctx, discovery);
   auto const spaces =
     sirius_ctx.get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-  if (spaces.size() != 1) {
+  // Admission takes a prefix of the sorted GPUs no longer than `topology.gpus_per_query`, then
+  // may shorten it by an estimate that needs the finished plan. No task runs past that prefix,
+  // and the tables of the GPUs the estimate leaves out are released when it is made.
+  std::vector<int> admissible;
+  for (auto const* space : spaces)
+    if (space) admissible.push_back(space->get_device_id());
+  std::sort(admissible.begin(), admissible.end());
+  admissible.erase(std::unique(admissible.begin(), admissible.end()), admissible.end());
+  admissible =
+    sirius::planner::apply_gpu_cap(std::move(admissible), sirius_ctx.get_config().gpus_per_query());
+  if (admissible.empty()) {
     throw duckdb::NotImplementedException(
-      "iceberg_scan with equality deletes builds its delete tables for one GPU, but %llu are "
-      "configured",
-      static_cast<unsigned long long>(spaces.size()));
+      "iceberg_scan with equality deletes builds its delete tables on a GPU, but none is "
+      "configured");
   }
-  auto const& space = *spaces.front();
-  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space.get_device_id()}};
-  auto stream = sirius::memory::runtime_stream_pool::acquire(space);
   // A remote delete file opens with the configuration this statement planned for it. A context
   // built for a configuration its path has since left belongs to this load, so keep one each.
   // The load may be the last reader of the others, and an execution need not follow it: once
@@ -490,13 +498,23 @@ std::shared_ptr<const sirius::op::scan::IcebergDeleteData> load_scan_delete_payl
     if (!io_ctx) { io_ctx = scan_manager.io_ctx_for(path, &planned->second); }
     return io_ctx;
   };
+  std::vector<sirius::memory::runtime_stream_pool::lease> streams;
+  std::vector<sirius::op::scan::equality_build_resources> resources;
+  streams.reserve(admissible.size());
+  resources.reserve(admissible.size());
+  // One space per device: a batch looks its tables up by device, so a device configured with
+  // several spaces would hold copies that are never probed.
+  for (auto const device_id : admissible) {
+    auto const* space =
+      sirius_ctx.get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, device_id);
+    rmm::cuda_device_id const device{device_id};
+    rmm::cuda_set_device_raii device_guard{device};
+    streams.push_back(sirius::memory::runtime_stream_pool::acquire(*space));
+    resources.push_back(
+      {device, streams.back().get(), space->get_default_allocator(), remote_ioctx, space});
+  }
   return sirius::op::scan::load_delete_payload(
-    context,
-    table_path,
-    ioctx,
-    discovery,
-    sirius::op::scan::equality_build_resources{
-      stream.get(), space.get_default_allocator(), remote_ioctx});
+    context, table_path, ioctx, discovery, std::move(resources));
 }
 
 //! Build an `iceberg_ingestible_table_info`: the parquet bind data plus the table's delete

@@ -371,6 +371,11 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   std::vector<int> active_gpu_ids = compute_admission_gpu_ids(
     plan, std::move(gpu_ids), sirius_ctx_ptr->get_config(), *query_operator_params);
   sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(query_id_, active_gpu_ids, full_gpu_count);
+  // A scan may have built state at plan time for GPUs the estimate has now left out.
+  planner::for_each_gpu_scan(plan, [&](op::sirius_physical_operator const& source) {
+    if (auto const* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator const*>(&source))
+      scan->get_ingestible().set_admitted_gpus(active_gpu_ids);
+  });
   try {
     std::string gpu_list;
     for (auto id : active_gpu_ids) {

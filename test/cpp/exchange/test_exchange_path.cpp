@@ -142,6 +142,100 @@ TEST_CASE("a peer on another host gets TCP lanes unless the NVLink fabric reache
   CHECK(std::string{describe(path::tcp_lanes)} == "host-staged over TCP lanes");
 }
 
+TEST_CASE("on a host with more than two ranks, GPUs joined only by PCIe stage each other",
+          "[exchange][path]")
+{
+  auto gpu = [](rank_t rank, char const* bus_id, nvlink_domain d, bool mirror) {
+    return endpoint{rank, bus_id, false, d, "boot-a", mirror};
+  };
+  auto const me        = gpu(0, "0000:01:00.0", {}, true);
+  auto const near      = gpu(1, "0000:02:00.0", {}, true);
+  auto const bare      = gpu(1, "0000:02:00.0", {}, false);
+  auto const automatic = [](endpoint const& a, endpoint const& b, host_view host) {
+    return choose_path(a, b, host_staging::automatic, mnnvl_mode::automatic, true, host);
+  };
+  CHECK(automatic(me, near, {.ranks = 2}) == path::nixl);
+  for (auto const ranks : {std::size_t{3}, std::size_t{8}}) {
+    CHECK(automatic(me, near, {.ranks = ranks}) == path::shared_memory);
+    // Staging needs the peer's mirror, whatever this rank has.
+    CHECK(automatic(me, bare, {.ranks = ranks}) == path::nixl);
+    CHECK(automatic(gpu(0, "0000:01:00.0", {}, false), near, {.ranks = ranks}) ==
+          path::shared_memory);
+    // Ranks on one GPU, and a GPU with NVLink, share no PCIe link.
+    CHECK(automatic(me, gpu(1, "0000:01:00.0", {}, true), {.ranks = ranks}) == path::nixl);
+    CHECK(automatic(me, near, {.ranks = ranks, .nvlink = true}) == path::nixl);
+    auto far    = near;
+    far.boot_id = "boot-b";
+    CHECK(automatic(me, far, {.ranks = ranks}) == path::tcp_lanes);
+    // The other modes, and a peer without peer access, are as on any host.
+    auto const with = [&](host_staging staging, endpoint const& peer, bool peer_access) {
+      return choose_path(me, peer, staging, mnnvl_mode::automatic, peer_access, {.ranks = ranks});
+    };
+    CHECK(with(host_staging::never, near, true) == path::nixl);
+    CHECK(with(host_staging::always, bare, true) == path::shared_memory);
+    CHECK(with(host_staging::remote, near, true) == path::tcp_lanes);
+    CHECK(with(host_staging::automatic, bare, false) == path::shared_memory);
+    CHECK(choose_path(me,
+                      bare,
+                      host_staging::automatic,
+                      mnnvl_mode::automatic,
+                      false,
+                      {.ranks = ranks, .nvlink = true}) == path::shared_memory);
+    // The NVLink fabric comes first on a crowded host too.
+    auto const fab = [](rank_t rank, char const* bus_id) {
+      return endpoint{rank, bus_id, true, domain(7, 32766), "boot-a", true};
+    };
+    CHECK(automatic(fab(0, "0000:01:00.0"), fab(1, "0000:02:00.0"), {.ranks = ranks}) ==
+          path::nvlink_fabric);
+  }
+}
+
+TEST_CASE("a rank keeps a mirror where a same-host peer stages to it", "[exchange][path]")
+{
+  // always: every same-host peer stages. never and remote: no peer maps a named mirror.
+  CHECK(keeps_mirror(host_staging::always, 2, {.ranks = 2, .nvlink = true}, false));
+  CHECK_FALSE(keeps_mirror(host_staging::always, 1, {}, false));
+  for (auto const staging : {host_staging::never, host_staging::remote}) {
+    CHECK_FALSE(keeps_mirror(staging, 8, {.ranks = 8}, true));
+  }
+  // auto: a GPU without peer access to this one, or a crowded host of GPUs without NVLink.
+  CHECK_FALSE(keeps_mirror(host_staging::automatic, 2, {.ranks = 2}, false));
+  CHECK(keeps_mirror(host_staging::automatic, 2, {.ranks = 2}, true));
+  CHECK(keeps_mirror(host_staging::automatic, 3, {.ranks = 3}, false));
+  CHECK_FALSE(keeps_mirror(host_staging::automatic, 8, {.ranks = 8, .nvlink = true}, false));
+  CHECK(keeps_mirror(host_staging::automatic, 8, {.ranks = 8, .nvlink = true}, true));
+  // The crowd is this host's ranks, not the cluster's.
+  CHECK_FALSE(keeps_mirror(host_staging::automatic, 8, {.ranks = 2}, false));
+}
+
+TEST_CASE("ranks that count their host differently never stage to a rank without a mirror",
+          "[exchange][path]")
+{
+  // One machine, four GPUs with peer access: three ranks listed under one host name, the fourth
+  // under another. Each rank's hello says keeps_mirror() of its own count.
+  struct rank_at {
+    endpoint self;
+    host_view view;
+  };
+  auto const rank_on = [](rank_t rank, char const* bus_id, host_view view) {
+    return rank_at{
+      endpoint{
+        rank, bus_id, false, {}, "boot-a", keeps_mirror(host_staging::automatic, 4, view, false)},
+      view};
+  };
+  auto const route = [](rank_at const& from, rank_at const& to) {
+    return choose_path(
+      from.self, to.self, host_staging::automatic, mnnvl_mode::automatic, true, from.view);
+  };
+  auto const a    = rank_on(0, "0000:01:00.0", {.ranks = 3});
+  auto const b    = rank_on(1, "0000:02:00.0", {.ranks = 3});
+  auto const lone = rank_on(3, "0000:04:00.0", {.ranks = 1});
+  CHECK(route(a, b) == path::shared_memory);
+  CHECK(route(b, a) == path::shared_memory);
+  CHECK(route(a, lone) == path::nixl);
+  CHECK(route(lone, a) == path::nixl);
+}
+
 TEST_CASE("sirius_exchange_mnnvl takes auto, require or off", "[exchange][path]")
 {
   CHECK(parse_mnnvl("auto") == mnnvl_mode::automatic);

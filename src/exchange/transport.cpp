@@ -634,7 +634,10 @@ void transport::stop()
 rank_t transport::rank() const noexcept { return _engine->fab.rank(); }
 rank_t transport::world_size() const noexcept { return _engine->fab.world_size(); }
 
-void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::data_batch> batch)
+void transport::send(stream_id stream,
+                     rank_t to,
+                     std::shared_ptr<cucascade::data_batch> batch,
+                     bool wait_for_room)
 {
   auto& e = *_engine;
   if (to >= world_size()) {
@@ -679,7 +682,7 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
   std::unique_lock lock{_mutex};
   _room.wait(lock, [&] {
     // A batch larger than the cap goes alone, else it would never fit.
-    return _error || _stop || _cancelled.contains(query) || e.queued_bytes == 0 ||
+    return !wait_for_room || _error || _stop || _cancelled.contains(query) || e.queued_bytes == 0 ||
            e.queued_bytes + bytes <= e.opts.max_queued_bytes;
   });
   if (_error) { std::rethrow_exception(_error); }

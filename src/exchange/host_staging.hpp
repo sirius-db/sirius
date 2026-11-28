@@ -20,8 +20,10 @@ namespace sirius::exchange {
 
 /// Whether writes to a peer go through its pinned host mirror instead of NIXL. automatic: over TCP
 /// lanes to peers on other hosts, and through shared memory to peers on this host whose GPU lacks
-/// peer access to this one (NVML). always: also to every peer on this host. never: NIXL to every
-/// peer. remote: TCP lanes to every peer, even on this host (for tests).
+/// peer access to this one (NVML), or, when more than two ranks share the host and this GPU has
+/// no active NVLink link, to peers with a mirror on other GPUs. always: also to every peer on
+/// this host.
+/// never: NIXL to every peer. remote: TCP lanes to every peer, even on this host (for tests).
 enum class host_staging { automatic, always, never, remote };
 
 /// Whether the rings go in fabric memory, so that peers on other nodes of this NVLink domain

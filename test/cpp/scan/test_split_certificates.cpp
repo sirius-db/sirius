@@ -1544,7 +1544,7 @@ TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
     REQUIRE(iceberg_set);
     CHECK(iceberg_set->positions.empty() == (path == intact));
     if (path == deleted) {
-      CHECK(iceberg_set->positions.data() == positions);
+      CHECK(&iceberg_set->positions.front() == positions);
       CHECK(std::vector<int64_t>(iceberg_set->positions.begin(), iceberg_set->positions.end()) ==
             std::vector<int64_t>{0, 0, 4});
     }
@@ -1628,7 +1628,8 @@ TEST_CASE("Iceberg per-file input distinguishes complete empty results from miss
   {
     info->delete_sets->emplace(path, std::make_shared<iceberg_delete_set const>(path));
     auto payload = std::make_shared<IcebergDeleteData>();
-    payload->equality_delete_groups.emplace_back();
+    payload->equality_replicas.push_back({rmm::get_current_cuda_device(), {}});
+    payload->equality_replicas.back().groups.emplace_back();
     info->delete_data = std::move(payload);
     CHECK_THROWS_WITH(
       make_ingestible(std::move(info)),
@@ -1705,7 +1706,8 @@ TEST_CASE("Iceberg per-file adaptation preserves path ambiguity and unsupported-
       // Loaded groups that no data file maps to would never be applied.
       auto info    = make_info({"/a/data.parquet"}, {});
       auto payload = std::make_shared<IcebergDeleteData>();
-      payload->equality_delete_groups.emplace_back();
+      payload->equality_replicas.push_back({rmm::get_current_cuda_device(), {}});
+      payload->equality_replicas.back().groups.emplace_back();
       info->delete_data = std::move(payload);
       CHECK_THROWS_WITH(make_ingestible(std::move(info)),
                         Catch::Matchers::ContainsSubstring(
@@ -1743,7 +1745,8 @@ TEST_CASE("Iceberg per-file adaptation preserves path ambiguity and unsupported-
     {
       auto info    = make_info({"/a/data.parquet"}, {});
       auto payload = std::make_shared<IcebergDeleteData>();
-      payload->equality_delete_groups.emplace_back().key_primary_indices = {3};
+      payload->equality_replicas.push_back({rmm::get_current_cuda_device(), {}});
+      payload->equality_replicas.back().groups.emplace_back().key_primary_indices = {3};
       payload->equality_groups_by_data_file.emplace(
         "/a/data.parquet", std::make_shared<equality_group_list const>(equality_group_list{0}));
       info->delete_data = std::move(payload);

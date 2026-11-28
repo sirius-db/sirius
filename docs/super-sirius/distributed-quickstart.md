@@ -65,8 +65,9 @@ sirius:
       quack_port: 9500          # rank i: 9500 + i
       exchange_port: 27000      # rank i: 27000 + i
     exchange:                   # the gateway gives every rank these
-      # host_staging: auto      # auto: TCP lanes to ranks on other hosts. Leave it unset with
-      #                         # ucx.rails: true, which makes it never (RDMA from the GPU)
+      # host_staging: auto      # auto: NVLink where the fabric reaches (mnnvl), else TCP lanes
+      #                         # to ranks on other hosts. Leave it unset with ucx.rails: true,
+      #                         # which makes it never (RDMA from the GPU)
       tcp_lanes: 0              # 0: 16 shared by the ranks of a host
       mnnvl: auto               # auto | require | off: NVLink between nodes (fabric memory)
       # For NVLink between nodes: larger rings (2.25 GiB of GPU memory per rank at 8 ranks,
@@ -97,7 +98,7 @@ number or list, stops the scripts before they apply any of it. `gateway.min_rank
 | `node.networks` | `SIRIUS_NODE_NETWORKS` | the gateway's subnet | Each rank listens on this node's first address in these CIDRs, and UCX uses that address's interface unless `ucx.net_devices` names others or `ucx.rails` takes the rail NICs |
 | `node.quack_port` | `SIRIUS_NODE_QUACK_PORT` | 9500 | First rank's Quack port |
 | `node.exchange_port` | `SIRIUS_NODE_EXCHANGE_PORT` | 27000 | First rank's exchange port |
-| `exchange.host_staging` | `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING` | `auto`; `never` with `ucx.rails: true` | `sirius_gateway_exchange_host_staging`, which the gateway sets as `sirius_exchange_host_staging` on every rank. `auto` reaches ranks on other hosts over TCP lanes. With RDMA between hosts on other devices than the rails, set `never` |
+| `exchange.host_staging` | `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING` | `auto`; `never` with `ucx.rails: true` | `sirius_gateway_exchange_host_staging`, which the gateway sets as `sirius_exchange_host_staging` on every rank. `auto` reaches ranks on other hosts over the NVLink fabric where it reaches, else over TCP lanes. With RDMA between hosts on other devices than the rails, set `never` |
 | `exchange.tcp_lanes` | `SIRIUS_GATEWAY_EXCHANGE_TCP_LANES` | 0 | `sirius_gateway_exchange_tcp_lanes`: TCP lanes per rank, at most 64. 0 shares 16 among the ranks of a host, at least 2 each |
 | `exchange.mnnvl` | `SIRIUS_GATEWAY_EXCHANGE_MNNVL` | `auto` | `sirius_gateway_exchange_mnnvl`, which the gateway sets as `sirius_exchange_mnnvl` on every rank: ranks on other nodes of the NVLink domain exchange over NVLink |
 | `exchange.frame_bytes` | `SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES` | 8388608 | `sirius_gateway_exchange_frame_bytes`: the exchange's frame size |
@@ -140,7 +141,7 @@ with the gateway. Ranks started before the gateway wait for its `gateway.conf`. 
 `/tmp/sirius_node_<user>_<cluster>/rank_<port>/rank.log` and `register.log`. Sirius's own log
 of every rank goes to `log/` under the directory the node was started in; export
 `SIRIUS_RANK_LOG_ROOT=<dir>` to give each rank `<dir>/<short hostname>-<quack port>/`, which
-nodes that share a file system need. Ctrl-C stops the
+nodes that share a file system need (the Slurm launcher sets it). Ctrl-C stops the
 node's ranks. If one rank's script exits on an error it cannot retry, the node stops all its
 ranks.
 
@@ -230,7 +231,9 @@ exchange port 27000 + `SLURM_LOCALID`. The script asks for 4 tasks per node;
 `sbatch -N2 --ntasks-per-node=2 scripts/sirius_slurm.sbatch` uses 2 GPUs per node. The gateway
 serves until the job ends. If either the gateway's step or the ranks' step exits, the job stops
 the other and ends with exit code 1. At exit the script removes `~/.sirius/gateways/<job id>/`,
-so the job's token, keys and DDL log go with it. It needs a shared `$HOME`.
+so the job's token, keys and DDL log go with it. It needs a shared `$HOME`. Each rank's
+Sirius log goes to `log/<short hostname>-<quack port>/` under the submit directory; an exported
+`SIRIUS_RANK_LOG_ROOT` names another root.
 
 Tested on two GB200 nodes with 2 GPUs each (`sbatch -N2 --ntasks-per-node=2`): a count at SF100
 and TPC-H Q12 were correct, and cancelling the gateway's step ended the job with exit code 1.
