@@ -67,8 +67,8 @@ struct resolution {
 /// byte-for-byte (an empty, "." or ".." segment, or a raw `%` byte) is refused before any prefix is
 /// consulted — including when only the default scope would serve it: the store or libcurl may
 /// normalize such a key into a published prefix's namespace, which the default scope must not
-/// serve. Key bytes are never rewritten here (only the scheme is case-folded) and a refused key is
-/// never retried, so a per-URI lookup and the execution guard answer alike.
+/// serve. Only the scheme is case-folded. With a nonempty set, lookup and execution both refuse an
+/// unmatchable key without retrying it against the default scope.
 [[nodiscard]] resolution resolve(const scope_set& set, std::string_view uri);
 
 /// Classifies the remote items of one plan against @p set: nothing when there is no item;

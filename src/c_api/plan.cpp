@@ -327,17 +327,11 @@ const char* sirius_plan_describe(const sirius_plan* plan) noexcept
 {
   return plan ? plan->description.c_str() : "";
 }
-void sirius_schema_retain(sirius_schema* value) noexcept { retain(value); }
-void sirius_schema_release(sirius_schema* value) noexcept { release<sirius_schema>{}(value); }
-void sirius_expression_retain(sirius_expression* value) noexcept { retain(value); }
-void sirius_expression_release(sirius_expression* value) noexcept
-{
-  release<sirius_expression>{}(value);
-}
-void sirius_plan_node_retain(sirius_plan_node* value) noexcept { retain(value); }
-void sirius_plan_node_release(sirius_plan_node* value) noexcept
-{
-  release<sirius_plan_node>{}(value);
-}
-void sirius_plan_retain(sirius_plan* value) noexcept { retain(value); }
-void sirius_plan_release(sirius_plan* value) noexcept { release<sirius_plan>{}(value); }
+void sirius_schema_retain(sirius_schema* value) noexcept { sirius::c_api::retain(value); }
+void sirius_schema_release(sirius_schema* value) noexcept { sirius::c_api::release(value); }
+void sirius_expression_retain(sirius_expression* value) noexcept { sirius::c_api::retain(value); }
+void sirius_expression_release(sirius_expression* value) noexcept { sirius::c_api::release(value); }
+void sirius_plan_node_retain(sirius_plan_node* value) noexcept { sirius::c_api::retain(value); }
+void sirius_plan_node_release(sirius_plan_node* value) noexcept { sirius::c_api::release(value); }
+void sirius_plan_retain(sirius_plan* value) noexcept { sirius::c_api::retain(value); }
+void sirius_plan_release(sirius_plan* value) noexcept { sirius::c_api::release(value); }

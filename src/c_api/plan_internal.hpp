@@ -1,6 +1,8 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "c_api/handle_internal.hpp"
+
 #include <sirius-c/plan/plan.h>
 
 #include <atomic>
@@ -14,16 +16,8 @@
 
 namespace sirius::c_api::plan {
 template <class T>
-void retain(T* value) noexcept
-{
-  if (value) { value->references.fetch_add(1, std::memory_order_relaxed); }
-}
-template <class T>
 struct release {
-  void operator()(T* value) const noexcept
-  {
-    if (value && value->references.fetch_sub(1, std::memory_order_acq_rel) == 1) { delete value; }
-  }
+  void operator()(T* value) const noexcept { c_api::release(value); }
 };
 template <class T>
 using owner = std::unique_ptr<T, release<T>>;
@@ -31,7 +25,7 @@ template <class T>
 owner<T> acquire(const T* value) noexcept
 {
   auto* handle = const_cast<T*>(value);
-  retain(handle);
+  c_api::retain(handle);
   return owner<T>{handle};
 }
 struct field {
