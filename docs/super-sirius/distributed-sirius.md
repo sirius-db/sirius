@@ -133,11 +133,21 @@ write access, a write is one device-to-host copy into that peer's mirror, then a
 naming the offset and size; the peer copies the bytes host-to-device into its receive ring and
 only then passes the write's own notification to the transport. Credits are unchanged: a mirror
 frame is reused only after the transport has copied its receive frame out.
+`auto` also stages a same-host peer on another GPU when more than two ranks share the host (ranks
+listed under one host name in `sirius_exchange_peers`), its own GPU has no NVLink (NVML's link
+states) and the peer keeps a mirror, as a rank on such a host and GPU does. Direct writes among
+many GPUs share the host's PCIe links (8 RTX PRO 6000 on one host, every rank to every other: 6.3
+GB/s per GPU direct, 24.2 through the mirrors), and among four they stopped GPFS reads on a host
+whose storage NICs sit on the GPUs' PCIe switches. The bound is set by that stall: the four GPUs
+of one socket there move 32 GB/s per GPU direct and 24 staged. Two ranks on a host write each
+other directly (48 GB/s each way there), and so, where the two GPUs have peer access, does a rank
+whose peer has no mirror or whose mirror it cannot map.
 `SET sirius_exchange_host_staging = 'always'` (or `'never'`) overrides the choice (default `auto`). Each rank logs
 its path to every peer at start. Staging maps the peer's mirror from this host's `/dev/shm`, so it
 works only between ranks on one host that share `/dev/shm`; ranks in separate IPC namespaces on one
-host need `never`. A rank that crashes leaves its mirror in `/dev/shm`; the launchers in
-`scripts/` remove mirrors whose process is gone before they start.
+host need `never`. A rank that crashes or is killed leaves its mirror in `/dev/shm`, as the ranks
+of a `sirius_slurm.sbatch` job do when it ends; the launchers in `scripts/` remove mirrors whose
+process is gone before they start.
 
 **TCP lanes.** Between hosts, UCX's TCP transport moves host memory directly but emulates a put of
 GPU memory, at about 0.2 GB/s, and one TCP connection is bound by the core that copies its socket.

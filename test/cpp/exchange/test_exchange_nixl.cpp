@@ -142,6 +142,15 @@ std::uint32_t count_from_env(char const* name, std::uint32_t fallback)
   return value != nullptr ? static_cast<std::uint32_t>(std::stoul(value)) : fallback;
 }
 
+/// How @p fab writes @p peer, with the lane count where lanes carry it.
+std::string path_text(nixl_fabric const& fab, rank_t peer)
+{
+  auto const route = fab.path_to(peer);
+  return route == sirius::exchange::path::tcp_lanes
+           ? std::to_string(fab.lanes_to(peer)) + " TCP lanes"
+           : sirius::exchange::describe(route);
+}
+
 /// Records what one stream's receiver is handed into @p got.
 struct recording_inbound : sirius::exchange::inbound {
   recording_inbound(received& got, stream_id stream) : got(got), stream(stream) {}
@@ -520,19 +529,17 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   }
   auto const seconds =
     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  double const gb       = static_cast<double>(batch_b) * per_peer * (world - 1) / 1e9;
-  auto const next       = (cfg.rank + 1) % world;
-  auto const route      = fab.path_to(next);
-  std::string const how = route == sirius::exchange::path::tcp_lanes
-                            ? std::to_string(fab.lanes_to(next)) + " TCP lanes"
-                            : sirius::exchange::describe(route);
-  std::printf("BANDWIDTH rank %u: received %.2f GB from %u peers in %.2f s: %.2f GB/s (%s)\n",
-              cfg.rank,
-              gb,
-              world - 1,
-              seconds,
-              gb / seconds,
-              how.c_str());
+  double const gb = static_cast<double>(batch_b) * per_peer * (world - 1) / 1e9;
+  std::printf(
+    "BANDWIDTH rank %u: received %.2f GB from %u peers in %.2f s: %.2f GB/s (%s, %u "
+    "frames per peer)\n",
+    cfg.rank,
+    gb,
+    world - 1,
+    seconds,
+    gb / seconds,
+    path_text(fab, (cfg.rank + 1) % world).c_str(),
+    recv_frames);
   // Every rank must have taken its batches before any tears down its fabric.
   for (rank_t to = 0; to < world; ++to) {
     t.close(99, to);
@@ -636,8 +643,8 @@ TEST_CASE("pairs of ranks on two nodes move batches at NVLink speed", "[.][nixl_
   // SIRIUS_EXCHANGE_PAIRS_SECONDS from the ranks that take part (the _4pair phases: every pair,
   // which is 4 with 8 ranks), and each receiver reports what it received per second. Last, every
   // rank sends its peer distinct batches, and the peer checks every value. The settings come from
-  // SIRIUS_EXCHANGE_{FRAME_BYTES, SEND_FRAMES, RECV_FRAMES_PER_PEER, MNNVL (default require),
-  // HOST_STAGING, PAIRS_GPU_GIB (default 40)}.
+  // SIRIUS_EXCHANGE_{FRAME_BYTES, SEND_FRAMES, RECV_FRAMES_PER_PEER, TCP_LANES, MNNVL (default
+  // require), HOST_STAGING, PAIRS_GPU_GIB (default 40)}.
   auto const* rank  = std::getenv("SIRIUS_EXCHANGE_RANK");
   auto const* peers = std::getenv("SIRIUS_EXCHANGE_PEERS");
   REQUIRE(rank != nullptr);
@@ -663,6 +670,7 @@ TEST_CASE("pairs of ranks on two nodes move batches at NVLink speed", "[.][nixl_
   opts.recv_frames_per_peer =
     static_cast<std::uint32_t>(std::stoul(env_or("SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER", "16")));
   cfg.staging        = staging_from_env();
+  cfg.lanes          = count_from_env("SIRIUS_EXCHANGE_TCP_LANES", 0);
   cfg.mnnvl          = opts.mnnvl;
   auto const seconds = std::stod(env_or("SIRIUS_EXCHANGE_PAIRS_SECONDS", "1.5"));
   big_env e(std::stoull(env_or("SIRIUS_EXCHANGE_PAIRS_GPU_GIB", "40")) << 30);
@@ -674,7 +682,7 @@ TEST_CASE("pairs of ranks on two nodes move batches at NVLink speed", "[.][nixl_
   std::printf("PAIRS rank %u peer %u: %s, rings %s, frame %zu MiB x %u send, %u per peer\n",
               me,
               peer,
-              sirius::exchange::describe(fab.path_to(peer)),
+              path_text(fab, peer).c_str(),
               recv.in_fabric_memory() ? "in fabric memory" : "from cudaMalloc",
               opts.frame_bytes >> 20,
               opts.send_frames,
