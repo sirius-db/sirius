@@ -36,6 +36,7 @@
 
 #include <cstdint>
 #include <numeric>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -102,7 +103,7 @@ iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestibl
                                     });
   bool const has_equality = legacy && !legacy->equality_groups_by_data_file.empty();
   // Groups nobody maps a data file to would be loaded and never applied.
-  if (legacy && !has_equality && !legacy->equality_delete_groups.empty()) {
+  if (legacy && !has_equality && !legacy->equality_replicas.empty()) {
     throw sirius::internal_exception(
       "[iceberg_gpu_ingestible] '" + _table_path +
       "': equality-delete groups were loaded without the data files they apply to");
@@ -135,7 +136,10 @@ iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestibl
     // The lowering appended every key to the scan. A key the plan does not read would make its
     // group match nothing, so that is refused.
     auto const& plan = _core.plan();
-    for (auto const& group : legacy->equality_delete_groups) {
+    // Every replica holds the same groups; the first one names their keys.
+    std::span<EqualityDeleteGroup const> groups;
+    if (!legacy->equality_replicas.empty()) groups = legacy->equality_replicas.front().groups;
+    for (auto const& group : groups) {
       std::vector<cudf::size_type> positions;
       for (auto const primary : group.key_primary_indices) {
         auto const column =
@@ -153,9 +157,8 @@ iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestibl
       }
       _equality_key_positions.push_back(std::move(positions));
     }
-    SIRIUS_LOG_DEBUG("[iceberg_gpu_ingestible] '{}': {} equality-delete group(s)",
-                     _table_path,
-                     legacy->equality_delete_groups.size());
+    SIRIUS_LOG_DEBUG(
+      "[iceberg_gpu_ingestible] '{}': {} equality-delete group(s)", _table_path, groups.size());
   }
 
   iceberg_delete_sets resolved;
@@ -837,7 +840,10 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
                                          "': decoded table has no owned state to filter");
       auto const rows_before = table->num_rows();
       for (auto const group : *equality_groups) {
-        equality_delete_filter filter(_equality_data, group, _equality_key_positions.at(group));
+        equality_delete_filter filter(_equality_data,
+                                      rmm::cuda_device_id{mem_space.get_device_id()},
+                                      group,
+                                      _equality_key_positions.at(group));
         table = filter.apply(std::move(table), {}, stream, mr_ref);
       }
       // Rows no longer line up with file positions or with any lineage the decoder returned.
