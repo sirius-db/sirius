@@ -25,6 +25,7 @@
 #include "planner/sirius_plan_partial_aggregate_pushdown.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "transparent/join_dimension_after_aggregate.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 
 #include <duckdb/common/enums/statement_type.hpp>
@@ -106,15 +107,7 @@ sirius::planner::partial_aggregate_pushdown_options partial_aggregate_pushdown_t
 std::uint64_t gpu_memory_budget(duckdb::ClientContext& context)
 {
   auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!runtime) { return 0; }
-  std::uint64_t budget = 0;
-  for (auto const& space : runtime->get_config().get_memory_space_configs()) {
-    auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
-    if (gpu == nullptr || gpu->memory_capacity == 0) { continue; }
-    std::uint64_t const threshold = gpu->downgrade_trigger_threshold();
-    budget                        = budget == 0 ? threshold : std::min(budget, threshold);
-  }
-  return budget;
+  return runtime ? runtime->get_config().smallest_gpu_downgrade_threshold() : 0;
 }
 
 using top_n_filter_copies = std::unordered_map<duckdb::DynamicFilterData const*,
@@ -502,6 +495,13 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
           sirius::sanitized_message(e));
         copy            = copy_logical_plan(*captured, context);
         exists_rewrites = rewrite_subqueries(copy);
+      }
+    }
+    if (plan_optimization_enabled(context, &sirius::operator_params::enable_late_dimension_join)) {
+      // Lookup columns that fit in one GPU do not make a join spill. With the GPU memory
+      // unknown, nothing moves.
+      if (auto const budget = gpu_memory_budget(context); budget > 0) {
+        join_dimensions_after_aggregate(context, copy, input.optimizer.binder, budget);
       }
     }
     // Recorded once the plan is final, so the counts describe the plan that is captured.

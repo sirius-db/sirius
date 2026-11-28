@@ -396,6 +396,14 @@ struct operator_params {
   /// reads, and keep the outer rows that have a group. See `answer_exists_from_aggregate`.
   bool enable_exists_from_aggregate = config::DEFAULT_ENABLE_EXISTS_FROM_AGGREGATE;
 
+  /// Distributed execution: apply a HAVING above a grouped aggregate's merge to the partial
+  /// groups that the Parquet footers prove already whole (see op::complete_group_having).
+  bool enable_complete_group_having = true;
+
+  /// Join a lookup table whose columns are only GROUP BY keys after the aggregation. See
+  /// `join_dimensions_after_aggregate`.
+  bool enable_late_dimension_join = true;
+
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.
   uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
@@ -585,6 +593,10 @@ struct sirius_config {
 
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
   get_memory_space_configs() const noexcept;
+
+  /// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving
+  /// data off it. 0 when no GPU capacity is configured.
+  [[nodiscard]] std::uint64_t smallest_gpu_downgrade_threshold() const;
 
   [[nodiscard]] const creator::task_creator_config& get_task_creator_config() const noexcept;
 

@@ -18,12 +18,15 @@
 #include "../operator_type_traits.hpp"
 #include "aggregate_test_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "expression/ast/node.hpp"
 #include "utils/test_validation_utility.hpp"
 
 #include <catch.hpp>
 #include <op/sirius_physical_grouped_aggregate.hpp>
 
 #include <algorithm>
+#include <optional>
+#include <set>
 
 using namespace duckdb;
 using namespace sirius::op;
@@ -197,4 +200,69 @@ TEMPLATE_TEST_CASE(
     expected_table->view(),
     true);
   REQUIRE(tables_match);
+}
+
+TEST_CASE("sirius_physical_grouped_aggregate drops whole groups that fail the merge's HAVING",
+          "[physical_grouped_aggregate]")
+{
+  using Traits        = gpu_type_traits<int64_t>;
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+
+  // Groups and their COUNT(v): 1 -> 2, 2 -> 1, 3 -> 3, 5 -> 1, NULL -> 2.
+  auto keys =
+    make_numeric_batch_with_nulls<int64_t>(*space,
+                                           {1, 1, 2, 3, 3, 3, 5, 0, 0},
+                                           {true, true, true, true, true, true, true, false, false},
+                                           cudf::type_id::INT64);
+  auto value =
+    make_numeric_batch<int64_t>(*space, std::vector<int64_t>(9, 10), cudf::type_id::INT64);
+  auto input = concatenate_batches_horizontal({keys, value}, *space);
+
+  auto expressions = sirius::test::create_aggregate_expressions<Traits>({0}, {"count"}, {1});
+  sirius_physical_grouped_aggregate aggregate(std::move(expressions.output_types),
+                                              std::move(expressions.aggregates),
+                                              std::move(expressions.groups),
+                                              5);
+  // HAVING COUNT(v) > 1, with 1 and 5 the min and max of a row group: a group with either key may
+  // continue in another row group, so only group 2 is whole and failing.
+  auto const bigint = sirius::logical_type::make(sirius::type_id::BIGINT);
+  auto filter       = std::make_shared<complete_group_having>();
+  filter->predicate = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::gt,
+    std::make_unique<sirius::ast::node>(sirius::ast::reference{1, bigint}),
+    std::make_unique<sirius::ast::node>(sirius::ast::constant{sirius::value{int64_t{1}}, bigint})});
+  filter->key       = 0;
+  std::vector<int64_t> const bounds{1, 5};
+  filter->row_group_bounds = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, 2, cudf::mask_state::UNALLOCATED, default_stream());
+  cudaMemcpy(filter->row_group_bounds->mutable_view().data<int64_t>(),
+             bounds.data(),
+             sizeof(int64_t) * bounds.size(),
+             cudaMemcpyHostToDevice);
+  aggregate.complete_groups = filter;
+
+  auto const groups = [&](bool whole_row_groups) {
+    pipelineable_operator_data data({input});
+    data.set_whole_row_groups(whole_row_groups);
+    auto out          = aggregate.execute(data, default_stream());
+    auto const& batch = dynamic_cast<pipelineable_operator_data const&>(*out).get_data_batches();
+    REQUIRE(batch.size() == 1);
+    auto const view  = sirius::get_cudf_table_view(*batch[0]);
+    auto const key   = copy_column_to_host<int64_t>(view.column(0));
+    auto const valid = copy_validity_to_host(view.column(0));
+    std::multiset<std::optional<int64_t>> out_keys;
+    for (std::size_t i = 0; i < key.size(); ++i) {
+      out_keys.insert(valid[i] ? std::optional<int64_t>{key[i]} : std::nullopt);
+    }
+    return out_keys;
+  };
+
+  // The NULL group gathers the NULLs of every row group, so it is never dropped.
+  CHECK(groups(true) == std::multiset<std::optional<int64_t>>{std::nullopt, 1, 3, 5});
+  // Without the mark a batch may hold part of a row group: nothing is dropped.
+  CHECK(groups(false) == std::multiset<std::optional<int64_t>>{std::nullopt, 1, 2, 3, 5});
+  CHECK(filter->groups_seen.load() == 5);
+  CHECK(filter->groups_kept.load() == 4);
 }

@@ -78,6 +78,7 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "op/sirius_physical_window.hpp"
+#include "planner/build_side_choice.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/distributed_plan.hpp"
 #include "planner/gpu_admission.hpp"
@@ -2434,7 +2435,21 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
       sirius_ctx->get_exchange_service(op_params),
       *gpu,
       sirius_ctx->next_distributed_query(context, op_params.distributed_query_id),
-      sirius_ctx->get_query_lifecycle_registry());
+      sirius_ctx->get_query_lifecycle_registry(),
+      op_params.enable_complete_group_having
+        ? planner::parquet_footer_reader{[&scans = sirius_ctx->get_scan_manager()](
+                                           std::string const& path) {
+            return scans.parquet_footer(path);
+          }}
+        : planner::parquet_footer_reader{},
+      // With the GPU memory unknown, no scan is deferred.
+      sirius_ctx->get_config().smallest_gpu_downgrade_threshold() > 0
+        ? planner::deferred_scan_policy{[&scans = sirius_ctx->get_scan_manager()](
+                                          std::string const& path) {
+                                          return scans.parquet_footer(path);
+                                        },
+                                        sirius_ctx->get_config().smallest_gpu_downgrade_threshold()}
+        : planner::deferred_scan_policy{});
   }
 }
 
@@ -2476,6 +2491,18 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   // keys are published into the subquery.
   sirius::planner::convert_mark_joins(context, op);
 
+  {
+    auto const sirius_ctx = context.registered_state
+                              ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                              : nullptr;
+    if (sirius_ctx) {
+      // With the GPU memory unknown, nothing is swapped.
+      if (auto const budget = sirius_ctx->get_config().smallest_gpu_downgrade_threshold();
+          budget > 0) {
+        sirius::planner::swap_unfiltered_builds(context, *op, budget);
+      }
+    }
+  }
   {
     auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerResolveTypes>();
     op->ResolveOperatorTypes();

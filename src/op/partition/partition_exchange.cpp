@@ -71,6 +71,17 @@ void partition_exchange::bind(std::vector<sirius_physical_partition*> inputs,
   }
 }
 
+void partition_exchange::defer_scan(sirius_physical_partition const& input, uint64_t bytes)
+{
+  std::lock_guard guard(_mutex);
+  for (std::size_t i = 0; i < _inputs.size(); ++i) {
+    if (_inputs[i] == &input && i != _sizing_input) {
+      _deferred_scan = deferred_scan{i, bytes};
+      _inputs[_sizing_input]->count_received_bytes();
+    }
+  }
+}
+
 std::optional<task_creation_hint> partition_exchange::prepare() { return prepare_impl(true); }
 std::optional<task_creation_hint> partition_exchange::hint() { return prepare_impl(false); }
 
@@ -91,7 +102,10 @@ std::optional<task_creation_hint> partition_exchange::prepare_impl(bool resolve)
     }
   }
   auto& driver = *_inputs[_sizing_input];
-  if (!driver.input_complete()) {
+  // The scan's size is known, so this needs no estimate, and once true it stays true.
+  bool const scan_holds =
+    _deferred_scan && !driver.input_complete() && driver.received_bytes() >= _deferred_scan->bytes;
+  if (!driver.input_complete() && !scan_holds) {
     auto hint = driver.sizing_hint();
     if (hint && hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA) { return hint; }
     if (!hint && !driver.input_complete()) {
@@ -106,6 +120,9 @@ std::optional<task_creation_hint> partition_exchange::prepare_impl(bool resolve)
   for (auto* input : _inputs) {
     stats.push_back(input->input_statistics(_inputs.size() == 1));
   }
+  if (scan_holds) {
+    stats[_sizing_input] = {_deferred_scan->bytes, 0, std::nullopt, std::nullopt, true};
+  }
   auto layouts = _choose(stats, empty);
   if (layouts.size() != _inputs.size()) {
     throw std::logic_error("partition policy must resolve every bound input");
@@ -115,11 +132,19 @@ std::optional<task_creation_hint> partition_exchange::prepare_impl(bool resolve)
       throw std::logic_error("partition exchange inputs must share a placement");
     }
   }
+  if (scan_holds) {
+    SIRIUS_LOG_INFO(
+      "partition_exchange: sizing input {} outgrew the deferred scan of {} bytes; the layout is "
+      "sized from the scan.",
+      _sizing_input,
+      _deferred_scan->bytes);
+  }
   SIRIUS_LOG_DEBUG(
-    "partition_exchange resolved {} inputs on sizing input {}: {} partitions, mode {}, sized from "
-    "{} bytes and {} rows, placement {}",
+    "partition_exchange resolved {} inputs on sizing input {}{}: {} partitions, mode {}, sized "
+    "from {} bytes and {} rows, placement {}",
     _inputs.size(),
     _sizing_input,
+    scan_holds ? ", which outgrew the deferred scan" : "",
     layouts.front().placement->num_partitions(),
     mode_name(layouts.front().mode),
     stats[_sizing_input].bytes,
@@ -128,6 +153,7 @@ std::optional<task_creation_hint> partition_exchange::prepare_impl(bool resolve)
   for (std::size_t i = 0; i < layouts.size(); ++i) {
     _inputs[i]->set_layout(std::move(layouts[i]));
   }
+  _scan_holds.store(scan_holds, std::memory_order_release);
   _resolved = true;
   return std::nullopt;
 }
