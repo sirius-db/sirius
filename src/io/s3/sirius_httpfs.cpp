@@ -238,7 +238,7 @@ bool match_glob_no_crawl(std::vector<std::string_view> const& keys,
 
 }  // namespace
 
-bool sirius_httpfs::CanHandleFile(const std::string& fpath)
+bool can_handle_s3_path(std::string const& fpath)
 {
   if (fpath.size() <= kScheme.size()) { return false; }
   for (std::size_t i = 0; i < kScheme.size(); ++i) {
@@ -253,6 +253,8 @@ bool sirius_httpfs::CanHandleFile(const std::string& fpath)
   auto const slash = rest.find('/');
   return slash != std::string_view::npos && slash != 0 && slash + 1 < rest.size();
 }
+
+bool sirius_httpfs::CanHandleFile(const std::string& fpath) { return can_handle_s3_path(fpath); }
 
 duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
   const std::string& path,

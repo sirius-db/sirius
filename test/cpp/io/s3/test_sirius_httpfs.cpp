@@ -793,12 +793,18 @@ TEST_CASE("Sirius S3 filesystem keeps precedence over later S3 handlers", "[s3][
 TEST_CASE("sirius_httpfs claims only valid S3 object paths", "[s3][filesystem]")
 {
   sirius::io::s3::sirius_httpfs fs;
-
-  CHECK(fs.CanHandleFile("s3://bucket/key.parquet"));
-  CHECK(fs.CanHandleFile("S3://bucket/key.parquet"));
-  CHECK_FALSE(fs.CanHandleFile("s3://bucket"));
-  CHECK_FALSE(fs.CanHandleFile("file:///tmp/key.parquet"));
-  CHECK_FALSE(fs.CanHandleFile("/tmp/key.parquet"));
+  for (auto const& [path, expected] : {std::pair{"s3://bucket/key.parquet", true},
+                                       std::pair{"S3://bucket/key.parquet", true},
+                                       std::pair{"s3://bucket", false},
+                                       std::pair{"S3://bucket/", false},
+                                       std::pair{"S3:///key", false},
+                                       std::pair{"s3a://bucket/key.parquet", false},
+                                       std::pair{"file:///tmp/key.parquet", false},
+                                       std::pair{"/tmp/key.parquet", false}}) {
+    CAPTURE(path);
+    CHECK(fs.CanHandleFile(path) == expected);
+    CHECK(sirius::io::s3::can_handle_s3_path(path) == expected);
+  }
   CHECK(fs.CanSeek());
 }
 
