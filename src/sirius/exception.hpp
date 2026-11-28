@@ -16,12 +16,31 @@
 
 #pragma once
 
+#include <cuda_runtime_api.h>
+
+#include <array>
+#include <cstdio>
 #include <exception>
 #include <format>
 #include <stdexcept>
 #include <string>
 
 namespace sirius {
+
+enum class gpu_completion_point { unknown, prepare, execute, failure, sink, retry, shutdown };
+
+inline char const* completion_point_name(gpu_completion_point point) noexcept
+{
+  switch (point) {
+    case gpu_completion_point::prepare: return "prepare";
+    case gpu_completion_point::execute: return "execute";
+    case gpu_completion_point::failure: return "failure";
+    case gpu_completion_point::sink: return "sink";
+    case gpu_completion_point::retry: return "retry";
+    case gpu_completion_point::shutdown: return "shutdown";
+    default: return "unknown";
+  }
+}
 
 class internal_exception : public std::runtime_error {
  public:
@@ -57,20 +76,42 @@ class invalid_input_exception : public std::runtime_error {
 };
 
 /**
- * @brief Reports that failure cleanup could not join all submitted GPU work.
+ * @brief Reports that submitted GPU work could not be confirmed complete.
  *
- * Storage reachable by unfinished work must remain allocated, so the error is never retried. Only
- * accumulation cleanup (`join_on_failure`) nests the original exception. The scan read paths
- * rethrow the instance `prepare_unjoined_failure` creates before they submit work, so their failure
- * path never allocates and does not carry the original error. Construction must therefore not
- * allocate; keep this a plain `std::exception` with a fixed message.
+ * Query cleanup retains resources reachable by this work. Status, stage and a bounded
+ * earlier diagnostic are copied without allocation. Default construction remains usable
+ * by scan paths that prepare the exception before submitting GPU work.
  */
 class unjoined_gpu_work : public std::exception {
  public:
+  explicit unjoined_gpu_work(cudaError_t status         = cudaSuccess,
+                             gpu_completion_point point = gpu_completion_point::unknown) noexcept
+    : status_(status), point_(point)
+  {
+  }
+  [[nodiscard]] cudaError_t error_code() const noexcept { return status_; }
+  [[nodiscard]] gpu_completion_point point() const noexcept { return point_; }
+  [[nodiscard]] char const* prior_error() const noexcept { return prior_error_.data(); }
+
+  void remember_prior_error(std::exception_ptr error) noexcept
+  {
+    try {
+      if (error) std::rethrow_exception(error);
+    } catch (std::exception const& e) {
+      std::snprintf(prior_error_.data(), prior_error_.size(), "%s", e.what());
+    } catch (...) {
+      std::snprintf(prior_error_.data(), prior_error_.size(), "%s", "non-standard exception");
+    }
+  }
   [[nodiscard]] char const* what() const noexcept override
   {
     return "GPU work may still run after a failed host join";
   }
+
+ private:
+  cudaError_t status_;
+  gpu_completion_point point_;
+  std::array<char, 256> prior_error_{};
 };
 
 }  // namespace sirius
