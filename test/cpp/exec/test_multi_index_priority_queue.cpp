@@ -335,6 +335,26 @@ TEST_CASE("multi_index gpu_index{-1} routes tasks with no preferred device",
   REQUIRE(q.device_bucket_sizes().empty());
 }
 
+TEST_CASE("multi_index try_pop_for_device orders this device and no preference by priority",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  q.push(task(20, keys_of(3, SiriusPhysicalOperatorType::FILTER, 0, /*device=*/0)));
+  q.push(task(21, keys_of(1)));  // no preferred device
+  q.push(task(22, keys_of(5, SiriusPhysicalOperatorType::FILTER, 0, /*device=*/0)));
+  q.push(task(23, keys_of(0, SiriusPhysicalOperatorType::FILTER, 0, /*device=*/1)));
+  q.push(task(24, keys_of(5)));  // ties with id 22; the preferred one goes first
+
+  REQUIRE(q.try_pop_for_device(0).value()->id == 21);
+  REQUIRE(q.try_pop_for_device(0).value()->id == 20);
+  REQUIRE(q.try_pop_for_device(0).value()->id == 22);
+  REQUIRE(q.try_pop_for_device(0).value()->id == 24);
+  // Another device's task is never taken.
+  REQUIRE_FALSE(q.try_pop_for_device(0).has_value());
+  REQUIRE(q.try_pop_for_device(1).value()->id == 23);
+  REQUIRE(q.empty());
+}
+
 TEST_CASE("multi_index device index stays consistent across other-index pops",
           "[multi_index_priority_queue]")
 {
