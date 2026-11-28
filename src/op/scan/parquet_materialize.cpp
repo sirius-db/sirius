@@ -256,8 +256,7 @@ std::unique_ptr<cudf::table> materialize_bulk(
   metadatas.reserve(sources.size());
   rg_per_src.reserve(sources.size());
 
-  // Reserved before the first read is issued: taking ownership of an issued
-  // read cannot throw, so its result is never dropped unread.
+  // Reserve before issuing reads so recording an issued read cannot allocate or throw.
   std::vector<pending_fetch> fetches;
   fetches.reserve(sources.size());
   for (std::size_t i = 0; i < sources.size(); ++i) {
