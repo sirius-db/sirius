@@ -17,13 +17,16 @@
 #pragma once
 
 // sirius
-#include "expression/ast/node.hpp"  // sirius::ast::node
+#include "expression/ast/node.hpp"            // sirius::ast::node
+#include "expression/ast/order_modifier.hpp"  // sirius::ast::order_modifier
 
 // standard library
 #include <memory>
+#include <optional>
 
 namespace duckdb {
 class Expression;
+struct BoundOrderByNode;
 }  // namespace duckdb
 
 namespace sirius::ast {
@@ -45,5 +48,12 @@ namespace sirius::ast {
  *         (target type), or BoundFunctionExpression (return type).
  */
 std::unique_ptr<node> from_duckdb(duckdb::Expression const& expr);
+
+/**
+ * @brief Translate the direction and NULL placement of one DuckDB ORDER BY key.
+ *
+ * @return std::nullopt when either is left unresolved (ORDER_DEFAULT or INVALID)
+ */
+std::optional<order_modifier> order_modifier_from_duckdb(duckdb::BoundOrderByNode const& key);
 
 }  // namespace sirius::ast

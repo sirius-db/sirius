@@ -25,9 +25,11 @@
 #include <cucascade/io/types.hpp>
 
 #include <algorithm>
+#include <future>
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace sirius::op::scan {
@@ -121,15 +123,31 @@ struct fetched_chunks {
   std::vector<cudf::device_span<std::uint8_t const>> spans;
 };
 
-/// Read every column chunk of @p src into device memory in ONE vectored
-/// request, so a split costs one round trip per file rather than one per chunk.
-/// That is the whole point of the bulk route against an object store, where
-/// every extra request is another round trip.
-fetched_chunks fetch_chunks(parquet_source const& src,
-                            cudf::io::parquet_reader_options const& options,
-                            std::span<cudf::io::text::byte_range_info const> ranges,
-                            ::cuda::stream_ref stream,
-                            rmm::device_async_resource_ref mr)
+/// Cap unjoined file reads per materialization; demand misses can compete with
+/// read-ahead for staging.
+constexpr std::size_t max_pending_fetches = 32;
+
+/// One source's vectored read, issued and not yet joined.
+struct pending_fetch {
+  pending_fetch()                           = default;
+  pending_fetch(pending_fetch&&)            = default;
+  pending_fetch& operator=(pending_fetch&&) = delete;
+
+  fetched_chunks chunks;
+  std::vector<cucascade::io::slice> reads;
+  /// Declared last: destroying it waits for the read, before the slices and
+  /// the buffers it writes to are freed.  Assignment would free them first.
+  std::future<std::size_t> read;
+};
+static_assert(std::is_nothrow_move_constructible_v<pending_fetch>);
+
+/// Start one logical vectored read of every column chunk of @p src into device
+/// memory.  The backend may serve it from cache or split it into physical reads.
+pending_fetch begin_fetch(parquet_source const& src,
+                          cudf::io::parquet_reader_options const& options,
+                          std::span<cudf::io::text::byte_range_info const> ranges,
+                          ::cuda::stream_ref stream,
+                          rmm::device_async_resource_ref mr)
 {
   // Derive the ranges when the caller did not already have them.  A caller that
   // fadvised this split does, and passing them avoids re-walking the footer.
@@ -139,24 +157,28 @@ fetched_chunks fetch_chunks(parquet_source const& src,
     ranges = owned;
   }
 
-  fetched_chunks out;
-  out.buffers.reserve(ranges.size());
+  pending_fetch out;
+  out.chunks.buffers.reserve(ranges.size());
   for (auto const& range : ranges) {
-    out.buffers.emplace_back(static_cast<std::size_t>(range.size()), stream, mr);
+    out.chunks.buffers.emplace_back(static_cast<std::size_t>(range.size()), stream, mr);
   }
 
-  std::vector<cucascade::io::slice> reads;
-  reads.reserve(ranges.size());
+  out.reads.reserve(ranges.size());
   for (std::size_t i = 0; i < ranges.size(); ++i) {
-    reads.emplace_back(static_cast<std::size_t>(ranges[i].offset()),
-                       static_cast<std::size_t>(ranges[i].size()),
-                       static_cast<std::uint8_t*>(out.buffers[i].data()));
+    out.reads.emplace_back(static_cast<std::size_t>(ranges[i].offset()),
+                           static_cast<std::size_t>(ranges[i].size()),
+                           static_cast<std::uint8_t*>(out.chunks.buffers[i].data()));
   }
 
-  {
-    std::ignore = src.datasource->device_read_ranges_async(reads, stream).get();
-  }
+  out.read = src.datasource->device_read_ranges_async(out.reads, stream);
+  return out;
+}
 
+fetched_chunks finish_fetch(pending_fetch fetch)
+{
+  std::ignore = fetch.read.get();
+
+  auto out = std::move(fetch.chunks);
   out.spans.reserve(out.buffers.size());
   for (auto const& buf : out.buffers) {
     out.spans.emplace_back(static_cast<std::uint8_t const*>(buf.data()), buf.size());
@@ -184,7 +206,7 @@ std::unique_ptr<cudf::table> materialize_bulk(
   if (sources.size() == 1) {
     // Single file: the single-source reader, whose chunk data is flat.
     auto const& src   = sources.front();
-    auto const chunks = fetch_chunks(src, options, ranges_for(ranges, 0), stream, mr);
+    auto const chunks = finish_fetch(begin_fetch(src, options, ranges_for(ranges, 0), stream, mr));
 
     hybrid_scan_reader reader(*src.metadata, options);
     auto result =
@@ -213,8 +235,24 @@ std::unique_ptr<cudf::table> materialize_bulk(
   metadatas.reserve(sources.size());
   rg_per_src.reserve(sources.size());
 
+  // Reserved before the first read is issued: taking ownership of an issued
+  // read cannot throw, so its result is never dropped unread.
+  std::vector<pending_fetch> fetches;
+  fetches.reserve(sources.size());
   for (std::size_t i = 0; i < sources.size(); ++i) {
-    auto chunks = fetch_chunks(sources[i], options, ranges_for(ranges, i), stream, mr);
+    try {
+      for (auto j = fetches.size(); j < sources.size() && j - i < max_pending_fetches; ++j) {
+        fetches.push_back(begin_fetch(sources[j], options, ranges_for(ranges, j), stream, mr));
+      }
+    } catch (...) {
+      // A failed read of an earlier file comes first: reading the files one at
+      // a time would have stopped there.
+      for (auto j = i; j < fetches.size(); ++j) {
+        std::ignore = fetches[j].read.get();
+      }
+      throw;
+    }
+    auto chunks = finish_fetch(std::move(fetches[i]));
     spans.insert(spans.end(), chunks.spans.begin(), chunks.spans.end());
     // Moving a device_buffer keeps its device pointer, so the spans stay valid;
     // the buffers just have to outlive the decode.

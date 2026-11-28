@@ -1,6 +1,7 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include "c_api/config_internal.hpp"  // IWYU pragma: keep
 #include "c_api/error_internal.hpp"
+#include "c_api/handle_internal.hpp"
 #include "config_loading.hpp"
 
 #include <sirius-c/context/config_builder.h>
@@ -8,16 +9,8 @@
 #include <string_view>
 
 namespace {
-template <typename T>
-void retain(T* value) noexcept
-{
-  if (value) { value->references.fetch_add(1, std::memory_order_relaxed); }
-}
-template <typename T>
-void release(T* value) noexcept
-{
-  if (value && value->references.fetch_sub(1, std::memory_order_acq_rel) == 1) { delete value; }
-}
+using sirius::c_api::release;
+using sirius::c_api::retain;
 }  // namespace
 
 void sirius_context_config_retain(sirius_context_config* config) noexcept { retain(config); }

@@ -2,10 +2,46 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
 namespace sirius::io::s3 {
+
+/// What a description shows in place of an S3 location.
+inline constexpr std::string_view redacted_s3_location = "s3://<redacted>";
+
+/// Whether @p uri starts with `s3://`, the scheme compared without regard to ASCII case.
+constexpr bool has_s3_scheme(std::string_view uri) noexcept
+{
+  constexpr std::string_view scheme = "s3://";
+  if (uri.size() < scheme.size()) { return false; }
+  for (std::size_t i = 0; i < scheme.size(); ++i) {
+    auto const c = uri[i];
+    if ((c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c) != scheme[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Why a bucket name is refused.
+enum class bucket_defect : std::uint8_t { none, empty_or_dot, byte };
+
+/// The bucket rule shared by scan locations and store prefixes: one or more ASCII letters,
+/// digits, `.`, `_` or `-`, and not `.` or `..`.
+constexpr bucket_defect check_bucket(std::string_view bucket) noexcept
+{
+  if (bucket.empty() || bucket == "." || bucket == "..") { return bucket_defect::empty_or_dot; }
+  for (auto const c : bucket) {
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+          c == '_' || c == '-')) {
+      return bucket_defect::byte;
+    }
+  }
+  return bucket_defect::none;
+}
 
 /// Scheme-only canonicalization for prefix matching: a copy of @p uri with the bytes before
 /// `://` lower-cased. Bucket and key bytes compare exactly.

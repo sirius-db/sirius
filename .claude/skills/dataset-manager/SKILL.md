@@ -11,6 +11,16 @@ argument-hint: "[benchmark] [scale_factor] [--format duckdb|parquet] [--cluster]
 
 Generate benchmark datasets by running the corresponding shell script under `test/<benchmark>_performance/`.
 
+## Existing scale_bench inputs
+
+`scale_bench` consumes an existing local Parquet dataset; this repository does
+not provide a generator for it. Do not ask for a TPC-H scale factor or invoke
+the TPC-H/TPC-DS generators as a substitute. Locate the requested dataset and
+check the directory mapping in the
+[scale_bench guide](../../../test/tpch_performance/README.md#scale_bench).
+The benchmark runner owns the temporary prepared table C and its cleanup;
+it is not a separately generated source dataset.
+
 ## Gather Parameters
 
 Parse `$ARGUMENTS` for:

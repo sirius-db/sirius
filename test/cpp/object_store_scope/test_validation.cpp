@@ -25,7 +25,8 @@ void expect_violation(std::optional<core::violation> const& actual,
                       reason why,
                       std::string_view text)
 {
-  REQUIRE(actual.has_value());
+  CHECK(actual.has_value());
+  if (!actual) { return; }
   CHECK(actual->field == field);
   CHECK(actual->why == why);
   auto const message = core::describe(*actual);
@@ -383,6 +384,10 @@ TEST_CASE("Object-store scope checks prefix shape in publication order", "[objec
     row{"s3:///a?x", reason::prefix_shape, "must be s3://bucket/ or s3://bucket/prefix/"},
     row{"s3://bucket", reason::prefix_no_trailing_slash, "must end with '/'"},
     row{"s3://bucket/a?x", reason::prefix_no_trailing_slash, "must end with '/'"},
+    row{"s3://bad bucket", reason::prefix_no_trailing_slash, "must end with '/'"},
+    row{"s3://bad bucket/?x/",
+        reason::prefix_query_or_fragment,
+        "must not contain a query or fragment"},
     row{"s3://bucket/a//b?x/",
         reason::prefix_query_or_fragment,
         "must not contain a query or fragment"},
@@ -409,5 +414,24 @@ TEST_CASE("Object-store scope checks prefix shape in publication order", "[objec
     expect_violation(core::check_uri_prefix(test.prefix), "uri_prefix", test.why, test.text);
     auto value = valid_settings(test.prefix);
     expect_violation(core::check_settings(value, {}), "uri_prefix", test.why, test.text);
+  }
+}
+
+TEST_CASE("Object-store scope rejects invalid bucket bytes before checking segments",
+          "[object_store_scope]")
+{
+  constexpr std::string_view text =
+    "bucket must use only ASCII letters, digits, '.', '_' or '-' and must not be '.' or '..'";
+  for (auto prefix : {"s3://../",
+                      "s3://./",
+                      "s3://bad bucket/",
+                      "s3://user:secret@bucket/",
+                      "s3://host:9000/",
+                      "s3://hi\xff/",
+                      "s3://bad bucket/a%/"}) {
+    CAPTURE(prefix);
+    expect_violation(core::check_uri_prefix(prefix), "uri_prefix", reason::prefix_bucket, text);
+    expect_violation(
+      core::check_settings(valid_settings(prefix), {}), "uri_prefix", reason::prefix_bucket, text);
   }
 }

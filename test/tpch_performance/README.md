@@ -1,6 +1,128 @@
-# TPC-H Performance Testing
+# TPC-H and scale_bench Performance Testing
 
 This directory contains benchmarking, profiling, and performance testing tools for comparing DuckDB (CPU) vs Sirius (GPU) on TPC-H queries at various scale factors.
+
+## scale_bench
+
+The primary Python runner also supports `--benchmark scale_bench`. Omitting
+`--benchmark` keeps the existing TPC-H behavior. TPC-DS retains its separate
+runner; the legacy shell scripts in this directory remain TPC-H-specific.
+
+```bash
+pixi run python test/tpch_performance/performance_test.py \
+    --benchmark scale_bench --input /data/scale_dataset \
+    --queries gb2,workflow --iterations 3 --engine gpu \
+    --config /path/to/sirius.yaml \
+    --temp-dir /scratch/scale_work --output /data/benchmark_results
+```
+
+Use `--engine both --validation` to compare CPU and GPU results, or `--engine cpu`
+for a CPU-only run. No TPC-H `--scale-factor` is needed or accepted for this
+benchmark. `--queries all` (also the default) selects:
+
+- `sort1`: all table-A rows ordered by `col_a`.
+- `sort2`: all table-A rows ordered by all five columns.
+- `gb1`: `col_a, count(*)`, grouped by `col_a`.
+- `gb2`: all five table-A columns and `count(*)`, grouped by all five columns.
+- `join1`: A LEFT JOIN B on the four recorded key pairs.
+- `workflow`: four chained LEFT JOINs through B, prepared C, D, and E, excluding
+  the right-hand join keys from the output.
+- `bfs`: directed `col_b -> col_d` edges, root 1000, expanding until no new
+  vertices remain.
+- `pagerank`: ten iterations over an unordered sample of at most 10,000 edges,
+  restart probability 0.15 and initial mass at the first sampled source vertex.
+
+Queries and exact expected column types are defined in `scale_bench.py`.
+Only the inputs required by the selected queries are opened. They are
+Parquet-backed views, discovered under these directories in `--input`:
+
+```text
+temp_forced_table_a/*.parquet -> table_a
+temp_table_b/*.parquet        -> table_b
+temp_forced_table_c/*.parquet -> table_c
+temp_forced_table_d/*.parquet -> table_d
+temp_forced_table_e/*.parquet -> table_e
+```
+
+Schema checks precede execution. Table A has four BIGINT columns (`col_a` through
+`col_d`) and one VARCHAR (`col_e`). C contains INTEGER lists; E contains VARCHAR
+lists. The other tables mix scalar integer and string columns. Files, sizes,
+observed schemas, preparation time and effective fingerprint SQL are retained
+in the existing run metadata. A single-node shuffle substitute is not included.
+
+### Result formats and timing
+
+`scale_bench` defaults to `--result-format fingerprint`, returning one summary
+row containing count, numeric sums and VARCHAR-length sums. Nested columns are
+excluded and recorded in metadata. This is not exhaustive value or output-order
+validation; payloads unused by these aggregates can be pruned by the optimizer.
+TPC-H still defaults to `--result-format rows`.
+
+Use `--result-format rows` to materialize the complete result through the client
+path, or `--result-format parquet` for the existing per-iteration Parquet export
+path. Full outputs can be enormous. Parquet mode supports the six SQL queries;
+select them explicitly instead of `all`. GPU exports must pass the existing
+cuDF-writer attribution check. The export includes query and writer time, and is
+kept under the benchmark output directory, separate from temporary inputs.
+
+Table-C preparation, connection initialization, fetching Python rows, output
+validation and cleanup are outside query timing. BFS/PageRank execution includes
+their iterative GPU SELECTs and CPU intermediate table writes/checkpoints, plus
+the final result SELECT. These algorithms use a private persistent work database
+per engine. Their state is initialized again for every iteration. GPU fallback
+is disabled for this workload. CPU fixtures do not establish GPU support.
+
+CPU/GPU validation compares scalar fingerprints or full rows for deterministic
+queries. PageRank's unordered sample can differ between executions: every run
+checks finite/nonnegative ranks, normalized rank mass, unique vertex coverage
+and sample-size bounds instead of comparing IDs/checksums from different
+samples. `validation.csv` success for PageRank means those invariant checks
+passed, not exact CPU/GPU equality. Per-iteration graph checks state their scope.
+
+BFS and PageRank require non-NULL edge endpoints in `table_a.col_b` and
+`table_a.col_d`. Selecting either algorithm adds an untimed CPU input check;
+NULL endpoints cause preparation to fail before temporary files are created.
+Edges are never silently filtered. SQL-only selections skip this check.
+
+BFS retains the historical root `1000`. Per-iteration metadata records
+`max_distance` (the greatest distance from the root), `reached_beyond_root`, and
+`expanded`. A root-only result passes correctness checks but emits a warning,
+also saved in metadata: it provides no evidence of traversal performance.
+
+### Prepared table C and temporary files
+
+Selecting `workflow` writes a CPU-prepared Parquet copy of C once per invocation,
+outside query timing. It replaces `col_c_11` with `CAST(col_c_11 AS VARCHAR)` under
+the same name, preserving the remaining columns, including lists. Both engines
+and all iterations use that same `table_c_prep` copy.
+
+`--temp-dir` is a **parent directory**. The runner creates a unique
+`scale_bench-*` child for prepared C and graph work databases; without this flag,
+the child is created beneath the benchmark run directory. The runner never
+reuses existing preparation or deletes the parent directory or unrelated files.
+It closes connections before removing its child on completion and exceptions.
+SIGINT (Ctrl-C), SIGTERM and SIGHUP request interruption of the active DuckDB
+connection, including during preparation, then exit with `128 + signal` and
+attempt cleanup. Previous signal handlers are restored afterward. Prompt
+cancellation through Sirius depends on the engine honoring interruption.
+Cleanup failures are recorded and reported; a failed
+cleanup makes an otherwise successful invocation fail. SIGKILL, process crashes
+and machine failure cannot guarantee cleanup: the run metadata retains the exact
+temporary path for manual recovery. Benchmark reports and exported result files
+are preserved.
+
+Existing `--profile` and `--mode` cache controls apply, including the runner's
+startup file-eviction hints. The hints cover prepared C as well as original
+inputs; filesystems can ignore them. CPU preparation itself reads input data,
+so omitting a profile does not establish cold-cache execution. This does not
+claim the same cache state as an external historical run.
+
+The first implementation supports local Parquet inputs and the serial runner.
+S3/native-DuckDB inputs, pinning, concurrent clients, external `nsys`/`gdb`
+wrappers and PageRank reference-result reuse are rejected before preparation.
+CPU JSON profiling is available through the existing `--duckdb-profiling` flag.
+For iterative workloads that JSON profile describes the final result SELECT;
+`runtime_s` also includes all preceding graph steps and materialization.
 
 ## Prerequisites
 
@@ -252,7 +374,9 @@ is kept beside it as `config.yml`.
 | `hot` | `cucs` | `lru` | back-to-back per query | nothing |
 
 **Config overrides come from `--profile` and `--pin parquet`.** With neither, the supplied
-YAML is used unchanged; otherwise the runner can write `effective_config.yml`.
+YAML is used unchanged; otherwise the runner can write `effective_config.yml`. Either way, Sirius
+writes the configuration it resolved at startup (every named value, plus defaults and the values it
+derived from the machine) to `<bench>/resolved_config.yaml`.
 
 The runner requests dataset-file eviction once at startup, even when `--profile` is omitted. `cold` keeps the
 *connection* (and so the GPU context and compiled plans) — it targets caches, not the process.
@@ -283,7 +407,7 @@ runner registers views over those keys.
 
 Key flags:
 - `--scale-factor SF` — dataset scale used to render Q11's `0.0001 / SF` threshold. Pass it explicitly; omission defaults to SF1 with a warning for rollout compatibility.
-- `--data-source parquet|duckdb` — input source/format (default `parquet`). `parquet`: `--input` is a directory of TPC-H parquet files (scanned via `read_parquet` → `GPU_PARQUET_SCAN`). `duckdb`: `--input` is a single `.duckdb` file whose native tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works in all modes (incl. `nsys-profile`), and `--pin` works for both. (This is the harness's own 2-value flag — see the disambiguation note below, distinct from the legacy shell `--data-source`.)
+- `--data-source parquet|duckdb|iceberg` — input source/format (default `parquet`). `parquet`: `--input` is a directory of TPC-H parquet files (scanned via `read_parquet` → `GPU_PARQUET_SCAN`). `duckdb`: `--input` is a single `.duckdb` file whose native tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works in all modes (incl. `nsys-profile`), and `--pin` works for both. (This is the harness's own 2-value flag — see the disambiguation note below, distinct from the legacy shell `--data-source`.) `iceberg`: `--input` is the `catalog.schema` of an Iceberg REST catalog and `--catalog-setup FILE` names a SQL file that attaches it (`CREATE SECRET ...; ATTACH ...`); the file holds credentials, so keep it outside the repository. It runs before Sirius is loaded, which keeps its statements out of `sirius.log`, so it cannot create `SIRIUS_S3` secrets. Needs the httpfs, avro and iceberg extensions installed. Serial runs without `--pin` or `--precmd` only.
 - `--engine gpu|cpu|both` — which engine to benchmark.
 - `--iterations N` — per-query iteration count.
 - `--profile cold|lukewarm|hot` (optional) — cache state to measure; see "Profiles" above. When given it overrides `cache.mode` / `cache.eviction` in `--config`; when omitted the config is left alone.
