@@ -257,7 +257,7 @@ step trace_through(sirius_physical_operator const& node,
       auto const type    = join.join_type;
       bool const carries = type == duckdb::JoinType::INNER || type == duckdb::JoinType::LEFT ||
                            type == duckdb::JoinType::RIGHT || type == duckdb::JoinType::OUTER;
-      if (!carries) { return step::reads(); }
+      if (!carries || join.build_counts()) { return step::reads(); }
       if (node.children.size() != 2) { return step::reads(); }
 
       bool const from_lhs = node.children[0].get() == &from;

@@ -147,7 +147,10 @@ struct build_probe_decision {
 /// config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW) and decoded resident payload. Broadcast charges
 /// the full build; hash partitioning charges rounded-up averages, which do not bound hash skew.
 /// Missing rows disable BUILD_PROBE including MARK joins. Right-family, mixed,
-/// and full-outer joins remain STANDARD because streaming would over-emit build rows.
+/// and full-outer joins remain STANDARD because streaming would over-emit build rows, except a
+/// build-driven RIGHT join when `right_may_stream`: it tracks which build rows matched and emits
+/// the rest once per partition, so it is never broadcast. Left STANDARD, it is partitioned for its
+/// planned probe, which each partition folds whole.
 ///
 /// Broadcast candidacy: a build is replicate-worthy when it is below the small-table threshold, OR
 /// when it is below `max_broadcast_join_size` AND the probe side is large relative to the build
@@ -186,7 +189,8 @@ struct build_probe_decision {
   double estimated_probe_to_build_ratio,
   std::optional<uint64_t> resident_bytes = std::nullopt,
   bool kept_build_streaming              = false,
-  bool correlated_mark                   = false);
+  bool correlated_mark                   = false,
+  bool right_may_stream                  = false);
 
 /**
  * @brief Select never-probed build slots that can be reclaimed after the probe producer closes.
@@ -403,7 +407,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   /// A kept-build join holds each partition's build in its slot after the ports drain, so the
-  /// operator stays nonempty until every slot has issued its emit task.
+  /// operator stays nonempty until every slot has issued its emit task. A streamed RIGHT join stays
+  /// nonempty until every partition has emitted its unmatched rows.
   [[nodiscard]] bool all_ports_empty() override;
 
   /// STANDARD / MIXED_JOIN only. Re-poll both input ports for newly-arrived batch IDs, extend
@@ -569,7 +574,47 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     // Kept-build joins: probe tasks issued for this slot whose execute() has not completed. The
     // emit task waits for zero so it reads every probe batch's flags.
     std::atomic<int> probes_in_flight{0};
+    // A streamed RIGHT join emits the build rows no probe batch matched once every probe task of
+    // the partition has finished. Probe tasks set `build_matched`; the final task re-reads
+    // `build_batch`.
+    std::unique_ptr<rmm::device_uvector<std::uint8_t>> build_matched;
+    /// In place of `build_matched` when the join counts its build rows' matches.
+    std::unique_ptr<rmm::device_uvector<std::int64_t>> build_match_counts;
+    std::shared_ptr<cucascade::data_batch> build_batch;
+    std::atomic<bool> unmatched_issued{false};
   };
+  /// A RIGHT join running BUILD_PROBE: probe batches stream through each partition's resident
+  /// build, and a final task per partition emits the unmatched build rows.
+  [[nodiscard]] bool streams_right_join() const
+  {
+    return join_type == duckdb::JoinType::RIGHT && _join_mode == HASH_JOIN_MODE::BUILD_PROBE;
+  }
+  /// The partition whose unmatched build rows can be emitted now. Requires `op_state_mutex`.
+  [[nodiscard]] std::optional<std::size_t> next_unmatched_partition(bool probe_finished);
+  /// Whether a streamed RIGHT join still has unmatched rows to emit. Requires `op_state_mutex`.
+  [[nodiscard]] bool unmatched_rows_pending() const;
+  std::unique_ptr<operator_data> emit_unmatched_build_rows(
+    per_partition_build_state& slot,
+    std::vector<::cucascade::read_only_data_batch> const& input_batches,
+    ::cuda::stream_ref stream);
+  /// What a streamed partition emits once its probe is done: the build rows no probe matched, with
+  /// NULL probe columns, or the build keys' counts.
+  std::unique_ptr<cudf::table> unmatched_build_table(per_partition_build_state& slot,
+                                                     cudf::table_view const& probe_view,
+                                                     cudf::table_view const& build_view,
+                                                     ::cuda::stream_ref stream);
+  /// Adds the pairs of one probe batch to per-build-row match counts.
+  void count_probe_matches(rmm::device_uvector<std::int64_t>& counts,
+                           cudf::table_view const& probe_view,
+                           rmm::device_uvector<cudf::size_type> const& probe_rows,
+                           rmm::device_uvector<cudf::size_type> const& build_rows,
+                           ::cuda::stream_ref stream) const;
+  /// `[build key, BIGINT count]` from per-build-row match counts, one row per distinct key.
+  std::unique_ptr<cudf::table> build_count_table(rmm::device_uvector<std::int64_t>&& counts,
+                                                 cudf::table_view const& build_view,
+                                                 ::cuda::stream_ref stream) const;
+  /// Free a streamed RIGHT partition once its unmatched rows are emitted.
+  static void release_streamed_slot(per_partition_build_state& slot);
   // Sized to num_partitions when BUILD_PROBE is entered (see get_partition_strategy). Elements are
   // non-movable (atomic member), so the vector is default-constructed at the target size and only
   // ever whole-move-assigned — never resized or push_back'd — so element moves are never required.
@@ -648,6 +693,32 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   }
 
  public:
+  //! Lets a build-driven RIGHT join stream its probe through a resident build (BUILD_PROBE).
+  [[nodiscard]] bool right_may_stream() const noexcept { return _right_may_stream; }
+  void set_right_may_stream(bool value) noexcept { _right_may_stream = value; }
+
+  /// A RIGHT join fused with the COUNT above it that groups on the build key alone: it emits
+  /// `[build key, BIGINT count]`, the count of a key with P build rows and M counted matches
+  /// being P * M, or P * `unmatched_fill` when M is 0.
+  struct build_count_spec {
+    cudf::size_type build_key;
+    /// COUNT(col)'s argument in the probe input, whose NULLs do not count; nullopt for COUNT(*).
+    std::optional<cudf::size_type> probe_value;
+    std::int64_t unmatched_fill;
+  };
+  /// Switches a streamable RIGHT join to counting. Output columns become `output_types`.
+  void enable_build_counts(build_count_spec spec,
+                           duckdb::vector<sirius::logical_type> output_types);
+  [[nodiscard]] std::optional<build_count_spec> const& build_counts() const noexcept
+  {
+    return _build_counts;
+  }
+
+  [[nodiscard]] bool is_mixed_join() const noexcept
+  {
+    return _join_mode == HASH_JOIN_MODE::MIXED_JOIN;
+  }
+
   [[nodiscard]] bool single_join_error_on_multiple_rows() const
   {
     return single_join_error_on_multiple_rows_;
@@ -672,6 +743,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// Kept-build: issue the emit task for the first slot whose probe stream is complete. Must be
   /// called with op_state_mutex held.
   std::unique_ptr<operator_data> next_kept_build_emit_task();
+  bool _right_may_stream = false;
+  std::optional<build_count_spec> _build_counts;
 };
 
 }  // namespace op
