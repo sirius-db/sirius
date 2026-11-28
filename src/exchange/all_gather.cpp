@@ -83,8 +83,10 @@ std::vector<std::shared_ptr<cucascade::data_batch>> all_gather(
   } const detach{service, stream};
 
   bool const contributes = mine && get_cudf_table_view(*mine).num_rows() > 0;
+  // Not waiting for room in the send queue: the exchange sinks' smaller batches take the room as
+  // it appears, and a join's filter can wait there until the scan it is for has sent everything.
   for (rank_t r = 0; r < world; ++r) {
-    if (contributes) { service.send(stream, r, mine); }
+    if (contributes) { service.send(stream, r, mine, /*wait_for_room=*/false); }
     service.close(stream, r);
   }
 
