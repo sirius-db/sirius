@@ -254,6 +254,7 @@ TEST_CASE("every operator option's fallback and audience", "[config][config_oper
   check(op.enable_partial_aggregate_below_join, true);
   check(op.enable_subquery_key_carry, true);
   check(op.enable_exists_from_aggregate, true);
+  check(op.enable_narrowing_expression_pushdown, true);
   check(op.parquet_footer_statistics_max_remote_reads, true);
   check(op.parquet_footer_statistics_max_local_reads, true);
   check(op.admission_bytes_per_gpu, true);
