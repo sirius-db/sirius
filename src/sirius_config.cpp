@@ -696,6 +696,7 @@ try {
   ops.enable_partial_aggregate_below_join      = op.enable_partial_aggregate_below_join.get();
   ops.enable_subquery_key_carry                = op.enable_subquery_key_carry.get();
   ops.enable_exists_from_aggregate             = op.enable_exists_from_aggregate.get();
+  ops.enable_narrowing_expression_pushdown     = op.enable_narrowing_expression_pushdown.get();
   ops.parquet_footer_statistics_max_remote_reads =
     op.parquet_footer_statistics_max_remote_reads.get();
   ops.parquet_footer_statistics_max_local_reads =
