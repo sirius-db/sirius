@@ -28,6 +28,7 @@ using sirius::planner::apply_gpu_cap;
 using sirius::planner::estimate_bytes_per_row;
 using sirius::planner::gpu_count_for_bytes;
 using sirius::planner::kept_side_fits;
+using sirius::planner::rows_in_value_range;
 using sirius::planner::scan_estimate;
 using sirius::planner::total_scan_bytes;
 
@@ -287,4 +288,22 @@ TEST_CASE("kept_side_fits compares one process's share of the kept side with its
   CHECK_FALSE(kept_side_fits(256 * gib, 4, 64 * gib));
   // A budget of 0 turns the kept-side build off.
   CHECK_FALSE(kept_side_fits(0, 4, 0));
+}
+
+TEST_CASE("rows_in_value_range keeps the range's share of an evenly spread column",
+          "[admission_estimator]")
+{
+  // 92 days of a column that holds 2406: TPC-H Q4's quarter of o_orderdate.
+  CHECK(rows_in_value_range(150'000'000'000, 8035, 10440, 8582, 8673) == 5'735'660'848);
+  // The whole column, and a range wider than it.
+  CHECK(rows_in_value_range(1000, 1, 100, 1, 100) == 1000);
+  CHECK(rows_in_value_range(1000, 1, 100, -50, 500) == 1000);
+  // One bound: the column's other end closes the range.
+  CHECK(rows_in_value_range(1000, 1, 100, 91, 100) == 100);
+  // One value, and a share that is not whole rounds up.
+  CHECK(rows_in_value_range(1000, 1, 100, 7, 7) == 10);
+  CHECK(rows_in_value_range(10, 1, 3, 2, 2) == 4);
+  // A range outside the column, or an empty one, keeps nothing.
+  CHECK(rows_in_value_range(1000, 1, 100, 101, 200) == 0);
+  CHECK(rows_in_value_range(1000, 1, 100, 60, 40) == 0);
 }

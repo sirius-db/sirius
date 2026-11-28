@@ -20,8 +20,12 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -29,6 +33,7 @@
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
@@ -441,6 +446,94 @@ std::vector<duckdb::idx_t> proven_unique_scan_outputs(duckdb::ClientContext& con
 
 // A correlated IN / ANY / ALL (see sirius_physical_hash_join::is_correlated_mark). DuckDB sends
 // `=` or `<>` here; it plans an ordered comparison as a min/max aggregate under a SINGLE join.
+/// Where an integer or DATE @p value stands among its type's values, or nullopt for another type.
+static std::optional<double> ordinal_of(duckdb::Value const& value)
+{
+  if (value.IsNull()) { return std::nullopt; }
+  if (value.type().id() == duckdb::LogicalTypeId::DATE) {
+    return static_cast<double>(duckdb::DateValue::Get(value).days);
+  }
+  if (value.type().IsIntegral()) { return value.GetValue<double>(); }
+  return std::nullopt;
+}
+
+/// Narrows @p low to @p high to the values @p condition keeps, when it is comparisons of the
+/// filtered column with a constant, joined by AND. False for any other condition.
+static bool narrow_to_range(duckdb::Expression const& condition, double& low, double& high)
+{
+  if (condition.GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_AND) {
+    auto const& all = condition.Cast<duckdb::BoundConjunctionExpression>().GetChildren();
+    return std::ranges::all_of(
+      all, [&](auto const& child) { return narrow_to_range(*child, low, high); });
+  }
+  if (!duckdb::BoundComparisonExpression::IsComparison(condition)) { return false; }
+  auto comparison     = duckdb::ExpressionType::INVALID;
+  auto const constant = duckdb::ExpressionFilter::TryGetColumnConstantComparison(
+    condition.Cast<duckdb::BoundFunctionExpression>(), comparison);
+  auto const bound = constant ? ordinal_of(constant->GetValue()) : std::nullopt;
+  if (!bound) { return false; }
+  switch (comparison) {
+    case duckdb::ExpressionType::COMPARE_EQUAL:
+      low  = std::max(low, *bound);
+      high = std::min(high, *bound);
+      return true;
+    case duckdb::ExpressionType::COMPARE_GREATERTHAN: low = std::max(low, *bound + 1); return true;
+    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+      low = std::max(low, *bound);
+      return true;
+    case duckdb::ExpressionType::COMPARE_LESSTHAN: high = std::min(high, *bound - 1); return true;
+    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+      high = std::min(high, *bound);
+      return true;
+    default: return false;
+  }
+}
+
+/// The rows of a join side that is one Parquet scan, under projections and filters, whose only
+/// scan filter holds an integer or DATE column between constants: the footers' row count times
+/// the range's share of the column's footer min to max. DuckDB estimates every such range at a
+/// fifth of the scan, whatever its width. Nullopt for any other side.
+static std::optional<std::size_t> range_filtered_scan_rows(duckdb::LogicalOperator const& side)
+{
+  auto const* node = &side;
+  while (node->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION ||
+         node->type == duckdb::LogicalOperatorType::LOGICAL_FILTER) {
+    if (node->children.size() != 1) { return std::nullopt; }
+    node = node->children[0].get();
+  }
+  if (node->type != duckdb::LogicalOperatorType::LOGICAL_GET) { return std::nullopt; }
+  auto const& get      = node->Cast<duckdb::LogicalGet>();
+  auto const* bind     = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
+  auto const scan_rows = transparent::parquet_scan_row_count(get);
+  if (!bind || !scan_rows || get.table_filters.HasMultiColumnFilters()) { return std::nullopt; }
+  std::optional<std::size_t> rows;
+  for (auto const& entry : get.table_filters) {
+    if (rows) { return std::nullopt; }
+    auto const& ids  = get.GetColumnIds();
+    auto const index = entry.GetIndex().GetIndex();
+    if (index >= ids.size() || ids[index].IsVirtualColumn()) { return std::nullopt; }
+    auto const column = ids[index].GetPrimaryIndex();
+    if (column >= get.names.size() || column >= get.returned_types.size() ||
+        entry.Filter().filter_type != duckdb::TableFilterType::EXPRESSION_FILTER) {
+      return std::nullopt;
+    }
+    auto const& filter = entry.Filter().Cast<duckdb::ExpressionFilter>();
+    if (!filter.expr || !filter.column_indexes.empty()) { return std::nullopt; }
+    // Footer statistics are kept under the bound name, which a column alias does not change.
+    auto const statistics = bind->file_options.GetColumnStatistics(
+      duckdb::Identifier(scan_source_names(get)[column]), get.returned_types[column]);
+    if (!statistics || !duckdb::NumericStats::HasMinMax(*statistics)) { return std::nullopt; }
+    auto const min = ordinal_of(duckdb::NumericStats::Min(*statistics));
+    auto const max = ordinal_of(duckdb::NumericStats::Max(*statistics));
+    if (!min || !max || *max < *min) { return std::nullopt; }
+    auto low  = *min;
+    auto high = *max;
+    if (!narrow_to_range(*filter.expr, low, high)) { return std::nullopt; }
+    rows = rows_in_value_range(*scan_rows, *min, *max, low, high);
+  }
+  return rows;
+}
+
 static bool is_correlated_any_mark(duckdb::LogicalComparisonJoin const& op)
 {
   std::vector<sirius::comparison_type> comparisons;
@@ -573,6 +666,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
+  // Read before create_plan() takes the scan's filters.
+  auto const kept_scan_rows =
+    op.join_type == duckdb::JoinType::RIGHT_SEMI || op.join_type == duckdb::JoinType::RIGHT_ANTI
+      ? range_filtered_scan_rows(*op.children[1])
+      : std::nullopt;
 
   auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   bool const dynamic_filter_enabled =
@@ -912,11 +1010,14 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       // Every partition keeps its build rows resident until the whole probe is read, and that
       // state cannot be spilled, so partitioning does not bound it. Build on the kept side only
       // when this process's part of it fits the per-GPU BUILD_PROBE residency budget across its
-      // GPUs. The estimate is of the whole kept side, also on a rank of a distributed plan.
+      // GPUs. The estimate is of the whole kept side, also on a rank of a distributed plan. A
+      // kept side that is a scan under a range uses the range's share of the column's values
+      // where that is below DuckDB's estimate.
       auto const num_gpus   = std::max<std::size_t>(1, gpu_spaces.size());
       auto const ranks      = std::max<std::size_t>(1, op_params.exchange_peers.size());
+      auto const kept_rows  = std::min(rhs_cardinality, kept_scan_rows.value_or(rhs_cardinality));
       auto const kept_bytes = sirius::memory::saturating_mul(
-        rhs_cardinality,
+        kept_rows,
         sirius::planner::estimate_bytes_per_row(hj.children[1]->types,
                                                 op_params.avg_variable_column_bytes));
       auto const budget =
@@ -928,7 +1029,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           "est {} rows, build est {} rows, {} bytes over {} rank(s)).",
           duckdb::JoinTypeToString(op.join_type),
           lhs_cardinality,
-          rhs_cardinality,
+          kept_rows,
           kept_bytes,
           ranks);
       } else {
