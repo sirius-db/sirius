@@ -17,6 +17,11 @@
 #pragma once
 #include "op/scan/parquet_scan_types.hpp"
 #include "op/scan/shared_materializer.hpp"
+
+#include <cucascade/io/io_context.hpp>
+
+#include <memory>
+#include <mutex>
 namespace sirius::op::scan {
 class parquet_scan_core {
  public:
@@ -203,6 +208,26 @@ class parquet_scan_core {
   // Per-file metadata-scan cursor. next_split_provider hands out one file index
   // per claim; the coalescer downstream batches files and chunks row groups.
   std::atomic<std::size_t> _next_file_idx{0};
+
+  struct file_pick {
+    std::size_t position;
+    /// The file's ioctx when ranking already resolved it, so its task does not resolve again.
+    std::shared_ptr<cucascade::io::ioctx> ctx;
+  };
+
+  /// Position in @c _selected_file_indices for the @p claim-th call: the unclaimed file the
+  /// prefetching cache holds the largest share of, so a scan re-reading a table (the previous
+  /// iteration, or a second scan of lineitem in one query) reaches its cached files before
+  /// the uncached ones' chunks evict them.  File order when nothing is cached.
+  file_pick pick_position(std::size_t claim, io::ioctx_resolver const& resolve);
+
+  std::mutex _claim_mtx;
+  std::atomic<bool> _file_order_off{false};
+  std::vector<bool> _claimed;
+  std::vector<std::shared_ptr<cucascade::io::ioctx>> _file_ctxs;
+  std::vector<std::size_t> _order;
+  std::size_t _order_pos         = 0;
+  std::size_t _claims_since_rank = 0;
   std::atomic<std::size_t> _reader_calls{0};
 
   // Dynamic join filters shared with the producing hash join; null when none are wired.

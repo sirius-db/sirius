@@ -1174,13 +1174,81 @@ bool parquet_scan_core::has_processed_all_metadata() const
   return _next_file_idx.load(std::memory_order_relaxed) >= _selected_file_indices.size();
 }
 
+parquet_scan_core::file_pick parquet_scan_core::pick_position(std::size_t claim,
+                                                              io::ioctx_resolver const& resolve)
+{
+  auto const n = _selected_file_indices.size();
+  if (n < 2) { return {claim, nullptr}; }
+  // Each claim is distinct, so the unlocked path moves out of a slot no other claim touches.
+  if (_file_order_off.load(std::memory_order_acquire)) {
+    return {claim, std::move(_file_ctxs[claim])};
+  }
+  std::lock_guard lock(_claim_mtx);
+  if (_claimed.empty()) {
+    _claimed.assign(n, false);
+    // A path no backend serves goes unranked; its metadata task reports the error.
+    _file_ctxs.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      try {
+        _file_ctxs[i] = resolve(_file_paths[_selected_file_indices[i]]);
+      } catch (...) {
+      }
+    }
+  }
+  // Between rankings the order is followed as is. Ranked by the cached share of the whole
+  // file: which columns a later split reads is not known before its footer.
+  constexpr std::size_t rerank_every = 8;
+  if (_order_pos >= _order.size() || _claims_since_rank >= rerank_every) {
+    std::vector<std::pair<std::size_t, std::size_t>> by_cached;  // (cached tenths, position)
+    by_cached.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      if (_claimed[i]) { continue; }
+      std::size_t tenths = 0;
+      if (auto const& ctx = _file_ctxs[i]; ctx && ctx->uses_fs_cache()) {
+        auto const held = ctx->cache()->residency(_file_paths[_selected_file_indices[i]]);
+        if (held && held->object_bytes > 0) {
+          tenths = held->resident_bytes * 10 / held->object_bytes;
+        }
+      }
+      by_cached.emplace_back(tenths, i);
+    }
+    // A scan that finds nothing cached when it starts has nothing to protect: the chunks that
+    // appear later are its own readahead, which file order already consumes.
+    if (_order.empty() && _claims_since_rank == 0 &&
+        std::none_of(
+          by_cached.begin(), by_cached.end(), [](auto const& e) { return e.first > 0; })) {
+      _file_order_off.store(true, std::memory_order_release);
+      return {claim, std::move(_file_ctxs[claim])};
+    }
+    // Coarse buckets, ties in file order: files cached about equally (all or nothing, the
+    // common cases) are read in file order.
+    std::stable_sort(by_cached.begin(), by_cached.end(), [](auto const& a, auto const& b) {
+      return a.first > b.first;
+    });
+    _order.clear();
+    for (auto const& entry : by_cached) {
+      _order.push_back(entry.second);
+    }
+    _order_pos         = 0;
+    _claims_since_rank = 0;
+  }
+  while (_order_pos < _order.size() && _claimed[_order[_order_pos]]) {
+    ++_order_pos;
+  }
+  auto const pick = _order_pos < _order.size() ? _order[_order_pos++] : claim;
+  _claimed[pick]  = true;
+  ++_claims_since_rank;
+  return {pick, std::move(_file_ctxs[pick])};
+}
+
 parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
   io::ioctx_resolver resolve)
 {
   if (!resolve) { throw std::runtime_error("parquet_scan_core: no scan_manager is wired."); }
-  auto const position = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
-  if (position >= _selected_file_indices.size()) { return nullptr; }
-  auto const idx = _selected_file_indices[position];
+  auto const claim = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
+  if (claim >= _selected_file_indices.size()) { return nullptr; }
+  auto [position, resolved] = pick_position(claim, resolve);
+  auto const idx            = _selected_file_indices[position];
 
   // Route each file to its own backend (s3:// -> rest, local -> uring) so a
   // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task
@@ -1188,11 +1256,11 @@ parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
   // parquet_batch_coalescer.
   auto const& file_path = _file_paths[idx];
   // The resolver returns a valid ioctx or throws if no backend supports the path.
-  return [this, file_path, idx, resolve = std::move(resolve)](
+  return [this, file_path, idx, resolved = std::move(resolved), resolve = std::move(resolve)](
            scan_manager::preparation_stop_token stop) -> std::unique_ptr<scan_info> {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-    auto io_ctx = resolve(file_path);
+    auto io_ctx = resolved ? resolved : resolve(file_path);
     try {
       return build_file_scan_info(file_path, idx, io_ctx, stop.token());
     } catch (unsupported_physical_input const&) {
