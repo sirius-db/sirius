@@ -32,6 +32,7 @@
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -630,7 +631,8 @@ TEST_CASE("column_chunk_range_cache matches column_chunk_ranges",
 
 namespace {
 using namespace std::chrono_literals;
-namespace scan = sirius::op::scan;
+namespace scan    = sirius::op::scan;
+using setup_fault = sirius::test::held_bulk_io::setup_fault;
 
 struct bulk_fixture {
   sirius::test::scratch_dir dir{"bulk_fetch"};
@@ -641,8 +643,8 @@ struct bulk_fixture {
   std::vector<scan::parquet_source> bulk, general;
   std::vector<std::vector<cudf::io::text::byte_range_info>> ranges;
 
-  explicit bulk_fixture(std::size_t n, bool setup_fault = false)
-    : io(std::make_shared<sirius::test::held_bulk_io>(setup_fault)),
+  explicit bulk_fixture(std::size_t n, setup_fault fault = setup_fault::none)
+    : io(std::make_shared<sirius::test::held_bulk_io>(fault)),
       resource(cudf::get_current_device_resource_ref(), *io)
   {
     auto [db, con] = sirius::make_test_db_and_connection();
@@ -700,6 +702,55 @@ void check_bulk_answer(bulk_fixture& f, bulk_run& run)
   REQUIRE(expected->num_columns() == 2);
   CHECK(sirius::test::expect_tables_equivalent_impl(actual->view(), expected->view(), f.stream));
 }
+
+struct short_counts {
+  std::size_t got, requested;
+
+  std::string message() const
+  {
+    return "Parquet column data: read " + std::to_string(got) + " of " + std::to_string(requested) +
+           " requested bytes";
+  }
+};
+
+// Shorten the logical extent, not the Parquet file the test backend reads from.
+// Only the last chunk is affected: either its last byte or the entire chunk is missing.
+short_counts shorten_last_chunk(bulk_fixture& f, std::size_t file, bool whole_chunk)
+{
+  auto const& ranges = f.ranges.at(file);
+  REQUIRE_FALSE(ranges.empty());
+  auto const last =
+    std::max_element(ranges.begin(), ranges.end(), [](auto const& a, auto const& b) {
+      return a.offset() < b.offset();
+    });
+  REQUIRE(last->size() > 1);
+  std::size_t total = 0;
+  for (auto it = ranges.begin(); it != ranges.end(); ++it) {
+    if (it != last) { REQUIRE(it->offset() + it->size() <= last->offset()); }
+    total += it->size();
+  }
+  std::size_t const missing = whole_chunk ? last->size() : 1;
+  auto const& full          = f.bulk.at(file).datasource->get_io_object();
+  REQUIRE(last->offset() + last->size() <= full.size());
+  auto shorter =
+    std::make_shared<bulk_object>(full.object_path(), last->offset() + last->size() - missing);
+  f.io->back_short_object_with(full.shared_from_this());
+  f.bulk[file].datasource = std::make_shared<cucascade::io::datasource>(f.io, std::move(shorter));
+  return {total - missing, total};
+}
+
+void check_short_file(bool whole_chunk)
+{
+  bulk_fixture f(1);
+  auto const expected = shorten_last_chunk(f, 0, whole_chunk);
+  bulk_run run(f);
+  REQUIRE(f.io->wait_issued(1, 10s) == 1);
+  REQUIRE(f.io->completion_bytes(0) == expected.got);
+  f.io->release(0);
+  REQUIRE(run.result.wait_for(10s) == std::future_status::ready);
+  CHECK_THROWS_MATCHES(
+    run.result.get(), std::runtime_error, Catch::Matchers::Message(expected.message()));
+}
 }  // namespace
 
 TEST_CASE("bulk fetch reads one file with one call", "[scan][bulk_fetch]")
@@ -712,7 +763,7 @@ TEST_CASE("bulk fetch reads one file with one call", "[scan][bulk_fetch]")
 }
 
 TEST_CASE("bulk fetch preserves ordered Parquet values with supplied or derived ranges",
-          "[scan][bulk_fetch]")
+          "[scan][bulk_fetch][bulk_exact_length]")
 {
   auto supplied = GENERATE(false, true);
   bulk_fixture f(2);
@@ -784,10 +835,75 @@ TEST_CASE("bulk fetch drains the held sibling before propagating a read error",
 TEST_CASE("bulk fetch preserves an earlier read error over a later setup error",
           "[scan][bulk_fetch]")
 {
-  bulk_fixture f(2, true);
+  bulk_fixture f(2, setup_fault::after_failed_read);
   bulk_run run(f);
   REQUIRE(run.result.wait_for(10s) == std::future_status::ready);
   CHECK_THROWS_AS(run.result.get(), sirius::test::first_file_error);
   CHECK(f.io->sample().calls == 1);
   CHECK(f.io->sample().setup_fault);
+}
+
+TEST_CASE("bulk fetch rejects a chunk crossing EOF", "[scan][bulk_fetch][bulk_exact_length]")
+{
+  check_short_file(false);
+}
+
+TEST_CASE("bulk fetch rejects a positive chunk starting at EOF",
+          "[scan][bulk_fetch][bulk_exact_length]")
+{
+  check_short_file(true);
+}
+
+TEST_CASE("bulk fetch settles the last sibling before reporting a short middle file",
+          "[scan][bulk_fetch][bulk_exact_length]")
+{
+  bulk_fixture f(3);
+  auto const expected = shorten_last_chunk(f, 1, false);
+  bulk_run run(f);
+  REQUIRE(f.io->wait_issued(3, 10s) == 3);
+  REQUIRE(f.io->completion_bytes(1) == expected.got);
+  f.io->release(0);
+  f.io->release(1);
+  CHECK(run.result.wait_for(150ms) == std::future_status::timeout);
+  auto const held = f.io->sample(2);
+  REQUIRE(held.sibling_targets > 0);
+  CHECK(held.sibling_releases == 0);
+  f.io->release(2);
+  REQUIRE(run.result.wait_for(10s) == std::future_status::ready);
+  CHECK_THROWS_MATCHES(
+    run.result.get(), std::runtime_error, Catch::Matchers::Message(expected.message()));
+  auto const done = f.io->sample(2);
+  CHECK_FALSE(done.early_release);
+  CHECK(done.sibling_releases == held.sibling_targets);
+}
+
+TEST_CASE("bulk fetch reports an earlier short completion over a later setup failure",
+          "[scan][bulk_fetch][bulk_exact_length]")
+{
+  bulk_fixture f(2, setup_fault::after_successful_read);
+  auto const expected = shorten_last_chunk(f, 0, true);
+  bulk_run run(f);
+  REQUIRE(run.result.wait_for(10s) == std::future_status::ready);
+  REQUIRE(f.io->sample().setup_fault);
+  REQUIRE(f.io->sample().calls == 1);
+  REQUIRE(f.io->completion_bytes(0) == expected.got);
+  CHECK_THROWS_MATCHES(
+    run.result.get(), std::runtime_error, Catch::Matchers::Message(expected.message()));
+}
+
+TEST_CASE("bulk fetch preserves the setup failure after an exact completion",
+          "[scan][bulk_fetch][bulk_exact_length]")
+{
+  bulk_fixture f(2, setup_fault::after_successful_read);
+  std::size_t expected = 0;
+  for (auto const& r : f.ranges.front()) {
+    expected += r.size();
+  }
+  REQUIRE(expected > 0);
+  bulk_run run(f);
+  REQUIRE(run.result.wait_for(10s) == std::future_status::ready);
+  REQUIRE(f.io->sample().setup_fault);
+  REQUIRE(f.io->sample().calls == 1);
+  REQUIRE(f.io->completion_bytes(0) == expected);
+  CHECK_THROWS_AS(run.result.get(), sirius::test::next_file_error);
 }

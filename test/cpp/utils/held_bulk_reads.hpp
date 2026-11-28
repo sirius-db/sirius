@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace sirius::test {
@@ -39,9 +40,13 @@ class held_bulk_io : public tracking_local_ioctx {
   };
 
  public:
-  explicit held_bulk_io(bool inject_setup_failure)
-    : tracking_local_ioctx(true), inject_setup_failure_(inject_setup_failure)
+  enum class setup_fault { none, after_failed_read, after_successful_read };
+
+  explicit held_bulk_io(setup_fault fault) : tracking_local_ioctx(true), fault_(fault) {}
+
+  void back_short_object_with(std::shared_ptr<cucascade::io::io_object const> full)
   {
+    full_object_ = std::move(full);
   }
 
   cucascade::exec::semi_future<std::size_t> mixed_readv_async_io(
@@ -49,18 +54,32 @@ class held_bulk_io : public tracking_local_ioctx {
     std::vector<cucascade::io::prepared_io_slice>&& slices) noexcept override
   {
     try {
+      bool const clipped = full_object_ && full_object_->object_path() == object.object_path();
       std::vector<void*> targets;
+      std::size_t requested = 0, available = 0;
       for (auto const& slice : slices) {
         targets.push_back(slice.d_buffer.data);
+        requested += slice.size();
+        if (slice.offset() < object.size()) {
+          available += std::min(slice.size(), object.size() - slice.offset());
+        }
       }
-      auto bytes = tracking_local_ioctx::mixed_readv_async_io(object, std::move(slices)).get();
+      // The shorter logical object reports EOF, but a caller that ignores the count
+      // still decodes complete, valid chunks from the full backing file.
+      auto bytes = tracking_local_ioctx::mixed_readv_async_io(clipped ? *full_object_ : object,
+                                                              std::move(slices))
+                     .get();
+      if (clipped) {
+        if (bytes != requested) { throw std::logic_error("incomplete test backing file"); }
+        bytes = available;
+      }
       std::lock_guard lock(mutex_);
       auto& req   = reads_.emplace_back(request{bytes, std::move(targets)});
       auto future = req.terminal->get_semi_future();
       peak_       = std::max(peak_, ++pending_);
-      if (inject_setup_failure_ && reads_.size() == 1) {
+      if (fault_ != setup_fault::none && reads_.size() == 1) {
         fail_next_alloc_ = true;
-        settle(req, true);
+        settle(req, fault_ == setup_fault::after_failed_read);
       } else if (open_) {
         settle(req, false);
       }
@@ -123,15 +142,21 @@ class held_bulk_io : public tracking_local_ioctx {
     std::size_t calls, peak, sibling_targets, sibling_releases;
     bool early_release, setup_fault;
   };
-  snapshot sample() const
+  snapshot sample(std::size_t sibling = 1) const
   {
     std::lock_guard lock(mutex_);
     return {reads_.size(),
             peak_,
-            reads_.size() > 1 ? reads_[1].targets.size() : 0,
-            reads_.size() > 1 ? reads_[1].releases : 0,
+            reads_.size() > sibling ? reads_[sibling].targets.size() : 0,
+            reads_.size() > sibling ? reads_[sibling].releases : 0,
             early_release_,
             setup_fault_};
+  }
+
+  std::size_t completion_bytes(std::size_t i) const
+  {
+    std::lock_guard lock(mutex_);
+    return reads_.at(i).bytes;
   }
 
  private:
@@ -146,7 +171,8 @@ class held_bulk_io : public tracking_local_ioctx {
     --pending_;
   }
 
-  bool const inject_setup_failure_;
+  setup_fault const fault_;
+  std::shared_ptr<cucascade::io::io_object const> full_object_;
   mutable std::mutex mutex_;
   std::condition_variable changed_;
   std::deque<request> reads_;

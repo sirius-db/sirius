@@ -126,9 +126,9 @@ struct cache_capacities {
 };
 /// No capacity limit.
 inline constexpr std::size_t unbounded = std::numeric_limits<std::size_t>::max();
-/// No limit on per-file statistics or on the files merged statistics refer to. An evicted
-/// per-file record is a miss at the next planning: its footer is read again, or it counts against
-/// a read limit. Merged statistics evicted for their references are merged again.
+/// Per-file records and the total number of file IDs in merged entries have no capacity limit.
+/// Evicting a per-file record can turn a hit into a miss. Evicting only a merge can require
+/// remerging retained records, not rereading their footers.
 inline constexpr cache_capacities default_cache_capacities{unbounded, 128, unbounded};
 /// The most sets of scan paths whose merged statistics are kept.
 inline constexpr std::size_t merged_statistics_cache_capacity = default_cache_capacities.merges;

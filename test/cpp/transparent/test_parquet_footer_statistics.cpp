@@ -1316,6 +1316,140 @@ std::size_t footer_fix_collect(duckdb::Connection& connection, duckdb::LogicalOp
   return added;
 }
 
+// The pass sees the original spelling; only the physical open is redirected to a real Parquet file.
+class footer_alias_fs final : public duckdb::FileSystem {
+ public:
+  footer_alias_fs(std::string prefix, std::string backing)
+    : prefix_(std::move(prefix)), backing_(std::move(backing))
+  {
+  }
+  std::string GetName() const override { return "footer-classification-observer"; }
+  bool IsManuallySet() override { return true; }
+  bool CanHandleFile(std::string const& path) override { return path.starts_with(prefix_); }
+  duckdb::unique_ptr<duckdb::FileHandle> OpenFile(
+    std::string const&,
+    duckdb::FileOpenFlags flags,
+    duckdb::optional_ptr<duckdb::FileOpener> opener) override
+  {
+    ++opens;
+    return local_->OpenFile(backing_, flags, opener);
+  }
+  duckdb::optional<duckdb::FileMetadata> GetStatsIfExists(
+    duckdb::OpenFileInfo const&, duckdb::optional_ptr<duckdb::FileOpener> opener) override
+  {
+    ++stats;
+    return local_->GetStatsIfExists(duckdb::OpenFileInfo(backing_), opener);
+  }
+  std::atomic<unsigned> opens{0}, stats{0};
+
+ private:
+  std::string prefix_, backing_;
+  duckdb::unique_ptr<duckdb::FileSystem> local_ = duckdb::FileSystem::CreateLocal();
+};
+
+class FooterPathFixture {
+ public:
+  FooterPathFixture()
+  {
+    footer_query_ok(con, "SET gpu_execution=false");
+    footer_query_ok(con, "SET enable_external_file_cache=false");
+    footer_query_ok(con, "SET parquet_metadata_cache=false");
+    footer_query_ok(con, "SET disable_parquet_prefetching=true");
+    footer_query_ok(con,
+                    "COPY (SELECT range AS x FROM range(3)) TO " + dir.file_literal("a.parquet"));
+    fs::last_write_time(dir.file("a.parquet"),
+                        fs::file_time_type::clock::now() - std::chrono::hours(1));
+  }
+
+  void check_admission(std::string const& prefix, bool remote)
+  {
+    auto& seen = observe(prefix);
+    footer_query_ok(con, "SET parquet_footer_statistics_max_remote_reads=2");
+    footer_query_ok(con, "SET parquet_footer_statistics_max_local_reads=-1");
+    auto const before = footer_detail::footer_read_count();
+    duckdb::vector<duckdb::OpenFileInfo> keys;
+    for (unsigned i = 0; i != 3; ++i) {
+      keys.emplace_back(prefix + std::to_string(i) + ".parquet");
+    }
+    auto plan = bind(std::move(keys));
+    CHECK(footer_fix_collect(con, *plan) == (remote ? 0 : 1));
+    check_footer_scan(*plan, 3, remote ? std::nullopt : std::optional<std::size_t>{9});
+    CHECK(footer_detail::footer_read_count() - before == (remote ? 0 : 3));
+    CHECK(seen.opens.load() == (remote ? 0 : 3));
+    if (remote) {
+      CHECK(seen.stats.load() == 0);
+    } else {
+      CHECK(seen.stats.load() >= 3);
+    }
+  }
+
+  void check_versions(std::string const& prefix, bool remote)
+  {
+    auto& seen      = observe(prefix);
+    auto const meta = duckdb::FileSystem::CreateLocal()->GetStatsIfExists(
+      duckdb::OpenFileInfo(dir.file("a.parquet")));
+    REQUIRE(meta);
+    REQUIRE(duckdb::ExternalFileCache::IsValid(
+      true, "", meta->last_modification_time, "", meta->last_modification_time));
+    auto const before = footer_detail::footer_read_count();
+    unsigned expected = 0;
+    for (bool strong : {false, true}) {
+      for (unsigned planning : {1, 2}) {
+        CAPTURE(prefix, strong, planning);
+        duckdb::vector<duckdb::OpenFileInfo> keys;
+        auto& key             = keys.emplace_back(prefix + "0.parquet");
+        key.extended_info     = duckdb::make_shared_ptr<duckdb::ExtendedOpenFileInfo>();
+        auto& opts            = key.extended_info->options;
+        opts["file_size"]     = duckdb::Value::BIGINT(meta->file_size);
+        opts["etag"]          = duckdb::Value(strong ? "\"same\"" : "W/\"same\"");
+        opts["last_modified"] = duckdb::Value::TIMESTAMP(meta->last_modification_time);
+        auto plan             = bind(std::move(keys));
+        (void)footer_fix_collect(con, *plan);
+        REQUIRE(footer_fix_rows(*plan) == 3);
+        if (planning == 1 || (remote && !strong)) { ++expected; }
+        CHECK(footer_detail::footer_read_count() - before == expected);
+        CHECK(seen.opens.load() == expected);
+      }
+    }
+    CHECK(seen.stats.load() == 0);
+  }
+
+ protected:
+  sirius::test::scratch_dir dir{"footer_path"};
+
+ private:
+  footer_alias_fs& observe(std::string const& prefix)
+  {
+    // Keep the real handler registered, behind the prefix-only observer in this private database.
+    auto& fsys   = con.context->db->GetFileSystem();
+    auto handler = fsys.ExtractSubSystem("SiriusHttpFS");
+    REQUIRE(handler);
+    auto mock  = duckdb::make_uniq<footer_alias_fs>(prefix, dir.file("a.parquet"));
+    auto& seen = *mock;
+    fsys.RegisterSubSystem(std::move(mock));
+    fsys.RegisterSubSystem(std::move(handler));
+    return seen;
+  }
+
+  duckdb::unique_ptr<duckdb::LogicalOperator> bind(duckdb::vector<duckdb::OpenFileInfo> keys)
+  {
+    footer_query_ok(con, "SET parquet_footer_statistics=false");
+    auto plan =
+      con.ExtractPlan("SELECT x FROM read_parquet(" + dir.file_literal("a.parquet") + ")");
+    REQUIRE(plan);
+    auto& binding = footer_fix_bind(*plan);
+    REQUIRE(binding.file_options.column_statistics.IsNull());
+    binding.file_list = duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(std::move(keys));
+    footer_query_ok(con, "SET parquet_footer_statistics=true");
+    return plan;
+  }
+
+  footer_cache_scope caches;
+  std::unique_ptr<duckdb::DuckDB> db = sirius::test::open_sirius_db(
+    nullptr, footer_engine_config(dir.path(), "    enable_dynamic_filter: false\n"));
+  duckdb::Connection con{*db};
+};
+
 class footer_listing_observer final : public duckdb::FileSystem {
  public:
   explicit footer_listing_observer(unsigned count = 4) : count_(count) {}
@@ -1397,6 +1531,31 @@ class footer_throwing_list final : public duckdb::SimpleMultiFileList {
 };
 
 }  // namespace
+
+TEST_CASE_METHOD(FooterPathFixture,
+                 "An over-limit uppercase S3 list is refused without opening or statting any key",
+                 "[integration][isolated_context][parquet_footer_statistics][footer_path_class]")
+{
+  check_admission("S3://footer-class/explicit/", true);
+}
+
+TEST_CASE_METHOD(
+  FooterPathFixture,
+  "A mixed-case S3 key is reused only with a strong tag despite an old modification time",
+  "[integration][isolated_context][parquet_footer_statistics][footer_path_class]")
+{
+  check_versions("S3://footer-class/listed/", true);
+}
+
+TEST_CASE_METHOD(FooterPathFixture,
+                 "Lowercase S3 and local footer paths retain their admission and reuse rules",
+                 "[integration][isolated_context][parquet_footer_statistics][footer_path_class]")
+{
+  SECTION("lowercase S3 admission") { check_admission("s3://footer-class/explicit/", true); }
+  SECTION("local admission") { check_admission(dir.file("explicit/"), false); }
+  SECTION("lowercase S3 reuse") { check_versions("s3://footer-class/listed/", true); }
+  SECTION("local reuse") { check_versions(dir.file("listed/"), false); }
+}
 
 TEST_CASE_METHOD(FooterAdmissionFixture,
                  "Footer walk stops on local misses rather than the number of paths",

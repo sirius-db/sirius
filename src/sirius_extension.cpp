@@ -3931,8 +3931,8 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
 
   config.AddExtensionOption(
     "parquet_footer_statistics",
-    "Whether a scan of several Parquet files gives DuckDB's optimizer the merged statistics of "
-    "all their footers, which DuckDB itself reads only with union_by_name",
+    "Whether the footer-statistics pass gives DuckDB's optimizer merged statistics for eligible "
+    "multi-file Parquet scans within their read limits",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true));
 

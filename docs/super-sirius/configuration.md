@@ -1132,7 +1132,8 @@ Each file's statistics are read once per process for each set of Parquet reader 
 such as `can_have_nan` change the bounds a footer reads as). They are reused while a local file's
 size, inode and modification time are unchanged, but never while that time is less than 10 seconds
 old (the rule DuckDB's own file caches use), and while an S3 object's size and strong ETag are
-unchanged; an object without a strong ETag is read on every query. The glob's listing supplies
+unchanged; an object without a strong ETag counts as a miss on each eligible scan. The glob's
+listing supplies
 these, so checking costs no request; a local file listed without them (an explicit file list) costs
 one `stat`. A scan's merged statistics are kept with the ids of the per-file statistics they were
 made from and reused while the cache still answers every file with those statistics,
@@ -1149,7 +1150,7 @@ read ahead or a read limit skips the scan:
 those of any path or glob, including `s3://` globs, returning the number of files read (an error when nothing matches).
 Reading ahead moves the cost, about 0.2 s for the 60 `lineitem` files at SF1000, from the first
 query to table loading. Footers read ahead use DuckDB's default Parquet options, so only scans
-with those options reuse them; a scan with other options reads the footers again.
+with those options reuse them; other reader options need their own records, subject to admission.
 
 Reading the footers costs planning time in proportion to the number of files, and remote footer
 work can require network requests. The two read limits bound it: by default one scan reads at most
@@ -1161,17 +1162,17 @@ at the first miss that exceeds the local limit: the admission pass does not chec
 files of such a scan. It is all or nothing because the
 statistics of some files are not statistics of the scan. A remote file named in an explicit list,
 which the listing did not describe, counts as a read even when cached, since checking it takes a
-request. `sirius_analyze_parquet` and `pin_table` are not limited: they process every file, so
-reading ahead is how a scan over a limit gets its statistics. Once they are read, a scan in the
-same process with the default reader options, whose listing identifies the unchanged files, finds
-them cached, and cached files do not count. The
+request. Explicit analysis and pin-time footer warming are exempt from the two limits. An eligible
+later scan can reuse warmed records in the same process when its reader options and the files'
+validated versions match. The
 two SQL settings are per connection; `SET GLOBAL` and `RESET GLOBAL` are refused, and the
 engine-wide values come from the YAML.
 
 The statistics of every file read stay cached, for each set of reader options, so the cache grows
-with the number of distinct files scanned. They have no capacity limit: a limit would make scans
-that together use more files than it holds miss the excess at every planning, and a miss is read
-again or counts against a read limit. A read limit bounds misses, not the total scan size. A scan's
+with the number of distinct files scanned. The per-file cache has no capacity limit. A bounded
+cache could turn a previously warmed file into a miss; that miss counts toward admission, and an
+admitted scan may need to read the footer again. A read limit bounds misses, not the total scan
+size. A scan's
 footer row count belongs to the plan whose planning
 covered the scan, and to the copies Sirius makes of that plan; another statement over the same
 paths does not supply it. It is unknown when `parquet_footer_statistics` is off, when a limit is

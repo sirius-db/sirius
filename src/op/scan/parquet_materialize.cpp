@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -135,6 +136,8 @@ struct pending_fetch {
 
   fetched_chunks chunks;
   std::vector<cucascade::io::slice> reads;
+  /// Bytes the ranges ask for; a backend clips a range that passes the end of its object.
+  std::size_t requested = 0;
   /// Declared last: destroying it waits for the read, before the slices and
   /// the buffers it writes to are freed.  Assignment would free them first.
   std::future<std::size_t> read;
@@ -158,6 +161,13 @@ pending_fetch begin_fetch(parquet_source const& src,
   }
 
   pending_fetch out;
+  for (auto const& range : ranges) {
+    auto const size = static_cast<std::size_t>(range.size());
+    if (size > std::numeric_limits<std::size_t>::max() - out.requested) {
+      throw std::overflow_error("Parquet column data: requested byte count overflows");
+    }
+    out.requested += size;
+  }
   out.chunks.buffers.reserve(ranges.size());
   for (auto const& range : ranges) {
     out.chunks.buffers.emplace_back(static_cast<std::size_t>(range.size()), stream, mr);
@@ -174,9 +184,20 @@ pending_fetch begin_fetch(parquet_source const& src,
   return out;
 }
 
+/// Wait for @p fetch's read.  Throws unless it returned every requested byte:
+/// the rest of a clipped range's buffer was never written.
+void join_exact(pending_fetch& fetch)
+{
+  auto const read = fetch.read.get();
+  if (read != fetch.requested) {
+    throw std::runtime_error("Parquet column data: read " + std::to_string(read) + " of " +
+                             std::to_string(fetch.requested) + " requested bytes");
+  }
+}
+
 fetched_chunks finish_fetch(pending_fetch fetch)
 {
-  std::ignore = fetch.read.get();
+  join_exact(fetch);
 
   auto out = std::move(fetch.chunks);
   out.spans.reserve(out.buffers.size());
@@ -235,8 +256,7 @@ std::unique_ptr<cudf::table> materialize_bulk(
   metadatas.reserve(sources.size());
   rg_per_src.reserve(sources.size());
 
-  // Reserved before the first read is issued: taking ownership of an issued
-  // read cannot throw, so its result is never dropped unread.
+  // Reserve before issuing reads so recording an issued read cannot allocate or throw.
   std::vector<pending_fetch> fetches;
   fetches.reserve(sources.size());
   for (std::size_t i = 0; i < sources.size(); ++i) {
@@ -248,7 +268,7 @@ std::unique_ptr<cudf::table> materialize_bulk(
       // A failed read of an earlier file comes first: reading the files one at
       // a time would have stopped there.
       for (auto j = i; j < fetches.size(); ++j) {
-        std::ignore = fetches[j].read.get();
+        join_exact(fetches[j]);
       }
       throw;
     }

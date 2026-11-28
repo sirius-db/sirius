@@ -33,6 +33,10 @@ class sirius_scan_manager;
 
 namespace sirius::io::s3 {
 
+/// True only for a well-formed @c s3://<bucket>/<key> (case-insensitive scheme; rejects
+/// @c s3://bucket with no key, @c file://, local paths): the paths @ref sirius_httpfs serves.
+[[nodiscard]] bool can_handle_s3_path(std::string const& path);
+
 /// @brief DuckDB FileSystem subsystem that lets DuckDB's native @c read_parquet
 /// BIND an @c s3:// object through Sirius's per-connection REST io backend.
 ///
@@ -62,8 +66,7 @@ class sirius_httpfs : public duckdb::FileSystem {
  public:
   sirius_httpfs() = default;
 
-  /// True only for a well-formed @c s3://<bucket>/<key> (case-insensitive
-  /// scheme; rejects @c s3://bucket with no key, @c file://, local paths).
+  /// @ref can_handle_s3_path.
   bool CanHandleFile(const std::string& fpath) override;
 
   duckdb::unique_ptr<duckdb::FileHandle> OpenFile(

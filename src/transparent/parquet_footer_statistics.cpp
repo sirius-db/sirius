@@ -16,6 +16,7 @@
 
 #include "transparent/parquet_footer_statistics.hpp"
 
+#include "io/s3/sirius_httpfs.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 
 #include <duckdb/common/file_system.hpp>
@@ -80,6 +81,13 @@ bool is_strong_etag(std::string_view tag)
                               [](unsigned char c) { return c == '"' || c < 0x21 || c == 0x7F; });
 }
 
+/// Whether \p path names a remote file. DuckDB's test compares lowercase scheme prefixes, so alone
+/// it takes the `S3://` spelling that Sirius's S3 file system serves for a local file.
+bool is_remote(std::string const& path)
+{
+  return io::s3::can_handle_s3_path(path) || duckdb::FileSystem::IsRemoteFile(path);
+}
+
 /// Text that is equal for two sightings of \p path only if they saw the same bytes, or nullopt when
 /// \p metadata cannot promise that. A remote file needs a strong ETag: a weak one allows different
 /// bytes, and a remote modification time may be absent or coarse. A local file's version tag holds
@@ -88,7 +96,7 @@ bool is_strong_etag(std::string_view tag)
 std::optional<std::string> version_of(std::string const& path, duckdb::FileMetadata const& metadata)
 {
   if (metadata.file_size < 0 || metadata.version_tag.empty()) { return std::nullopt; }
-  if (duckdb::FileSystem::IsRemoteFile(path)) {
+  if (is_remote(path)) {
     if (!is_strong_etag(metadata.version_tag)) { return std::nullopt; }
   } else if (!duckdb::ExternalFileCache::IsValid(/*validate=*/true,
                                                  /*cached_version_tag=*/"",
@@ -358,7 +366,7 @@ scan_statistics cached_statistics(duckdb::ClientContext& context,
   bool const stop_over_local  = local_limit >= 0 && statistics_cache_unbounded();
   for (std::size_t i = 0; i < files.size(); ++i) {
     ++result.inspected;
-    bool const remote = duckdb::FileSystem::IsRemoteFile(files[i].path);
+    bool const remote = is_remote(files[i].path);
     result.keys[i]    = cache_key(options_identity, files[i].path);
     result.listed[i]  = listed_metadata(files[i]);
     if (result.listed[i]) {
