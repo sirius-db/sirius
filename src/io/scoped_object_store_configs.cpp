@@ -139,4 +139,10 @@ std::optional<scoped_object_store_configs::snapshot> scoped_object_store_configs
   return std::nullopt;
 }
 
+bool scoped_object_store_configs::contains(std::uint64_t id) const
+{
+  std::lock_guard lk{_mtx};
+  return _snapshots.contains(id);
+}
+
 }  // namespace sirius::io

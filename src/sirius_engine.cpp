@@ -40,6 +40,10 @@
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx.hpp"
 
+#ifdef SIRIUS_WITH_MELD_UNITS
+#include "meld/meld_units_pass.hpp"
+#endif
+
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
@@ -382,6 +386,12 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                                                    std::move(active_gpu_ids),
                                                    std::move(query_operator_params)};
 
+#ifdef SIRIUS_WITH_MELD_UNITS
+  if (duckdb::Value meld_units; context.TryGetCurrentSetting("meld_units", meld_units) &&
+                                !meld_units.IsNull() && meld_units.GetValue<bool>()) {
+    sirius::meld::place_meld_units(*sirius_physical_plan);
+  }
+#endif
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
                                                                   /*parent=*/nullptr);
   sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(

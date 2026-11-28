@@ -299,6 +299,43 @@ std::vector<oracle_key_target> oracle_targets_for_join(duckdb::LogicalComparison
   return found;
 }
 
+void collect_scans_of(duckdb::LogicalOperator& op,
+                      std::string const& table_name,
+                      std::vector<duckdb::LogicalGet*>& out)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto& get        = op.Cast<duckdb::LogicalGet>();
+    auto const table = get.GetTable();
+    if (table && table->name.GetIdentifierName() == table_name) { out.push_back(&get); }
+  }
+  for (auto& child : op.children) {
+    collect_scans_of(*child, table_name, out);
+  }
+}
+
+// Output ordinal of a column in the plan's only scan of a table, in the coordinate space of
+// oracle_key_target::output_ordinal. Names the expected scan column where DuckDB's walk finds no
+// target.
+std::size_t scan_output_ordinal_of(duckdb::LogicalOperator& plan,
+                                   std::string const& table_name,
+                                   std::string const& column_name)
+{
+  std::vector<duckdb::LogicalGet*> scans;
+  collect_scans_of(plan, table_name, scans);
+  REQUIRE(scans.size() == 1);
+  auto& get           = *scans[0];
+  auto const bindings = get.GetColumnBindings();
+  std::optional<std::size_t> output_ordinal;
+  for (std::size_t i = 0; i < bindings.size(); ++i) {
+    if (get.GetColumnName(get.GetColumnIndex(bindings[i])).GetIdentifierName() == column_name) {
+      output_ordinal = i;
+      break;
+    }
+  }
+  REQUIRE(output_ordinal.has_value());
+  return *output_ordinal;
+}
+
 template <typename Fn>
 void for_each_operator(sirius_physical_operator* root, const Fn& fn)
 {
@@ -558,14 +595,14 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
-                 "discovery parity - an intervening RIGHT join: both bind through it",
+                 "discovery parity - an intervening ANTI join: both bind through it",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  // Removing a nested match can synthesize a NULL probe key, but the producing equality rejects it.
+  // ANTI emits probe rows unchanged and synthesizes no NULLs.
   dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM (SELECT l.id AS id FROM big_left l "
-                            "RIGHT JOIN small_c c ON l.val = c.ckey) x "
+                            "ANTI JOIN small_c c ON l.val = c.ckey) x "
                             "JOIN small_right r ON x.id = r.rid WHERE r.other > 0");
 
   auto joins = comparison_joins_of(*c.oracle_plan);
@@ -574,7 +611,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   auto* intervening = joins[1];
   REQUIRE(comparison_joins_of(*producing->children[0]) ==
           std::vector<duckdb::LogicalComparisonJoin*>{intervening});
-  REQUIRE(intervening->join_type == duckdb::JoinType::RIGHT);
+  REQUIRE(intervening->join_type == duckdb::JoinType::ANTI);
 
   auto const oracle = oracle_targets_for_join(*producing);
   REQUIRE(oracle.size() == 1);
@@ -592,20 +629,23 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
-                 "discovery parity - intervening OUTER and ANTI joins preserve probe descent",
+                 "discovery parity - intervening RIGHT/OUTER joins: DuckDB refuses, Sirius binds",
                  "[dynamic_filter][parity][isolated_context]")
 {
+  // DuckDB never descends a NULL-generating probe side, because filtering it can create unmatched
+  // rows. Sirius refuses that descent only for NULL-preserving keys: an unmatched row carries a
+  // NULL probe key, which the producing equality rejects.
   struct case_spec {
     duckdb::JoinType join_type;
     std::string query;
   };
-  std::vector<case_spec> const cases{{duckdb::JoinType::OUTER,
+  std::vector<case_spec> const cases{{duckdb::JoinType::RIGHT,
+                                      "SELECT * FROM (SELECT l.id AS id FROM big_left l "
+                                      "RIGHT JOIN small_c c ON l.val = c.ckey) x "
+                                      "JOIN small_right r ON x.id = r.rid WHERE r.other > 0"},
+                                     {duckdb::JoinType::OUTER,
                                       "SELECT * FROM (SELECT l.id AS id FROM big_left l "
                                       "FULL OUTER JOIN small_c c ON l.val = c.ckey) x "
-                                      "JOIN small_right r ON x.id = r.rid WHERE r.other > 0"},
-                                     {duckdb::JoinType::ANTI,
-                                      "SELECT * FROM (SELECT l.id AS id FROM big_left l "
-                                      "ANTI JOIN small_c c ON l.val = c.ckey) x "
                                       "JOIN small_right r ON x.id = r.rid WHERE r.other > 0"}};
 
   dynamic_filter_on_guard filter_on(*con);
@@ -620,19 +660,16 @@ TEST_CASE_METHOD(discovery_parity_fixture,
             std::vector<duckdb::LogicalComparisonJoin*>{intervening});
     REQUIRE(intervening->join_type == spec.join_type);
 
-    auto const oracle = oracle_targets_for_join(*producing);
-    REQUIRE(oracle.size() == 1);
-    REQUIRE(oracle[0].condition_index == 0);
-    REQUIRE(oracle[0].table_name == "big_left");
+    REQUIRE(oracle_targets_for_join(*producing).empty());
+    auto const id_ordinal = scan_output_ordinal_of(*c.oracle_plan, "big_left", "id");
 
     auto physical_joins = hash_joins_of(c.physical.get());
     REQUIRE(physical_joins.size() == 2);
     REQUIRE(hash_joins_of(physical_joins[0]->children[0].get()) ==
             std::vector<sirius::op::sirius_physical_hash_join*>{physical_joins[1]});
     REQUIRE(scan_bindings_of(*physical_joins[0], c.physical.get()) ==
-            std::vector<sirius_scan_binding>{{.condition_index = 0,
-                                              .table_name      = oracle[0].table_name,
-                                              .push_ordinal    = oracle[0].output_ordinal}});
+            std::vector<sirius_scan_binding>{
+              {.condition_index = 0, .table_name = "big_left", .push_ordinal = id_ordinal}});
   }
 }
 

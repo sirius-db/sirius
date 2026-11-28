@@ -18,8 +18,8 @@ scripts = ["scripts/pixi_activate.sh"]
 
 [activation.env]
 SCCACHE_BASEDIRS = "$PIXI_PROJECT_ROOT:$CONDA_PREFIX"
-# BASEDIRS + preprocessor cache mode can serve another checkout's object and depfile
-# (mozilla/sccache#2863, fix in #2868); remove once a release with the fix is pinned.
+# With BASEDIRS, preprocessor cache mode hits restore another checkout's depfile, so ninja
+# misses local header edits; keep until sccache regenerates depfiles on those hits.
 SCCACHE_DIRECT = "false"
 
 [dependencies]
@@ -31,7 +31,7 @@ cxx-compiler = "*"
 git = "*"
 make = "*"
 ninja = "*"
-sccache = "=0.18.0" # Version must match sccache version installed by mozilla-actions/sccache-action in GH workflows
+sccache = "=0.20.1" # Version must match sccache version installed by mozilla-actions/sccache-action in GH workflows
 unzip = "*"
 clang = "22.*"
 wget = "*"
@@ -61,7 +61,7 @@ yaml-cpp = "*"
 libabseil = "*"
 libutf8proc = "*"
 # Fixture/data-generation Python client; the engine and LOAD tests use the pinned v2 source.
-duckdb = "=2.0.0"
+duckdb = "=2.0.1"
 spdlog = "1.*"
 sqlite = "3.*"
 rust-src = "*"
@@ -83,6 +83,8 @@ snappy = "*"
 fastavro = "1.*"
 # For Meld's decode backend; in lockstep with `clang` above.
 mlir = "22.*"
+# For Meld to assemble the PTX nvcc writes with the same toolkit, not the driver.
+libnvjitlink-dev = "*"
 
 [feature.dev-libs.pypi-dependencies]
 # Local TPC-H Iceberg dataset writer; reuses the existing Python and PyArrow.

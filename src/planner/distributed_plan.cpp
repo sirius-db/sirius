@@ -455,7 +455,8 @@ struct rewriter {
                                             bool ordered)
   {
     // Refused before any rank runs: the wire would refuse the first batch. Grouped STDDEV_SAMP
-    // partials are STRUCT columns, an ungrouped COUNT(DISTINCT) partial a LIST.
+    // partials are STRUCT columns, an ungrouped COUNT(DISTINCT) partial a LIST. A distributed plan
+    // has no dictionary carrier (see dictionary_carrier_enabled).
     for (auto const& type : slot->has_physical_overrides() ? slot->get_physical_types()
                                                            : physical_types_of(slot->types)) {
       if (!exchange::sendable(type)) {

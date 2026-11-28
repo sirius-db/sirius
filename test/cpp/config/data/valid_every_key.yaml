@@ -1,0 +1,192 @@
+# Every key the configuration reads, each set away from its default, in spellings both the typed
+# reader and the original YAML reader accept. Resolves on a machine with at least one GPU.
+sirius:
+  topology:
+    gpu_ids: [0]
+    gpus_per_query: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.9
+      reservation_limit_fraction: 0.95
+      downgrade_trigger_fraction: 0.85
+      downgrade_stop_fraction: 0.5
+    host:
+      capacity_bytes: 4GiB
+      reservation_limit_fraction: 0.9
+      downgrade_trigger_fraction: 0.85
+      downgrade_stop_fraction: 0.7
+      block_size: 2MiB
+      pool_size: 64
+      initial_number_pools: 2
+    disk:
+      disk_id: 1
+      capacity_bytes: 2TiB
+      downgrade_root_dirs: /tmp
+  max_concurrent_queries: 2
+  executor:
+    task_creator:
+      num_threads: 3
+      cpu_affinity: [0, 1]
+    scan_manager:
+      num_threads: 6
+      cpu_affinity: [2, 3]
+      backend: native
+      uring_n_reactors: 3
+      rest_n_reactors: 6
+      reserve_rest_reactor_cpus: false
+      httpfs_external_file_cache: true
+      max_readahead_scans: 5
+      readahead_strategy: opportunistic
+      uring:
+        n_max_concurrent_scans: 7
+        slices_per_pass: 8
+        range_batch_slices: 4
+      rest:
+        n_max_concurrent_scans: 12
+        request_timeout_s: 45
+        stall_speed_limit_bytes: 32768
+        stall_time_s: 20
+        merge_max_gap: 1MiB
+        min_segment_bytes: 2MiB
+        max_segment_bytes: 8MiB
+        footer_probe_bytes: 256KiB
+        list_max_matches: 5000
+        list_max_scanned: 50000
+        retry_backoff_base_ms: 75
+        retry_jitter_ms: 25
+        max_retry_attempts: 4
+        max_auth_retry_attempts: 2
+        honor_retry_after: false
+        max_connections: 96
+        conn_max_age_s: 30
+        upkeep_interval_ms: 5000
+        upkeep_http1: true
+        connect_timeout_ms: 2500
+        dns_ttl_s: 120
+        dns_accumulate: true
+        dns_max_addresses: 32
+        keepalive_idle_s: 30
+        keepalive_interval_s: 10
+        keepalive_count: 3
+        min_mtu: 1400
+        mtu_reject_max_attempts: 4
+        close_with_rst: false
+        receive_buffer_bytes: 512KiB
+        queue_depth: 512
+        wait_mode: uring
+        iowq_max_unbound: 4
+        fan_out: 3
+        interface: lo
+        pin_to_irq_cpus: false
+        raise_reactor_priority: true
+        tls:
+          ktls: disable
+          user_space_rx: library
+          recv_placement: iowq
+          min_version: tls1.2
+          max_version: tls1.3
+          expect_no_pad: false
+          session_cache: true
+          session_cache_per_endpoint: 16
+          max_connection_bytes: 1GiB
+          ciphersuites: TLS_AES_256_GCM_SHA384
+          cipher_list: ECDHE-RSA-AES256-GCM-SHA384
+          groups: X25519
+          sni_override: example.internal
+          allow_tls13_without_rekey: false
+      cache:
+        mode: os
+        eviction: idle
+        min_prefetching_budget_fraction: 0.1
+        eviction_threshold_fraction: 0.7
+      memory_prefetcher:
+        enable: true
+        num_threads: 3
+        min_free_fraction: 0.3
+        poll_interval_ms: 4
+        drain_quiet_ms: 50
+      preparation:
+        max_inflight_metadata_jobs: 128
+        max_inflight_dv_jobs: 8
+        lookahead_batches: 3
+        max_control_work: 5
+        drain_quantum: 6
+        coordinator_workers: 2
+        native_reader_workers: 3
+        max_native_readers: 9
+        partial_batch:
+          min_fill_percent: 60
+          min_residence: 40ms
+          max_residence: 1500ms
+        interrupt_check_interval: 20ms
+    pipeline:
+      num_threads: 5
+    downgrade:
+      num_threads: 2
+      cpu_affinity: [4]
+      monitor_period: 20ms
+      copy_chunk_bytes: 512MiB
+  telemetry:
+    enable_quent: false
+    enable_nvtx: true
+    output_directory: every_key_telemetry
+    engine_name: everyKey
+    nvtx_injection_lib: /nonexistent/libnvtx_inject.so
+  compression:
+    enable_pin_table_compression: false
+    min_batch_size_bytes: 2MiB
+    max_compressed_fraction: 0.6
+    input_plan_dir: /nonexistent/plans
+    enable_spill_compression: true
+    spill_min_batch_bytes: 32MiB
+    spill_max_compressed_fraction: 0.5
+    spill_encode_reserve_fraction: 0.25
+  operator_params:
+    enable_late_materialization: false
+    enable_fused_scan_filter: false
+    enable_low_cardinality_groupby: false
+    late_materialization_min_boundaries: 6
+    late_materialization_min_value_x_boundaries: 64
+    late_materialization_count_defer: true
+    late_materialization_min_value_compressed: 2
+    fused_scan_diagnostics: true
+    fused_scan_max_selectivity: 0.3
+    fused_scan_full_route_max_selectivity: 0.2
+    fused_scan_index_walk_max_selectivity: 0.25
+    fused_scan_max_membership_sources: 2
+    scan_task_batch_size: 64MiB
+    max_sort_partition_bytes: 128MiB
+    max_sort_partition_memory_fraction: 0.25
+    hash_partition_bytes: 96MiB
+    concat_batch_bytes: 48MiB
+    cross_join_task_bytes: 40MiB
+    sort_sample_bytes: 24MiB
+    max_build_hash_table_bytes: 512MiB
+    max_build_probe_resident_bytes: 384MiB
+    max_broadcast_join_size: 128MiB
+    mark_join_build_switch_ratio: 4.0
+    enable_dynamic_filter: false
+    enable_dynamic_filter_multi_partition: false
+    enable_dynamic_zone_map_filter: true
+    dynamic_filter_domain_coverage_threshold: 0.8
+    dynamic_filter_inlist_max_l2_fraction: 0.25
+    dynamic_filter_keep_threshold: 0.8
+    enable_pinned_zone_map_pruning: false
+    enable_decimal_sum_stats_bound: false
+    enable_compressed_materialization: false
+    enable_dictionary_carrier: true
+    enable_dense_count_join: false
+    enable_delim_aggregate_reuse: false
+    pin_table_prove_unique_keys: false
+    pin_table_unique_exact_max_bytes: 256MiB
+    enable_exists_minmax_rewrite: false
+    enable_partial_aggregate_below_join: false
+    enable_subquery_key_carry: true
+    enable_exists_from_aggregate: true
+    enable_complete_group_having: false
+    parquet_footer_statistics_max_remote_reads: 64
+    parquet_footer_statistics_max_local_reads: -1
+    admission_bytes_per_gpu: 4GiB
+    avg_variable_column_bytes: 48
+    enable_runtime_size_estimation: true
+    use_hw_decompression: true

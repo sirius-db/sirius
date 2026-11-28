@@ -221,6 +221,7 @@ std::unique_ptr<cudf::column> date_arithmetic_checked(cudf::transform_input cons
   auto days_ticks = day_counts(reversed ? left : right, difference ? date_type : int32_type);
   // transform skips rows with either input NULL and propagates their
   // validity. Infinity must be handled before invoking checked arithmetic.
+  // Day counts below -infinity are out of range, as input and as result.
   static std::string const offset_prefix = R"(
 #include <cuda/numeric>
 
@@ -233,7 +234,8 @@ __device__ cudf::errc date_offset(int32_t* out, int32_t date, int32_t days)
   }
   auto result = cuda::)";
   static std::string const offset_suffix = std::string{R"((date, days);
-  if (result.overflow || result.value == infinity || result.value == -infinity) {
+  if (date < -infinity || result.overflow || result.value <= -infinity ||
+      result.value >= infinity) {
     return cudf::errc::)"} + cudf::to_string(overflow_error) +
                                            R"(;
   }

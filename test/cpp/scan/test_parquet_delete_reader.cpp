@@ -20,6 +20,8 @@
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_context_state.hpp>
+#include <duckdb/main/prepared_statement.hpp>
+#include <duckdb/storage/external_file_cache/caching_file_system.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/parquet_delete_reader.hpp>
 #include <parquet_extension.hpp>
@@ -28,6 +30,7 @@
 #include <utils/s3_backend.hpp>
 
 #include <algorithm>
+#include <array>
 #include <barrier>
 #include <chrono>
 #include <condition_variable>
@@ -38,6 +41,7 @@
 #include <future>
 #include <set>
 #include <thread>
+#include <utility>
 
 namespace {
 using namespace sirius::op::scan;
@@ -412,7 +416,136 @@ class delete_remote_fs : public duckdb::FileSystem {
   bool OnDiskFile(duckdb::FileHandle&) override { return false; }
   std::string GetName() const override { return "delete-remote"; }
 };
+
+class footer_cache_probe_fs final : public delete_remote_fs {
+ public:
+  footer_cache_probe_fs(std::string const& path, bool bypass)
+    : delete_remote_fs(path), bypass_(bypass)
+  {
+  }
+
+  duckdb::optional<duckdb::timestamp_t> GetCacheValidUntil(duckdb::FileHandle&) override
+  {
+    if (bypass_) { return duckdb::timestamp_t::ninfinity(); }
+    return {};
+  }
+
+  bool CanHandleFile(std::string const& path) override
+  {
+    return path.starts_with("https://footer-cache-probe/");
+  }
+  bool IsManuallySet() override { return true; }
+  std::string GetName() const override { return "footer-cache-probe"; }
+  duckdb::vector<duckdb::OpenFileInfo> Glob(std::string const& path, duckdb::FileOpener*) override
+  {
+    return {duckdb::OpenFileInfo(path)};
+  }
+
+  void Read(duckdb::FileHandle& handle, void* buffer, int64_t count, duckdb::idx_t offset) override
+  {
+    {
+      std::lock_guard guard(mutex_);
+      reads.emplace_back(offset, count);
+    }
+    delete_remote_fs::Read(handle, buffer, count, offset);
+  }
+
+  std::vector<std::pair<duckdb::idx_t, int64_t>> reads;
+
+ private:
+  bool bypass_;
+  std::mutex mutex_;
+};
+
+int64_t cached_probe_bytes(duckdb::Connection& connection, std::string const& path)
+{
+  auto result = connection.Query(
+    "SELECT coalesce(sum(nr_bytes), 0)::BIGINT FROM duckdb_external_file_cache() WHERE path = '" +
+    path + "'");
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->RowCount() == 1);
+  return result->Collection().GetValue(0, 0).GetValue<int64_t>();
+}
 }  // namespace
+
+TEST_CASE("Footer cache deadline probe distinguishes exact reads from whole-file caching",
+          "[parquet_delete_reader][httpfs_efc_probe]")
+{
+  auto const bypass   = GENERATE(false, true);
+  auto const validate = GENERATE(false, true);
+  CAPTURE(bypass, validate);
+  delete_fixture f;
+  f.write(10000);
+  REQUIRE_FALSE(f.connection.Query("SET threads=1")->HasError());
+  REQUIRE_FALSE(f.connection.Query("SET enable_external_file_cache=true")->HasError());
+  REQUIRE_FALSE(f.connection
+                  .Query(std::string{"SET validate_external_file_cache="} +
+                         (validate ? "'VALIDATE_ALL'" : "'NO_VALIDATION'"))
+                  ->HasError());
+  auto fs                 = duckdb::make_uniq<footer_cache_probe_fs>(f.path, bypass);
+  auto& remote            = *fs;
+  remote.expected_context = f.connection.context.get();
+  f.db.GetFileSystem().RegisterSubSystem(std::move(fs));
+  f.path = "https://footer-cache-probe/deletes.parquet";
+  REQUIRE(duckdb::FileSystem::IsRemoteFile(f.path));
+  REQUIRE(remote.bytes.size() > 8);
+  REQUIRE(remote.bytes.size() < 2 * 1024 * 1024);
+
+  auto caching_fs = duckdb::CachingFileSystem::Get(*f.connection.context);
+  auto handle =
+    caching_fs.OpenFile(duckdb::OpenFileInfo{f.path}, duckdb::FileFlags::FILE_FLAGS_READ);
+  auto const offset = remote.bytes.size() - 8;
+  auto pin          = handle->Read(8, offset);
+  std::array<char, 8> trailer{};
+  pin.CopyTo(duckdb::data_ptr_cast(trailer.data()), trailer.size());
+  CHECK(std::string(trailer.data(), trailer.size()) == remote.bytes.substr(offset));
+  REQUIRE(remote.reads.size() == 1);
+  CHECK(remote.reads.front().first == (bypass ? offset : 0));
+  CHECK(remote.reads.front().second == (bypass ? 8 : int64_t(remote.bytes.size())));
+  CHECK(cached_probe_bytes(f.connection, f.path) == (bypass ? 0 : int64_t(remote.bytes.size())));
+  auto const identity = handle->GetFileHandle()->Stats();
+  if (bypass) {
+    REQUIRE(identity.cache_valid_until);
+    CHECK(*identity.cache_valid_until == duckdb::timestamp_t::ninfinity());
+  } else {
+    CHECK_FALSE(identity.cache_valid_until);
+  }
+  CHECK(remote.GetVersionTag(*handle->GetFileHandle()) == "1");
+  CHECK(remote.GetFileSize(*handle->GetFileHandle()) == int64_t(remote.bytes.size()));
+}
+
+TEST_CASE("Footer cache deadline probe preserves Parquet binding and delete identity checks",
+          "[parquet_delete_reader][httpfs_efc_probe]")
+{
+  auto const bypass = GENERATE(false, true);
+  CAPTURE(bypass);
+  delete_fixture f;
+  f.write(10000);
+  REQUIRE_FALSE(f.connection.Query("SET threads=1")->HasError());
+  REQUIRE_FALSE(f.connection.Query("SET enable_external_file_cache=true")->HasError());
+  REQUIRE_FALSE(f.connection.Query("SET validate_external_file_cache='NO_VALIDATION'")->HasError());
+  auto fs                 = duckdb::make_uniq<footer_cache_probe_fs>(f.path, bypass);
+  auto& remote            = *fs;
+  remote.expected_context = f.connection.context.get();
+  f.db.GetFileSystem().RegisterSubSystem(std::move(fs));
+  f.path = "https://footer-cache-probe/deletes.parquet";
+
+  auto prepared = f.connection.Prepare("SELECT pos FROM read_parquet('" + f.path + "')");
+  INFO((prepared->HasError() ? prepared->GetError() : ""));
+  REQUIRE_FALSE(prepared->HasError());
+  uint64_t rows = 0;
+  f.read({}, position_projection, [&](auto& chunk) { rows += chunk.size(); });
+  CHECK(rows == 10000);
+  CHECK(cached_probe_bytes(f.connection, f.path) == (bypass ? 0 : int64_t(remote.bytes.size())));
+  REQUIRE_THROWS_WITH(f.read(
+                        {},
+                        [&](auto const&, uint64_t) {
+                          ++remote.generation;
+                          return std::vector<uint64_t>{0};
+                        },
+                        [](auto&) { FAIL("replacement must be rejected before consuming rows"); }),
+                      Catch::Matchers::ContainsSubstring("object changed"));
+}
 
 TEST_CASE("Remote Parquet deletes honor read-ahead settings with one decode worker",
           "[parquet_delete_reader][remote]")

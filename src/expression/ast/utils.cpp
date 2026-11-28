@@ -96,7 +96,8 @@ std::unique_ptr<node> rebuild(node const& src, Xform const& xform)
         return std::make_unique<node>(aggregate{alt.function(),
                                                 rebuild_children(alt.arguments(), xform),
                                                 alt.return_type(),
-                                                alt.distinct()});
+                                                alt.distinct(),
+                                                alt.order()});
       } else {
         static_assert(sizeof(T) == 0,
                       "Unhandled sirius::ast alternative in rebuild(node) — add an arm "
