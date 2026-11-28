@@ -424,6 +424,11 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   // Materialize plan-time wiring descriptors into runtime repositories and ports.
   pipeline::materialize_repository_wiring(result.repository_wirings, *repo_manager);
+  sirius_ctx_ptr->get_data_repository_registry().set_spill_rank(
+    query_id_,
+    std::make_shared<const sirius::data::data_repository_manager_registry::spill_rank_fn>(
+      pipeline::make_spill_rank(
+        result.repository_wirings, result.scheduled_pipelines, *repo_manager)));
 
   new_scheduled   = std::move(result.scheduled_pipelines);
   total_pipelines = result.meta_pipeline_count;

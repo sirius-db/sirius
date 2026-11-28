@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <format>
 #include <limits>
@@ -373,10 +374,11 @@ void downgrade_executor::processing_loop()
 
       // === TIER 1: Data repositories ===
       // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
-      // query: outer loop DESCENDING by query id (newest query first), inner loop in
-      // get_repositories() order — ascending {operator_id, port_id} — with early stop once the
-      // reservation is satisfied. Operator ids restart at 0 per query, so ordering is
-      // (query id, operator id) rather than a single global counter.
+      // query: outer loop DESCENDING by query id (newest query first), inner loop by DESCENDING
+      // spill rank (see pipeline::make_spill_rank) — the repositories whose consumer can run
+      // latest go first — with get_repositories() order, ascending {operator_id, port_id},
+      // breaking ties, and early stop once the reservation is satisfied. Operator ids restart at
+      // 0 per query, so ordering is (query id, rank, operator id) rather than a global counter.
       //
       // Newest-first is the fairness policy: query ids are monotonic, so the newest query is the
       // one that has made the least progress, and spilling it costs the least re-materialization
@@ -398,6 +400,19 @@ void downgrade_executor::processing_loop()
         if (!borrow) { continue; }
         if (req->satisfied.load() || pool_interrupted || target_completed()) break;
         auto repos = manager->get_repositories();
+        if (auto const rank = _data_repo_registry.get_spill_rank(victim_id)) {
+          std::vector<std::pair<std::int64_t, decltype(repos)::value_type>> ranked;
+          ranked.reserve(repos.size());
+          for (auto* repo : repos) {
+            ranked.emplace_back((*rank)(repo), repo);
+          }
+          std::stable_sort(ranked.begin(), ranked.end(), [](auto const& a, auto const& b) {
+            return a.first > b.first;
+          });
+          for (std::size_t i = 0; i < repos.size(); ++i) {
+            repos[i] = ranked[i].second;
+          }
+        }
         for (auto* repo : repos) {
           if (req->satisfied.load() || target_completed()) break;
 
@@ -503,7 +518,13 @@ void downgrade_executor::processing_loop()
       }
 
       // === TIER 2: task_scheduler task queue ===
-      if (can_convert && !req->satisfied.load() && !target_completed() && _pipeline_task_queue) {
+      // A queued task runs next, so spilling its GPU inputs just to reach the monitor's stop
+      // threshold usually brings them straight back. Only demand requests, which a pipeline is
+      // blocked on, take GPU inputs from queued tasks.
+      bool const tier2_allowed =
+        !req->is_monitor_request || _space_id.tier != cucascade::memory::Tier::GPU;
+      if (can_convert && tier2_allowed && !req->satisfied.load() && !target_completed() &&
+          _pipeline_task_queue) {
         size_t max_tasks_to_convert = _pipeline_task_queue->size();
         size_t tasks_converted      = 0;
         failed_pipeline_candidates.reserve(max_tasks_to_convert);

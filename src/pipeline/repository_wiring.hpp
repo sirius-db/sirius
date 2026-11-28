@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "data/data_repository_manager_registry.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
@@ -66,6 +67,22 @@ struct repository_wiring {
 //! insertion uses pipeline ids to keep `_ports_list` ordered.
 void materialize_repository_wiring(const std::vector<repository_wiring>& wirings,
                                    cucascade::shared_data_repository_manager& data_repo_manager);
+
+//! Spill rank for the repositories that `materialize_repository_wiring` created from @p wirings.
+//!
+//! A repository's batches are next used when its consumer pipeline can run, which is roughly
+//! when the last of that pipeline's producers finishes. The rank is therefore the latest position
+//! in @p pipelines (the scheduling order) among the consumer's unfinished producers, or -1 once
+//! every producer has finished and the consumer can run. A join whose probe side has not been
+//! produced yet thus ranks after the input of a pipeline whose only producer is about to finish.
+//! Repositories not created from @p wirings rank -1.
+//!
+//! The function holds only weak references to the pipelines and reads their atomic finished
+//! flags, so a spill sweep can call it from any thread.
+data::data_repository_manager_registry::spill_rank_fn make_spill_rank(
+  const std::vector<repository_wiring>& wirings,
+  const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines,
+  cucascade::shared_data_repository_manager& data_repo_manager);
 
 /**
  * @brief Stamp every operator in @p pipelines with a dense, 0-based id for this query.
