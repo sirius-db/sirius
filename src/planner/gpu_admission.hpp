@@ -107,6 +107,18 @@ inline uint64_t accumulate_scan_bytes(uint64_t running, uint64_t rows, uint64_t 
   return running + scan_bytes;
 }
 
+/**
+ * @brief Whether this process's GPUs can keep its part of a RIGHT_SEMI / RIGHT_ANTI kept side.
+ *
+ * @p kept_bytes estimates the whole kept side. A distributed plan hash-exchanges that side, so
+ * each of the @p ranks processes keeps one share of it; one process keeps all of it.
+ * @p budget_bytes is the residency budget of this process's GPUs.
+ */
+inline bool kept_side_fits(uint64_t kept_bytes, std::size_t ranks, uint64_t budget_bytes)
+{
+  return kept_bytes / std::max<std::size_t>(1, ranks) < budget_bytes;
+}
+
 /// Row count and per-row width of one scan, read off the plan.
 struct scan_estimate {
   uint64_t rows;
