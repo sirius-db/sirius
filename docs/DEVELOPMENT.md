@@ -51,12 +51,9 @@ rules. The published URL appears on the deployment job.
 
 ## Building Sirius
 
-Clone the repository with all submodules:
-
-```bash
-git clone --recurse-submodules https://github.com/sirius-db/sirius.git
-cd sirius
-```
+Follow the [source quick start](README.md#quick-start) to clone Sirius and
+initialize the submodules for the engine and shared DuckDB extension. The
+[standalone build](building.md#building-without-pixi) needs only the engine sources.
 
 Build with Pixi (uses all available cores). The default builds Sirius, its C++ tests,
 and the shared DuckDB extension in GCC Release mode:

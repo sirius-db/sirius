@@ -101,8 +101,10 @@ void restore_bundle(std::vector<std::size_t> const& output_positions,
     }
     auto produced = materialize(*column, selection, stream, mr, transfers);
     // A narrow-stored pin may come back a strictly narrower carrier of the
-    // restored type, and only that; anything else is not what was deferred.
-    if (produced->type() != restored_types[i]) {
+    // restored type, and only that; anything else is not what was deferred. A
+    // planned dictionary carrier is a hint its STRING values satisfy.
+    if (produced->type() != restored_types[i] &&
+        !sirius::is_dictionary_carrier_of(restored_types[i], produced->type())) {
       if (!sirius::can_restore_to(produced->type(), restored_types[i])) {
         throw std::runtime_error("late_mat::materialize_at_port: origin column " +
                                  std::to_string(i) +

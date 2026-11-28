@@ -80,3 +80,21 @@ TEST_CASE("S3 config scopes isolate paths and publish immutable replacement snap
   REQUIRE(beta_superseded.has_value());
   CHECK(*beta_superseded == beta_file->id);
 }
+
+TEST_CASE("S3 config scopes report whether a path still maps to a snapshot", "[s3][routing]")
+{
+  sirius::io::scoped_object_store_configs scopes;
+  cucascade::io::object_store_config first;
+  first.endpoint  = "http://127.0.0.1:19001";
+  auto second     = first;
+  second.endpoint = "http://127.0.0.1:19002";
+
+  CHECK_FALSE(scopes.install("s3://bucket/table/data.parquet", first).has_value());
+  auto const planned = scopes.resolve("s3://bucket/table/data.parquet");
+  REQUIRE(planned.has_value());
+  CHECK(scopes.contains(planned->id));
+  // The last path leaves the config; a read that planned with it keeps its own copy.
+  CHECK(scopes.install("s3://bucket/table/data.parquet", second) == planned->id);
+  CHECK_FALSE(scopes.contains(planned->id));
+  CHECK(planned->config->endpoint == first.endpoint);
+}
