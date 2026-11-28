@@ -24,6 +24,25 @@ Use both kinds of evidence when comparing performance across code changes. If no
 
 ## Workflows
 
+### Benchmark-family scope
+
+The `nsys_report.sh`, `nsys_analyze.sh` and `nsys_compare.sh` automation below
+uses TPC-H query numbers and layouts. The shared runner also accepts
+`--benchmark scale_bench`, but currently rejects external `--precmd nsys|gdb`.
+Do not pass named queries to the TPC-H wrappers or imply that profiling support
+was added by the scale_bench adapter. Existing independently captured profiles
+can still be inspected, with their workload and capture boundaries stated.
+
+For unprofiled scale_bench measurements, use Workflow S-A in the
+[benchmark skill](../benchmark/SKILL.md#workflow-s-a-scale_bench) and the
+[runner guide](../../../test/tpch_performance/README.md#scale_bench). Its paths
+are `sirius/<query-name>/sirius.log`, not `sirius/q<N>/sirius.log`. Match the result
+format as well as the queries/config/cache state across comparisons: fingerprint
+mode omits nested payloads, whereas rows/Parquet materialize full results.
+Workflow's CPU preparation is untimed; graph CPU materialization is timed.
+The existing `--duckdb-profiling` flag is CPU-only; for graph workloads its JSON
+describes the final SELECT, not the complete multi-statement algorithm.
+
 There are four workflows — choose based on what the user wants:
 
 ### Workflow A: Full Performance Analysis (recommended)

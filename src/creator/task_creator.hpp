@@ -429,7 +429,8 @@ class task_creator {
   ///  - gpu_ids() is the active executor set that partition affinity indexes,
   ///    so the pin resolves to a real executor when num_gpus < physical count.
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
-  /// Rotate independently within each NUMA node, including interleaved host-pin inputs.
+  /// Rotate independently within each NUMA node, including interleaved host-pin inputs, and
+  /// within each admitted set of that node's GPUs.
   sirius::memory::numa_affinity _numa_affinity;
   /// Separate from NUMA affinity. A task can take a NUMA pick and then be clamped, so
   /// sharing one counter advances it twice per task: against an even subset size the stride

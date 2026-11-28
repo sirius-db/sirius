@@ -53,7 +53,9 @@ enum class compressed_materialization_activity : std::uint8_t {
   pin_columns_narrowed,
   scan_sidecar_installed,
   partition_narrow_columns,
-  scan_narrow_targets_retracted
+  scan_narrow_targets_retracted,
+  /// Columns a scan emitted as DICTIONARY32 carriers, per batch.
+  scan_dictionary_carriers
 };
 
 /// One published event: the tag that says which it is, and the arguments the

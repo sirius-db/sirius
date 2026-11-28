@@ -191,6 +191,29 @@ void derive_projection_sidecar(sirius::op::sirius_physical_operator& op,
   derive_projection_sidecar(op, child_schema, native);
 }
 
+// The native boundary of a grouped aggregate whose partial layout no sidecar describes, except
+// that a DICTIONARY32 group key read by nothing else enters unrestored: grouping on its codes is
+// equality on its values, and the aggregate decodes it on the grouped output, which it emits
+// native.
+void admit_dictionary_group_keys(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
+{
+  auto const& aggregate     = slot->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  auto const child_schema   = output_physical_schema(*slot->children[0]);
+  auto const read_by_values = aggregate.value_read_inputs();
+  std::unordered_set<std::size_t> dictionary_keys;
+  for (auto const idx : aggregate.group_idx) {
+    if (idx >= 0 && static_cast<std::size_t>(idx) < child_schema.size() &&
+        child_schema[static_cast<std::size_t>(idx)].id() == cudf::type_id::DICTIONARY32 &&
+        !read_by_values.contains(static_cast<std::size_t>(idx))) {
+      dictionary_keys.insert(static_cast<std::size_t>(idx));
+    }
+  }
+  restore_columns_matching(slot->children[0], [&](std::size_t column_idx) {
+    return !dictionary_keys.contains(column_idx);
+  });
+  slot->set_physical_types({});
+}
+
 // Return whether @p op is a projection consisting solely of bare column references. Such a
 // projection forwards column views without materializing a batch, so a narrow carrier crossing
 // it saves no bandwidth.
@@ -379,12 +402,13 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       if (aggregate.has_grouping_sets()) { break; }
       // Only a plain slot keeps the partial batch in the declared `types` shape a sidecar describes
       // and reads its input through cudf_aggregate_idx; any other slot kind keeps the native
-      // boundary.
-      if (!sirius::op::all_slots_plain(aggregate.aggregate_slots)) { break; }
-      // Grouping functions append output columns the operator does not compute through group_idx /
-      // aggregate_slots; the arity check rejects that shape along with any other layout drift.
-      if (slot->types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {
-        break;
+      // boundary. Grouping functions append output columns the operator does not compute through
+      // group_idx / aggregate_slots; the arity check rejects that shape along with any other layout
+      // drift.
+      if (!sirius::op::all_slots_plain(aggregate.aggregate_slots) ||
+          slot->types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {
+        admit_dictionary_group_keys(slot);
+        return;
       }
       auto const child_width = slot->children[0]->types.size();
       bool consistent        = true;
@@ -423,14 +447,18 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       // Output prefix 0..group_idx.size()-1 holds the keys (get_output_grouping_indices is the
       // iota over it) and mirrors the child key carriers; aggregate outputs are cast to their
       // declared return types by the aggregation implementation and stay native. No restore is
-      // inserted above: downstream boundaries widen the keys on the small grouped output.
+      // inserted above: downstream boundaries widen the keys on the small grouped output. A
+      // dictionary carrier key ends here: the aggregate groups on its codes and emits strings.
       auto const child_schema = output_physical_schema(*slot->children[0]);
       auto const native       = native_physical_schema(*slot);
       auto schema             = native;
       for (std::size_t key_pos = 0; key_pos < aggregate.group_idx.size(); ++key_pos) {
         if (key_pos >= schema.size()) { break; }
         auto const child_idx = static_cast<std::size_t>(aggregate.group_idx[key_pos]);
-        if (child_idx < child_schema.size()) { schema[key_pos] = child_schema[child_idx]; }
+        if (child_idx < child_schema.size() &&
+            child_schema[child_idx].id() != cudf::type_id::DICTIONARY32) {
+          schema[key_pos] = child_schema[child_idx];
+        }
       }
       install_physical_schema(*slot, std::move(schema), native);
       return;

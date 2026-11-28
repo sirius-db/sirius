@@ -17,12 +17,17 @@
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -60,12 +65,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -84,13 +92,18 @@ pre_decline iceberg_decline(scan_reason reason,
   return {verdict, reason, "iceberg_scan declines the GPU scan path: " + std::move(text)};
 }
 
-bool names_remote_object(std::string const& path)
+// The scheme of @p path when it names a remote object, else nullopt.
+std::optional<std::string> remote_scheme(std::string const& path)
 {
   try {
-    return cucascade::io::parse(path).scheme != "file";
+    auto scheme = cucascade::io::parse(path).scheme;
+    if (scheme == "file") { return std::nullopt; }
+    return scheme;
   } catch (std::invalid_argument const&) {
     // A bare relative path is not a URI; only an explicit scheme marker makes one remote.
-    return path.find("://") != std::string::npos;
+    auto const marker = path.find("://");
+    if (marker == std::string::npos) { return std::nullopt; }
+    return path.substr(0, marker);
   }
 }
 
@@ -126,13 +139,34 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
   } catch (op::scan::equality_plan_error const& e) {
     return iceberg_decline(scan_reason::iceberg_equality_plan_unproven, e.what());
   }
-  // Delete files are opened on the scan manager's local I/O context.
+  // The plan keeps the delete files that apply to a data file, and only those are opened. A
+  // live delete that applies to none is never read, so its format does not matter, like its URI.
+  //
+  // The spec also allows Avro and ORC delete files. The format is in the inventory, so no
+  // delete file is opened to find out.
+  std::unordered_set<std::string_view> applicable;
   for (auto const& file : plan.files) {
-    if (names_remote_object(file.file_path)) {
-      return iceberg_decline(scan_reason::iceberg_equality_remote,
-                             "equality delete '" + file.file_path +
-                               "' is not a local file; the GPU scan path reads equality "
-                               "deletes from the local file system only");
+    applicable.insert(file.file_path);
+  }
+  for (auto const& entry : inventory.entries) {
+    if (entry.content == "EQUALITY_DELETES" && applicable.contains(entry.file_path) &&
+        !duckdb::StringUtil::CIEquals(entry.file_format, "parquet")) {
+      return iceberg_decline(scan_reason::iceberg_equality_file_format,
+                             "equality delete '" + entry.file_path + "' is stored as " +
+                               entry.file_format +
+                               "; the GPU scan path reads Parquet equality deletes only");
+    }
+  }
+  // A remote delete file is read through the REST backend. Whether one serves it is decided
+  // from the URI and the registered backends, without building a context or opening anything.
+  for (auto const& file : plan.files) {
+    auto const scheme = remote_scheme(file.file_path);
+    if (!scheme) { continue; }
+    auto const backend = sirius_ctx.get_scan_manager().planning_io_backend(file.file_path);
+    if (*scheme != "s3" || backend != cucascade::io::io_context_type::restful) {
+      return iceberg_decline(
+        scan_reason::iceberg_equality_remote,
+        "equality delete '" + file.file_path + "' is remote and no Sirius backend reads its URI");
     }
   }
 
@@ -229,22 +263,41 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
   std::optional<op::scan::iceberg_delete_inventory>& inventory,
   std::string_view injection)
 {
-  if (op.parameters.empty() || op.parameters.front().IsNull()) {
-    return iceberg_decline(
-      scan_reason::iceberg_no_table_path,
-      "iceberg_scan called without a table path, so its delete files cannot be inspected");
-  }
-
   std::string table_path;
-  try {
-    // GetValue<string>() calls ToString() even for INTEGER at this DuckDB pin.
-    if (op.parameters.front().type().id() != duckdb::LogicalTypeId::VARCHAR)
-      throw duckdb::InvalidInputException("Iceberg table path must be VARCHAR");
-    table_path = op.parameters.front().GetValue<std::string>();
-  } catch (...) {
-    return iceberg_decline(
-      scan_reason::iceberg_table_path_not_string,
-      "iceberg_scan table path is not a string, so its delete files cannot be inspected");
+  std::optional<duckdb::QualifiedName> catalog_name;
+  bool const catalog_table = op.parameters.empty() || op.parameters.front().IsNull();
+  if (catalog_table) {
+    // A catalog table's scan has no path argument. Address the table by its quoted qualified
+    // name, which iceberg_metadata() resolves through the same catalog.
+    duckdb::optional_ptr<duckdb::TableCatalogEntry> table;
+    try {
+      table = op.GetTable();
+    } catch (...) {
+      // GetTable() runs extension code; a failure leaves no table to address.
+    }
+    if (!table) {
+      return iceberg_decline(
+        scan_reason::iceberg_no_table_path,
+        "iceberg_scan called without a table path, so its delete files cannot be inspected");
+    }
+    auto const quoted = [](std::string const& name) {
+      return duckdb::KeywordHelper::WriteQuotedAndEscaped(name, '"');
+    };
+    table_path = quoted(table->ParentCatalog().GetName().GetIdentifierName()) + "." +
+                 quoted(table->ParentSchema().name.GetIdentifierName()) + "." +
+                 quoted(table->name.GetIdentifierName());
+    catalog_name.emplace(table->ParentCatalog().GetName(), table->ParentSchema().name, table->name);
+  } else {
+    try {
+      // GetValue<string>() calls ToString() even for INTEGER at this DuckDB pin.
+      if (op.parameters.front().type().id() != duckdb::LogicalTypeId::VARCHAR)
+        throw duckdb::InvalidInputException("Iceberg table path must be VARCHAR");
+      table_path = op.parameters.front().GetValue<std::string>();
+    } catch (...) {
+      return iceberg_decline(
+        scan_reason::iceberg_table_path_not_string,
+        "iceberg_scan table path is not a string, so its delete files cannot be inspected");
+    }
   }
   if (table_path.empty()) {
     return iceberg_decline(
@@ -291,6 +344,17 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
   auto const bound = op::scan::capture_iceberg_snapshot(op.function, op.bind_data.get(), context);
   if (!has_explicit_id) {
     if (!bound) {
+      // The extension withholds the snapshot of a table that has none and of a scan that also
+      // reads the transaction's own uncommitted changes. A catalog query names neither
+      // iceberg_scan nor snapshot_from_id, so say it in terms of the table.
+      if (catalog_table) {
+        return pre_decline{
+          scan_verdict::unsupported,
+          scan_reason::iceberg_no_snapshot_id,
+          "Iceberg table " + table_path +
+            " has no committed snapshot the GPU scan path can read: the table is empty, or "
+            "this statement also reads changes its transaction has not committed"};
+      }
       return iceberg_decline(
         scan_reason::iceberg_no_snapshot_id,
         "iceberg_scan was called without 'snapshot_from_id' and the binding did not publish "
@@ -350,12 +414,49 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
       }
       ~probe_timer() { stop(); }
     } timer{delete_time_us};
+    // The catalog resolves the name again on the connection that reads the inventory, and the
+    // first lookup pins the table for that transaction. The table bound there under the same
+    // name is therefore the one the inventory is read from: its UUID must be the bound one.
+    //
+    // This lookup names no snapshot, so it binds the table's current one, and only its UUID is
+    // compared. The statement may read a retained snapshot of a table that has no current
+    // snapshot: the inner binding then publishes a UUID and no snapshot ID. Which snapshot is
+    // read stays the inventory's choice, made from the snapshot ID the statement bound.
+    std::function<std::string(duckdb::ClientContext&)> unconfirmed_table;
+    if (catalog_name && bound) {
+      unconfirmed_table = [&](duckdb::ClientContext& inner) -> std::string {
+        duckdb::EntryLookupInfo lookup(duckdb::CatalogType::TABLE_ENTRY, *catalog_name);
+        auto entry = duckdb::Catalog::GetEntry(inner, lookup, duckdb::OnEntryNotFound::RETURN_NULL);
+        std::optional<std::string> resolved;
+        if (entry && entry->type == duckdb::CatalogType::TABLE_ENTRY) {
+          duckdb::unique_ptr<duckdb::FunctionData> bind;
+          auto const function =
+            entry->Cast<duckdb::TableCatalogEntry>().GetScanFunction(inner, bind, lookup);
+          if (lookup_connector(function, bind.get(), inner)) {
+            resolved = op::scan::capture_iceberg_table_uuid(
+              duckdb::BoundTableFunction(function), bind.get(), inner);
+          }
+        }
+        if (resolved && *resolved == bound->table_uuid) { return {}; }
+        // Another UUID is another table. No table under the name, or one that publishes no
+        // UUID, is not known to be another table: its identity is unknown, and the text says so.
+        if (resolved) {
+          return "Table UUID mismatch: " + table_path + " was bound as table " + bound->table_uuid +
+                 " and now resolves to table " + *resolved +
+                 ", so its delete files would be read from another table";
+        }
+        return table_path + " was bound as table " + bound->table_uuid +
+               ", and the delete lookup could not identify the table that name now resolves "
+               "to, so its delete files cannot be tied to the bound table";
+      };
+    }
     auto result = op::scan::read_delete_inventory(
       context,
       table_path,
       snapshot_id,
       injection,
-      bound ? std::string_view(bound->table_uuid) : std::string_view{});
+      bound ? std::string_view(bound->table_uuid) : std::string_view{},
+      unconfirmed_table);
     auto const n_delete_files = result.equality_count;
     if (n_delete_files > 0) {
       if (!result.inventory) {
@@ -379,6 +480,12 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
         "the iceberg delete probe returned no rows, so the table's delete files could not be "
         "inspected",
         scan_verdict::incomplete);
+    }
+    if (e.unconfirmed_table) {
+      // The metadata was readable, but not shown to be the bound table's: the lookup reached
+      // another table, or one it could not identify. what() says which.
+      return iceberg_decline(
+        scan_reason::evidence_missing, std::string(e.what()), scan_verdict::incomplete);
     }
     return iceberg_decline(scan_reason::evidence_missing,
                            "the iceberg delete probe could not read this table's metadata (" +
@@ -411,13 +518,51 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   return out;
 }
 
+// The scan's own filter evaluates on the decoded batch, before normalization, so a filtered column
+// keeps its native carrier.
+bool scan_filters_column(duckdb::LogicalGet const& op, std::size_t ids_position)
+{
+  if (op.table_filters.HasMultiColumnFilters()) { return true; }
+  for (auto const& filter : op.table_filters) {
+    if (filter.GetIndex() == ids_position) { return true; }
+  }
+  return false;
+}
+
+// The position in the scan's column ids that feeds output column @p output_idx, if any.
+std::optional<std::size_t> scan_ids_position(duckdb::LogicalGet const& op,
+                                             std::size_t output_idx,
+                                             std::size_t ids_size)
+{
+  std::size_t ids_position = output_idx;
+  if (!op.projection_ids.empty()) {
+    if (output_idx >= op.projection_ids.size()) { return std::nullopt; }
+    ids_position = op.projection_ids[output_idx];
+  }
+  if (ids_position >= ids_size) { return std::nullopt; }
+  return ids_position;
+}
+
+void carry_as_dictionary(cudf::data_type& carrier,
+                         std::size_t output_idx,
+                         duckdb::ColumnIndex const& id)
+{
+  carrier = cudf::data_type{cudf::type_id::DICTIONARY32};
+  SIRIUS_LOG_DEBUG("[sirius_plan_get] scan output {} (table column {}) carried as DICTIONARY32",
+                   output_idx,
+                   id.GetPrimaryIndex());
+}
+
 std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
                                                   duckdb::SiriusContext* state,
                                                   bool compressed_materialization_on,
+                                                  bool dictionary_carrier_on,
                                                   const duckdb::vector<duckdb::ColumnIndex>& ids,
                                                   sirius::scan_manager::pinned_entry const* entry)
 {
-  if (!state || !compressed_materialization_on || entry == nullptr) { return {}; }
+  if (!state || (!compressed_materialization_on && !dictionary_carrier_on) || entry == nullptr) {
+    return {};
+  }
 
   // Install a narrow sidecar only when the pinned cache can serve this scan. Each target comes from
   // recorded stored-column metadata, so compressed and uncompressed chunks use the same path. A
@@ -436,17 +581,27 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
     auto const native  = sirius::get_cudf_type(logical);
     if (!native) { return {}; }
     result.push_back(*native);
-    if (!sirius::is_narrowable_numeric_type(logical)) { continue; }
+    bool const dictionary_candidate =
+      native->id() == cudf::type_id::STRING && dictionary_carrier_on;
+    bool const numeric_candidate =
+      compressed_materialization_on && sirius::is_narrowable_numeric_type(logical);
+    if (!numeric_candidate && !dictionary_candidate) { continue; }
 
-    std::size_t ids_position = output_idx;
-    if (!op.projection_ids.empty()) {
-      if (output_idx >= op.projection_ids.size()) { continue; }
-      ids_position = op.projection_ids[output_idx];
+    auto const ids_position = scan_ids_position(op, output_idx, ids.size());
+    if (!ids_position) { continue; }
+
+    if (dictionary_candidate) {
+      if (!scan_filters_column(op, *ids_position) &&
+          sirius::scan_manager::pinned_column_dictionary_carriable(
+            *entry, projection[*ids_position], sirius::dictionary_carrier_max_keys_bytes)) {
+        carry_as_dictionary(result.back(), output_idx, ids[*ids_position]);
+        changed = true;
+      }
+      continue;
     }
-    if (ids_position >= ids.size()) { continue; }
 
-    auto const target =
-      sirius::scan_manager::pinned_column_narrow_carrier(*entry, projection[ids_position], *native);
+    auto const target = sirius::scan_manager::pinned_column_narrow_carrier(
+      *entry, projection[*ids_position], *native);
     if (!target) { continue; }
     result.back() = *target;
     changed       = true;
@@ -667,12 +822,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
                         : nullptr;
 
   // Resolved once for this plan against the connection being planned for, so the parquet
-  // identity probe and the residency gate below cannot disagree about whether narrowing is on.
+  // identity probe and the residency gate below cannot disagree about which carriers are on.
   bool const compressed_materialization_on = duckdb::compressed_materialization_enabled(context);
+  bool const dictionary_carrier_on         = duckdb::dictionary_carrier_enabled(context);
 
   // One pinned-entry probe per scan: the compressed-materialization residency gate and
   // the seq_scan MVCC cache-or-CPU guard below share the result. The parquet identity
-  // feeds only the gate, so its file resolution runs only when the feature is on.
+  // feeds only the gate, so its file resolution runs only when a carrier setting is on.
   // Both probes are OWNING: the shared_ptr holds the entry alive across the guards below, so a
   // concurrent UNPIN on another connection cannot invalidate it mid-check. `pinned` is the
   // shared raw view over whichever probe matched.
@@ -718,7 +874,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         serves_insert_deltas = true;
       }
     }
-  } else if (!marked_decline && sirius_state && compressed_materialization_on) {
+  } else if (!marked_decline && sirius_state &&
+             (compressed_materialization_on || dictionary_carrier_on)) {
     auto const files = resolve_parquet_scan_file_paths(
       op.function.GetName().GetIdentifierName(), op.bind_data.get(), op.parameters);
     if (!files.empty()) {
@@ -730,6 +887,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   auto physical_types = scan_physical_schema(op,
                                              sirius_state.get(),
                                              compressed_materialization_on,
+                                             dictionary_carrier_on,
                                              column_ids,
                                              serves_insert_deltas ? nullptr : pinned);
 

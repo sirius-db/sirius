@@ -148,6 +148,8 @@ std::string route(std::string const& sql, bool allow_join)
   for (auto& stmt : parser.statements) {
     // The parser leaves each statement's own text in query (and its location at 0).
     auto text = stmt->query;
+    // DuckDB 2.0.1 starts a statement's text right after the terminator of the one before.
+    StringUtil::LTrim(text);
     StringUtil::RTrim(text, ";\n\t ");
     // The newline ends a trailing line comment, which would otherwise hold the terminator.
     routed += runs_on_gateway(*stmt, allow_join)
