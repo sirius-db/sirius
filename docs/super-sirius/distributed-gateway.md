@@ -238,9 +238,14 @@ On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid
 the gateway set it up as its only rank), and `sirius_rank_exit()`
 (`src/exchange/rank_control.cpp`).
 
-The gateway reads these settings when `sirius_gateway_start` runs, or when the first
-statement starts the registered ranks. `sirius_gateway_restart` and the gateway's own
-restarts reuse what it read then; a restart before any start reads them.
+The gateway reads the settings that shape a start (`sirius_gateway_duckdb_binary`,
+`sirius_gateway_sirius_extension`, `sirius_gateway_rank_init`, the six
+`sirius_gateway_exchange_*`, `sirius_gateway_log_dir` and the three
+`sirius_gateway_rank_*_sql`) when `sirius_gateway_start` runs, or when a statement starts the
+registered ranks: the first statement, and a later one that finds no rank running after a
+start that failed. `sirius_gateway_restart` and the gateway's own restarts of running ranks
+reuse what it read then; a restart before any start reads them. The other settings are read
+when they are used, so a change applies from the next statement.
 
 | Setting | Default | What |
 |---|---|---|
