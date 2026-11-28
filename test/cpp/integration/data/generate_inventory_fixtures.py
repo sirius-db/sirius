@@ -180,6 +180,8 @@ for variant, names in (
     ("dv_unsupported_uri", ("a",)),
     ("dv_supported_s3_uri", ("a",)),
     ("dv_unused_unsupported_uri", ("a",)),
+    ("dv_unused_s3_uri", ("a",)),
+    ("dv_lowercase_format", ("a",)),
 ):
     dest = out / variant
     (dest / "metadata").mkdir(parents=True, exist_ok=True)
@@ -224,7 +226,7 @@ for variant, names in (
                         df["file_path"] = str(data)
                         df["file_size_in_bytes"] = data.stat().st_size
                     else:
-                        if variant == "dv_unused_unsupported_uri":
+                        if variant in ("dv_unused_unsupported_uri", "dv_unused_s3_uri"):
                             unused = copy.deepcopy(row)
                         sidecar = dest / "data" / (name + ".puffin")
                         footer = copy.deepcopy(source_footer)
@@ -249,6 +251,9 @@ for variant, names in (
                         df["file_path"] = str(sidecar)
                         df["referenced_data_file"] = str(data)
                         df["file_size_in_bytes"] = sidecar.stat().st_size
+                        if variant == "dv_lowercase_format":
+                            # DuckDB's Iceberg writer records the format in lower case.
+                            df["file_format"] = "puffin"
                         if variant == "dv_unsupported_uri":
                             # Keep metadata, manifests, and data local while making only the
                             # Puffin sidecar a remote URI with no registered Sirius backend.
@@ -263,9 +268,13 @@ for variant, names in (
                     expanded.append(row)
             rows = expanded
             if unused is not None:
-                unused["data_file"][
-                    "file_path"
-                ] = "http://unsupported-puffin.invalid/unused-sidecar.puffin"
+                # For a data file the scan does not select: under a scheme no backend reads,
+                # or under s3://, where opening it would need a credential.
+                unused["data_file"]["file_path"] = (
+                    "s3://sirius-unused-puffin/unused-sidecar.puffin"
+                    if variant == "dv_unused_s3_uri"
+                    else "http://unsupported-puffin.invalid/unused-sidecar.puffin"
+                )
                 unused["data_file"]["referenced_data_file"] = str(
                     dest / "data" / "unselected.parquet"
                 )

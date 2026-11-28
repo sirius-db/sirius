@@ -17,6 +17,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 
 namespace sirius {
 
@@ -44,5 +45,10 @@ std::string rewrite_sirius_owned_remote_parquet_calls(std::string const& query);
 /// fallback: S3 parquet is read only on the GPU path, and DuckDB's CPU reader
 /// has no S3 filesystem, so an s3:// query cannot fall back to CPU.
 bool references_sirius_owned_s3_parquet(std::string const& query);
+
+/// `CREATE SECRET` or `ATTACH` when @p statement is one, or is an `EXPLAIN` of one, else empty.
+/// Their literals are credentials, so the statement text must not be logged. Not empty either
+/// for a statement DuckDB's tokenizer rejects.
+std::string_view credential_statement_kind(std::string const& statement);
 
 }  // namespace sirius

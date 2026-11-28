@@ -116,15 +116,19 @@ After `initialize()`, the engine has per-GPU memory pools, the default backend's
 Tables that benefit from being resident in GPU memory get **pinned** via the SQL surface:
 
 ```sql
-CALL pin_table('lineitem');                    -- distribute chunks across GPU memory spaces (default)
-CALL pin_table('lineitem', tier => 'host');    -- pin into host memory only
+-- distribute chunks across GPU memory spaces
+CALL pin_table('/data/lineitem/*.parquet', name => 'lineitem', tier => 'gpu');
+-- pin into host memory only
+CALL pin_table('/data/lineitem/*.parquet', name => 'lineitem', tier => 'host');
 ```
+
+`tier` and `name` are required. The format is inferred from a `.parquet`, `.db` or `.duckdb` path, or given with `format =>`. A DuckDB table is named by `name` and resolved from the catalog of an attached database, typically with `format => 'duckdb'` and no path; see [Pinned Tables](scan.md#pinned-tables).
 
 The pin pipeline (`src/pin_table.cpp`, `src/scan_manager/`):
 
 1. **Open the parquet files.** `PinTableFunction` reads every file of the pin through the scan manager's ioctx.
 2. **Enumerate and coalesce.** Parquet metadata yields row groups. The coalescer bundles them into batches sized to `scan_task_batch_size`. A large file spans several batches; small files share one.
-3. **Distribute round-robin per batch.** `round_robin_strategy` assigns each batch the next GPU memory space from an atomic cursor. The unit is a batch, so one file's row groups can land on different GPUs. Each pin call starts the round-robin cursor at 0. Identical batch sequences therefore produce the same device sequence. Batch boundaries depend on the projected column set, so pinning the same table with different columns can slice it differently. The merge path rejects different batch layouts.
+3. **Distribute round-robin per batch.** The unit is a batch, so one file's row groups can land on different GPUs. GPU-tier pins build a fresh `round_robin_strategy` for each call, starting at 0, so identical batch sequences produce the same device sequence. Host-tier pins instead use the scan manager's persistent `host_pin_placement` cursor, which interleaves GPUs across NUMA host spaces and continues across calls and tables. Batch boundaries depend on the projected column set, so pinning the same table with different columns can slice it differently. The merge path rejects different batch layouts.
 4. **Materialize each batch into its target space.** The pin path makes the target GPU current (`cuda_set_device_raii`), takes a stream from that GPU's memory space, and passes the space's allocator to `read_parquet`. The decoded columns land on the owning GPU.
 5. **Record the pinned entry.** Raw column-major GPU entries store `data_batches_by_column` and `chunk_memory_spaces`; `chunk_memory_spaces[i]` is the owning space for chunk `i` across columns. Compression-enabled entries can instead store raw and compressed batches in `device_chunks`, with each chunk recording where it is stored.
 

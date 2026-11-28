@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/aggregate/carried_columns.hpp"
 #include "telemetry/data_batch_probe.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -73,7 +74,8 @@ class gpu_aggregate_impl {
    * @brief Perform local grouped aggregate on the input data batch.
    *
    * @throw std::runtime_error if `carried_idx` is non-empty and an entry of `group_idx` or
-   * `carried_idx` is outside the input's columns
+   * `carried_idx` is outside the input's columns, or a position of `carried_order` is outside
+   * `carried_idx`
    *
    * @param input The input data batch.
    * @param group_idx The group columns.
@@ -85,7 +87,10 @@ class gpu_aggregate_impl {
    *        a multi-column COLLECT_SET where a struct column is synthesized from those column
    *        indices. Empty entries (or an empty outer vector) use `aggregate_idx` directly.
    * @param carried_idx Input columns emitted after the aggregate results, all taken from one
-   *        arbitrary row of each group; empty for none.
+   *        row of each group: the first under `carried_order`, or an arbitrary row when it is
+   *        empty; empty for none.
+   * @param carried_order Row order that picks the carried row; its positions index
+   *        `carried_idx`.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
    * @param telemetry_info Per-batch telemetry sink.
@@ -113,6 +118,7 @@ class gpu_aggregate_impl {
     const std::vector<int>& aggregate_idx,
     const std::vector<std::vector<int>>& aggregate_struct_col_indices,
     const std::vector<int>& carried_idx,
+    const carried_row_order& carried_order,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info                    = {},

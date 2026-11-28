@@ -132,7 +132,7 @@ TEST_CASE_METHOD(DivisionFixture,
 }
 
 TEST_CASE_METHOD(DivisionFixture,
-                 "checked division - signed minima divided or reduced modulo minus one overflow",
+                 "checked division - signed minima overflow by minus one with remainder zero",
                  "[integration][gpu_execution][checked_division]")
 {
   run_ok(
@@ -142,13 +142,59 @@ TEST_CASE_METHOD(DivisionFixture,
   run_ok("CHECKPOINT;");
   auto const strategy = GENERATE("materialize", "ast_interpret", "ast_jit");
   run_ok("SET expression_evaluator_strategy = '" + std::string(strategy) + "';");
+  // Only the quotient overflows: // raises DuckDB's error through CPU replay, while % returns
+  // DuckDB's 0 on the GPU for a column divisor and for a constant one.
   int id = 0;
   for (auto const* type : {"TINYINT", "SMALLINT", "INTEGER", "BIGINT"}) {
-    for (auto const* op : {"//", "%"}) {
-      expect_error("SELECT a::" + std::string(type) + op + "b::" + type +
-                     " FROM div_min WHERE id = " + std::to_string(id),
-                   "Overflow in division");
-    }
+    CAPTURE(strategy, type);
+    auto const a    = "a::" + std::string(type);
+    auto const b    = "b::" + std::string(type);
+    auto const rows = " FROM div_min WHERE id = " + std::to_string(id);
+    expect_error("SELECT " + a + " // " + b + rows, "Overflow in division");
+    run_ok("SET enable_duckdb_fallback = false;");
+    compare_gpu_vs_cpu("SELECT " + a + " % " + b + rows);
+    compare_gpu_vs_cpu("SELECT " + a + " % -1" + rows);
     ++id;
   }
+  // The GPU cannot scan a HUGEINT column, so the HUGEINT minimum is a constant numerator.
+  auto const minimum = std::string("(-170141183460469231731687303715884105728)::HUGEINT");
+  auto const rows    = std::string(" FROM div_min WHERE id = 0");
+  expect_error("SELECT " + minimum + " // b::HUGEINT" + rows, "Overflow in division");
+  run_ok("SET enable_duckdb_fallback = false;");
+  compare_gpu_vs_cpu("SELECT " + minimum + " % b::HUGEINT" + rows);
+}
+
+TEST_CASE_METHOD(DivisionFixture,
+                 "checked division - a zero divisor beside a signed minimum by minus one",
+                 "[integration][gpu_execution][checked_division]")
+{
+  // Each group g holds one type's minimum over -1 and a zero divisor.
+  run_ok(
+    "CREATE TABLE div_mixed AS SELECT id::INTEGER id, g::INTEGER g, a::BIGINT a, b::BIGINT b "
+    "FROM (VALUES (0, 0, -128, -1), (1, 0, 9, 0), (2, 1, -32768, -1), (3, 1, 9, 0), "
+    "(4, 2, -2147483648, -1), (5, 2, 9, 0), (6, 3, -9223372036854775808, -1), (7, 3, 9, 0)) "
+    "t(id, g, a, b);");
+  run_ok("CHECKPOINT;");
+  auto const strategy = GENERATE("materialize", "ast_interpret", "ast_jit");
+  run_ok("SET expression_evaluator_strategy = '" + std::string(strategy) + "';");
+  // The zero divisor sends an unguarded % to CPU replay, which returns NULL for it and 0 for the
+  // minimum. Under a CASE that excludes it, % is retried on the other row and stays on the GPU.
+  auto const check = [&](std::string const& mod, std::string const& rows) {
+    run_ok("SET enable_duckdb_fallback = true;");
+    run_ok("SET error_on_division_by_zero = false;");
+    expect_runtime_fallback_matches_cpu("SELECT id, " + mod + rows);
+    run_ok("SET error_on_division_by_zero = true;");
+    run_ok("SET enable_duckdb_fallback = false;");
+    compare_gpu_vs_cpu("SELECT id, CASE WHEN b = 0 THEN NULL ELSE " + mod + " END" + rows);
+  };
+  int group = 0;
+  for (auto const* type : {"TINYINT", "SMALLINT", "INTEGER", "BIGINT"}) {
+    CAPTURE(strategy, type);
+    check("a::" + std::string(type) + " % b::" + type,
+          " FROM div_mixed WHERE g = " + std::to_string(group));
+    ++group;
+  }
+  // The GPU cannot scan a HUGEINT column, so the HUGEINT minimum is a constant numerator.
+  check("(-170141183460469231731687303715884105728)::HUGEINT % b::HUGEINT",
+        " FROM div_mixed WHERE g = 0");
 }

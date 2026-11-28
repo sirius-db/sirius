@@ -46,6 +46,8 @@ class scoped_object_store_configs {
   [[nodiscard]] std::optional<std::uint64_t> install(std::string_view path,
                                                      object_store_config config);
   [[nodiscard]] std::optional<snapshot> resolve(std::string_view path) const;
+  /// Whether a path still maps to the snapshot @p id.
+  [[nodiscard]] bool contains(std::uint64_t id) const;
 
  private:
   struct transparent_string_hash {

@@ -366,7 +366,13 @@ class SiriusConnectionState : public ClientContextState {
   /// objects across DatabaseInstances still get distinct ids).
   [[nodiscard]] uint64_t connection_id() const noexcept { return connection_id_; }
 
+  /// The statement's connection when this is a Sirius internal connection, else null. Set
+  /// before the internal connection runs anything, so IO threads may read it.
+  void set_internal_outer(weak_ptr<ClientContext> outer) { internal_outer_ = std::move(outer); }
+  [[nodiscard]] shared_ptr<ClientContext> internal_outer() const { return internal_outer_.lock(); }
+
  private:
+  weak_ptr<ClientContext> internal_outer_;
   uint64_t planning_generation_   = 0;
   uint64_t captured_generation_   = 0;
   uint64_t declined_generation_   = 0;
@@ -553,6 +559,10 @@ class SiriusContext : public ClientContextState {
   /// \brief Initialize the Sirius context with the given configuration.
   void initialize(const sirius::parsed_sirius_config& config);
 
+  /// \brief Initialize the Sirius context with the user's configuration: it is resolved against
+  /// this machine (sirius::create_sirius_config) once telemetry is up.
+  void initialize(const sirius::config::user_config& config);
+
   /**
    * @brief Suppress QueryBegin/QueryEnd side-effects for internal DuckDB connections.
    *
@@ -597,6 +607,11 @@ class SiriusContext : public ClientContextState {
 
     unique_ptr<QueryResult> Query(const string& sql);
     unique_ptr<QueryResult> Submit(const string& sql);
+    /// Runs @p read with this connection's context, in its transaction: a catalog lookup made
+    /// there sees what the connection's queries see. An exception from @p read, whatever its
+    /// type, invalidates that transaction, so a caller that goes on to query should have
+    /// @p read report failure by other means.
+    void read_catalog(const std::function<void(ClientContext&)>& read);
 
    private:
     struct implementation;
@@ -1267,6 +1282,10 @@ bool like_swar_fastpath_enabled(ClientContext& context);
 /// The registered default carries the YAML value (see InitialGPUConfigs), so a
 /// `sirius.operator_params` entry is what a connection inherits until it sets its own.
 bool compressed_materialization_enabled(ClientContext& context);
+
+/// \brief Read the per-session `enable_dictionary_carrier` setting, resolved per connection like
+/// `enable_compressed_materialization`. A distributed connection plans no dictionary carrier.
+bool dictionary_carrier_enabled(ClientContext& context);
 
 /// \brief Print the "GPU execution failed, falling back to DuckDB" banner with the GPU error.
 ///

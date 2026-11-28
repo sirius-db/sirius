@@ -15,6 +15,7 @@
  */
 
 #include "exec/invocable.hpp"
+#include "io/scoped_object_store_configs.hpp"
 #include "op/scan/gpu_row_positions.hpp"
 #include "op/scan/owning_table_view.hpp"
 #include "op/scan/scan_execution_record.hpp"
@@ -31,6 +32,8 @@
 #include <span>
 #include <stdexcept>
 #include <stop_token>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -103,6 +106,9 @@ class ingestible_table_info {
   scan_contract_id contract_id = 0;
   test_injections injections;
   std::shared_ptr<physical_profile_table> profiles = std::make_shared<physical_profile_table>();
+  /// The S3 configuration this statement resolved for each remote file it opens, by path. The
+  /// scan opens with it: the path's own entry is shared by every connection and may be replaced.
+  std::unordered_map<std::string, sirius::io::scoped_object_store_configs::snapshot> s3_configs;
 
   virtual ~ingestible_table_info() = default;
   virtual bool allows_cached_rows() const { return true; }

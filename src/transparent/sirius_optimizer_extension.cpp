@@ -83,6 +83,24 @@ bool plan_optimization_enabled(duckdb::ClientContext& context,
   return runtime && runtime->get_config().get_operator_params().*option;
 }
 
+/// The thresholds of the partial aggregate pushdown. They are its defaults unless the test-only
+/// settings, which exist only when test options are enabled, say otherwise.
+sirius::planner::partial_aggregate_pushdown_options partial_aggregate_pushdown_thresholds(
+  duckdb::ClientContext& context)
+{
+  sirius::planner::partial_aggregate_pushdown_options options;
+  auto const read = [&]<typename T>(char const* name, T& threshold) {
+    duckdb::Value setting;
+    if (context.TryGetCurrentSetting(name, setting) && !setting.IsNull()) {
+      threshold = setting.GetValue<T>();
+    }
+  };
+  read("partial_aggregate_min_kept_share", options.min_kept_share);
+  read("partial_aggregate_max_extra_keys", options.max_extra_keys);
+  read("partial_aggregate_min_rows_per_key", options.min_rows_per_key);
+  return options;
+}
+
 /// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving data
 /// off it. 0 when no GPU capacity is configured.
 std::uint64_t gpu_memory_budget(duckdb::ClientContext& context)
@@ -207,6 +225,7 @@ void preserve_parquet_bindings(duckdb::LogicalOperator const& from,
       // Serialization rebinds the wildcard and loses Hive pruning. Copy the verified
       // bind data instead; DuckDB gives the copy its own materialized file list.
       copied.bind_data = original.bind_data->Copy();
+      copy_parquet_scan_row_count(original, copied);
     }
   }
   for (std::size_t i = 0; i < from.children.size(); ++i) {
@@ -267,6 +286,8 @@ void prepare_for_sirius(duckdb::OptimizerExtensionInput& input, duckdb::LogicalO
   if (parquet_footer_statistics_enabled(context)) {
     auto const scans = add_parquet_footer_statistics(context, plan);
     if (scans > 0) { SIRIUS_LOG_DEBUG("Gave {} Parquet scans their footer statistics", scans); }
+  } else {
+    forget_parquet_scan_row_counts(plan);
   }
   bool const gpu_execution = gpu_execution_enabled(context);
   // Only a statement that can reach the GPU is rewritten; anything else must get the plan DuckDB
@@ -471,8 +492,10 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     if (plan_optimization_enabled(context,
                                   &sirius::operator_params::enable_partial_aggregate_below_join)) {
       try {
-        pushed_aggregates = sirius::planner::push_partial_aggregates_below_joins(
-          context, input.optimizer.binder, copy);
+        pushed_aggregates =
+          sirius::planner::push_partial_aggregates_below_joins(
+            context, input.optimizer.binder, copy, partial_aggregate_pushdown_thresholds(context))
+            .pushed;
       } catch (std::exception& e) {
         SIRIUS_LOG_WARN(
           "Transparent execution: partial aggregate pushdown failed, planning without it: {}",

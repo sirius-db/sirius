@@ -81,12 +81,12 @@ access differently, and probing first keeps the skill portable.
 ## Step 2 — Resolve the PR
 
 ```
-gh pr view <n> --repo <owner>/<repo> --json title,body,commits,files,headRefName,baseRefName,author,state,url
+gh pr view <n> --repo <owner>/<repo> --json title,body,commits,files,headRefName,baseRefName,headRefOid,baseRefOid,author,state,url
 ```
 
 This is the single most important call: it's the ground truth for the file list and diff scope
-used throughout the rest of the digest (see the warning in Step 4 about why local `git diff`
-isn't a substitute).
+used throughout the rest of the digest. Record the head and base object IDs; branch names can
+move while the digest is being written.
 
 ## Step 3 — Follow the references to other PRs and issues
 
@@ -103,34 +103,63 @@ Summarize each in a couple of lines in the digest — enough for the reader to u
 this PR is part of (what it closes, what it supersedes, what design doc it's stacked on). Don't
 write a full digest of each referenced item; that's scope creep.
 
-## Step 4 — Check out the PR branch locally
+## Step 4 — Inspect the pinned revisions without changing the user's checkout
 
-Line-accurate `#L123` links need real file content, and that means having the branch checked out
-— `gh pr diff` line offsets alone aren't enough to point at, say, a function definition three
-lines below where its diff hunk started.
+Capture `gh pr diff <n> --repo <owner>/<repo>` and the metadata from Step 2, then query the head
+and base object IDs again. If either moved, discard the captured metadata and diff and repeat from
+Step 2 so the file list, hunks, and revisions describe the same PR state. If the PR keeps moving,
+stop and report that a consistent snapshot could not be obtained. Use the captured GitHub file
+list and diff as the authority for scope; a local three-dot diff can include unrelated changes.
+The compare API's merge base is only a candidate for the PR's diff base
+(`gh api repos/<owner>/<repo>/compare/<base-oid>...<head-oid> --jq .merge_base_commit.sha`).
+[GitHub can use different bases for compare and PR diffs](https://docs.github.com/en/pull-requests/reference/pull-requests#differences-between-commits-on-compare-and-pull-request-pages).
+Verify the complete captured patch against the candidate-to-head diff, including changed paths,
+old/new blobs, modes and hunks; matching a few context lines is insufficient. If it differs,
+use the captured patch's old blob IDs and the PR/base history to locate an earlier candidate
+containing those blobs at their old paths, then verify the whole patch again. Record the verified
+PR diff-base commit separately from the base tip. If none can be verified, report the limitation
+and omit unverified old-side source links rather than substituting the compare diff.
 
-**Safety first:** run `git status --porcelain`. If anything is uncommitted (tracked or
-untracked), **stop and tell the user** exactly what's dirty, and ask them to stash or commit
-before re-running the skill. Do not auto-stash — that's someone's in-progress work, not yours to
-move.
+If the pinned PR head is missing locally, fetch it from the base repository's URL using
+`refs/pull/<n>/head`:
 
-If clean:
-
+```sh
+git fetch --no-tags --no-write-fetch-head https://github.com/<owner>/<repo>.git refs/pull/<n>/head
 ```
-gh pr checkout <n> --repo <owner>/<repo>
+
+Fetch the base branch or other required objects from the same repository as needed. Verify that the
+recorded head, base, and verified diff-base object IDs identify commits before using them. A moving
+ref may fetch a different head, so keep using the pinned object IDs. Report any pinned commits you
+cannot obtain.
+
+From the repository root, check the pinned head's filter attributes before
+creating a worktree:
+
+```sh
+git ls-tree -r -z --name-only <head-oid> |
+  git check-attr --source=<head-oid> -z --stdin filter
 ```
 
-Note which branch/commit the repo was on beforehand so you can mention it in the final summary —
-the user may want to switch back afterward, but don't do that automatically.
+Check assigned drivers against the configured `filter.*.smudge` and
+`filter.*.process` commands. Use pinned Git object reads if a filter would run
+repository code or fetch data, or if you cannot check the filters. Otherwise,
+create a private temporary parent with `mktemp -d` and add the checkout inside
+it with checkout hooks and FSMonitor disabled:
 
-**Why not just use local `git diff` against the base branch for everything?** On a branch that
-periodically merged the base branch back in (common on long-running PRs), the local three-dot
-diff's merge-base calculation can get confused by those merge commits and pull in unrelated files
-from work that landed on the base branch after this PR's diff was actually opened — this has
-happened in practice and silently made a digest describe files the PR never touched. `gh pr view
---json files` / `gh pr diff` are the authoritative source for *which files and diff hunks belong
-to this PR*. Use the local checkout only to resolve current, exact line numbers for links — not
-to redetermine scope.
+```sh
+git -c core.hooksPath=/dev/null -c core.fsmonitor=false worktree add --detach <temporary-path> <head-oid>
+```
+
+Use `git -c core.fsmonitor=false grep -n` to navigate the worktree. If filters
+can alter the search or a worktree is unavailable, search the pinned commit with
+`git --literal-pathspecs grep -n -e <pattern> <head-oid> -- <path>`. Use
+`git show <head-oid>:<path> | cat -n` for exact source and line numbers.
+A symlink blob records its target path. For a submodule, record the commit
+from its gitlink and report any unavailable context. Use
+`git show <diff-base-oid>:<path>` for old-side source from the verified diff base.
+When finished, run
+`git -c core.fsmonitor=false worktree remove <temporary-path>` from the original repository and remove
+the empty temporary parent. Preserve the user's original checkout and its files.
 
 ## Step 5 — Identify the key changes, ranked by conceptual centrality
 
@@ -188,7 +217,7 @@ most one edge on each source line. The diagram should:
   would be misleading;
 - use plain conceptual labels rather than filenames and full function signatures;
 - distinguish decisions and older paths that materially affect behavior;
-- avoid branches that were not verified from the PR description, diff, or checked-out code.
+- avoid branches that were not verified from the PR description, diff, or code at the pinned revisions.
 
 Immediately below the diagram, add a short **Code anchors** list linking 2–5 diagram concepts to
 their exact source lines. The diagram is orientation, not evidence by itself; the links make its
@@ -276,7 +305,7 @@ safe, which means you have to check rather than assume.
 
 Detect moves from the diff: `gh pr diff` marks pure renames as `rename from` / `rename to` with no
 hunks, but a move plus edits usually appears as a separate delete + add pair with near-identical
-content. `gh pr view --json files` paths compared against the base branch's tree will surface the
+content. `gh pr view --json files` paths compared against the pinned diff-base tree will surface the
 latter. For each moved file or function, diff old content against new content and classify it:
 
 - **Logically intact** — content is byte-identical apart from things that can't change behavior:
@@ -310,19 +339,15 @@ what keeps it honest instead of silently confident.
 
 ## Link rules (all of this exists so the digest is actually navigable, not just readable)
 
-- Every file mention is a markdown link: `[filename.cpp](relative/path/to/filename.cpp)`. Never
-  leave a bare filename in backticks when a link is possible.
-- Never use `foo.{hpp,cpp}` shorthand for a header/source pair — always two separate links:
-  `[foo.hpp](path/foo.hpp)` and `[foo.cpp](path/foo.cpp)`.
-- Point at a specific line with `#L<N>`: `[foo.cpp](path/foo.cpp#L123)`.
-- Paths are relative to the digest's own location, `PR_digests/` (one level below repo root), so
-  a link to source looks like `../src/path/to/file.cpp#L123`. If the output location ever moves,
-  adjust the `../` depth to match.
-- Get line numbers by reading/grepping the real, checked-out file — not from memory, and not from
-  `gh pr diff` hunk headers alone (those are diff-relative, though they do coincide with absolute
-  file lines for a brand-new file).
-- Near the top of the digest, note that line numbers are accurate as of generation time and will
-  drift if the branch is later rebased or amended.
+- Every file mention is a Markdown link. Use GitHub permalinks to the pinned head commit for
+  current code and to the verified PR diff-base commit for removed or old diff code, for example
+  `[foo.cpp](https://github.com/<owner>/<repo>/blob/<head-oid>/src/foo.cpp#L123)`. Encode paths
+  as needed for URLs. These links remain accurate even if the user's checkout is dirty or on a
+  different branch. Link moved files to their respective diff-base and head revisions.
+- Never use `foo.{hpp,cpp}` shorthand for a header/source pair — link each file separately.
+- Get line numbers by reading the file at its pinned revision, not from memory or diff hunk headers
+  alone. Near the top of the digest, identify the head, base tip and diff-base commit IDs used; note that a later
+  PR update may differ from this snapshot.
 
 ## Output
 
@@ -333,13 +358,13 @@ what keeps it honest instead of silently confident.
 - Create the `PR_digests/` directory if it doesn't exist. Write and verify the Markdown first,
   then generate the HTML from it. Never hand-edit the HTML; regenerate it after every Markdown
   change.
-- Add `PR_digests/` to the repo's `.gitignore` if it isn't already there — these are local review
-  artifacts, not something to commit. Check once per run; don't ask the user about it each time.
+- Preserve existing files at the output paths; ask before overwriting them. Do not modify the user's
+  `.gitignore` or other work to hide the artifacts.
 - Structure, top to bottom:
   1. Title + a one-line note that this digest explains what the PR does and where it lives, and
      is not a critique or approval recommendation — so nobody mistakes "no concerns listed" for
      "no concerns found."
-  2. A one-line caveat about line-number drift (see Link rules).
+  2. A one-line snapshot note with the pinned head, base tip and diff-base commits (see Link rules).
   3. Header table: PR number/link, title, author, branch (head → base), scope (commit/file
      count), closes, supersedes.
   4. The PR description, quoted.
@@ -360,20 +385,19 @@ what keeps it honest instead of silently confident.
 After the Markdown is complete, render its companion preview with the repository-local script:
 
 ```sh
-pixi run python .claude/skills/pr-digest/scripts/render_digest_html.py \
+python3 -I .claude/skills/pr-digest/scripts/render_digest_html.py \
   PR_digests/PR_digest_<PR_NUMBER>.md \
   PR_digests/PR_digest_<PR_NUMBER>.html
 ```
 
-If `pixi` is unavailable, run the same script with `python3`; it uses only the Python standard
-library. Treat a renderer failure as an incomplete digest, not an optional preview. Check the
+The renderer uses only the Python standard library. Treat a renderer failure as an incomplete digest, not an optional preview. Check the
 reported counts against the Markdown's `diff` and Mermaid fences, confirm the HTML contains no
 remote assets, and open the HTML in a browser or HTML preview when one is available.
 
 In the final response, link both files and identify Markdown as the editable source and HTML as
-the rendered preview. Also mention the branch/commit that was checked out to generate the links.
+the rendered preview. Also identify the pinned head, base tip and diff-base commits used for the digest.
 
 See `references/example_digest.md` in this skill directory for a full worked example (PR #1277 —
 sirius-db/sirius, "dynamic filters: SIP") showing the expected structure, link density, trimming
-style, and tagging. Use `references/plain_language.md` as the authority for prose style when the
-worked example uses denser technical language.
+style, and tagging. Use `references/plain_language.md` as the
+authority for prose style when the worked example uses denser technical language.

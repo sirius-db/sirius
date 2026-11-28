@@ -1,6 +1,7 @@
-# TPC-H Performance Testing
+# TPC-H and scale_bench Performance Testing
 
-Benchmarking tools for comparing DuckDB (CPU) vs Sirius (GPU) on TPC-H queries at various scale factors.
+Benchmarking tools for comparing DuckDB (CPU) vs Sirius (GPU). The Python runner
+supports TPC-H and scale_bench; the legacy shell runners below remain TPC-H-specific.
 
 ## Prerequisites
 
@@ -69,7 +70,36 @@ Use the Iceberg benchmark below to compare results and timings.
 
 All commands run from the **project root** directory.
 
+### scale_bench with the shared Python runner
+
+Select `--benchmark scale_bench` for named queries over an existing local
+Parquet dataset. TPC-H remains the default; do not supply `--scale-factor` for
+scale_bench. TPC-DS continues to use its separate scripts.
+
+```bash
+pixi run python test/tpch_performance/performance_test.py \
+    --benchmark scale_bench --input /path/to/dataset \
+    --queries gb2,workflow --engine gpu --iterations 3 \
+    --config /path/to/sirius.yaml --temp-dir /scratch/scale_work \
+    --output /path/to/results
+```
+
+Omit `--queries` or use `all` for all eight workloads. The default result format
+is `fingerprint`, which excludes nested output columns. Use `--engine both
+--validation` for CPU/GPU comparison with the documented fingerprint and
+PageRank validation limits. Full `rows` and `parquet` output have different
+materialization costs; graph workloads reject Parquet output.
+
+Workflow writes prepared table C outside query timing. `--temp-dir` is a parent
+for an owned child, automatically removed with graph intermediates after the
+run; it is separate from retained Parquet result exports. See the
+[scale_bench guide](README.md#scale_bench) for input layout, named queries,
+cleanup/crash handling, timing boundaries and unsupported options. Pinning,
+concurrency and external profiling wrappers are not supported for this family.
+
 ### Read-only concurrent queries
+
+This section applies to TPC-H.
 
 `performance_test.py --concurrency N` runs N client streams in **one shared database and
 Sirius runtime**, without refresh operations. Each stream has its own connection and at most
@@ -298,7 +328,10 @@ Each run creates a directory under `runs/<timestamp>_sf<SF>_2iter/` containing:
 
 ### Running individual queries
 
-`run_tpch_parquet.sh` is the core runner used by all benchmarks. It runs queries in a single DuckDB session with 2 iterations each (cold + warm, back-to-back) and auto-generates missing datasets.
+`run_tpch_parquet.sh` is the legacy TPC-H shell runner used by
+`benchmark_and_validate.sh`. It runs queries in a single DuckDB session with
+2 iterations each and can auto-generate missing TPC-H datasets. The Python
+runner above requires existing inputs and is also the entry point for scale_bench.
 
 ```bash
 # Run Sirius on queries 1-22
