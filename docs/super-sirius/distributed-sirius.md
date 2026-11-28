@@ -217,6 +217,12 @@ NULL build key makes an unmatched probe row's mark NULL rather than false, on wh
 row is. Each rank also sends one row of its build input to every rank, so a rank's share is empty
 only when the whole build is: a NULL probe key's mark is NULL against any non-empty build. That
 row matches nothing off its home rank, since every probe row with its key hashes there.
+A `RIGHT_SEMI` or `RIGHT_ANTI` join builds on its kept side, and streams its probe side instead of
+collecting it, when one rank's share of the kept side fits that rank's `max_build_probe_resident_bytes`
+budget: the estimate of the whole kept side divided by the ranks.
+Where the kept side is one Parquet scan under a constant range on an integer or `DATE` column, its
+rows are the footers' row count times the range's share of the column's min to max, when that is
+below DuckDB's estimate (a fifth of the scan for any range).
 A nested-loop join refuses the types that emit unmatched build rows (`RIGHT`, `OUTER`,
 `RIGHT_SEMI`, `RIGHT_ANTI`), since every rank holds the whole build.
 

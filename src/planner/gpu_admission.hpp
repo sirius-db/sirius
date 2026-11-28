@@ -21,6 +21,7 @@
 #include <absl/functional/function_ref.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -105,6 +106,32 @@ inline uint64_t accumulate_scan_bytes(uint64_t running, uint64_t rows, uint64_t 
   auto const scan_bytes = rows * bytes_per_row;
   if (running > k_max - scan_bytes) { return k_max; }
   return running + scan_bytes;
+}
+
+/**
+ * @brief Whether this process's GPUs can keep its part of a RIGHT_SEMI / RIGHT_ANTI kept side.
+ *
+ * @p kept_bytes estimates the whole kept side. A distributed plan hash-exchanges that side, so
+ * each of the @p ranks processes keeps one share of it; one process keeps all of it.
+ * @p budget_bytes is the residency budget of this process's GPUs.
+ */
+inline bool kept_side_fits(uint64_t kept_bytes, std::size_t ranks, uint64_t budget_bytes)
+{
+  return kept_bytes / std::max<std::size_t>(1, ranks) < budget_bytes;
+}
+
+/**
+ * @brief Rows of a scan that a filter keeps which holds one column from @p low to @p high, both
+ * included, where the column's values run from @p min to @p max and are spread evenly.
+ */
+inline uint64_t rows_in_value_range(
+  uint64_t scan_rows, double min, double max, double low, double high)
+{
+  low  = std::max(low, min);
+  high = std::min(high, max);
+  if (high < low) { return 0; }
+  return static_cast<uint64_t>(
+    std::ceil(static_cast<double>(scan_rows) * (high - low + 1.0) / (max - min + 1.0)));
 }
 
 /// Row count and per-row width of one scan, read off the plan.
