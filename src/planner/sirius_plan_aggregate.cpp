@@ -14,15 +14,20 @@
  * limitations under the License.
  */
 
+#include "core_functions/aggregate/distributive_functions.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/function/aggregate/distributive_function_utils.hpp"
+#include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/scalar/generic_functions.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression_map.hpp"
+#include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -31,6 +36,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
@@ -53,6 +59,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 
@@ -62,8 +69,8 @@ namespace {
 
 // Translate a vector of DuckDB expressions into Sirius AST nodes at the planner
 // boundary. The source vector is drained; size and order are preserved. If
-// from_duckdb declines an unsupported shape (e.g. an ORDER BY aggregate rewritten
-// to arg_min_null / create_sort_key), it returns null — which the downstream
+// from_duckdb declines an unsupported shape (e.g. a create_sort_key the ordered-first
+// decode left in an aggregate's input), it returns null — which the downstream
 // aggregate/projection operators cannot represent. Rather than build a GPU plan
 // containing null nodes (which crashes at execution time), throw here so the
 // query falls back to DuckDB's CPU execution.
@@ -198,6 +205,207 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> project_shared_filter_p
     std::move(child), std::move(projected), std::move(types), estimated_cardinality);
 }
 
+bool is_first(duckdb::BoundAggregateExpression const& aggregate)
+{
+  return sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName()) ==
+         sirius::aggregate_id::first;
+}
+
+// Whether row order cannot change @p aggregate's result, so its ORDER BY can be dropped. Until
+// #2537 settles floating aggregates, a floating sum or average is not, since its rounding follows
+// the order DuckDB adds in.
+bool ignores_row_order(duckdb::BoundAggregateExpression const& aggregate)
+{
+  auto const id =
+    sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName());
+  if (!id) { return false; }
+  switch (*id) {
+    case sirius::aggregate_id::min:
+    case sirius::aggregate_id::max:
+    case sirius::aggregate_id::count:
+    case sirius::aggregate_id::count_star: return true;
+    case sirius::aggregate_id::sum:
+    case sirius::aggregate_id::sum_no_overflow:
+    case sirius::aggregate_id::avg: {
+      auto const& input = aggregate.GetChildren()[0]->GetReturnType();
+      return input.IsIntegral() || input.id() == duckdb::LogicalTypeId::DECIMAL;
+    }
+    default: return false;
+  }
+}
+
+// Whether @p signature is one of @p builtins' overloads. An overload registered under a built-in's
+// name joins its catalog set, so the name alone does not identify DuckDB's function.
+bool is_builtin_overload(duckdb::FunctionSignature const& signature,
+                         duckdb::AggregateFunctionSet const& builtins)
+{
+  return std::ranges::any_of(builtins.functions, [&](auto const& builtin) {
+    return builtin->GetSignature().IsSameOverload(signature);
+  });
+}
+
+bool is_arg_min_null(duckdb::BoundAggregateExpression const& aggregate)
+{
+  static auto const builtins = duckdb::ArgMinNullFun::GetFunctions();
+  return aggregate.Function().GetName().GetIdentifierName() == "arg_min_null" &&
+         is_builtin_overload(aggregate.Function().GetDefinition()->GetSignature(), builtins);
+}
+
+bool is_arg_max_null(duckdb::BoundAggregateExpression const& aggregate)
+{
+  static auto const builtins = duckdb::ArgMaxNullFun::GetFunctions();
+  return aggregate.Function().GetName().GetIdentifierName() == "arg_max_null" &&
+         is_builtin_overload(aggregate.Function().GetDefinition()->GetSignature(), builtins);
+}
+
+// DuckDB rewrites first(v ORDER BY ...) to arg_min_null(v, sort_key) and last(v ORDER BY ...) to
+// arg_max_null(v, sort_key). One with its own ORDER BY, which breaks ties on the sort key, is not a
+// decodable FIRST.
+bool is_unordered_arg_min_or_max_null(duckdb::BoundAggregateExpression const& aggregate)
+{
+  return (is_arg_min_null(aggregate) || is_arg_max_null(aggregate)) &&
+         aggregate.GetChildren().size() == 2 && !aggregate.GetOrderBys();
+}
+
+// DuckDB's create_sort_key(k1, 'm1', ...) with every modifier a non-NULL constant.
+bool is_decodable_sort_key(duckdb::Expression const& expression)
+{
+  if (expression.GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) { return false; }
+  auto const& sort_key = expression.Cast<duckdb::BoundFunctionExpression>();
+  auto const& terms    = sort_key.GetChildren();
+  if (sort_key.Function().GetName().GetIdentifierName() != "create_sort_key" ||
+      !sort_key.Function().GetDefinition()->GetSignature().IsSameOverload(
+        duckdb::CreateSortKeyFun::GetFunction().GetSignature()) ||
+      terms.empty() || terms.size() % 2 != 0) {
+    return false;
+  }
+  for (std::size_t i = 1; i < terms.size(); i += 2) {
+    if (terms[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT ||
+        terms[i]->Cast<duckdb::BoundConstantExpression>().GetValue().IsNull()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Number of references to column @p index of the child anywhere in @p expression.
+std::size_t count_references(duckdb::Expression const& expression, duckdb::idx_t index)
+{
+  std::size_t count = 0;
+  if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF &&
+      expression.Cast<duckdb::BoundReferenceExpression>().Index() == index) {
+    ++count;
+  }
+  duckdb::ExpressionIterator::EnumerateChildren(
+    expression, [&](duckdb::Expression const& child) { count += count_references(child, index); });
+  return count;
+}
+
+// DuckDB's common-subexpression pass moves a create_sort_key that several ordered FIRSTs or LASTs
+// share into the projection below, leaving arg_min_null(v, #i) or arg_max_null(v, #i). When only
+// such aggregates read #i, puts the sort key back inline over key columns: #i becomes the first
+// key, the others are appended, and a key already projected elsewhere reads that column.
+void inline_shared_sort_keys(duckdb::LogicalAggregate& op)
+{
+  if (op.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_PROJECTION) { return; }
+  auto& projection = op.children[0]->Cast<duckdb::LogicalProjection>();
+  if (projection.types.size() != projection.expressions.size()) { return; }
+  std::map<duckdb::idx_t, std::vector<duckdb::BoundAggregateExpression*>> readers;
+  for (auto& expression : op.expressions) {
+    auto& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
+    if (!is_unordered_arg_min_or_max_null(aggregate)) { continue; }
+    auto const& key = *aggregate.GetChildren()[1];
+    if (key.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
+    auto const index = key.Cast<duckdb::BoundReferenceExpression>().Index();
+    if (index < projection.expressions.size() &&
+        is_decodable_sort_key(*projection.expressions[index])) {
+      readers[index].push_back(&aggregate);
+    }
+  }
+  for (auto const& [index, aggregates] : readers) {
+    std::size_t uses = 0;
+    for (auto const* expressions : {&op.groups, &op.expressions}) {
+      for (auto const& expression : *expressions) {
+        uses += count_references(*expression, index);
+      }
+    }
+    // Rewriting the column would change what any other reader sees.
+    if (uses != aggregates.size()) { continue; }
+
+    // Owns the sort key until the iteration ends, so `terms` never outlives its node.
+    auto const sort_key = std::move(projection.expressions[index]);
+    auto& terms         = sort_key->Cast<duckdb::BoundFunctionExpression>().GetChildrenMutable();
+    auto inline_key     = sort_key->Copy();
+    auto& inline_terms  = inline_key->Cast<duckdb::BoundFunctionExpression>().GetChildrenMutable();
+    projection.types[index]       = terms[0]->GetReturnType();
+    projection.expressions[index] = terms[0]->Copy();
+    for (std::size_t term = 0; term < terms.size(); term += 2) {
+      // An equal column already projected is reused, so equal orders decode to equal references.
+      auto const& expressions = projection.expressions;
+      auto const reused       = std::ranges::find_if(expressions, [&](auto const& projected) {
+        return &projected != &expressions[index] && projected->Equals(*terms[term]);
+      });
+      auto column             = static_cast<duckdb::idx_t>(reused - expressions.begin());
+      if (reused == expressions.end()) {
+        column = term == 0 ? index : expressions.size();
+        if (term != 0) {
+          projection.types.push_back(terms[term]->GetReturnType());
+          projection.expressions.push_back(terms[term]->Copy());
+        }
+      }
+      inline_terms[term] =
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(terms[term]->GetReturnType(), column);
+    }
+    for (auto* aggregate : aggregates) {
+      aggregate->GetChildrenMutable()[1] = inline_key->Copy();
+    }
+  }
+}
+
+// Rebuilds DuckDB's rewrite of first(v ORDER BY k1 m1, ...), arg_min_null(v, create_sort_key(k1,
+// 'm1', ...)), as that first. The sort key is never NULL and orders rows as the ORDER BY does.
+// arg_max_null becomes a first under the reverse of every direction and NULL placement. Other
+// expressions are left alone.
+void decode_ordered_first(duckdb::ClientContext& context,
+                          duckdb::unique_ptr<duckdb::Expression>& expression)
+{
+  auto& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
+  auto& children  = aggregate.GetChildrenMutable();
+  if (!is_unordered_arg_min_or_max_null(aggregate) || !is_decodable_sort_key(*children[1])) {
+    return;
+  }
+  auto& terms        = children[1]->Cast<duckdb::BoundFunctionExpression>().GetChildrenMutable();
+  bool const reverse = is_arg_max_null(aggregate);
+
+  auto order_bys = duckdb::make_uniq<duckdb::BoundOrderModifier>();
+  for (std::size_t i = 0; i < terms.size(); i += 2) {
+    auto modifiers = duckdb::OrderModifiers::Parse(
+      terms[i + 1]->Cast<duckdb::BoundConstantExpression>().GetValue().ToString());
+    if (reverse) {
+      modifiers.order_type = modifiers.order_type == duckdb::OrderType::ASCENDING
+                               ? duckdb::OrderType::DESCENDING
+                               : duckdb::OrderType::ASCENDING;
+      modifiers.null_type  = modifiers.null_type == duckdb::OrderByNullType::NULLS_FIRST
+                               ? duckdb::OrderByNullType::NULLS_LAST
+                               : duckdb::OrderByNullType::NULLS_FIRST;
+    }
+    order_bys->orders.emplace_back(modifiers.order_type, modifiers.null_type, std::move(terms[i]));
+  }
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> value;
+  value.push_back(std::move(children[0]));
+  auto const value_type = value[0]->GetReturnType();
+  duckdb::FunctionBinder binder(context);
+  // DISTINCT never changes the row first picks, so the first is bound without it.
+  auto first = binder.BindAggregateFunction(duckdb::FirstFunctionGetter::GetFunction(value_type),
+                                            std::move(value),
+                                            std::move(aggregate.GetFilterMutable()),
+                                            duckdb::AggregateType::NON_DISTINCT);
+  first->GetOrderBysMutable() = std::move(order_bys);
+  first->SetAlias(aggregate.GetAlias());
+  first->SetQueryLocation(aggregate.GetQueryLocation());
+  expression = std::move(first);
+}
+
 duckdb::AggregateFunctionCatalogEntry& builtin_count_entry(duckdb::ClientContext& context)
 {
   auto& catalog = duckdb::Catalog::GetSystemCatalog(context);
@@ -220,8 +428,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
   duckdb::vector<duckdb::LogicalType> types;
   duckdb::vector<duckdb::idx_t> masked_columns;
   // Keys borrow immutable heap nodes owned by expressions; moving their unique_ptrs does not move
-  // the nodes. Clear the map before translation drains those owners.
+  // the nodes. Clear the maps before translation drains those owners.
   duckdb::expression_map_t<duckdb::idx_t> masked_inputs;
+  // Equal ORDER BY keys share one projected column, so FIRSTs with equal orders get equal slots.
+  duckdb::expression_map_t<duckdb::idx_t> order_inputs;
   auto project_input = [&](duckdb::unique_ptr<duckdb::Expression> expression, bool masked) {
     bool const shareable = masked && can_share_expression(*expression);
     if (shareable) {
@@ -235,12 +445,28 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
     if (shareable) { masked_inputs.emplace(*expressions.back(), index); }
     return index;
   };
+  auto project_order_key = [&](duckdb::unique_ptr<duckdb::Expression> key) {
+    auto const found = order_inputs.find(*key);
+    if (found != order_inputs.end()) { return found->second; }
+    auto const index = project_input(std::move(key), false);
+    order_inputs.emplace(*expressions[index], index);
+    return index;
+  };
 
-  // bind sorted aggregates
+  // Only FIRST keeps an ORDER BY, without the terms a group key makes constant. Another aggregate's
+  // ORDER BY must simplify away, have no argument to order, or not change the result.
   for (auto& aggr : aggregates) {
     auto& bound_aggr = aggr->Cast<duckdb::BoundAggregateExpression>();
-    if (bound_aggr.GetOrderBys()) {
-      duckdb::FunctionBinder::BindSortedAggregate(context, bound_aggr, groups, grouping_sets);
+    auto& order_bys  = bound_aggr.GetOrderBysMutable();
+    if (!order_bys) { continue; }
+    if (order_bys->Simplify(groups, grouping_sets) || bound_aggr.GetChildren().empty() ||
+        ignores_row_order(bound_aggr)) {
+      order_bys.reset();
+    } else if (!is_first(bound_aggr)) {
+      throw duckdb::NotImplementedException(
+        "An ORDER BY on an aggregate other than first() is not supported on the GPU (falling back "
+        "to CPU): " +
+        bound_aggr.ToString());
     }
   }
   for (auto& group : groups) {
@@ -261,6 +487,14 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
       auto const type  = child_expr->GetReturnType();
       auto const index = project_input(std::move(child_expr), filter != nullptr);
       child_expr       = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, index);
+    }
+
+    if (auto& order_bys = bound_aggr.GetOrderBysMutable()) {
+      for (auto& key : order_bys->orders) {
+        auto const type  = key.expression->GetReturnType();
+        auto const index = project_order_key(std::move(key.expression));
+        key.expression   = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, index);
+      }
     }
 
     // FILTERed aggregates with  no argument (currently, only COUNT(*))
@@ -284,6 +518,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
     }
   }
   masked_inputs.clear();
+  order_inputs.clear();
   if (expressions.empty()) { return child; }
   child       = project_shared_filter_predicates(std::move(child), expressions, masked_columns);
   auto inputs = translate_expressions(std::move(expressions));
@@ -944,6 +1179,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       "Grouping sets without GROUP BY keys are not supported in GPU aggregates");
   }
 
+  inline_shared_sort_keys(op);
+  for (auto& expression : op.expressions) {
+    decode_ordered_first(context, expression);
+  }
+
   // Validate FILTER lowering before child planning; DISTINCT remains supported only in COUNT.
   for (auto const& expression : op.expressions) {
     auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
@@ -964,25 +1204,53 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     }
   }
 
-  // The Sirius aggregate node cannot carry an ORDER BY, so a FIRST refuses its own. A FILTER
-  // on FIRST is refused above because FIRST does not skip NULLs.
+  // A FIRST's ORDER BY runs only grouped, one ORDER BY per aggregate list. A FILTER on FIRST is
+  // refused above because FIRST does not skip NULLs.
+  duckdb::BoundAggregateExpression const* first_ordered = nullptr;
   for (auto const& expression : op.expressions) {
     auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
-    if (sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName()) !=
-        sirius::aggregate_id::first) {
-      continue;
-    }
-    if (aggregate.GetOrderBys()) {
-      throw duckdb::NotImplementedException(
-        "first() with an ORDER BY clause is not supported on the GPU (falling back to CPU): " +
-        aggregate.ToString());
+    if (!is_first(aggregate)) { continue; }
+    if (auto const& order = aggregate.GetOrderBys()) {
+      // The selector returns the row's value, where DuckDB returns the sorted aggregate's state.
+      if (aggregate.StateExportMode() == duckdb::AggregateStateExportMode::STATE_EXPORT) {
+        throw duckdb::NotImplementedException(
+          "first() with an ORDER BY and EXPORT_STATE is not supported on the GPU (falling back to "
+          "CPU): " +
+          aggregate.ToString());
+      }
+      if (op.groups.empty()) {
+        throw duckdb::NotImplementedException(
+          "first() with an ORDER BY clause and no GROUP BY is not supported on the GPU (falling "
+          "back to CPU): " +
+          aggregate.ToString());
+      }
+      if (first_ordered &&
+          !duckdb::BoundOrderModifier::Equals(*first_ordered->GetOrderBys(), *order)) {
+        throw duckdb::NotImplementedException(
+          "first() with different ORDER BYs in one GROUP BY is not supported on the GPU (falling "
+          "back to CPU); an ordered last() counts as first() under the reversed order: " +
+          first_ordered->ToString() + " vs " + aggregate.ToString());
+      }
+      first_ordered = &aggregate;
+      for (auto const& key : order->orders) {
+        reject_nested_column_operation(*key.expression, "an aggregate ORDER BY");
+        // Until #2598 is fixed: the GPU lower() and upper() map some characters differently from
+        // DuckDB's, so they can rank rows differently.
+        if (reads_case_mapping(*key.expression, *op.children[0])) {
+          throw duckdb::NotImplementedException(
+            "first() with a NOCASE-collated, lower() or upper() ORDER BY key is not supported on "
+            "the GPU (falling back to CPU); an ordered last() counts as first(): " +
+            aggregate.ToString());
+        }
+      }
     }
     // One carried row per key answers one grouping set, and the set expansion copies no carried
     // columns.
     if (has_grouping_sets) {
       throw duckdb::NotImplementedException(
         "grouped FIRST is not supported over several grouping sets or beside a grouping function "
-        "(falling back to CPU)");
+        "(falling back to CPU); an ordered last() counts as first(): " +
+        aggregate.ToString());
     }
   }
 

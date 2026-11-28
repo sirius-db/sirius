@@ -63,19 +63,6 @@ std::unique_ptr<cudf::table> make_table(std::unique_ptr<cudf::column> column)
   return make_table(std::move(columns));
 }
 
-std::unique_ptr<cudf::column> with_nulls(
-  std::unique_ptr<cudf::column> column,
-  std::vector<bool> const& valid,
-  ::cuda::stream_ref stream         = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
-{
-  REQUIRE(static_cast<std::size_t>(column->size()) == valid.size());
-  auto valid_column       = vector_to_cudf_column<gpu_type_traits<bool>>(valid, stream, mr);
-  auto [mask, null_count] = cudf::bools_to_mask(valid_column->view(), stream, mr);
-  column->set_null_mask(std::move(*mask), null_count);
-  return column;
-}
-
 void require_columns_equal(cudf::column_view const& actual,
                            cudf::column_view const& expected,
                            ::cuda::stream_ref stream,

@@ -87,9 +87,10 @@ Run the wrapper's SQL tests from the root:
 pixi run make -C sirius-duckdb test_release
 ```
 
-## CUDA-selecting core extensions
+## CUDA-selecting loader
 
-The core-extension layout has three artifacts:
+Sirius ships as three artifacts: the core `sirius` loader and two community
+backends.
 
 - `sirius`: a CUDA-free loader built from `loader/`, with no Sirius package or CUDA toolkit dependency.
 - `sirius_cuda12`: the backend built with CUDA 12.
@@ -137,10 +138,13 @@ into a silent CPU fallback.
 | `gpu_execution` | Transparent GPU execution is active for this session; `false` under `SIRIUS_DISABLE` |
 | `fallback_reason` | Why GPU execution is unavailable; `NULL` once the backend loaded |
 
-This layout is for DuckDB core distribution: the loader follows DuckDB's
-autoload policy, trusting core signatures and using DuckDB's configured
-auto-install repository, not the repository it came from. Community signatures
-are not supported.
+The loader `sirius` is a core extension; the backends `sirius_cuda12` and
+`sirius_cuda13` are community extensions. The loader installs a backend from
+DuckDB's configured auto-install repository, not the repository the loader came
+from. If that is DuckDB's default core repository, the loader uses the community
+repository instead; other repositories, such as mirrors and local test
+repositories, are used as configured. Loading a community backend requires
+`allow_community_extensions`, which is on by default.
 
 These are Linux glibc amd64/arm64 SBSA builds; Jetson/Tegra is not supported.
 The loader does not detect or reject unsupported GPU architectures.
@@ -225,7 +229,7 @@ cp sirius-duckdb/build/release/src/libduckdb_static.a \
   sirius-duckdb/build/release/src/main/extension/libduckdb_loadable_extensions.a \
   sirius-duckdb/build/release/src/main/http/libduckdb_httplib.a "$prebuilt/"
 pixi run cmake -S sirius-duckdb/duckdb -B build/loader -G Ninja \
-  -DDUCKDB_EXPLICIT_VERSION=v2.0.0 \
+  -DDUCKDB_EXPLICIT_VERSION=v2.0.1 \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=ON -DBUILD_SHELL=OFF \
   -DEXTENSION_STATIC_BUILD=ON -DDUCKDB_LINKER=bfd \
   -DPREBUILT_BINARY="$prebuilt/libduckdb_static.a" \
@@ -241,7 +245,7 @@ pixi run python sirius-duckdb/loader/test/test_loader.py \
 They expect no driver; on a GPU machine, hide it with the test fixture:
 
 ```sh
-repository="$PWD/build/loader/repository/v2.0.0/$(cat build/loader/duckdb_platform_out)"
+repository="$PWD/build/loader/repository/v2.0.1/$(cat build/loader/duckdb_platform_out)"
 mkdir -p "$repository"
 cp build/loader/extension/sirius/sirius.duckdb_extension "$repository/"
 LOCAL_EXTENSION_REPO="$PWD/build/loader/repository" \

@@ -1,7 +1,7 @@
 ---
 name: benchmark
 description: >
-  Run TPC-H benchmarks on Super Sirius or DuckDB CPU baseline — either the regular per-query
+  Run TPC-H or scale_bench benchmarks on Super Sirius or DuckDB CPU baseline — regular per-query
   timing/validation run, or the TPC-H official power run + throughput run (RF1/RF2 refresh
   functions reporting Power@Size / Throughput@Size / QphH@Size). Generate data, execute queries,
   validate results, and compare timings. Trigger when the user mentions benchmarking, TPC-H,
@@ -14,18 +14,21 @@ disable-model-invocation: true
 
 You are running SQL benchmarks for Sirius, a GPU-accelerated SQL query engine built on DuckDB. This skill manages data generation, benchmark execution across two engines (Super Sirius, DuckDB CPU), and result comparison.
 
-Currently this skill covers **TPC-H only**. TPC-DS support has been removed from this skill for now and will be added back later.
+This skill covers **TPC-H and scale_bench** through the existing Python runner.
+TPC-DS retains separate scripts and is outside this skill's current workflow.
 
 ## Choose the Benchmark Type
 
 Use the request to select the workflow. Ask only if the choice remains ambiguous:
 
 - **Regular benchmark**: per-query timing and GPU-vs-CPU validation with
-  `performance_test.py` (Workflow H-B).
+  `performance_test.py`: TPC-H is the default (Workflow H-B); select
+  `--benchmark scale_bench` for the named scale workloads (Workflow S-A).
 - **TPC-H official (power + throughput run)**: refresh functions and Power@Size /
   Throughput@Size / QphH@Size with `tpch_power_throughput.py` (Workflow H-C).
 
-The engine, GPU compatibility, and fallback sections below apply to both.
+The official power/throughput workflow is TPC-H-only. Do not apply its scale
+factors, refresh functions, or QphH metrics to scale_bench.
 
 ## Two Engines
 
@@ -42,6 +45,7 @@ The engine, GPU compatibility, and fallback sections below apply to both.
 ## Working Directory
 
 All commands run from the **project root**. TPC-H scripts live in `test/tpch_performance/`.
+The shared Python runner and scale_bench adapter also live in that directory.
 
 ## GPU-Compatible Queries
 
@@ -49,7 +53,9 @@ A query is **GPU-compatible** when it meets both criteria:
 1. **Executes completely on Super Sirius** — every operator in the query plan runs on the GPU without falling back to DuckDB's CPU engine
 2. **Produces correct results** — the GPU output matches DuckDB CPU output exactly
 
-All 22 TPC-H queries (1-22) are GPU-compatible.
+All 22 TPC-H queries (1-22) are GPU-compatible. For scale_bench, distinguish GPU
+computation from the expected CPU preparation and graph intermediate writes
+described in Workflow S-A; those writes are not a CPU fallback of the SELECT.
 
 ## Identifying GPU Fallback and Errors
 
@@ -69,7 +75,10 @@ Underlying these you'll often see a CUDA / RMM runtime error from the cuDF kerne
 - `"thrust::system_error"` / `"cudaError"` / `"CUDA error:"` — generic catch-all prefixes
 - `"Assertion `...` failed"` — cuDF/libcudf assertion (often a precondition violation)
 
-These messages land in the post-split per-query Sirius logs at `<benchmark_dir>/sirius/q<N>/sirius.log`:
+These messages land in the post-split per-query Sirius logs at
+`<benchmark_dir>/sirius/q<N>/sirius.log` for TPC-H and
+`<benchmark_dir>/sirius/<query-name>/sirius.log` for scale_bench. Use `sirius/*/sirius.log`
+rather than a `q*` glob when inspecting named workloads.
 
 ```bash
 # Queries that fell back to DuckDB CPU
@@ -87,6 +96,58 @@ grep -lE "illegal memory access|out of memory|rmm::bad_alloc|RMM failure|misalig
 A query that **falls back internally** (Sirius fallback enabled — the default) still returns rows to the Python client, so `csv/runtimes.csv` is complete and `<engine>/q<N>/result.txt` is populated; the fallback only shows up in the per-query Sirius log. A query that **errors outright** (fallback disabled, or a non-recoverable CUDA error like illegal memory access) raises a Python exception in `con.execute(...).fetchall()` and aborts the run — `csv/runtimes.csv` is truncated at the failing iteration and the per-query Sirius log captures the underlying error.
 
 **Note on illegal memory access**: once CUDA hits `cudaErrorIllegalAddress`, the device context is poisoned and **every subsequent kernel launch fails** with the same error until the process exits. If you see "illegal memory access" repeating across queries, look at the **first** occurrence — the rest are downstream noise.
+
+## Workflow S-A: scale_bench
+
+Use the existing runner with `--benchmark scale_bench`. Do not create a separate
+runner, map the queries to TPC-H numbers, or pass `--scale-factor`.
+
+```bash
+pixi run python test/tpch_performance/performance_test.py \
+    --benchmark scale_bench --input /path/to/dataset \
+    --queries gb2,workflow --engine gpu --iterations 3 \
+    --config /path/to/sirius.yaml --temp-dir /scratch/scale_work \
+    --output /path/to/results
+```
+
+- Queries: `sort1`, `sort2`, `gb1`, `gb2`, `join1`, `workflow`, `bfs`, `pagerank`;
+  omit `--queries` or use `all` for the complete set. Shuffle is not included.
+- Input is an existing local Parquet dataset. The exact directory mapping,
+  expected types and query definitions are in `test/tpch_performance/scale_bench.py`;
+  use the [scale_bench guide](../../../test/tpch_performance/README.md#scale_bench)
+  for the input layout. No dataset generator is bundled.
+- Defaults to `--result-format fingerprint`: count, numeric sums and VARCHAR
+  length sums, excluding nested columns. A matching fingerprint is not full-value
+  or output-order equality; unused payloads may be pruned. `rows` materializes the
+  full result. `parquet` uses the existing end-to-end query/export path for the six
+  SQL queries; it rejects BFS/PageRank, so select the SQL names explicitly.
+- Workflow prepares a CPU Parquet copy of C, replacing `col_c_11` with VARCHAR
+  under the same name. Preparation is outside timing and shared across engines
+  and iterations. `--temp-dir` is a parent for a unique owned child; defaults to
+  beneath the run directory. The runner removes that child after connections
+  close on completion or handled failure/termination. Reports and result exports
+  are preserved. After SIGKILL/crash, inspect the recorded path before cleanup;
+  never delete the supplied parent or unrelated files.
+  SIGINT, SIGTERM and SIGHUP request active-connection interruption before cleanup;
+  prompt GPU cancellation still depends on engine interruption support.
+- BFS uses `col_b -> col_d` from root 1000. PageRank uses an unordered sample of
+  up to 10,000 edges and ten iterations. Graph timings include CPU intermediate
+  materialization/checkpoints. PageRank validation checks rank invariants instead
+  of exact cross-sample checksums; do not describe it as exhaustive CPU equality.
+  Graph selections reject NULL `col_b`/`col_d` endpoints during untimed preparation.
+  A root-only BFS result passes correctness checks but warns that traversal was
+  not exercised; inspect `expanded`, `reached_beyond_root` and `max_distance` in
+  per-iteration metadata before using its runtime as traversal evidence.
+- `--engine both --validation` enables CPU/GPU comparison with those scope
+  limits. GPU fallback is disabled, but still inspect positive GPU evidence in
+  the named logs, including each graph's explicit `gpu_execution` steps.
+- Existing cache profiles/modes apply. Input pinning, concurrency, S3/native
+  DuckDB inputs and external `--precmd nsys|gdb` are not supported. Do not silently
+  substitute these modes or route named queries through TPC-H profiling scripts.
+- Runs are named `scale_bench_<timestamp>_...`; named query directories and
+  `csv/runtimes.csv` reuse the existing format. Retain preparation timing,
+  skipped columns, graph checks and cleanup status from run metadata. Compare
+  runs only with matched query/result formats, preparation and cache policies.
 
 ---
 
@@ -267,8 +328,9 @@ a validation mismatch or an unexpected row-count after a refresh — treat it as
 
 # Before Running the Regular Benchmark (`performance_test.py`)
 
-Use parameters supplied by the user and applicable runner defaults. Check that the dataset path,
-format, and scale factor match; the scale factor controls Q11's threshold. For GPU runs, use the
+Use parameters supplied by the user and applicable runner defaults. Select the benchmark
+family first; Workflow S-A supplies scale_bench-specific constraints. For TPC-H, check that
+the dataset path, format, and scale factor match; the scale factor controls Q11's threshold. For GPU runs, use the
 provided config or a valid `SIRIUS_CONFIG_FILE`. Ask only for information that cannot be determined
 and materially affects the run. If an input is missing, search for an existing dataset before
 considering generation (Workflow H-A).

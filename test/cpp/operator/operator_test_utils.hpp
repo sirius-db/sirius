@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "operator/operator_type_traits.hpp"
 #include "scan/test_utils.hpp"
 
 #include <cudf/column/column.hpp>
@@ -25,6 +26,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -40,6 +42,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
+#include <utils/data_utils.hpp>
 #include <utils/utils.hpp>
 
 #include <cstddef>
@@ -333,6 +336,20 @@ inline std::shared_ptr<cucascade::data_batch> make_numeric_batch_with_nulls(
 
   return ::sirius::make_data_batch(
     std::move(table), space, stream, ::sirius::telemetry::batch_telemetry_info{});
+}
+
+/// @brief Returns @p column with row i set to NULL wherever @p valid[i] is false.
+inline std::unique_ptr<cudf::column> with_nulls(
+  std::unique_ptr<cudf::column> column,
+  std::vector<bool> const& valid,
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
+{
+  REQUIRE(static_cast<std::size_t>(column->size()) == valid.size());
+  auto valid_column = sirius::test::vector_to_cudf_column<gpu_type_traits<bool>>(valid, stream, mr);
+  auto [mask, null_count] = cudf::bools_to_mask(valid_column->view(), stream, mr);
+  column->set_null_mask(std::move(*mask), null_count);
+  return column;
 }
 
 inline std::unique_ptr<cudf::column> make_string_column(const std::vector<std::string>& values,

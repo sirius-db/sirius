@@ -51,6 +51,7 @@
 #include "planner/gpu_admission.hpp"
 #include "planner/join_implied_filters.hpp"
 #include "planner/join_key_nullability.hpp"
+#include "planner/proven_unique_scan_columns.hpp"
 #include "planner/scan_source_names.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_join_utils.hpp"
@@ -416,6 +417,41 @@ static unique_keys prove_unique_columns(duckdb::SiriusContext* sirius_context,
   }
 }
 
+/// The context whose pin-time uniqueness facts count as proofs, which they do only with
+/// pin_table_prove_unique_keys. Without one, prove_unique_columns considers declared PRIMARY KEYs
+/// alone.
+static duckdb::shared_ptr<duckdb::SiriusContext> pin_facts_of(duckdb::ClientContext& context)
+{
+  auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_context && !duckdb::query_operator_options(context)->prove_unique_keys) {
+    sirius_context.reset();
+  }
+  return sirius_context;
+}
+
+std::vector<duckdb::idx_t> proven_unique_scan_outputs(duckdb::ClientContext& context,
+                                                      duckdb::LogicalGet& get)
+{
+  std::vector<duckdb::idx_t> outputs;
+  for (auto const& key : prove_unique_columns(pin_facts_of(context).get(), get)) {
+    if (key.size() == 1) { outputs.push_back(*key.begin()); }
+  }
+  return outputs;
+}
+
+// A correlated IN / ANY / ALL (see sirius_physical_hash_join::is_correlated_mark). DuckDB sends
+// `=` or `<>` here; it plans an ordered comparison as a min/max aggregate under a SINGLE join.
+static bool is_correlated_any_mark(duckdb::LogicalComparisonJoin const& op)
+{
+  std::vector<sirius::comparison_type> comparisons;
+  comparisons.reserve(op.conditions.size());
+  for (auto const& condition : op.conditions) {
+    comparisons.push_back(sirius::from_duckdb(condition.GetComparisonType()));
+  }
+  return sirius::op::sirius_physical_hash_join::is_correlated_mark(comparisons,
+                                                                   op.mark_types.size());
+}
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJoin& op)
 {
@@ -484,11 +520,14 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     reject_nested_column_operation(*condition.RightReference(), "a join condition");
   }
 
-  // A MARK join mixing null-safe (IS NOT DISTINCT FROM) and plain keys has no correct GPU
-  // encoding (see mark_join_mixes_null_safe_keys in sirius_physical_hash_join.cpp), and the NLJ
-  // is no escape hatch: its MARK arm models the mixture but evaluates each (left batch x right
-  // batch) pair independently, so a left side spread over several right batches emits one partial
-  // mark per pair. Reject here so both routes are closed and DuckDB's CPU mark join answers.
+  // A MARK join mixing null-safe (IS NOT DISTINCT FROM) keys with another key runs on the GPU
+  // only as a correlated IN / ANY / ALL, and only in the hash join. Any other mixture has no
+  // correct GPU encoding (see mark_join_mixes_null_safe_keys in sirius_physical_hash_join.cpp),
+  // and the NLJ is no escape hatch: its MARK arm models the mixture but evaluates each (left
+  // batch x right batch) pair independently, so a left side spread over several right batches
+  // emits one partial mark per pair. Reject so both routes are closed and DuckDB's CPU mark join
+  // answers.
+  bool mark_mixes_null_safe_keys = false;
   if (op.join_type == duckdb::JoinType::MARK) {
     bool has_null_safe = false;
     bool all_null_safe = !op.conditions.empty();
@@ -499,10 +538,33 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         all_null_safe = false;
       }
     }
-    if (has_null_safe && !all_null_safe) {
+    mark_mixes_null_safe_keys = has_null_safe && !all_null_safe;
+    bool const is_correlated  = is_correlated_any_mark(op);
+    if (mark_mixes_null_safe_keys && !is_correlated) {
       throw duckdb::NotImplementedException(
         "MARK join mixing a null-safe (IS NOT DISTINCT FROM) key with a plain key not supported "
         "in GPU");
+    }
+    // DuckDB's hash join applies the per-group rule to any MARK with one condition more than
+    // `mark_types` (PhysicalHashJoin::InitializeHashTable), whatever the comparisons are. A shape
+    // is_correlated_mark does not accept, such as an explicit MARK whose keys are all
+    // IS NOT DISTINCT FROM, would get the join-wide rule here and differ from DuckDB.
+    if (!op.mark_types.empty() && op.mark_types.size() + 1 == op.conditions.size() &&
+        !is_correlated) {
+      throw duckdb::NotImplementedException(
+        "MARK join with a per-group NULL rule that is not a correlated IN / ANY / ALL not "
+        "supported in GPU");
+    }
+    // cuDF's AST has no comparison on nested values, and the per-group NULL rule is not built for
+    // them.
+    if (is_correlated) {
+      auto const& in_key = op.conditions.back();
+      if (in_key.GetLHS().GetReturnType().IsNested() ||
+          in_key.GetRHS().GetReturnType().IsNested()) {
+        throw duckdb::NotImplementedException(
+          "Correlated IN / ANY / ALL on a nested (STRUCT, LIST, MAP or ARRAY) value not supported "
+          "in GPU");
+      }
     }
   }
 
@@ -538,13 +600,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                        origin_policy::value_preserving)
                    : std::vector<std::size_t>{};
 
-  // Pin-time uniqueness facts count as proofs only with pin_table_prove_unique_keys; without a
-  // context, prove_unique_columns considers declared PRIMARY KEYs alone.
-  auto* const pin_facts_context =
-    sirius_context && duckdb::query_operator_options(context)->prove_unique_keys
-      ? sirius_context.get()
-      : nullptr;
-  auto build_side_unique_keys  = prove_unique_columns(pin_facts_context, *op.children[1]);
+  auto build_side_unique_keys  = prove_unique_columns(pin_facts_of(context).get(), *op.children[1]);
   auto left                    = create_plan(*op.children[0]);
   auto right                   = create_plan(*op.children[1]);
   left->estimated_cardinality  = lhs_cardinality;
@@ -623,8 +679,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   sirius::op::sirius_physical_hash_join::materialize_expression_join_keys(
     conditions, left, right, left_projection_map, right_projection_map);
 
-  bool is_supported_by_hash_join =
-    sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions, op.join_type);
+  bool is_supported_by_hash_join = sirius::op::sirius_physical_hash_join::are_conditions_supported(
+    conditions, op.join_type, op.mark_types.size());
+  // Only the hash join has the per-group rule, so a correlated MARK it declines falls back to the
+  // CPU. One such case is an inequality IN key that shares a column with a correlation key.
+  if (mark_mixes_null_safe_keys && !is_supported_by_hash_join) {
+    throw duckdb::NotImplementedException(
+      "Correlated IN / ANY / ALL whose conditions the GPU hash join cannot run not supported in "
+      "GPU");
+  }
   if (is_supported_by_hash_join && !prefer_range_joins) {
     auto options               = duckdb::query_operator_options(context);
     const auto& op_params      = *options;
