@@ -415,10 +415,10 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   // Every rank sends the same number of large batches to every other rank at once, as a shuffle
   // does, through the transport with the runtime's ring sizes, and reports what it received per
   // second. SIRIUS_EXCHANGE_HOST_STAGING and SIRIUS_EXCHANGE_MNNVL (default auto) pick the path
-  // (as sirius_exchange_host_staging and sirius_exchange_mnnvl do), SIRIUS_EXCHANGE_TCP_LANES and
-  // SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER size it (as the settings sirius_exchange_tcp_lanes and
-  // sirius_exchange_recv_frames_per_peer do), and SIRIUS_EXCHANGE_BW_BATCHES (default 96) sets
-  // the batches to each peer.
+  // (as sirius_exchange_host_staging and sirius_exchange_mnnvl do), SIRIUS_EXCHANGE_TCP_LANES,
+  // SIRIUS_EXCHANGE_FRAME_BYTES, SIRIUS_EXCHANGE_SEND_FRAMES and
+  // SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER size it (as the sirius_exchange_* settings of those
+  // names do), and SIRIUS_EXCHANGE_BW_BATCHES (default 96) sets the batches to each peer.
   auto const* rank  = std::getenv("SIRIUS_EXCHANGE_RANK");
   auto const* peers = std::getenv("SIRIUS_EXCHANGE_PEERS");
   REQUIRE(rank != nullptr);
