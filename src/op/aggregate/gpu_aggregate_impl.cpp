@@ -17,6 +17,7 @@
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/carried_columns.hpp"
@@ -144,6 +145,7 @@ std::unique_ptr<cudf::column> decode_key_codes(cudf::column_view const& codes,
                                                ::cuda::stream_ref stream,
                                                rmm::device_async_resource_ref mr)
 {
+  if (codes.size() == 0) { return cudf::make_empty_column(strings.type()); }
   cudf::column_view const code_values(
     codes.type(), codes.size(), codes.head(), nullptr, 0, codes.offset());
   cudf::column_view const dictionary(cudf::data_type{cudf::type_id::DICTIONARY32},
@@ -171,6 +173,7 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   const std::vector<int>& aggregate_idx,
   const std::vector<std::vector<int>>& aggregate_struct_col_indices,
   const std::vector<int>& carried_idx,
+  const carried_row_order& carried_order,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
@@ -190,6 +193,19 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
 
   auto mr = memory_space.get_default_allocator();
 
+  // A zero-row dictionary carrier may have no children for cuDF to read; its empty strings stand
+  // in for it.
+  std::unique_ptr<cudf::column> empty_strings;
+  if (input_table.num_rows() == 0) {
+    std::vector<cudf::column_view> columns(input_table.begin(), input_table.end());
+    for (auto& column : columns) {
+      if (column.type().id() != cudf::type_id::DICTIONARY32) { continue; }
+      if (!empty_strings) { empty_strings = cudf::make_empty_column(cudf::type_id::STRING); }
+      column = empty_strings->view();
+    }
+    input_table = cudf::table_view(columns);
+  }
+
   if (!carried_idx.empty()) {
     // Nothing checks these plan-time indices against a batch's width before this point.
     auto const require_in_range = [&](int idx) {
@@ -202,8 +218,16 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
     std::ranges::for_each(group_idx, require_in_range);
     std::ranges::for_each(carried_idx, require_in_range);
   }
+  for (auto const position : carried_order.positions) {
+    if (position < 0 || static_cast<std::size_t>(position) >= carried_idx.size()) {
+      throw std::runtime_error("local_grouped_aggregate: order position " +
+                               std::to_string(position) + " is out of range for " +
+                               std::to_string(carried_idx.size()) + " carried columns");
+    }
+  }
 
-  if (aggregates.empty() && !carried_idx.empty() && !group_idx.empty()) {
+  // cudf::distinct keeps an arbitrary row, which only an unordered list may take.
+  if (aggregates.empty() && !carried_idx.empty() && !group_idx.empty() && carried_order.empty()) {
     std::vector<cudf::size_type> selected(group_idx.begin(), group_idx.end());
     selected.insert(selected.end(), carried_idx.begin(), carried_idx.end());
     auto deduped = detail::aggregate_carried_columns_only(
@@ -323,9 +347,18 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   std::vector<std::optional<cudf::column_view>> encoded_key_strings(group_idx.size());
   std::vector<cudf::column_view> group_cols;
   group_cols.reserve(group_idx.size());
+  // A dictionary carrier key groups on its INT32 codes, which cuDF hashes far faster than a
+  // dictionary column; the output codes are decoded against the carrier's keys below.
+  std::vector<std::optional<cudf::column_view>> carrier_keys(group_idx.size());
   for (int idx : group_idx) {
     if (use_label_keys) { break; }
     auto col = input_table.column(idx);
+    if (col.type().id() == cudf::type_id::DICTIONARY32) {
+      cudf::dictionary_column_view const dictionary(col);
+      carrier_keys[group_cols.size()] = dictionary.keys();
+      group_cols.push_back(dictionary.get_indices_annotated());
+      continue;
+    }
     if (col.type().id() == cudf::type_id::STRING && col.size() > 0) {
       cudf::strings_column_view scv(col);
       auto avg_len = static_cast<double>(scv.chars_size(stream)) / col.size();
@@ -541,6 +574,16 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
       }
     } else {
       request.values = input_table.column(aggregate_col_id);
+      // cuDF's hash group-by rejects dictionary values, sending the whole batch down the sort
+      // path; a count reads only validity, which the codes share.
+      bool const counts_only =
+        std::ranges::all_of(input_col_to_agg[aggregate_col_id], [](auto const& agg) {
+          return agg->kind == cudf::aggregation::Kind::COUNT_VALID ||
+                 agg->kind == cudf::aggregation::Kind::COUNT_ALL;
+        });
+      if (request.values.type().id() == cudf::type_id::DICTIONARY32 && counts_only) {
+        request.values = cudf::dictionary_column_view(request.values).get_indices_annotated();
+      }
     }
     request.aggregations = std::move(input_col_to_agg[aggregate_col_id]);
     requests.push_back(std::move(request));
@@ -558,10 +601,11 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
 
   // The selector is outside input_col_order, so the result loop skips it.
   // It survives the M2 path below, which sorts every request's values.
+  std::vector<cudf::size_type> const carried(carried_idx.begin(), carried_idx.end());
   std::optional<detail::carried_row_selector> row_selector;
   if (!carried_idx.empty()) {
-    row_selector =
-      detail::append_carried_row_selector(requests, input_table.num_rows(), stream, mr);
+    row_selector = detail::append_carried_row_selector(
+      requests, input_table.select(carried), carried_order, stream, mr);
   }
 
   // cuDF's hash M2 computes sum(x*x) - sum(x)*sum(x)/n, which can catastrophically
@@ -623,6 +667,11 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
                                   mr);
     output_cols    = key_table->release();
   }
+  // A dictionary carrier ends at the aggregate, so its keys leave as strings.
+  for (size_t i = 0; i < carrier_keys.size(); i++) {
+    if (!carrier_keys[i]) { continue; }
+    output_cols[i] = decode_key_codes(output_cols[i]->view(), *carrier_keys[i], stream, mr);
+  }
 
   // Decode dictionary-encoded group key columns back to STRING
   for (size_t i = 0; i < group_idx.size(); i++) {
@@ -635,8 +684,7 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
         encoded_key_owners[i].reset();
       }
     } else if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
-      cudf::dictionary_column_view dict_view(output_cols[i]->view());
-      output_cols[i] = cudf::dictionary::decode(dict_view, stream, mr);
+      output_cols[i] = decode_dictionary_carrier(output_cols[i]->view(), stream, mr);
     }
   }
 
@@ -698,13 +746,20 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   }
 
   if (row_selector) {
-    std::vector<cudf::size_type> const carried(carried_idx.begin(), carried_idx.end());
     for (auto& column : detail::gather_carried_columns(
            input_table.select(carried),
+           *row_selector,
            groupby_result.second[row_selector->request_idx].results.front()->view(),
            stream,
            mr)) {
       output_cols.push_back(std::move(column));
+    }
+    if (!carried_order.empty()) {
+      SIRIUS_LOG_DEBUG(
+        "local_grouped_agg: carried row ranked by {} order key(s) ({} rows in, {} groups)",
+        carried_order.positions.size(),
+        input_table.num_rows(),
+        output_cols.back()->size());
     }
   }
 
@@ -950,6 +1005,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   const std::vector<int>& aggregate_idx,
   const std::vector<std::vector<int>>& aggregate_struct_col_indices,
   const std::vector<int>& carried_idx,
+  const carried_row_order& carried_order,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info,
@@ -965,6 +1021,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
                                               aggregate_idx,
                                               aggregate_struct_col_indices,
                                               carried_idx,
+                                              carried_order,
                                               stream,
                                               memory_space,
                                               aggregate_input_max_abs,
@@ -972,6 +1029,22 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
                                               split_wide_integer_sums,
                                               enable_low_cardinality_groupby);
   if (num_groups != nullptr) { *num_groups = output_table->num_rows(); }
+  // The low-cardinality path gathers a dictionary carrier key as-is; the carrier ends here.
+  std::vector<std::size_t> decode_keys;
+  for (std::size_t key = 0; key < group_idx.size(); ++key) {
+    if (output_table->get_column(static_cast<cudf::size_type>(key)).type().id() ==
+        cudf::type_id::DICTIONARY32) {
+      decode_keys.push_back(key);
+    }
+  }
+  if (!decode_keys.empty()) {
+    auto columns = output_table->release();
+    for (auto const key : decode_keys) {
+      columns[key] = decode_dictionary_carrier(
+        columns[key]->view(), stream, memory_space.get_default_allocator());
+    }
+    output_table = std::make_unique<cudf::table>(std::move(columns));
+  }
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 
@@ -997,6 +1070,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouping_sets_a
                                          aggregates,
                                          aggregate_idx,
                                          aggregate_struct_col_indices,
+                                              {},
                                               {},
                                          stream,
                                          memory_space,

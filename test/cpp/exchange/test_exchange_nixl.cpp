@@ -448,7 +448,7 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   ring_opts.frame_bytes = count_from_env("SIRIUS_EXCHANGE_FRAME_BYTES",
                                          static_cast<std::uint32_t>(ring_opts.frame_bytes));
   ring_opts.send_frames = count_from_env("SIRIUS_EXCHANGE_SEND_FRAMES", ring_opts.send_frames);
-  auto const memory = sirius::exchange::ring_memory_for(cfg.mnnvl);
+  auto const memory     = sirius::exchange::ring_memory_for(cfg.mnnvl);
   auto const recv_frames =
     count_from_env("SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER", ring_opts.recv_frames_per_peer);
   frame_ring send(ring_opts.send_frames, ring_opts.frame_bytes, memory);

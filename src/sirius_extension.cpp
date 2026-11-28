@@ -74,6 +74,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_partial_aggregate_pushdown.hpp"
 #include "planner/unsupported_optimizers.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 #include "transparent/plan_source_policy.hpp"
@@ -109,6 +110,10 @@ extern "C" int cudaProfilerStop();
 #include "sirius_interface.hpp"
 #include "sirius_registration.hpp"
 #include "sirius_sql_rewrite.hpp"
+
+#ifdef SIRIUS_WITH_MELD_UNITS
+#include "meld/meld_units_pass.hpp"
+#endif
 #include "util/segfault_backtrace.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
@@ -283,15 +288,21 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
     sirius_ctx->throw_runtime_unavailable();
   }
 
+  std::optional<sirius::scan_manager::sirius_scan_manager::s3_config_snapshot> planned;
   if (sirius::io::s3::is_s3_path(uri)) {
     auto s3_config = sirius::io::s3::resolve_duckdb_s3_secret(
       context, uri, sirius_ctx->get_config().get_scan_manager_config().object_store);
-    sirius_ctx->get_scan_manager().install_s3_config(uri, std::move(s3_config));
+    planned = sirius_ctx->get_scan_manager().install_s3_config(uri, std::move(s3_config));
+  }
+  if (auto const counters = sirius_ctx->physical_counters();
+      counters->track_units && counters->s3_config_installed_for_testing) {
+    counters->s3_config_installed_for_testing(uri);
   }
 
-  auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
-  return_types     = std::move(bind_result.return_types);
-  names            = StringsToIdentifiers(bind_result.names);
+  auto bind_result =
+    sirius_ctx->get_scan_manager().describe_parquet(uri, planned ? &*planned : nullptr);
+  return_types = std::move(bind_result.return_types);
+  names        = StringsToIdentifiers(bind_result.names);
   return make_uniq<SiriusReadParquetBindData>(
     uri, bind_result.total_num_rows, return_types, IdentifiersToStrings(names));
 }
@@ -994,6 +1005,45 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
 }
 
 }  // namespace
+
+// DuckDB stores these settings in the client context; NULL leaves the engine's limit in force.
+static void SetParquetFooterStatisticsReadLimit(ClientContext& /*context*/,
+                                                SetScope /*scope*/,
+                                                Value& parameter)
+{
+  if (!parameter.IsNull() && parameter.GetValue<int64_t>() < -1) {
+    throw InvalidInputException(
+      "A footer-statistics read limit is -1 (no limit), 0 (cached statistics only) or the most "
+      "footers to read for one scan; got %s",
+      parameter.ToString());
+  }
+}
+
+// Session-only: a GLOBAL value could be reset away, and DuckDB then calls the option unrecognized.
+static void add_footer_read_limit_option(DBConfig& config, char const* name, char const* files)
+{
+  ExtensionOption option(
+    StringUtil::Format(
+      "The most footers of %s files parquet_footer_statistics reads for one scan; a scan that "
+      "needs more is planned without them. -1: no limit, 0: cached statistics only, NULL: "
+      "sirius.operator_params.%s",
+      files,
+      name),
+    LogicalType::BIGINT,
+    SetParquetFooterStatisticsReadLimit,
+    Value(LogicalType::BIGINT),
+    SetScope::SESSION,
+    /*is_debug=*/false,
+    /*is_deprecated=*/false);
+  option.supports_global = false;
+  config.AddExtensionOption(name, std::move(option));
+  // DuckDB keeps no value for a NULL default; reading the option then fails. Store the NULL.
+  optional_ptr<const ConfigurationOption> builtin;
+  auto const index = config.TryGetSettingIndex(name, builtin);
+  if (index.IsValid() && !config.user_settings.IsSet(index.GetIndex())) {
+    config.SetOption(index.GetIndex(), Value(LogicalType::BIGINT));
+  }
+}
 
 static bool parquet_footer_statistics_enabled(ClientContext& context)
 {
@@ -3188,6 +3238,30 @@ static void SetEnablePartialAggregateBelowJoin(ClientContext& context,
                    params->enable_partial_aggregate_below_join);
 }
 
+static void SetPartialAggregateMinKeptShare(ClientContext& /*context*/,
+                                            SetScope /*scope*/,
+                                            Value& parameter)
+{
+  // DuckDB stores this setting in the client context.
+  auto const share = DoubleValue::Get(parameter);
+  if (!(share >= 0.0) || share > 1.0) {
+    throw InvalidInputException("partial_aggregate_min_kept_share must be in [0.0, 1.0], got %f",
+                                share);
+  }
+}
+
+static void SetPartialAggregateMinRowsPerKey(ClientContext& /*context*/,
+                                             SetScope /*scope*/,
+                                             Value& parameter)
+{
+  // DuckDB stores this setting in the client context.
+  auto const rows = DoubleValue::Get(parameter);
+  if (!(rows >= 0.0)) {
+    throw InvalidInputException("partial_aggregate_min_rows_per_key must be 0 or more, got %f",
+                                rows);
+  }
+}
+
 static void SetEnableSubqueryKeyCarry(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                      = get_operator_params(context, scope);
@@ -3344,6 +3418,14 @@ static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
   // compressed_materialization_enabled(). A copy kept in shared state would answer for every
   // connection, so one connection's SET would redirect another's scans while that connection's
   // current_setting still reported the old value.
+}
+
+static void SetEnableDictionaryCarrier(ClientContext& /*context*/,
+                                       SetScope /*scope*/,
+                                       Value& /*parameter*/)
+{
+  // Empty for the reason SetEnableCompressedMaterialization is: planning reads the connection's
+  // own value through dictionary_carrier_enabled().
 }
 
 static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scope, Value& parameter)
@@ -3514,6 +3596,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::VARCHAR,
     Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
     SetExpressionEvaluatorStrategy);
+
+  config.AddExtensionOption(
+    "sirius_s3_header_signing",
+    "Sign S3 requests made with a DuckDB secret in the Authorization header instead of a "
+    "presigned URL",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(false));
 
   add_sirius_option(
     config,
@@ -3816,10 +3905,33 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_partial_aggregate_below_join",
-                    "aggregate below an inner join that only adds group-by payload",
+                    "aggregate below a join that only adds group-by payload",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_partial_aggregate_below_join),
                     SetEnablePartialAggregateBelowJoin);
+  sirius::planner::partial_aggregate_pushdown_options const pushdown_defaults;
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "partial_aggregate_min_kept_share",
+                    "share of its rows a joined scan must keep for an aggregate to go below the "
+                    "join; 0 accepts any",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(pushdown_defaults.min_kept_share),
+                    SetPartialAggregateMinKeptShare);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "partial_aggregate_max_extra_keys",
+                    "columns an aggregate below a join may group by beyond the join's keys",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(pushdown_defaults.max_extra_keys));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "partial_aggregate_min_rows_per_key",
+                    "rows per group an aggregate below a join must be estimated to combine where "
+                    "the query does not group by its keys; 0 never trusts the estimate",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(pushdown_defaults.min_rows_per_key),
+                    SetPartialAggregateMinRowsPerKey);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_subquery_key_carry",
@@ -3888,6 +4000,9 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "all their footers, which DuckDB itself reads only with union_by_name",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true));
+
+  add_footer_read_limit_option(config, "parquet_footer_statistics_max_remote_reads", "remote");
+  add_footer_read_limit_option(config, "parquet_footer_statistics_max_local_reads", "local");
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
@@ -4046,6 +4161,9 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value::BOOLEAN(true),
     SetEnableGpuExecution);
 
+#ifdef SIRIUS_WITH_MELD_UNITS
+  sirius::meld::add_meld_units_option(config);
+#endif
   config.AddExtensionOption(
     "pin_table_compression",
     "Default for pin_table calls that omit the compression named "
@@ -4161,6 +4279,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_compressed_materialization),
     SetEnableCompressedMaterialization);
+
+  config.AddExtensionOption(
+    "enable_dictionary_carrier",
+    "Keep VARCHAR columns whose Simpatico pin is dictionary-encoded as DICTIONARY32 carriers past "
+    "the scan, so grouped aggregates group on the codes (off by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_dictionary_carrier),
+    SetEnableDictionaryCarrier);
 
   config.AddExtensionOption(
     "admission_bytes_per_gpu",

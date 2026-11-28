@@ -22,6 +22,12 @@
 #include <string>
 
 namespace {
+// +/-INT32_MAX day counts are the DATE infinities, so finite dates span
+// [INT32_MIN + 2, INT32_MAX - 1] and INT32_MIN lies below -infinity.
+constexpr int32_t max_date    = std::numeric_limits<int32_t>::max() - 1;
+constexpr int32_t min_date    = std::numeric_limits<int32_t>::min() + 2;
+constexpr int32_t below_range = std::numeric_limits<int32_t>::min();
+
 class DateArithmeticFixture : public sirius::test::GpuExecutionFixture {
  public:
   void strategy(std::string const& value)
@@ -69,8 +75,8 @@ TEST_CASE_METHOD(DateArithmeticFixture,
 {
   strategy(GENERATE("materialize", "ast_interpret", "ast_jit"));
   run_ok("CREATE TABLE dates(a DATE,b DATE,n INTEGER)");
-  auto const high = duckdb::Value::DATE(duckdb::date_t{std::numeric_limits<int32_t>::max() - 1});
-  auto const low  = duckdb::Value::DATE(duckdb::date_t{std::numeric_limits<int32_t>::min()});
+  auto const high = duckdb::Value::DATE(duckdb::date_t{max_date});
+  auto const low  = duckdb::Value::DATE(duckdb::date_t{min_date});
   auto statement  = con->Prepare("INSERT INTO dates VALUES (?, ?, 0)");
   REQUIRE_FALSE(statement->HasError());
   auto forward = statement->Execute(high, low);
@@ -86,15 +92,21 @@ TEST_CASE_METHOD(DateArithmeticFixture,
                  "[integration][gpu_execution][date_arithmetic]")
 {
   auto const operation = GENERATE("a+n", "n+a", "a-n");
-  auto const edge      = GENERATE(0, 1, 2, 3);
+  // A DATE day count and the days added to it.
+  auto const [days, delta] = GENERATE(table<int32_t, int32_t>({
+    {max_date, 1},     // lands on +infinity
+    {max_date, 2},     // overflows INT32
+    {min_date, -1},    // lands on -infinity
+    {min_date, -2},    // lands below -infinity
+    {min_date, -3},    // overflows INT32
+    {below_range, 0},  // input below -infinity
+    {below_range, 2},  // input below -infinity, sum in range
+  }));
   strategy(GENERATE("materialize", "ast_interpret", "ast_jit"));
   bool const subtract = std::string(operation) == "a-n";
-  int32_t const days =
-    edge < 2 ? std::numeric_limits<int32_t>::max() - 1 : std::numeric_limits<int32_t>::min();
-  int const delta = edge == 0 ? 1 : edge == 1 ? 2 : edge == 2 ? -1 : 1;
   run_ok("CREATE TABLE dates(a DATE,n INTEGER)");
   run_ok("INSERT INTO dates SELECT DATE '2000-01-01',1 FROM range(5000)");
-  // DATE's INT32_MIN carrier is finite but does not round-trip via its text parser.
+  // The edge is bound as a day count: INT32_MIN does not round-trip via DATE's text parser.
   auto statement = con->Prepare("INSERT INTO dates VALUES (?, ?)");
   REQUIRE_FALSE(statement->HasError());
   auto inserted = statement->Execute(duckdb::Value::DATE(duckdb::date_t{days}),

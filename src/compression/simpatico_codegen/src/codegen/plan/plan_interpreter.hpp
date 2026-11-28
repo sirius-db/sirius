@@ -12,6 +12,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -184,6 +185,15 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 decode_predicate const* pred = nullptr,
                                                 decode_selection const* sel  = nullptr);
 
+/// Most bytes (offsets plus chars) the keys of a DICTIONARY32 output may take. A chunk whose
+/// dictionary is larger decodes to its strings instead: every later copy of a dictionary column,
+/// by a gather, a mask, or a split, copies its keys whole.
+inline constexpr std::size_t dictionary_output_max_keys_bytes = std::size_t{512} * 1024;
+
+/// The bytes allocated to the STRING keys of DICTIONARY32 @p dictionary, known on the host without
+/// waiting on a stream; zero for one without a keys child, as a zero-row dictionary may be.
+std::size_t dictionary_keys_bytes(cudf::column const& dictionary);
+
 /// What one plan can do for a decode beyond reconstructing its column.
 ///
 /// One probe, so a capability and the route that implements it cannot drift
@@ -217,6 +227,10 @@ struct column_decode_caps {
   /// predicate is answered against the keys. Pushing a predicate into any other
   /// plan is correct but pointless: it only moves the comparison.
   bool can_answer_equality = false;
+
+  /// The bytes of the keys of the `dictionary` value root, when the compress walk recorded them;
+  /// see PlanNode::dictionary_keys_bytes.
+  std::optional<std::size_t> dictionary_keys_bytes;
 
   /// The root decodes into a lane of at most 64 bits. The range ballot compares in int64, so a
   /// wider lane (DECIMAL128) can decode compacted but cannot ballot a range.

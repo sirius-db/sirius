@@ -72,12 +72,16 @@ class host_pin_placement;
  * it is the type passed to `compress_with_plan` and therefore reproduced by decompression.
  * `native` records the declared logical type's native cuDF mapping when available, otherwise the
  * decoded type. Planning uses it to validate narrow sidecars, and DuckDB cache serving uses it to
- * reject projected type drift.
+ * reject projected type drift. `dictionary_keys_bytes` marks a compressed column whose decode can
+ * return its codes and keys as a DICTIONARY32 carrier, with the bytes its keys take.
  */
 struct pinned_column_storage_meta {
   cudf::data_type carrier{cudf::type_id::EMPTY};  ///< actual stored / compress-input cuDF type
   bool narrowed{false};  ///< carrier is narrower than the pin-time native mapping
   cudf::data_type native{cudf::type_id::EMPTY};  ///< declared-native mapping or decoded fallback
+  /// Bytes (offsets plus chars) of the keys of a string `dictionary` value root; empty when the
+  /// column is compressed without one, or the compressor did not record them.
+  std::optional<std::size_t> dictionary_keys_bytes;
 };
 
 /// Chunk-major stored-column metadata: element [c][i] describes cached column i of chunk c.

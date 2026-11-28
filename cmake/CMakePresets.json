@@ -93,10 +93,10 @@
       "binaryDir": "${fileDir}/../build/release-meld",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "SIMPATICO_ENABLE_MELD": "ON",
-        "SIMPATICO_MELD_SOURCE_DIR": "${fileDir}/../../meld"
+        "SIMPATICO_MELD_SOURCE_DIR": "${fileDir}/../../meld",
+        "SIRIUS_ENABLE_MELD_UNITS": "ON"
       },
-      "displayName": "GCC Release, with Meld's decoders",
+      "displayName": "GCC Release, with Meld's decoders and execution units",
       "inherits": "base",
       "name": "release-meld"
     },
