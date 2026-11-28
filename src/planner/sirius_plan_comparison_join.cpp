@@ -911,29 +911,33 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         op.join_type == duckdb::JoinType::RIGHT_ANTI) {
       // Every partition keeps its build rows resident until the whole probe is read, and that
       // state cannot be spilled, so partitioning does not bound it. Build on the kept side only
-      // when all of it fits the per-GPU BUILD_PROBE residency budget across the GPUs.
+      // when this process's part of it fits the per-GPU BUILD_PROBE residency budget across its
+      // GPUs. The estimate is of the whole kept side, also on a rank of a distributed plan.
       auto const num_gpus   = std::max<std::size_t>(1, gpu_spaces.size());
+      auto const ranks      = std::max<std::size_t>(1, op_params.exchange_peers.size());
       auto const kept_bytes = sirius::memory::saturating_mul(
         rhs_cardinality,
         sirius::planner::estimate_bytes_per_row(hj.children[1]->types,
                                                 op_params.avg_variable_column_bytes));
       auto const budget =
         sirius::memory::saturating_mul(num_gpus, op_params.max_build_probe_resident_bytes);
-      if (kept_bytes < budget) {
+      if (sirius::planner::kept_side_fits(kept_bytes, ranks, budget)) {
         hj.set_kept_build_streaming(true);
         SIRIUS_LOG_DEBUG(
           "[sirius_plan_comparison_join] {} builds on its kept side and streams the probe (probe "
-          "est {} rows, build est {} rows, {} bytes).",
+          "est {} rows, build est {} rows, {} bytes over {} rank(s)).",
           duckdb::JoinTypeToString(op.join_type),
           lhs_cardinality,
           rhs_cardinality,
-          kept_bytes);
+          kept_bytes,
+          ranks);
       } else {
         SIRIUS_LOG_DEBUG(
           "[sirius_plan_comparison_join] {} keeps the STANDARD build: its kept side, est {} "
-          "bytes, exceeds the {} GPU(s)' residency budget of {} bytes.",
+          "bytes over {} rank(s), exceeds the {} GPU(s)' residency budget of {} bytes.",
           duckdb::JoinTypeToString(op.join_type),
           kept_bytes,
+          ranks,
           num_gpus,
           budget);
       }
