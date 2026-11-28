@@ -43,7 +43,9 @@
 // duckdb
 #include <duckdb/common/assert.hpp>
 #include <duckdb/common/enums/expression_type.hpp>
+#include <duckdb/common/enums/order_type.hpp>
 #include <duckdb/common/exception.hpp>
+#include <duckdb/planner/bound_result_modifier.hpp>
 #include <duckdb/planner/expression.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_between_expression.hpp>
@@ -425,9 +427,22 @@ std::unique_ptr<node> translate_aggregate(duckdb::BoundAggregateExpression const
   }
   auto arguments = translate_children(aggr.GetChildren());
   if (!arguments) { return nullptr; }
+  std::vector<order_modifier> order;
+  if (auto const& order_bys = aggr.GetOrderBys()) {
+    for (auto const& key : order_bys->orders) {
+      auto modifier   = order_modifier_from_duckdb(key);
+      auto translated = from_duckdb(*key.expression);
+      if (!modifier || !translated) { return nullptr; }
+      arguments->push_back(std::move(translated));
+      order.push_back(*modifier);
+    }
+  }
   auto return_type = sirius::from_duckdb(aggr.GetReturnType());
-  return std::make_unique<node>(
-    aggregate{*agg_id_opt, std::move(*arguments), std::move(return_type), aggr.IsDistinct()});
+  return std::make_unique<node>(aggregate{*agg_id_opt,
+                                          std::move(*arguments),
+                                          std::move(return_type),
+                                          aggr.IsDistinct(),
+                                          std::move(order)});
 }
 
 std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& expr)
@@ -501,6 +516,22 @@ std::unique_ptr<node> from_duckdb(duckdb::Expression const& expr)
       throw duckdb::InternalException("[sirius::ast::from_duckdb] Unknown ExpressionClass: %d",
                                       expr.GetExpressionClass());
   }
+}
+
+std::optional<order_modifier> order_modifier_from_duckdb(duckdb::BoundOrderByNode const& key)
+{
+  order_modifier modifier;
+  switch (key.type) {
+    case duckdb::OrderType::ASCENDING: modifier.direction = sort_direction::ascending; break;
+    case duckdb::OrderType::DESCENDING: modifier.direction = sort_direction::descending; break;
+    default: return std::nullopt;
+  }
+  switch (key.null_order) {
+    case duckdb::OrderByNullType::NULLS_FIRST: modifier.nulls = null_placement::first; break;
+    case duckdb::OrderByNullType::NULLS_LAST: modifier.nulls = null_placement::last; break;
+    default: return std::nullopt;
+  }
+  return modifier;
 }
 
 }  // namespace sirius::ast

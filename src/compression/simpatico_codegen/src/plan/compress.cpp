@@ -224,6 +224,10 @@ void CompressWalk::publish_dictionary_key_width_hint(NodeId n,
   auto const* dictionary = dynamic_cast<dictionary_compressed_representation const*>(&repr);
   if (!dictionary) return;
   PlanNode& node = tree.nodes[n];
+  if (dictionary->dict_column) {
+    node.dictionary_keys_bytes =
+      static_cast<std::int64_t>(dictionary_keys_bytes(*dictionary->dict_column));
+  }
   for (size_t idx = 0; idx < node.output_names.size(); ++idx) {
     if (node.output_names[idx] == "keys_offsets" &&
         consumer_by_input.count(ValueId{n, static_cast<ChannelId>(idx)})) {

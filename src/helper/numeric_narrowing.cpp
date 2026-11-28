@@ -19,18 +19,25 @@
 #include "sirius/exception.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/concatenate.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/dictionary/encode.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <limits>
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace sirius {
 namespace {
@@ -170,7 +177,16 @@ std::unique_ptr<cudf::column> cast_through_rep(cudf::column_view const& column,
   // Given caller-established carrier provenance, tunnel only when exactly one side is a
   // representation-backed DATE and the other is a strict narrow carrier. Every other pair,
   // including DATE<->TIMESTAMP, follows cuDF's conversion rules.
-  auto const source     = column.type();
+  auto const source = column.type();
+  // A dictionary carrier may already arrive in its STRING form, and cuDF casts only fixed-width
+  // targets.
+  if (source == target) { return std::make_unique<cudf::column>(column, stream, mr); }
+  if (is_dictionary_carrier_of(source, target)) {
+    return decode_dictionary_carrier(column, stream, mr);
+  }
+  if (is_dictionary_carrier_of(target, source)) {
+    return cudf::dictionary::encode(column, cudf::data_type{cudf::type_id::INT32}, stream, mr);
+  }
   auto const rep_target = narrowing_rep_type(target);
   auto const narrows_carrier =
     narrowing_rep_type(source) != source && can_narrow_to(source, target);
@@ -262,6 +278,69 @@ bool can_restore_to(cudf::data_type source, cudf::data_type target)
 {
   return same_numeric_carrier_family(source, target) &&
          cudf::size_of(source) < cudf::size_of(target);
+}
+
+bool is_dictionary_carrier_of(cudf::data_type carrier, cudf::data_type native) noexcept
+{
+  return carrier.id() == cudf::type_id::DICTIONARY32 && native.id() == cudf::type_id::STRING;
+}
+
+std::size_t dictionary_keys_bytes(cudf::column const& column)
+{
+  if (column.num_children() <= cudf::dictionary_column_view::keys_column_index) { return 0; }
+  return column.child(cudf::dictionary_column_view::keys_column_index).alloc_size();
+}
+
+std::unique_ptr<cudf::column> decode_dictionary_carrier(cudf::column_view const& column,
+                                                        ::cuda::stream_ref stream,
+                                                        rmm::device_async_resource_ref mr)
+{
+  if (column.size() == 0) { return cudf::make_empty_column(cudf::type_id::STRING); }
+  return cudf::dictionary::decode(cudf::dictionary_column_view(column), stream, mr);
+}
+
+std::unique_ptr<cudf::table> concatenate_carriers(
+  std::vector<cudf::table_view> tables,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr,
+  std::function<std::unique_ptr<cudf::table>(std::vector<cudf::table_view> const&)> const&
+    concatenate)
+{
+  // An empty carrier may lack the keys child, so its type cannot match a populated one.
+  if (tables.size() > 1) {
+    auto const empty = [](cudf::table_view const& table) { return table.num_rows() == 0; };
+    if (std::ranges::all_of(tables, empty)) {
+      return std::make_unique<cudf::table>(tables.front(), stream, mr);
+    }
+    std::erase_if(tables, empty);
+  }
+  std::vector<std::unique_ptr<cudf::column>> decoded;
+  auto const width = tables.empty() ? 0 : tables.front().num_columns();
+  for (cudf::size_type c = 0; c < width; ++c) {
+    auto const is_dictionary = [c](cudf::table_view const& table) {
+      return table.column(c).type().id() == cudf::type_id::DICTIONARY32;
+    };
+    if (std::ranges::none_of(tables, is_dictionary) || std::ranges::all_of(tables, is_dictionary)) {
+      continue;
+    }
+    for (auto& table : tables) {
+      if (!is_dictionary(table)) { continue; }
+      decoded.push_back(decode_dictionary_carrier(table.column(c), stream, mr));
+      std::vector<cudf::column_view> columns(table.begin(), table.end());
+      columns[c] = decoded.back()->view();
+      table      = cudf::table_view(columns);
+    }
+  }
+  // Merging keys can take a carrier past the cap that each input kept to.
+  auto columns =
+    (concatenate ? concatenate(tables) : cudf::concatenate(tables, stream, mr))->release();
+  for (auto& column : columns) {
+    if (column->type().id() == cudf::type_id::DICTIONARY32 &&
+        dictionary_keys_bytes(*column) > dictionary_carrier_max_keys_bytes) {
+      column = decode_dictionary_carrier(column->view(), stream, mr);
+    }
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
 }
 
 bool numeric_range_fits(cudf::data_type target, const numeric_range& range) noexcept

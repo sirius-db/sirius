@@ -42,6 +42,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <initializer_list>
 #include <latch>
 #include <limits>
 #include <memory>
@@ -66,6 +67,7 @@ using namespace std::chrono_literals;
 namespace fs = std::filesystem;
 
 constexpr char kFixtureUri[] = "s3://bucket/prefix/object";
+constexpr char kS3Item[]     = "s3://<redacted>";
 
 static_assert(std::is_aggregate_v<ObjectStoreConfig>);
 static_assert(std::is_const_v<decltype(ObjectStoreConfig::endpoint)> &&
@@ -871,19 +873,17 @@ TEST_CASE("FFI object store scopes remote plans before either entry point binds"
     auto context      = make_context_from_config(memory_config(), inputs.snapshot());
     struct scope_case {
       std::string path;
-      std::string display;
       bool in_scope;
     };
     std::vector<scope_case> const cases{
-      {"s3://bucket/other/k.parquet", "s3://bucket/other/k.parquet", false},
-      {"S3://bucket/allowed/k.parquet", "S3://bucket/allowed/k.parquet", true},
-      {"s3://Bucket/allowed/k.parquet", "s3://Bucket/allowed/k.parquet", false},
-      {"s3://bucket/allowed/../other/k.parquet", "s3://bucket/allowed/../other/k.parquet", false},
-      {"s3://bucket/allowed//k.parquet", "s3://bucket/allowed//k.parquet", false},
-      {"s3://bucket/allowed/%2e%2e/k.parquet", "s3://bucket/allowed/%2e%2e/k.parquet", false},
-      {"s3://bucket/allowed/k.parquet", "s3://bucket/allowed/k.parquet", true},
+      {"s3://bucket/other/k.parquet", false},
+      {"S3://bucket/allowed/k.parquet", true},
+      {"s3://Bucket/allowed/k.parquet", false},
+      {"s3://bucket/allowed/../other/k.parquet", false},
+      {"s3://bucket/allowed//k.parquet", false},
+      {"s3://bucket/allowed/%2e%2e/k.parquet", false},
+      {"s3://bucket/allowed/k.parquet", true},
       {"s3://u:part@" + std::string(object_store_sentinels[2]) + "@bucket/allowed/k@part.parquet",
-       "s3://part.parquet",  // Conservative last-@ redaction.
        false},
     };
     for (auto const& item : cases) {
@@ -892,7 +892,7 @@ TEST_CASE("FFI object store scopes remote plans before either entry point binds"
         auto const plan = read_plan({{item.path + authentication_suffix()}});
         check_refusal([&] { invoke_plan(*context, entry, plan); },
                       item.in_scope ? "object_store_route_unavailable:" : "object_store_scope:",
-                      item.display);
+                      kS3Item);
       }
     }
   }
@@ -932,7 +932,7 @@ TEST_CASE("FFI object store scopes bare empty and trailing object keys",
         auto const plan = read_plan({{item.path}});
         check_refusal([&] { invoke_plan(*context, entry, plan); },
                       item.in_scope ? "object_store_route_unavailable:" : "object_store_scope:",
-                      item.path);
+                      kS3Item);
       }
     }
   }
@@ -980,9 +980,8 @@ TEST_CASE("FFI object store refuses remote plans before range validation without
                       item.length,
                       path);
               auto const plan = read_plan({item});
-              // Last-@ display contract.
-              auto const message = check_refusal(
-                [&] { invoke_plan(*context, entry, plan); }, token, "s3://part.parquet");
+              auto const message =
+                check_refusal([&] { invoke_plan(*context, entry, plan); }, token, kS3Item);
               CHECK(message.find("byte-range splits are only supported") == std::string::npos);
               CHECK(message.find("overflows a 64-bit offset") == std::string::npos);
               CHECK(message.find("path type other than uri_file") == std::string::npos);
@@ -996,8 +995,7 @@ TEST_CASE("FFI object store refuses remote plans before range validation without
         auto mixed = local;
         mixed.push_back({"s3://bucket/k.parquet" + authentication_suffix()});
         auto const mixed_plan = read_plan(mixed);
-        check_refusal(
-          [&] { invoke_plan(*context, entry, mixed_plan); }, token, "s3://bucket/k.parquet");
+        check_refusal([&] { invoke_plan(*context, entry, mixed_plan); }, token, kS3Item);
         auto const local_plan = read_plan(local);
         auto const message    = check_refusal([&] { invoke_plan(*context, entry, local_plan); },
                                            "a read names",
@@ -1024,11 +1022,11 @@ TEST_CASE("FFI object store failed fragment builds recapture on retry",
     auto fragment   = sirius::ffi::make_fragment(*context);
     auto const plan = read_plan({{"s3://bucket/k.parquet" + authentication_suffix()}});
     auto build      = [&] { fragment->build(plan); };
-    check_refusal(build, "object_store_unconfigured:", "s3://bucket/k.parquet");
+    check_refusal(build, "object_store_unconfigured:", kS3Item);
     context->put_object_store(inputs.snapshot());
-    check_refusal(build, "object_store_route_unavailable:", "s3://bucket/k.parquet");
+    check_refusal(build, "object_store_route_unavailable:", kS3Item);
     context->drop_object_store("");
-    check_refusal(build, "object_store_unconfigured:", "s3://bucket/k.parquet");
+    check_refusal(build, "object_store_unconfigured:", kS3Item);
   }
   observer.finish();
   CHECK(observer.error() == 0);
@@ -1096,12 +1094,12 @@ TEST_CASE("FFI object store preserves captured snapshots across publication chan
             if (pause.failure) { std::rethrow_exception(pause.failure); }
           },
           "object_store_route_unavailable:",
-          "s3://bucket/k.parquet");
+          kS3Item);
         check_refusal([&] { invoke_plan(*context, entry, plan); },
                       action == 1   ? "object_store_scope:"
                       : action == 2 ? "object_store_route_unavailable:"
                                     : "object_store_unconfigured:",
-                      "s3://bucket/k.parquet");
+                      kS3Item);
         CHECK(pause.calls == 1);
       }
     }
@@ -1131,14 +1129,15 @@ TEST_CASE("FFI object store redacts credential-bearing URI forms at both entries
   };
   // Explicit protocol examples, not an oracle computed by the production formatter.
   std::vector<row> const cases{
-    {"s3://u:" + secret + "/with/slash@bucket/k", "s3://bucket/k"},
-    {"s3://u:" + secret + "?x@bucket/k", "<redacted-uri>"},
-    {"s3://u:" + secret + "#x@bucket/k", "<redacted-uri>"},
-    {"//u:" + secret + "@host/k.metadata.json", "<redacted-uri>", true},
-    {"//u:" + secret + "@host/k?next=https://x@y", "<redacted-uri>", true},
-    {"s3://bucket/k@part.parquet", "s3://part.parquet"},
-    {"s3://bucket/k", "s3://bucket/k"},
-    {"s3://bucket/k%40part", "s3://bucket/k%40part", false, "object_store_scope:"},
+    {"s3://u:" + secret + "/with/slash@bucket/k", kS3Item},
+    {"s3://u:" + secret + "?x@bucket/k", kS3Item},
+    {"s3://u:" + secret + "#x@bucket/k", kS3Item},
+    {"//u:" + secret + "@host/k.metadata.json", "<redacted-uri>", true, "object_store_scope:"},
+    {"//u:" + secret + "@host/k?next=https://x@y", "<redacted-uri>", true, "object_store_scope:"},
+    {"https://u:" + secret + "@host/k?query", "https://host/k", false, "object_store_scope:"},
+    {"s3://bucket/k@part.parquet", kS3Item},
+    {"s3://bucket/k", kS3Item},
+    {"s3://bucket/k%40part", kS3Item, false, "object_store_scope:"},
   };
   auto context = make_context_from_config(memory_config());
   for (int state = 0; state != 3; ++state) {
@@ -1192,18 +1191,24 @@ TEST_CASE("FFI object store inventories direct and nested Iceberg metadata befor
     context->drop_object_store("");
     inputs.uri_prefix = state == 1 ? "s3://bucket/allowed/" : "";
     if (state != 0) { context->put_object_store(inputs.snapshot()); }
-    std::string const token = state == 0   ? "object_store_unconfigured:"
-                              : state == 1 ? "object_store_scope:"
-                                           : "object_store_route_unavailable:";
-    for (auto const& uri : std::vector<std::string>{"s3://other-bucket/t/metadata/v1.json",
-                                                    "/tmp/m.json",
-                                                    "file:///tmp/m.json",
-                                                    observer.endpoint() + "/m.json"}) {
+    struct row {
+      std::string uri;
+      std::string display;
+      bool default_hit;
+    };
+    auto const http = observer.endpoint() + "/m.json";
+    for (auto const& item : {row{"S3://other-bucket/t/metadata/v1.json", kS3Item, true},
+                             row{"/tmp/m.json", "/tmp/m.json", false},
+                             row{"file:///tmp/m.json", "file:///tmp/m.json", false},
+                             row{http, http, false}}) {
+      auto token = state == 0                       ? "object_store_unconfigured:"
+                   : state == 2 && item.default_hit ? "object_store_route_unavailable:"
+                                                    : "object_store_scope:";
       for (bool nested : {false, true}) {
-        auto const plan = iceberg_plan(uri, nested);
+        auto const plan = iceberg_plan(item.uri, nested);
         for (auto entry : {entry_point::execute, entry_point::fragment_build}) {
-          CAPTURE(state, uri, nested, entry == entry_point::execute);
-          check_refusal([&] { invoke_plan(*context, entry, plan); }, token, uri);
+          CAPTURE(state, item.uri, nested, entry == entry_point::execute);
+          check_refusal([&] { invoke_plan(*context, entry, plan); }, token, item.display);
         }
       }
     }
@@ -1238,6 +1243,9 @@ TEST_CASE("FFI object store scoped sets preserve longest matches and supplied po
   context->put_object_store(b);
   CHECK(context->object_store_config_for("s3://unclaimed/object") == nullptr);
   context->put_object_store(d);
+  for (auto uri : {"https://other/file", "gs://other/file", "/tmp/m.json"}) {
+    CHECK(context->object_store_config_for(uri) == nullptr);
+  }
   CHECK(context->object_store_config_for("s3://unclaimed/object").get() == d.get());
   CHECK(context->object_store_config_for("s3://b/x/f").get() == a.get());
   CHECK(context->object_store_config_for("s3://b/x/y/f").get() == b.get());
@@ -1330,7 +1338,7 @@ TEST_CASE("FFI object store applies the raw-key gate before selecting a scope",
         if (expected == resolution::refused) {
           check_refusal([&] { (void)context->object_store_config_for(item.uri); },
                         "object_store_scope:",
-                        item.uri);
+                        kS3Item);
         } else {
           ObjectStoreConfig const* snapshot = nullptr;
           if (expected == resolution::scoped) { snapshot = scoped.get(); }
@@ -1347,7 +1355,7 @@ TEST_CASE("FFI object store applies the raw-key gate before selecting a scope",
         for (auto const entry : {entry_point::execute, entry_point::fragment_build}) {
           CAPTURE(entry == entry_point::execute);
           auto const message =
-            check_refusal([&] { invoke_plan(*context, entry, plan); }, token, item.uri);
+            check_refusal([&] { invoke_plan(*context, entry, plan); }, token, kS3Item);
           if (empty) {
             CHECK(message.find("or through an Iceberg metadata path") != std::string::npos);
           }
@@ -1380,10 +1388,11 @@ TEST_CASE("FFI object store getters and execution refuse invalid selected keys w
         std::string const uri = std::string(prefix) + suffix;
         CAPTURE(uri, with_default);
         check_refusal(
-          [&] { (void)context->object_store_config_for(uri); }, "object_store_scope:", uri);
+          [&] { (void)context->object_store_config_for(uri); }, "object_store_scope:", kS3Item);
         auto const plan = read_plan({{uri}});
         for (auto entry : {entry_point::execute, entry_point::fragment_build}) {
-          check_refusal([&] { invoke_plan(*context, entry, plan); }, "object_store_scope:", uri);
+          check_refusal(
+            [&] { invoke_plan(*context, entry, plan); }, "object_store_scope:", kS3Item);
         }
       }
       CHECK(context->object_store_config_for(std::string(prefix) + "good").get() == scoped.get());
@@ -1438,10 +1447,10 @@ TEST_CASE("FFI object store drop validates keys and leaves absent keys unchanged
       if (pause.failure) { std::rethrow_exception(pause.failure); }
     },
     "object_store_route_unavailable:",
-    "s3://bucket/allowed/f");
+    kS3Item);
   check_refusal([&] { invoke_plan(*context, entry_point::execute, plan); },
                 "object_store_route_unavailable:",
-                "s3://bucket/allowed/f");
+                kS3Item);
 }
 
 TEST_CASE("FFI object store concurrent writers have serializable membership and pointer identity",
@@ -1578,10 +1587,17 @@ TEST_CASE("FFI object store checks the full inventory before reporting an unavai
   object_store_inputs inputs;
   inputs.uri_prefix = "s3://bucket/allowed/";
   auto context      = make_context_from_config(memory_config(), inputs.snapshot());
-  for (auto const* bad : {"s3://elsewhere/f", "s3://bucket/allowed/../outside"}) {
+  struct row {
+    char const* uri;
+    char const* reason;
+  };
+  for (auto [bad, reason] : {row{"s3://elsewhere/f", "outside every published"},
+                             row{"s3://bucket/allowed/../outside", "names a key segment"}}) {
     auto const plan = read_plan({{"s3://bucket/allowed/good"}, {bad, 1, 1}});
     for (auto entry : {entry_point::execute, entry_point::fragment_build}) {
-      check_refusal([&] { invoke_plan(*context, entry, plan); }, "object_store_scope:", bad);
+      auto message =
+        check_refusal([&] { invoke_plan(*context, entry, plan); }, "object_store_scope:", kS3Item);
+      CHECK(message.find(reason) != std::string::npos);
     }
   }
 }
@@ -1629,14 +1645,14 @@ TEST_CASE("FFI object store queued binding captures after transaction admission"
         if (queue.first_error) { std::rethrow_exception(queue.first_error); }
       },
       "object_store_route_unavailable:",
-      "s3://b/a/f");
+      kS3Item);
     // A pre-transaction capture would still contain A and produce object_store_scope here.
     check_refusal(
       [&] {
         if (queue.second_error) { std::rethrow_exception(queue.second_error); }
       },
       "object_store_route_unavailable:",
-      "s3://b/b/f");
+      kS3Item);
   }
 }
 
@@ -1696,11 +1712,11 @@ TEST_CASE("FFI object store failed execution attempts release captures before re
         if (pause.failure) { std::rethrow_exception(pause.failure); }
       },
       "object_store_route_unavailable:",
-      "s3://bucket/allowed/f");
+      kS3Item);
     CHECK(deleted);
     CHECK(reentered);
     CHECK(weak_a.expired());
-    check_refusal([&] { invoke(remote); }, "object_store_unconfigured:", "s3://bucket/allowed/f");
+    check_refusal([&] { invoke(remote); }, "object_store_unconfigured:", kS3Item);
     CHECK_THROWS(invoke("not a substrait plan"));
   }
 }
@@ -1765,7 +1781,9 @@ TEST_CASE("FFI object store successful local fragments retain captures through r
 namespace {
 
 template <typename Exception, typename Operation>
-void check_exact_object_store_message(Operation&& operation, std::string_view expected)
+void check_exact_object_store_message(Operation&& operation,
+                                      std::string_view expected,
+                                      std::initializer_list<std::string_view> hidden = {})
 {
   bool threw = false;
   try {
@@ -1776,6 +1794,10 @@ void check_exact_object_store_message(Operation&& operation, std::string_view ex
     INFO("exception text: " << error.what());
     CHECK(typeid(error) == typeid(Exception));
     CHECK(std::string_view(error.what()) == expected);
+    for (auto canary : hidden) {
+      CAPTURE(canary);
+      CHECK(std::string_view(error.what()).find(canary) == std::string_view::npos);
+    }
     check_no_sentinels(error.what());
   } catch (...) {
     FAIL_CHECK("Expected a standard exception with the pinned dynamic type");
@@ -2157,8 +2179,8 @@ TEST_CASE("FFI object store messages pin drop errors and empty default semantics
 TEST_CASE("FFI object store messages pin lookup refusal and empty registry miss",
           "[isolated_context][ffi][object_store][object_store_messages]")
 {
-  auto const uri = "s3://user:" + std::string(object_store_sentinels[3]) +
-                   "@bucket/prefix/../object" + authentication_suffix();
+  auto const uri = "S3://user:" + std::string(object_store_sentinels[3]) +
+                   "@LookupBucketCanary/prefix/../LookupKeyCanary" + authentication_suffix();
   {
     auto context = make_context_from_config(memory_config());
     CHECK(context->object_store_config_for(uri) == nullptr);
@@ -2167,24 +2189,28 @@ TEST_CASE("FFI object store messages pin lookup refusal and empty registry miss"
   }
   message_registry published;
   auto const expected =
-    "object_store_scope: 's3://bucket/prefix/../object' names a key segment that cannot be matched "
+    "object_store_scope: 's3://<redacted>' names a key segment that cannot be matched "
     "byte-for-byte against the published uri_prefix set";
   check_exact_object_store_message<sirius::invalid_input_exception>(
-    [&] { (void)published.context->object_store_config_for(uri); }, expected);
+    [&] { (void)published.context->object_store_config_for(uri); },
+    expected,
+    {"LookupBucketCanary", "LookupKeyCanary"});
   published.check();
   auto const fallback = message_snapshot("");
   published.context->put_object_store(fallback);
   check_exact_object_store_message<sirius::invalid_input_exception>(
-    [&] { (void)published.context->object_store_config_for(uri); }, expected);
+    [&] { (void)published.context->object_store_config_for(uri); },
+    expected,
+    {"LookupBucketCanary", "LookupKeyCanary"});
   published.check(fallback);
 }
 
 TEST_CASE("FFI object store messages pin all remote refusals at both execution entries",
           "[isolated_context][ffi][object_store][object_store_messages]")
 {
-  auto const auth     = "s3://user:" + std::string(object_store_sentinels[3]) + "@";
-  auto const ordinary = auth + "bucket/prefix/object" + authentication_suffix();
-  auto const unstable = auth + "bucket/prefix/../object" + authentication_suffix();
+  auto const auth     = "S3://user:" + std::string(object_store_sentinels[3]) + "@";
+  auto const ordinary = auth + "ReadBucketCanary/prefix/ReadKeyCanary" + authentication_suffix();
+  auto const unstable = auth + "BadBucketCanary/prefix/../BadKeyCanary" + authentication_suffix();
   {
     auto context    = make_context_from_config(memory_config());
     auto const plan = read_plan({{ordinary}});
@@ -2192,9 +2218,10 @@ TEST_CASE("FFI object store messages pin all remote refusals at both execution e
       CAPTURE(entry == entry_point::execute);
       check_exact_object_store_message<sirius::invalid_input_exception>(
         [&] { invoke_plan(*context, entry, plan); },
-        "object_store_unconfigured: the plan reads 's3://bucket/prefix/object' from an object "
+        "object_store_unconfigured: the plan reads 's3://<redacted>' from an object "
         "store or through an Iceberg metadata path, but this Context has no object-store snapshot "
-        "(Context::put_object_store)");
+        "(Context::put_object_store)",
+        {"ReadBucketCanary", "ReadKeyCanary"});
       CHECK(context->object_store_config_for(kFixtureUri) == nullptr);
       CHECK(context->object_store_config_for("s3://other/prefix/object") == nullptr);
       CHECK(context->object_store_config_for("s3://missing/object") == nullptr);
@@ -2206,16 +2233,18 @@ TEST_CASE("FFI object store messages pin all remote refusals at both execution e
     auto const bad_key_plan = read_plan({{unstable}});
     check_exact_object_store_message<sirius::invalid_input_exception>(
       [&] { invoke_plan(*published.context, entry, bad_key_plan); },
-      "object_store_scope: 's3://bucket/prefix/../object' names a key segment that cannot be "
-      "matched byte-for-byte against the published uri_prefix set");
+      "object_store_scope: 's3://<redacted>' names a key segment that cannot be "
+      "matched byte-for-byte against the published uri_prefix set",
+      {"BadBucketCanary", "BadKeyCanary"});
     published.check();
     // A matched first item must not hide a later item outside the published set.
     auto const outside_plan =
-      read_plan({{kFixtureUri}, {auth + "outside/object" + authentication_suffix()}});
+      read_plan({{"s3://bucket/prefix/MatchedKeyCanary"},
+                 {auth + "OutsideBucketCanary/OutsideKeyCanary" + authentication_suffix()}});
     check_exact_object_store_message<sirius::invalid_input_exception>(
       [&] { invoke_plan(*published.context, entry, outside_plan); },
-      "object_store_scope: the plan reads 's3://outside/object', outside every published "
-      "uri_prefix");
+      "object_store_scope: the plan reads 's3://<redacted>', outside every published uri_prefix",
+      {"bucket", "MatchedKeyCanary", "OutsideBucketCanary", "OutsideKeyCanary"});
     published.check();
   }
   // User-info changes raw prefix matching. A default scope serves that literal URI.
@@ -2226,8 +2255,86 @@ TEST_CASE("FFI object store messages pin all remote refusals at both execution e
     auto const plan = read_plan({{ordinary}});
     check_exact_object_store_message<sirius::invalid_input_exception>(
       [&] { invoke_plan(*published.context, entry, plan); },
-      "object_store_route_unavailable: the plan reads 's3://bucket/prefix/object' from an "
-      "object store; native object-store reads are not yet served on the FFI path");
+      "object_store_route_unavailable: the plan reads 's3://<redacted>' from an "
+      "object store; native object-store reads are not yet served on the FFI path",
+      {"ReadBucketCanary", "ReadKeyCanary"});
     published.check(fallback);
+  }
+}
+
+TEST_CASE("FFI object store rejects invalid buckets on factory, put and absent drop",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  constexpr auto reason =
+    "ObjectStoreConfig.uri_prefix: bucket must use only ASCII letters, "
+    "digits, '.', '_' or '-' and must not be '.' or '..'";
+  constexpr std::array keys{"s3://../",
+                            "s3://./",
+                            "s3://bad bucket/",
+                            "s3://user:secret@bucket/",
+                            "s3://host:9000/",
+                            "s3://hi\xff/"};
+  connection_observer observer;
+  observer.positive_control();
+  object_store_inputs inputs;
+  inputs.endpoint = observer.endpoint();
+  for (auto key : keys) {
+    inputs.uri_prefix = key;
+    check_exact_object_store_message<std::invalid_argument>(
+      [&] { (void)make_context_from_config(memory_config(), inputs.snapshot()); }, reason);
+  }
+  inputs.uri_prefix.clear();
+  auto fallback     = inputs.snapshot();
+  auto context      = make_context_from_config(memory_config(), fallback);
+  inputs.uri_prefix = "s3://valid/";
+  auto sibling      = inputs.snapshot();
+  context->put_object_store(sibling);
+  for (auto key : keys) {
+    CAPTURE(key);
+    inputs.uri_prefix = key;
+    auto rejected     = inputs.snapshot();
+    // Drop first: the key must be absent even if a broken put would accept it.
+    check_exact_object_store_message<std::invalid_argument>(
+      [&] { context->drop_object_store(key); }, reason);
+    check_exact_object_store_message<std::invalid_argument>(
+      [&] { context->put_object_store(rejected); }, reason);
+    check_snapshot_identity(context->object_store_config_for("s3://valid/x"), sibling);
+    check_snapshot_identity(context->object_store_config_for("s3://other/x"), fallback);
+    CHECK(rejected.use_count() == 1);
+  }
+  context.reset();
+  observer.finish();
+  CHECK(observer.error() == 0);
+  CHECK(observer.accepted() == 1);
+}
+
+TEST_CASE("FFI default reports the first miss or raw-key refusal in a mixed inventory",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  using error            = sirius::invalid_input_exception;
+  auto context           = make_context_from_config(memory_config(), message_snapshot(""));
+  std::string const good = "S3://MatchedBucketCanary/MatchedKeyCanary";
+  std::string const miss = "https://user:private@h/missing?query";
+  std::string const bad  = "https://h/a%2Fb?query";
+  constexpr auto outside =
+    "object_store_scope: the plan reads 'https://h/missing', "
+    "outside every published uri_prefix";
+  constexpr auto unstable =
+    "object_store_scope: 'https://h/a%2Fb' names a key segment that "
+    "cannot be matched byte-for-byte against the published uri_prefix set";
+  CHECK(context->object_store_config_for(miss) == nullptr);
+  check_exact_object_store_message<error>([&] { (void)context->object_store_config_for(bad); },
+                                          unstable);
+  for (auto entry : {entry_point::execute, entry_point::fragment_build}) {
+    auto verify = [&](std::vector<scan_item> const& items, char const* expected) {
+      auto const plan = read_plan(items);
+      check_exact_object_store_message<error>(
+        [&] { invoke_plan(*context, entry, plan); },
+        expected,
+        {"MatchedBucketCanary", "MatchedKeyCanary", "private", "?query"});
+    };
+    verify({{good}, {miss}}, outside);
+    verify({{good}, {miss}, {bad}}, outside);
+    verify({{good}, {bad}, {miss}}, unstable);
   }
 }

@@ -36,6 +36,10 @@ option(
   SIRIUS_DISTRIBUTION_DEFAULTS
   "Default to DuckDB logging and no Quent telemetry, for released extensions"
   OFF)
+option(
+  SIRIUS_DEVELOPER_MODE
+  "Developer mode: the effective configuration Sirius writes includes developer-only settings"
+  OFF)
 
 # Optional features
 option(ENABLE_STREAM_CHECK

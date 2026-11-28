@@ -18,6 +18,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/carried_columns.hpp"
@@ -46,8 +47,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <numeric>
+#include <string>
 #include <utility>
 
 namespace sirius {
@@ -193,10 +196,16 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   // reads no offsets.
   constexpr auto string_chars_limit =
     static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
-  auto const mr          = memory_space.get_default_allocator();
-  auto output_cudf_table = input_bytes > string_chars_limit
-                             ? concat_tables(input_cudf_table_views, stream, mr)
-                             : cudf::concatenate(input_cudf_table_views, stream, mr);
+  auto const mr = memory_space.get_default_allocator();
+  auto output_cudf_table =
+    input_bytes > string_chars_limit
+      ? concatenate_carriers(std::move(input_cudf_table_views),
+                             stream,
+                             mr,
+                             [&](std::vector<cudf::table_view> const& tables) {
+                               return concat_tables(tables, stream, mr);
+                             })
+      : concatenate_carriers(std::move(input_cudf_table_views), stream, mr);
 
   // Create output data batch.
   return make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info);
@@ -335,6 +344,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   int num_group_cols,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   int num_carried,
+  const carried_row_order& carried_order,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info,
@@ -360,6 +370,13 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   if (static_cast<std::size_t>(input_cudf_table_views[0].num_columns()) != layout.num_columns()) {
     throw std::runtime_error(
       "`num columns = num_group_cols + num aggregates + num_carried` not true in "
+      "`merge_grouped_aggregate()`");
+  }
+  if (std::ranges::any_of(carried_order.positions, [&](cudf::size_type position) {
+        return position < 0 || position >= num_carried;
+      })) {
+    throw std::runtime_error(
+      "`carried_order` names a column outside the carried columns in "
       "`merge_grouped_aggregate()`");
   }
   // Partials of sorted input batches are themselves sorted, and with a table pinned in key order
@@ -410,7 +427,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
     }
   }
 
-  if (aggregates.empty() && num_carried > 0 && num_group_cols > 0) {
+  // cudf::distinct keeps an arbitrary row, which only an unordered list may take.
+  if (aggregates.empty() && num_carried > 0 && num_group_cols > 0 && carried_order.empty()) {
     auto deduped =
       detail::aggregate_carried_columns_only(concatenated->view(), num_group_cols, stream, mr);
     SIRIUS_LOG_DEBUG(
@@ -534,10 +552,12 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
     requests.push_back(std::move(request));
   }
 
+  std::vector<cudf::size_type> carried(static_cast<std::size_t>(num_carried));
+  std::iota(carried.begin(), carried.end(), static_cast<cudf::size_type>(layout.carried_column(0)));
   std::optional<detail::carried_row_selector> row_selector;
   if (num_carried > 0) {
-    row_selector =
-      detail::append_carried_row_selector(requests, concatenated->num_rows(), stream, mr);
+    row_selector = detail::append_carried_row_selector(
+      requests, concatenated->view().select(carried), carried_order, stream, mr);
   }
 
   // Call cudf groupby and populate output columns
@@ -559,18 +579,18 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   if (row_selector) {
     // Every carried column of a partial row came from one input row, so gathering them all by one
     // selector keeps them from one row.
-    std::vector<cudf::size_type> carried(static_cast<std::size_t>(num_carried));
-    std::iota(
-      carried.begin(), carried.end(), static_cast<cudf::size_type>(layout.carried_column(0)));
     auto carried_columns = detail::gather_carried_columns(
       concatenated->view().select(carried),
+      *row_selector,
       groupby_result.second[row_selector->request_idx].results.front()->view(),
       stream,
       mr);
     SIRIUS_LOG_DEBUG(
-      "merge_grouped_agg: gathered {} carried column(s) by MIN row position ({} batches, {} rows "
-      "in, {} groups)",
+      "merge_grouped_agg: gathered {} carried column(s) by {} ({} batches, {} rows in, {} groups)",
       num_carried,
+      carried_order.empty()
+        ? std::string{"MIN row position"}
+        : std::format("MIN rank under {} order key(s)", carried_order.positions.size()),
       input.size(),
       concatenated->num_rows(),
       carried_columns.front()->size());

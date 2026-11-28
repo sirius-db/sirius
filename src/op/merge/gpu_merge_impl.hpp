@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/aggregate/carried_columns.hpp"
 #include "telemetry/data_batch_probe.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -132,14 +133,18 @@ class gpu_merge_impl {
    * For each batch, the first `num_group_cols` are the group columns, followed by aggregate columns
    * corresponding to `aggregates`, followed by `num_carried` carried columns.
    *
-   * @throw std::runtime_error if `input` has fewer than two batches or its width is not
-   * `num_group_cols + aggregates.size() + num_carried`
+   * @throw std::runtime_error if `input` has fewer than two batches, its width is not
+   * `num_group_cols + aggregates.size() + num_carried`, or a position of `carried_order` is not
+   * below `num_carried`
    *
    * @param input The input batches to be merged.
    * @param num_group_cols The number of group columns.
    * @param aggregates The aggregate functions.
    * @param num_carried The number of trailing carried columns. The output keeps one row per group
-   * for them, all from the same input row.
+   * for them, all from the same input row: the first under `carried_order`, or an arbitrary row
+   * when it is empty.
+   * @param carried_order Row order that picks the carried row; its positions index the carried
+   * columns.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
    * @param telemetry_info Per-batch telemetry sink.
@@ -156,6 +161,7 @@ class gpu_merge_impl {
     int num_group_cols,
     const std::vector<cudf::aggregation::Kind>& aggregates,
     int num_carried,
+    const carried_row_order& carried_order,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {},

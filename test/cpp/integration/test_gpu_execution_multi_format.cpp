@@ -23,6 +23,7 @@
  * generic duckdb_scan path) is currently disabled.
  */
 
+#include "io/s3/duckdb_secret_config.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
@@ -831,10 +832,10 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   //
   // What the pin is really protecting is the CPU oracle for EQUALITY deletes: the 1.4.4-era
   // build ignored them silently, so an oracle on that build would agree with a GPU path that
-  // dropped them too. 4c0c0874c4 (the build INSTALL resolves for DuckDB v2.0.0) was checked
+  // dropped them too. f979b5b28a (the build INSTALL resolves for DuckDB v2.0.1) was checked
   // against test/cpp/integration/data/iceberg_v2_equality_delete and returns the 3 surviving
   // rows, not all 5. Re-run that check when bumping this.
-  static constexpr const char* kVerifiedIcebergVersion = "4c0c0874c4";
+  static constexpr const char* kVerifiedIcebergVersion = "f979b5b28a";
 
   // Which delete kinds the GPU scan path applies itself. Positional deletes and V3 deletion
   // vectors are applied by iceberg_gpu_ingestible (they share one per-file position map), so
@@ -1076,7 +1077,8 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
                         sirius::op::scan::verdict_reason::iceberg_equality_key_unsupported,
                         sirius::op::scan::verdict_reason::iceberg_equality_budget,
                         sirius::op::scan::verdict_reason::iceberg_equality_multi_gpu,
-                        sirius::op::scan::verdict_reason::iceberg_equality_remote}) {
+                        sirius::op::scan::verdict_reason::iceberg_equality_remote,
+                        sirius::op::scan::verdict_reason::iceberg_equality_file_format}) {
       auto index = static_cast<std::size_t>(reason);
       CHECK(after.semantic_declines[index] == before.semantic_declines[index]);
     }
@@ -2114,22 +2116,65 @@ TEST_CASE("iceberg equality deletes are built on the configured GPU rather than 
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
-                 "gpu_execution iceberg - a remote equality delete declines before it is opened",
+                 "gpu_execution iceberg - an equality delete no reader serves declines unopened",
                  "[integration][gpu_execution][iceberg]")
 {
-  // Only the delete file's URI is remote, and nothing exists there. With the fallback off the
-  // refusal is the statement's error, so no reader goes on to open it.
-  auto path = table("iceberg_v2_eq_remote_delete");
+  // Only the delete file is out of reach, and nothing exists where the manifest puts it: under
+  // a URI no backend reads, or as an Avro file. With the fallback off the refusal is the
+  // statement's error, so no reader goes on to open it.
+  using reason = sirius::op::scan::verdict_reason;
+  struct unread {
+    char const* table;
+    reason declined;
+    char const* text;
+  };
+  for (auto const& [name, declined, text] :
+       {unread{"iceberg_v2_eq_remote_delete",
+               reason::iceberg_equality_remote,
+               "is remote and no Sirius backend reads its URI"},
+        unread{"iceberg_v2_eq_avro_delete",
+               reason::iceberg_equality_file_format,
+               "is stored as AVRO"}}) {
+    INFO(name);
+    sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(table(name)));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring(text));
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    auto index = static_cast<std::size_t>(declined);
+    CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
+    CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - an Avro equality delete that applies to no data "
+                 "file does not decline",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The Avro delete is live and was committed before the only data file, so it applies to
+  // nothing. Nothing exists where the manifest puts it: the rows come back only if no reader
+  // opens it, and the scan stays on the GPU only if its format is not held against it.
+  auto path = table("iceberg_v2_eq_avro_delete_older");
+  require_delete_files(path, 1);
+  auto inventory =
+    sirius::op::scan::read_delete_inventory(*con->context, path, current_snapshot_id(path));
+  REQUIRE(inventory.inventory);
+  CHECK(inventory.equality_count == 1);
+  CHECK(std::ranges::any_of(inventory.inventory->entries, [](auto const& entry) {
+    return entry.content == "EQUALITY_DELETES" &&
+           duckdb::StringUtil::CIEquals(entry.file_format, "avro");
+  }));
+  CHECK(
+    sirius::op::scan::read_equality_plan(*con->context, *inventory.inventory, 64).files.empty());
+
   sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
-  auto before = sirius::test::get_transparent_execution_stats(*con);
-  auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(path));
-  REQUIRE(result);
-  REQUIRE(result->HasError());
-  CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("is not a local file"));
-  auto after = sirius::test::get_transparent_execution_stats(*con);
-  auto index = static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_remote);
-  CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
-  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+  // No delete payload is loaded: the plan retained no file to load.
+  expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                       {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}},
+                       0);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
@@ -4676,6 +4721,17 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "A deletion vector whose manifest records a lower-case format applies on the GPU",
+                 "[integration][iceberg][deletion_vector]")
+{
+  // Read as a Parquet position-delete file, the Puffin sidecar fails to open at run time.
+  expect_iceberg_rows("SELECT fruit, count FROM " +
+                        pinned_scan(inventory_fixture("dv_lowercase_format")) + " ORDER BY count",
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "Qualifying DV work starts on workers after lowering and before decode",
                  "[integration][scan_preparation][iceberg][deferred]")
 {
@@ -5377,6 +5433,30 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   REQUIRE(result);
   INFO((result->HasError() ? result->GetError() : ""));
   REQUIRE_FALSE(result->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "A Puffin for an unselected data file needs no S3 credential",
+                 "[integration][scan_preparation][iceberg][planning]")
+{
+  // The vector for an unselected data file sits under s3://, and the only secret that covers
+  // it is one Sirius cannot use. The scan never opens that file, so resolving a credential
+  // for it must not be what fails the statement.
+  auto table = inventory_fixture("dv_unused_s3_uri");
+  REQUIRE_FALSE(
+    con
+      ->Query("CREATE OR REPLACE SECRET unused_puffin (TYPE SIRIUS_S3, SCOPE "
+              "'s3://sirius-unused-puffin/', KEY_ID 'k', SECRET 's', URL_STYLE 'vhost')")
+      ->HasError());
+  absl::Cleanup drop_secret = [&] { con->Query("DROP SECRET IF EXISTS unused_puffin"); };
+  // The secret is the unusable one: resolving that path by itself is refused.
+  CHECK_THROWS_WITH(sirius::io::s3::resolve_duckdb_s3_secret(
+                      *con->context, "s3://sirius-unused-puffin/unused-sidecar.puffin", {}),
+                    Catch::Matchers::ContainsSubstring("url_style='path'"));
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(table) + " ORDER BY count",
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
