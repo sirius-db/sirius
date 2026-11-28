@@ -62,10 +62,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace cucascade;
@@ -4517,6 +4520,85 @@ TEMPLATE_TEST_CASE("MATERIALIZE floating IN with only NULL constants returns NUL
   auto output = evaluator.evaluate(cudf::table_view{{input->view()}});
   REQUIRE(output->num_rows() == 3);
   REQUIRE(copy_valids_to_host(output->view().column(0)) == std::vector<bool>{false, false, false});
+}
+
+// TPC-DS q8 filters on a 400-entry string IN list. Lowered to a comparison chain, every entry is a
+// separate input of the cuDF JIT kernel, which NVRTC fails to compile.
+TEMPLATE_TEST_CASE("Long constant IN lists preserve membership semantics under every strategy",
+                   "[expression_evaluator][in_list][constant_in][null_logic][large_in_list]",
+                   int32_t,
+                   double,
+                   std::string)
+{
+  auto& space         = *get_default_gpu_space();
+  auto mr             = get_resource_ref(space);
+  auto stream         = cudf::get_default_stream();
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const length   = GENERATE(
+    exp_executor::max_ast_in_list_size, exp_executor::max_ast_in_list_size + 1, std::size_t{400});
+  auto const include_null = GENERATE(false, true);
+  auto const negated      = GENERATE(false, true);
+  // Under NOT, the IN list is evaluated as an AST operand.
+  auto const wrapped = GENERATE(false, true);
+
+  constexpr bool is_string = std::is_same_v<TestType, std::string>;
+  auto const type          = logical_type::make(is_string ? type_id::VARCHAR
+                                       : std::is_same_v<TestType, int32_t> ? type_id::INTEGER
+                                                                           : type_id::DOUBLE);
+  auto to_value            = [](int key) -> TestType {
+    if constexpr (is_string)
+      return std::format("{:05d}", key);
+    else
+      return static_cast<TestType>(key);
+  };
+  auto constant = [&](int key) {
+    return std::make_unique<ast_node>(sirius::ast::constant{sirius::value{to_value(key)}, type});
+  };
+
+  // The list holds the keys 3 * i for i < length.
+  auto const last = 3 * static_cast<int>(length - 1);
+  std::vector<std::optional<int>> const probe_keys{0, 3, last, 1, -3, last + 3, std::nullopt};
+  std::vector<std::unique_ptr<ast_node>> list;
+  for (std::size_t i = 0; i < length; ++i)
+    list.push_back(constant(3 * static_cast<int>(i)));
+  if (include_null) list.push_back(make_null_const(type));
+  auto expr = make_in(make_ref_typed(0, type), std::move(list), negated);
+  if (wrapped) expr = make_unary(sirius::ast::unary_op::kind::op_not, std::move(expr));
+
+  std::unique_ptr<cudf::column> input;
+  if constexpr (is_string) {
+    std::vector<std::unique_ptr<cudf::column>> rows;
+    std::vector<cudf::column_view> row_views;
+    for (auto const& key : probe_keys) {
+      cudf::string_scalar scalar(key ? to_value(*key) : "", key.has_value(), stream, mr);
+      rows.push_back(cudf::make_column_from_scalar(scalar, 1, stream, mr));
+      row_views.push_back(rows.back()->view());
+    }
+    input = cudf::concatenate(row_views, stream, mr);
+  } else {
+    std::vector<std::optional<TestType>> rows;
+    for (auto const& key : probe_keys)
+      rows.push_back(key ? std::optional{to_value(*key)} : std::nullopt);
+    // -0.0 equals the list entry 0.0.
+    if constexpr (std::is_floating_point_v<TestType>) rows[0] = -TestType{0};
+    input =
+      make_nullable_rep_column<TestType>(space, sirius::require_cudf_type(type), rows, TestType{0});
+  }
+
+  exp_executor evaluator(*expr, mr, stream, sirius::expression_query_policy{strategy}, 1);
+  auto output       = evaluator.evaluate(cudf::table_view{{input->view()}});
+  auto const values = copy_column_to_host<int8_t>(output->view().column(0));
+  auto const valid  = copy_valids_to_host(output->view().column(0));
+  REQUIRE(values.size() == probe_keys.size());
+  for (std::size_t i = 0; i < probe_keys.size(); ++i) {
+    CAPTURE(strategy, length, include_null, negated, wrapped, i);
+    auto const key     = probe_keys[i];
+    bool const matches = key && *key >= 0 && *key <= last && *key % 3 == 0;
+    // A NULL entry turns every nonmatch into NULL, for NOT IN too.
+    bool const expected_valid = key.has_value() && (matches || !include_null);
+    REQUIRE(valid[i] == expected_valid);
+    if (expected_valid) CHECK(bool(values[i]) == (matches != negated != wrapped));
+  }
 }
 
 TEST_CASE("a constant of an unsupported scalar type names the type",

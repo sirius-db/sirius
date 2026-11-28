@@ -68,6 +68,10 @@ class expression_evaluator {
 
  public:
   static constexpr std::size_t default_min_ast_size = 2;
+  /// All-constant IN lists longer than this use a `cudf::contains` lookup under every strategy
+  /// instead of a chain of equality comparisons. Each list entry is a separate input of the cuDF
+  /// JIT kernel, and NVRTC fails to compile kernels with a few hundred inputs.
+  static constexpr std::size_t max_ast_in_list_size = 16;
 
   /**
    * @brief The result of adding an expression to the executor's AST tree.
