@@ -31,7 +31,7 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 **Motivation:** Sorting datasets larger than GPU memory requires distributed sorting with dynamic partition boundaries. SORT_SAMPLE and SORT_PARTITION are tightly coupled (the partition operator reads boundaries directly from the sample operator via `_sample_op`), so colocating them in one pipeline eliminates an unnecessary repository hop and scheduling overhead.
 
 **Mechanism:** ORDER_BY is split into 3 pipeline phases:
-1. **ORDER_BY**: Local sort of each batch
+1. **ORDER_BY + SORT_KEY_SAMPLE**: Local sort of each batch, then key rows of it are kept for the boundaries
 2. **SORT_SAMPLE + SORT_PARTITION**: Sample N batches to compute boundaries, then range-partition — both run back-to-back in the same `gpu_pipeline_task`
 3. **MERGE_SORT**: Multi-way merge of pre-sorted partitions via `cudf::merge_order_by()`
 
@@ -43,15 +43,15 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Config:** `max_sort_partition_bytes` (default: auto, 33% of GPU memory)
 
-### SORT_SAMPLE Byte-Based Merge Sampling (PRs #876, #886)
+### SORT_SAMPLE Byte-Based Key-Row Sampling (PRs #876, #886)
 
 **Motivation:** Multi-partition sorting samples batches to compute partition boundaries. A fixed sample batch count does not scale with variable batch sizes, single-batch task input contradicted the multi-batch sample the hint waited for, and concatenating + fully re-sorting the sample wasted work because upstream ORDER_BY already emits locally sorted batches. Scheduling boundary computation with a CAS election also let losing tasks waste GPU work.
 
-**Mechanism:** `sirius_physical_sort_sample` overrides `get_next_task_input_data()` so the boundary task receives the full multi-batch sample the hint waited for. Sampling is byte-based: it pulls batches until `sort_sample_bytes` is reached (or upstream finishes), then merges the already-sorted sample batches with `gpu_merge_impl::merge_order_by` and computes boundaries from the merged run — no concatenate-and-full-sort. When the sample contains the complete upstream input, its actual bytes determine the partition count; partial samples still extrapolate from estimated cardinality. Boundary scheduling uses an explicit `NOT_DONE -> SCHEDULED -> DONE` state machine: `get_next_task_input_data()` claims the sample and moves to `SCHEDULED`, `get_next_task_hint()` returns `nullopt` while `SCHEDULED` so no duplicate boundary task is created, `execute()` moves to `DONE`, and OOM resets to `NOT_DONE` for retry. After boundaries are computed the operator falls back to single-batch passthrough.
+**Mechanism:** SORT_KEY_SAMPLE runs after ORDER_BY in the same pipeline and keeps regularly spaced sort-key rows of every sorted batch in host memory (`sort_key_sample`), so the sample is not limited to the batches one task can load. SORT_SAMPLE reads that store. The boundary task starts once upstream finishes (the default, `sort_sample_bytes = 0`) or once a nonzero `sort_sample_bytes` of input was handed over. It takes one waiting batch, merges the kept key tables, and chooses boundaries from them. Each retained row represents the same stride of input rows, including when batches have different sizes; the stride doubles to keep at most about 1M rows. The range count uses measured input after upstream completion, otherwise the runtime byte projection when available, then planner cardinality. The larger of the byte and row limits sets the count, capped by sample rows. Boundary scheduling uses an explicit `NOT_DONE -> SCHEDULED -> DONE` state machine: `get_next_task_input_data()` claims the sample and moves to `SCHEDULED`, `get_next_task_hint()` returns `nullopt` while `SCHEDULED` so no duplicate boundary task is created, `execute()` moves to `DONE`, and OOM leaves the state at `SCHEDULED` for retry with the same input. After boundaries are computed the operator falls back to single-batch passthrough.
 
-**Code path:** `src/op/sirius_physical_sort_sample.cpp` — `get_next_task_input_data()`, `get_next_task_hint()`, `execute()`; `src/planner/sirius_physical_plan_generator.cpp` — wiring `sort_sample_bytes` into SORT_SAMPLE
+**Code path:** `src/op/sort_key_sample.cpp` — the kept key rows; `src/op/sirius_physical_sort_key_sample.cpp` — `execute()` keeps the key rows of each sorted batch; `src/op/sirius_physical_sort_sample.cpp` — `get_next_task_input_data()`, `get_next_task_hint()`, `execute()`; `src/planner/sirius_physical_plan_generator.cpp` — wiring `sort_sample_bytes` into SORT_SAMPLE
 
-**Config:** `sort_sample_bytes` (default: 512 MB), settable via YAML and the `sort_sample_bytes` SET option
+**Config:** `sort_sample_bytes` (default: 0, all input; a distributed sort left at 0 takes one scan batch), settable via YAML and the `sort_sample_bytes` SET option
 
 ### Merge Pipeline Fusion (PR #1190)
 

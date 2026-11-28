@@ -104,9 +104,9 @@ std::size_t apply_tier_narrowing_policy(sirius::op::sirius_physical_operator& pl
  * own sidecar.
  *
  * This pass runs on the pre-wrap tree only: pipeline wrapper operators (PARTITION, CONCAT,
- * MERGE_*, SORT_PARTITION, SORT_SAMPLE, GPU_SCAN, DYNAMIC_FILTER) are inserted afterwards by
- * `sirius_physical_plan_generator::insert_gpu_pipeline_operators`, which copies the finished
- * sidecars onto the wrappers.
+ * MERGE_*, SORT_PARTITION, SORT_SAMPLE, SORT_KEY_SAMPLE, GPU_SCAN, DYNAMIC_FILTER) are inserted
+ * afterwards by `sirius_physical_plan_generator::insert_gpu_pipeline_operators`, which copies the
+ * finished sidecars onto the wrappers.
  */
 void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot);
 

@@ -427,13 +427,14 @@ TEST_CASE_METHOD(merge_fusion_fixture,
         REQUIRE(order != nullptr);
         REQUIRE(merge_sort != nullptr);
 
-        // MERGE_GROUP_BY fuses into the ORDER_BY sink that consumes it.
+        // MERGE_GROUP_BY fuses into the pipeline of the ORDER_BY that consumes it, which
+        // SORT_KEY_SAMPLE ends.
         CHECK(pipeline_contains_both(engine.new_scheduled,
                                      SiriusPhysicalOperatorType::MERGE_GROUP_BY,
                                      SiriusPhysicalOperatorType::ORDER_BY));
         CHECK(merge == order);
         REQUIRE(merge->get_sink());
-        CHECK(merge->get_sink()->type == SiriusPhysicalOperatorType::ORDER_BY);
+        CHECK(merge->get_sink()->type == SiriusPhysicalOperatorType::SORT_KEY_SAMPLE);
 
         // Global sort chain stays above the local ORDER_BY pipeline.
         CHECK(merge != merge_sort);

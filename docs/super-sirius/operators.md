@@ -71,7 +71,7 @@ publication separates them for LIMIT's one-batch claims.
 | Operator | `output_order_preservation()` |
 |---|---|
 | MERGE_SORT, MERGE_TOP_N | `FIXED_ORDER` |
-| ORDER_BY (local sort), TOP_N (local top-N), SORT_SAMPLE, SORT_PARTITION | `NO_ORDER` |
+| ORDER_BY (local sort), TOP_N (local top-N), SORT_KEY_SAMPLE, SORT_SAMPLE, SORT_PARTITION | `NO_ORDER` |
 | PARTITION, CONCAT, UNION | `NO_ORDER` |
 | WINDOW, REPLICATE | `NO_ORDER` |
 | HASH_JOIN, NESTED_LOOP_JOIN, DENSE_COUNT_JOIN | `NO_ORDER` |
@@ -476,6 +476,18 @@ Local sort of each data batch.
 
 - **GPU execution:** `gpu_order_impl::local_order_by()` using `cudf::order_by()`
 - **Key members:** `orders` (sort keys with ASC/DESC and null ordering), `projections` (output columns), `is_index_sort`
+- **Pipeline role:** under a SORT_KEY_SAMPLE, which is where the planner puts it, it is neither a sink nor a source and runs inside that operator's pipeline. On its own it ends its pipeline.
+
+### `sirius_physical_sort_key_sample` — `SORT_KEY_SAMPLE`
+**File:** `src/op/sirius_physical_sort_key_sample.hpp`
+
+Runs after ORDER_BY and ends its pipeline. It keeps evenly spaced sort-key rows of every sorted
+batch in the `sort_key_sample` store (`src/op/sort_key_sample.hpp`) that the plan's SORT_SAMPLE
+reads, and passes the batches on unchanged.
+
+- The store keeps the rows in host memory: one stride for all batches, a power of two that doubles until at most about 1M rows are kept.
+- A batch is named by its original ID, so a retried task replaces its earlier rows, also when the retry runs on another GPU and gets clones of its input.
+- It keeps nothing once SORT_SAMPLE has chosen the boundaries and closed the store.
 
 ### `sirius_physical_top_n` — `TOP_N`
 **File:** `src/op/sirius_physical_top_n.hpp`
@@ -625,13 +637,20 @@ neither half of.
 ### `sirius_physical_sort_sample` — `SORT_SAMPLE`
 **File:** `src/op/sirius_physical_sort_sample.hpp`
 
-Samples input batches to compute P-1 partition boundary rows for range partitioning. Sampling is byte-based: it accumulates batches until `sort_sample_bytes` worth of input is available, rather than a fixed batch count.
+Computes P-1 partition boundary rows for range partitioning from key rows of every sorted batch.
+The SORT_KEY_SAMPLE that ends the producing pipeline adds the key rows of each batch to the
+store this operator shares with it (`key_sample()`) before the batch reaches the input port.
+
+`sort_sample_bytes` is the input to see before the boundaries are chosen. The default, 0, waits
+for all of it. Input that ends before a nonzero value is reached is used whole. A distributed
+sort left at 0 takes one scan batch, because ranks weight their samples by this budget.
 
 Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE → SCHEDULED → DONE`.
-- `get_next_task_hint()` waits in `NOT_DONE` until enough sample bytes are available (or the upstream finishes), then signals READY; it returns `std::nullopt` while `SCHEDULED` so at most one boundary task is in flight.
-- `get_next_task_input_data()` (overridden) claims the accumulated sample batches and moves the state to `SCHEDULED`, handing them to `execute()` as a single multi-batch input.
-- `execute()` merges the pre-sorted sample batches, computes the boundaries, and moves to `DONE`. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
+- `get_next_task_hint()` waits in `NOT_DONE` until the upstream pipeline finishes, or until a nonzero `sort_sample_bytes` of input was handed over and a batch waits, then signals READY; it returns `std::nullopt` while `SCHEDULED` so at most one boundary task is in flight.
+- `get_next_task_input_data()` (overridden) claims one waiting batch for the boundary task and moves the state to `SCHEDULED`.
+- `execute()` copies the kept key rows to its GPU, merges them, computes boundaries, and moves to `DONE`. Range sizing uses measured input when upstream is finished, otherwise the runtime byte estimate when available, then the planner estimate. It also caps expected rows per range at half cuDF's column limit. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED`, the key rows stay, and the rescheduled task retries with the same input, preventing a duplicate boundary task.
 - Once `DONE`, the operator falls back to default scheduling and passes through remaining batches unchanged.
+- Counting repeated boundaries is best-effort: a GPU allocation failure or a retryable CUDA launch error records `repeated_boundaries=unavailable` and keeps the completed boundaries. The task is not retried for it, because the distributed hook rejects a second run and the query would fail. Any other error propagates.
 
 ### `sirius_physical_sort_partition` — `SORT_PARTITION`
 **File:** `src/op/sirius_physical_sort_partition.hpp`
@@ -640,6 +659,10 @@ Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to 
 
 Each range slice is published to its original repository partition, retaining indices even when
 intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.
+The operator counts rows, data bytes, and slices per range when `sink()` publishes each slice.
+At finalization, `Sort ranges:` logs the claimed input batch count, sample size, key-row
+count, stride, target and observed range sizes, while
+`Sort range sizes:` lists each range's row and byte counts at DEBUG level.
 
 ### `sirius_physical_merge_sort` — `MERGE_SORT`
 **File:** `src/op/sirius_physical_merge_sort.hpp`
@@ -722,7 +745,8 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | REPLICATE | Relational | `gpu_replicate_impl::plan_slices()` + `materialize()`; one `cudf::gather` per output batch |
 | ORDER_BY | Sort | `gpu_order_impl::local_order_by()` |
 | TOP_N | Sort | Order + limit |
-| SORT_SAMPLE | Sort | Sample + boundary computation |
+| SORT_KEY_SAMPLE | Sort | Key rows of each sorted batch, kept in host memory |
+| SORT_SAMPLE | Sort | Boundary computation from the kept key rows |
 | SORT_PARTITION | Sort | Range partition by boundaries |
 | MERGE_SORT | Sort | `gpu_merge_impl::merge_order_by()` |
 | UNGROUPED_AGGREGATE | Agg | `gpu_aggregate_impl::local_ungrouped_aggregate()` |

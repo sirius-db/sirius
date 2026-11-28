@@ -45,6 +45,8 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "op/sirius_physical_sort_key_sample.hpp"
+#include "op/sirius_physical_sort_sample.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"  // IWYU pragma: keep
 #include "planner/delim_cte_proof.hpp"
@@ -3294,7 +3296,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - order-by and top-n wrap to their merge chains",
                  "[plan_tree_shape][isolated_context]")
 {
-  SECTION("order-by becomes MERGE_SORT -> SORT_PARTITION -> SORT_SAMPLE -> ORDER_BY")
+  SECTION(
+    "order-by becomes MERGE_SORT -> SORT_PARTITION -> SORT_SAMPLE -> SORT_KEY_SAMPLE -> "
+    "ORDER_BY")
   {
     auto plan = generate_sirius_plan(*con, "SELECT * FROM big_left ORDER BY val");
     INFO(tree_to_string(plan.get()));
@@ -3308,7 +3312,18 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto* sort_sample = sort_partition->children[0].get();
     REQUIRE(sort_sample->type == SiriusPhysicalOperatorType::SORT_SAMPLE);
     REQUIRE(sort_sample->children.size() == 1);
-    CHECK(sort_sample->children[0]->type == SiriusPhysicalOperatorType::ORDER_BY);
+    auto* key_sample = sort_sample->children[0].get();
+    REQUIRE(key_sample->type == SiriusPhysicalOperatorType::SORT_KEY_SAMPLE);
+    REQUIRE(key_sample->children.size() == 1);
+    REQUIRE(key_sample->children[0]->type == SiriusPhysicalOperatorType::ORDER_BY);
+    // The key rows are kept where the sample operator reads them.
+    CHECK(key_sample->Cast<sirius::op::sirius_physical_sort_key_sample>().key_sample() ==
+          sort_sample->Cast<sirius::op::sirius_physical_sort_sample>().key_sample());
+    // SORT_KEY_SAMPLE ends the sorting pipeline and ORDER_BY runs inside it.
+    CHECK(key_sample->is_sink());
+    CHECK(key_sample->is_source());
+    CHECK_FALSE(key_sample->children[0]->is_sink());
+    CHECK_FALSE(key_sample->children[0]->is_source());
   }
 
   SECTION("top-n becomes MERGE_TOP_N -> TOP_N")

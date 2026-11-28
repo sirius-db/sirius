@@ -7,6 +7,7 @@
 #include <cuda/stream_ref>
 
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <memory>
 
@@ -20,6 +21,8 @@ class tracked_scan_resource {
     std::size_t fail_at          = std::numeric_limits<std::size_t>::max();
     cudaStream_t expected_stream = nullptr;
     bool wrong_stream            = false;
+    // Thrown at fail_at when set; rmm::out_of_memory otherwise.
+    std::exception_ptr failure;
   };
   explicit tracked_scan_resource(rmm::device_async_resource_ref upstream, ::cuda::stream_ref stream)
     : state(std::make_shared<counters>()), upstream_(upstream)
@@ -73,8 +76,9 @@ class tracked_scan_resource {
  private:
   void attempt()
   {
-    if (state->attempts++ == state->fail_at)
-      throw rmm::out_of_memory("injected scan allocation failure");
+    if (state->attempts++ != state->fail_at) { return; }
+    if (state->failure) { std::rethrow_exception(state->failure); }
+    throw rmm::out_of_memory("injected scan allocation failure");
   }
   rmm::device_async_resource_ref upstream_;
 };

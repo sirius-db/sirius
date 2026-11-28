@@ -67,7 +67,8 @@ uint64_t derived_default_batch_size();
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES   = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES    = DEFAULT_BATCH_SIZE;
+/// 0: SORT_SAMPLE picks its range boundaries from all the input.
+constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES = 0;
 
 /// Fallback BUILD_PROBE budgets with the default hash partition size equal to batch size.
 /// Resolution derives the index budget from startup hash_partition_bytes; the resident budget
@@ -226,7 +227,8 @@ struct operator_params {
   /// join is larger is split into tasks over row ranges of the left batch.
   uint64_t cross_join_task_bytes = config::DEFAULT_BATCH_SIZE;
 
-  /// Target size (bytes) of data to sample before computing sort partition boundaries.
+  /// Bytes of sorted input SORT_SAMPLE sees before it picks the range boundaries. 0 waits for
+  /// all the input.
   uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
   /// Estimated per-GPU cuco hash-table byte budget for BUILD_PROBE, computed from measured rows.
@@ -286,6 +288,13 @@ struct operator_params {
 
   /// More than one rank: plans are split across processes and exchange rows.
   [[nodiscard]] bool distributed() const noexcept { return exchange_peers.size() > 1; }
+
+  /// sort_sample_bytes as SORT_SAMPLE takes it. Ranks weight their samples by this budget, so a
+  /// distributed sort left at 0 takes one scan batch.
+  [[nodiscard]] uint64_t effective_sort_sample_bytes() const noexcept
+  {
+    return sort_sample_bytes == 0 && distributed() ? scan_task_batch_size : sort_sample_bytes;
+  }
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;

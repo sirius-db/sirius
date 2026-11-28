@@ -43,7 +43,7 @@ flowchart BT
     OP --> J
     LB -. "Bloom, ORed across ranks" .-> OS
     J --> GX["EXCHANGE hash(l_shipmode)"]
-    GX --> M["PARTITION → MERGE_GROUP_BY → ORDER_BY"]
+    GX --> M["PARTITION → MERGE_GROUP_BY → ORDER_BY → SORT_KEY_SAMPLE"]
     M --> SS["SORT_SAMPLE<br/>(samples gathered: same boundaries everywhere)"]
     SS --> RX["EXCHANGE range"]
     RX --> SP["SORT_PARTITION → MERGE_SORT"]
@@ -170,7 +170,9 @@ arrived. It is used three ways:
 - **`SORT_SAMPLE` in distributed mode.** Each rank shares up to 1024 evenly spaced rows of its
   sorted sample, and every rank merges them all in rank order. From the same global sample each
   rank derives the same world − 1 range boundaries for the exchange after it, and its own
-  `SORT_PARTITION` boundaries from inside its range. A rank with no input still runs its boundary
+  `SORT_PARTITION` boundaries from inside its range. A rank's say is scaled by how much of
+  `sort_sample_bytes` its sample reached, so a distributed sort left at the default (0, all input)
+  takes one scan batch instead. A rank with no input still runs its boundary
   task (`runs_without_input()`), since the others wait for it. `distribute_plan()` sets a
   `sample_all_gather_boundaries` on the plan's `SORT_SAMPLE` (`set_cross_rank_boundaries()`),
   which the operator asks for its boundaries instead of cutting its own sample. It cannot be set
@@ -200,7 +202,7 @@ single-process plan already partitions:
 | the same, with `COUNT(DISTINCT)` | `hash` on the group keys, below `HASH_GROUP_BY`: partial distinct sets are LIST columns, which the wire does not carry |
 | `MERGE_AGGREGATE → UNGROUPED_AGGREGATE` | `gather` to rank 0, between them |
 | `MERGE_TOP_N → TOP_N` | `gather` to rank 0, between them; a row outside its rank's top N is outside the overall top N |
-| `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY` | `range` between `SORT_PARTITION` and a distributed `SORT_SAMPLE` |
+| `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → SORT_KEY_SAMPLE → ORDER_BY` | `range` between `SORT_PARTITION` and a distributed `SORT_SAMPLE` |
 | the result | `gather` to rank 0, ordered after a distributed sort |
 
 `GPU_SCAN`, `FILTER`, `PROJECTION` and `DYNAMIC_FILTER` keep their input's placement. A `CTE`

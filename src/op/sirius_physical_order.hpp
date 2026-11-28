@@ -55,11 +55,19 @@ class sirius_physical_order : public sirius_physical_operator {
   duckdb::vector<std::size_t> projections;
   bool is_index_sort;
 
-  bool is_source() const override { return true; }
-  bool is_sink() const override { return true; }
+  //! Under a SORT_KEY_SAMPLE it runs inside that operator's pipeline; otherwise it ends its own.
+  bool is_source() const override { return !feeds_sort_key_sample(); }
+  bool is_sink() const override { return !feeds_sort_key_sample(); }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
+
+ private:
+  [[nodiscard]] bool feeds_sort_key_sample() const noexcept
+  {
+    auto const* parent = get_parent_op();
+    return parent != nullptr && parent->type == SiriusPhysicalOperatorType::SORT_KEY_SAMPLE;
+  }
 };
 
 }  // namespace op

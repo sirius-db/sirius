@@ -333,13 +333,13 @@ For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to 
 
 ```mermaid
 graph LR
-    P1["Pipeline 1<br/>[scan, ..., ORDER_BY]"] -->|"PIPELINE"| P2["Pipeline 2<br/>[SORT_SAMPLE, SORT_PARTITION]"]
+    P1["Pipeline 1<br/>[scan, ..., ORDER_BY, SORT_KEY_SAMPLE]"] -->|"PIPELINE"| P2["Pipeline 2<br/>[SORT_SAMPLE, SORT_PARTITION]"]
     P2 -->|"FULL"| P3["Pipeline 3<br/>[MERGE_SORT]"]
     P3 -->|"FULL"| DS["downstream"]
 ```
 
-1. **Pipeline 1**: Current pipeline keeps ORDER_BY as sink (local sort per batch)
-2. **Pipeline 2**: SORT_SAMPLE and SORT_PARTITION run back-to-back in the same `gpu_pipeline_task`. `PIPELINE` barrier from Pipeline 1 — batches arrive as produced; SORT_SAMPLE overrides `get_next_task_hint()` to wait for N samples before computing boundaries; SORT_PARTITION reads boundaries directly from SORT_SAMPLE via `_sample_op`
+1. **Pipeline 1**: Current pipeline runs ORDER_BY (local sort per batch) and ends in SORT_KEY_SAMPLE, the sink, which keeps key rows of each sorted batch and passes the batch on
+2. **Pipeline 2**: SORT_SAMPLE and SORT_PARTITION run back-to-back in the same `gpu_pipeline_task`. `PIPELINE` barrier from Pipeline 1 — batches arrive as produced; SORT_SAMPLE overrides `get_next_task_hint()` to wait for all the input (or `sort_sample_bytes` of it) before computing boundaries from the key rows SORT_KEY_SAMPLE kept; SORT_PARTITION reads boundaries directly from SORT_SAMPLE via `_sample_op`
 3. **Pipeline 3**: MERGE_SORT. `FULL` barrier — must wait for all partitions. Downstream pipelines that previously used ORDER_BY as source are updated to use MERGE_SORT
 
 ### HASH_GROUP_BY
@@ -410,7 +410,7 @@ Eligibility is decided at plan time by `mark_fusable_merge_pipelines` (`sirius_p
 - **Partition sinks** (`PARTITION`, `SORT_PARTITION`) — require complete upstream input in one task.
 - **`MERGE_AGGREGATE`** (ungrouped aggregate) — uses a different partial-result handoff.
 
-Total-input structural sinks such as `ORDER_BY`, `TOP_N`, and an outer `GROUP BY` **are** fusable: they already buffer their full input, so folding the merge in does not change when they observe complete data.
+Total-input structural sinks such as `SORT_KEY_SAMPLE` (which ends ORDER_BY's pipeline), `TOP_N`, and an outer `GROUP BY` **are** fusable: they already buffer their full input, so folding the merge in does not change when they observe complete data.
 
 ## Part 4: Port Wiring
 
