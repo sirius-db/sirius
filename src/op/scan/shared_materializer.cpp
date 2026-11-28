@@ -460,7 +460,7 @@ static decode_result materialize_impl(prepared_split const& split,
       apply_lineage_visibility(
         b.table,
         lineage,
-        [&](std::string const& file) -> std::span<int64_t const> {
+        [&](std::string const& file) -> block_span<int64_t const> {
           for (auto const& binding : pending)
             if (binding.file == file)
               for (auto const& input : inputs.visibility)

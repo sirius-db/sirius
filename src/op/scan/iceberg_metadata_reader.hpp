@@ -34,6 +34,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -44,6 +45,10 @@
 namespace cucascade::io {
 class ioctx;
 }  // namespace cucascade::io
+
+namespace cucascade::memory {
+class memory_space;
+}  // namespace cucascade::memory
 
 namespace sirius::op::scan {
 
@@ -185,8 +190,15 @@ struct EqualityDeleteGroup {
   std::unique_ptr<cudf::distinct_hash_join> hash_join;
 };
 
-/// Ascending indices into @ref IcebergDeleteData::equality_delete_groups.
+/// Ascending indices into the groups of an @ref equality_replica.
 using equality_group_list = std::vector<uint32_t>;
+
+/// A table's equality-delete groups as built on one device. Every replica of a table holds the
+/// same groups in the same order.
+struct equality_replica {
+  rmm::cuda_device_id device;
+  std::vector<EqualityDeleteGroup> groups;
+};
 
 /**
  * @brief Fully materialized Iceberg delete data for one table.
@@ -199,11 +211,20 @@ struct IcebergDeleteData {
   /// V2 positional deletes and V3 deletion vectors merged: data_file_path -> sorted positions.
   std::unordered_map<std::string, std::vector<int64_t>> positional_deletes;
 
-  /// Built on one device; the plan gate declines multi-GPU configurations.
-  std::vector<EqualityDeleteGroup> equality_delete_groups;
-  /// The device @ref equality_delete_groups live on. They are released with it current.
-  std::optional<rmm::cuda_device_id> equality_device;
+  /// One per GPU the query can be admitted to, none when no group applies to a data file. Each
+  /// is released with its device current. Mutable: admission releases the ones it leaves out
+  /// through the scan's const payload.
+  mutable std::vector<equality_replica> equality_replicas;
   ~IcebergDeleteData();
+
+  /// Releases the tables on every device outside @p devices. Not synchronized: call before a
+  /// batch probes.
+  void release_equality_replicas_outside(std::span<int const> devices) const;
+
+  /// The groups built on @p device. Throws when there are none: skipping the probe would return
+  /// deleted rows, and another device's tables need not be addressable from this one.
+  [[nodiscard]] std::vector<EqualityDeleteGroup> const& equality_groups_on(
+    rmm::cuda_device_id device) const;
 
   /// Every data file of the snapshot (keyed as the manifest wrote the path) -> the groups that
   /// apply to it. Files with the same applicability share one list object. Empty when the table
@@ -213,7 +234,7 @@ struct IcebergDeleteData {
 
   [[nodiscard]] bool empty() const
   {
-    return positional_deletes.empty() && equality_delete_groups.empty() &&
+    return positional_deletes.empty() && equality_replicas.empty() &&
            equality_groups_by_data_file.empty();
   }
 };
@@ -233,14 +254,17 @@ EqualityDeleteGroup build_equality_group(std::vector<int32_t> key_field_ids,
                                          ::cuda::stream_ref stream,
                                          rmm::device_async_resource_ref mr);
 
-/// A stream and an allocator of the device equality-delete tables are built on. The caller makes
-/// that device current for the load.
+/// A device equality-delete tables are built on, with a stream and an allocator of it.
 struct equality_build_resources {
+  rmm::cuda_device_id device;
   ::cuda::stream_ref stream;
   rmm::device_async_resource_ref mr;
   /// The context an `s3://` delete file is opened on, with its statement's credentials. Unset
-  /// or returning null, such a file fails the load.
+  /// or returning null, such a file fails the load. The first entry's is the one used.
   std::function<std::shared_ptr<cucascade::io::ioctx>(std::string const& path)> remote_ioctx = {};
+  /// The GPU memory space @ref mr allocates from. Keys are copied between the devices of two
+  /// entries through it; null stages such a copy on the host, which then needs a space as well.
+  cucascade::memory::memory_space const* space = nullptr;
 };
 
 /**
@@ -252,10 +276,11 @@ struct equality_build_resources {
  * table has no deletes" and never "the deletes could not be read" — treating the second as the
  * first drops deletes silently and returns rows the table removed.
  *
- * @param metadata_ioctx Routes the local equality-delete parquet and footer reads. Single-GPU
- *                       is sufficient (planning-time reads). Shared because every datasource
- *                       opened on it co-owns it; nullptr throws.
- * @param equality_resources Required when @p discovery has equality deletes; absent throws.
+ * @param metadata_ioctx Routes the local equality-delete parquet and footer reads. Shared
+ *                       because every datasource opened on it co-owns it; nullptr throws.
+ * @param equality_resources One per GPU a scan task can run on; the delete tables are built
+ *                       once on each. The first reads the delete files and the others copy its
+ *                       keys. Required when @p discovery has equality deletes; empty throws.
  * The caller supplies discovery from the scan's snapshot-scoped inventory.
  */
 std::shared_ptr<const IcebergDeleteData> load_delete_payload(
@@ -263,7 +288,7 @@ std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   std::string const& table_path,
   std::shared_ptr<cucascade::io::ioctx> const& metadata_ioctx,
   iceberg_delete_discovery const& discovery,
-  std::optional<equality_build_resources> equality_resources = std::nullopt);
+  std::vector<equality_build_resources> equality_resources = {});
 
 /// Legacy payload builds. Monotonic; retained for the existing scan-local read oracle.
 uint64_t iceberg_delete_data_uncached_read_count();

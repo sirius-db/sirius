@@ -81,6 +81,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -1076,7 +1077,6 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
                         sirius::op::scan::verdict_reason::iceberg_equality_plan_unproven,
                         sirius::op::scan::verdict_reason::iceberg_equality_key_unsupported,
                         sirius::op::scan::verdict_reason::iceberg_equality_budget,
-                        sirius::op::scan::verdict_reason::iceberg_equality_multi_gpu,
                         sirius::op::scan::verdict_reason::iceberg_equality_remote,
                         sirius::op::scan::verdict_reason::iceberg_equality_file_format}) {
       auto index = static_cast<std::size_t>(reason);
@@ -2021,36 +2021,6 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
   }
 }
 
-TEST_CASE_METHOD(
-  GPUExecutionIcebergEqRulesFixture,
-  "gpu_execution iceberg - equality deletes decline when several GPUs are configured",
-  "[integration][gpu_execution][iceberg]")
-{
-  // The delete tables live on one device. This process runs on one GPU, so the device count the
-  // gate sees is overridden: what is covered is the refusal, not how devices are counted.
-  auto scan     = pinned_scan(table("iceberg_v2_eq_wide_delete_file"));
-  auto query    = "SELECT fruit, count FROM " + scan + " ORDER BY count;";
-  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
-  auto reset    = reset_after_test(counters->equality_gpu_count_for_testing);
-  auto index =
-    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_multi_gpu);
-
-  counters->equality_gpu_count_for_testing = 2;
-  auto before                              = sirius::test::get_transparent_execution_stats(*con);
-  expect_iceberg_rows(
-    query, gpu_route::plan_fallback, {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
-  auto after = sirius::test::get_transparent_execution_stats(*con);
-  CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
-  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
-  // A table without equality deletes never reaches that gate.
-  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(v2_path) + " ORDER BY count;",
-                      kPositionalDeleteRoute,
-                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
-
-  counters->equality_gpu_count_for_testing = 1;
-  expect_equality_rows(query, {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
-}
-
 TEST_CASE("iceberg equality deletes are built on the configured GPU rather than the planning one",
           "[iceberg][multi_gpu][isolated_context]")
 {
@@ -2113,6 +2083,180 @@ TEST_CASE("iceberg equality deletes are built on the configured GPU rather than 
     MultiFormatFixtureBase::collect_rows(*result) ==
     std::vector<std::vector<std::string>>{{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
   REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{0});
+}
+
+TEST_CASE("iceberg equality deletes are built once on a GPU configured with two memory spaces",
+          "[iceberg][isolated_context]")
+{
+  sirius::test::scratch_dir scratch{"iceberg_equality_two_spaces"};
+  {
+    std::ofstream config(scratch.path() / "two-spaces.yaml");
+    config << R"(sirius:
+  space:
+    gpu:
+      - { device_id: 0, memory_capacity: 512Mi }
+      - { device_id: 0, memory_capacity: 512Mi }
+    host:
+      - { numa_id: 0, memory_capacity: 4Gi, block_size: 1Mi, pool_size: 128 }
+)";
+  }
+  auto db = sirius::test::open_sirius_db(nullptr, scratch.path() / "two-spaces.yaml");
+  duckdb::Connection con(*db);
+  auto run = [&](std::string const& sql) {
+    auto result = con.Query(sql);
+    if (result->HasError()) UNSCOPED_INFO(result->GetError());
+    REQUIRE_FALSE(result->HasError());
+    return result;
+  };
+  run("LOAD iceberg");
+  auto const spaces = sirius::test::get_registered_sirius_context(con)
+                        ->get_memory_manager()
+                        .get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(spaces.size() == 2);
+  REQUIRE(spaces[0]->get_device_id() == spaces[1]->get_device_id());
+  std::array const idle{spaces[0]->get_available_memory(), spaces[1]->get_available_memory()};
+
+  // One DuckDB thread keeps the submitted plan idle: its tables are built and no task has run.
+  run("SET threads=1");
+  run("SET gpu_execution=true");
+  run("SET enable_duckdb_fallback=false");
+  auto const before = sirius::test::get_transparent_execution_stats(con);
+  auto prepared =
+    con.Prepare("SELECT fruit, count FROM iceberg_scan('" +
+                equality_fixture("iceberg_v2_eq_wide_delete_file") + "') ORDER BY count");
+  REQUIRE_FALSE(prepared->HasError());
+  duckdb::vector<duckdb::Value> parameters;
+  auto pending = prepared->Submit(parameters);
+  REQUIRE_FALSE(pending->HasError());
+  // A second set of tables on the same device would be held by the other space and never probed.
+  CHECK((spaces[0]->get_available_memory() < idle[0]) +
+          (spaces[1]->get_available_memory() < idle[1]) ==
+        1);
+  pending->Complete();
+  REQUIRE_FALSE(pending->HasError());
+  sirius::test::require_transparent_execution_delta(
+    before, sirius::test::get_transparent_execution_stats(con), 1, 0, 1, 0);
+  CHECK(
+    MultiFormatFixtureBase::collect_rows(*pending) ==
+    std::vector<std::vector<std::string>>{{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE("iceberg equality deletes are applied on every GPU a query can be admitted to",
+          "[iceberg][multi_gpu][isolated_context]")
+{
+  if (!sirius::test::has_gpus(2)) SKIP("Requires two visible GPUs");
+  // 0 admits a query to both GPUs, 1 to the first one only. An estimate that one GPU covers
+  // also admits it to the first only, but is made after the tables are built on both.
+  auto const [gpus_per_query, admission_bytes_per_gpu] =
+    GENERATE(table<int, uint64_t>({{0, 0}, {1, 0}, {0, uint64_t{1} << 40}}));
+  sirius::test::scratch_dir scratch{"iceberg_equality_2gpu"};
+  {
+    std::ofstream config(scratch.path() / "2gpu.yaml");
+    config << "sirius:\n  topology:\n    num_gpus: 2\n    gpus_per_query: " << gpus_per_query << R"(
+  memory:
+    gpu:
+      usage_limit_fraction: 0.2
+    host:
+      capacity_bytes: 32000000000
+      initial_number_pools: 2
+      pool_size: 128
+      block_size: 1048576
+)";
+  }
+  auto db = sirius::test::open_sirius_db(nullptr, scratch.path() / "2gpu.yaml");
+  duckdb::Connection con(*db);
+  auto run = [&](std::string const& sql) {
+    auto result = con.Query(sql);
+    if (result->HasError()) UNSCOPED_INFO(result->GetError());
+    REQUIRE_FALSE(result->HasError());
+    return result;
+  };
+  run("LOAD iceberg");
+  auto sirius = sirius::test::get_registered_sirius_context(con);
+  auto const spaces =
+    sirius->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(spaces.size() == 2);
+  auto const* second = spaces[0]->get_device_id() == 1 ? spaces[0] : spaces[1];
+  REQUIRE(second->get_device_id() == 1);
+  auto const idle = second->get_available_memory();
+
+  // The table's five data files differ in the delete groups that apply to them, so each is a
+  // batch of its own, and the batches alternate between the admitted devices.
+  std::mutex mutex;
+  std::set<int> devices;
+  std::size_t second_while_scanning    = idle;
+  auto counters                        = sirius->physical_counters();
+  auto reset                           = reset_after_test(counters->scan_execution_for_testing,
+                                counters->iceberg_equality_open_for_testing);
+  counters->scan_execution_for_testing = [&](bool, auto const&) {
+    std::lock_guard lock{mutex};
+    devices.insert(rmm::get_current_cuda_device().value());
+    second_while_scanning = std::min(second_while_scanning, second->get_available_memory());
+  };
+  // By the last delete file, the earlier groups are built on every device the load was given.
+  std::size_t second_while_loading            = idle;
+  counters->iceberg_equality_open_for_testing = [&](std::string const&) {
+    second_while_loading = std::min(second_while_loading, second->get_available_memory());
+  };
+
+  run("SET gpu_execution=true");
+  run("SET enable_duckdb_fallback=false");
+  run("SET admission_bytes_per_gpu=" + std::to_string(admission_bytes_per_gpu));
+  auto const query = "SELECT v FROM iceberg_scan('" +
+                     equality_fixture("iceberg_v2_eq_partition_shapes") + "') ORDER BY v";
+  auto const before                           = sirius::test::get_transparent_execution_stats(con);
+  auto gpu                                    = run(query);
+  auto const after                            = sirius::test::get_transparent_execution_stats(con);
+  counters->iceberg_equality_open_for_testing = {};
+  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 0);
+  // Five delete files, each read once: a second device copies the keys the first one decoded.
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads + 5);
+  {
+    std::lock_guard lock{mutex};
+    if (gpus_per_query == 1 || admission_bytes_per_gpu != 0) {
+      // No task runs on the second GPU, so it holds no tables while the scan runs.
+      CHECK(devices == std::set<int>{0});
+      CHECK(second_while_scanning == idle);
+      // A cap of one GPU builds nothing on the second. The estimate is made after the load, so
+      // its tables are built there and then released.
+      CHECK((second_while_loading == idle) == (gpus_per_query == 1));
+    } else {
+      CHECK(devices == std::set<int>{0, 1});
+    }
+  }
+
+  run("SET gpu_execution=false");
+  auto cpu = run(query);
+  sirius::test::require_transparent_execution_delta(
+    after, sirius::test::get_transparent_execution_stats(con), 0, 0, 0);
+  std::vector<std::vector<std::string>> const expected{
+    {"12"}, {"13"}, {"21"}, {"22"}, {"23"}, {"31"}, {"33"}, {"41"}, {"42"}, {"43"}, {"51"}, {"52"}};
+  CHECK(MultiFormatFixtureBase::collect_rows(*gpu) == expected);
+  CHECK(MultiFormatFixtureBase::collect_rows(*cpu) == expected);
+
+  // A load that fails on its last delete file, when the earlier groups are complete on every
+  // device, releases them all and leaves the next query able to run.
+  std::vector<std::size_t> available;
+  for (auto const* space : spaces)
+    available.push_back(space->get_available_memory());
+  run("SET gpu_execution=true");
+  std::size_t opened                          = 0;
+  counters->iceberg_equality_open_for_testing = [&](std::string const&) {
+    if (++opened == 5) throw std::runtime_error("injected: the last delete file");
+  };
+  auto failed                                 = con.Query(query);
+  counters->iceberg_equality_open_for_testing = {};
+  REQUIRE(failed);
+  CHECK(failed->HasError());
+  CHECK(opened == 5);
+  std::size_t index = 0;
+  for (auto const* space : spaces)
+    CHECK(space->get_available_memory() == available[index++]);
+  auto const before_retry = sirius::test::get_transparent_execution_stats(con);
+  auto retry              = run(query);
+  sirius::test::require_transparent_execution_delta(
+    before_retry, sirius::test::get_transparent_execution_stats(con), 1, 0, 1, 0);
+  CHECK(MultiFormatFixtureBase::collect_rows(*retry) == expected);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
@@ -4624,19 +4768,18 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto path = inventory_fixture("equality_bad_dv");
   auto scan = pinned_scan(path);
   REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
-  // The equality delete beside the vector is refused at the plan gate, here as on a multi-GPU
-  // configuration. That happens before the vector's manifest is expanded and its descriptor read.
+  // The equality delete beside the vector is refused at the plan gate, here by a row ceiling it
+  // exceeds. That happens before the vector's manifest is expanded and its descriptor read.
   auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
-  auto reset    = reset_after_test(counters->equality_gpu_count_for_testing);
-  counters->equality_gpu_count_for_testing = 2;
-  auto before                              = sirius::test::get_transparent_execution_stats(*con);
-  auto result                              = con->Query("SELECT fruit, count FROM " + scan);
+  auto reset    = reset_after_test(counters->statement_equality_limit_for_testing);
+  counters->statement_equality_limit_for_testing = 0;
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("SELECT fruit, count FROM " + scan);
   REQUIRE(result);
   REQUIRE(result->HasError());
-  CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("on a single GPU only"));
-  auto after = sirius::test::get_transparent_execution_stats(*con);
-  auto reason =
-    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_multi_gpu);
+  CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("0 rows per statement"));
+  auto after  = sirius::test::get_transparent_execution_stats(*con);
+  auto reason = static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_budget);
   CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);
   CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
   CHECK(after.iceberg_dv_manifest_reads == before.iceberg_dv_manifest_reads);
@@ -4772,6 +4915,37 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   CHECK(order_ok);
   CHECK(decodes > 0);
   CHECK(reader != owner);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "A deletion vector larger than one host block is applied on the GPU",
+                 "[integration][scan_preparation][iceberg][deferred]")
+{
+  // 140,000 deleted positions take 1.12 MB: two blocks of the 1 MiB host pool, which stop being
+  // neighbours once the pool has been used. `scattered` supplies 4 KiB blocks with gaps instead,
+  // so the 21 KB Puffin blob spans several blocks too.
+  auto scattered = GENERATE(false, true);
+  auto table     = inventory_fixture("dv_two_blocks");
+  auto counters  = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  preparation_test_state observed(counters, scattered ? std::optional<bool>(true) : std::nullopt);
+  if (scattered) {
+    observed.provider->grant_bytes          = 8 * 1024 * 1024;
+    observed.provider->quantum              = 4096;
+    observed.provider->seen->scatter_blocks = true;
+  }
+  // Two statements: a fresh pool hands the first one adjacent blocks. The second reads the
+  // deletes through row lineage. Applying only the first block of positions leaves 18,928 rows.
+  for (auto const* column : {"count", "file_row_number"}) {
+    auto const value = std::string(column);
+    expect_iceberg_rows("SELECT count(*), sum(" + value + "), min(" + value + "), max(" + value +
+                          ") FROM " + pinned_scan(table),
+                        gpu_route::gpu,
+                        {{"10000", "749925000", "0", "149985"}});
+  }
+  REQUIRE(observed.routes.size() == 2);
+  CHECK(observed.routes.front().second);
+  CHECK(observed.routes.back().second);
+  CHECK(observed.reads_started.size() == 2);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,

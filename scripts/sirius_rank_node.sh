@@ -259,6 +259,13 @@ if [ -n "${SIRIUS_RANK_LOG_ROOT:-}" ]; then
   export SIRIUS_LOG_DIR=$SIRIUS_RANK_LOG_ROOT/$(hostname -s)-$port
   mkdir -p "$SIRIUS_LOG_DIR"
 fi
+# A rank killed together with its launcher leaves its mirrors too: remove those whose process is
+# gone.
+for f in /dev/shm/sirius-exchange-*; do
+  [ -e "$f" ] || continue
+  owner=${f#/dev/shm/sirius-exchange-}
+  [ -d "/proc/${owner%%-*}" ] || rm -f "$f" 2> /dev/null || true
+done
 trap stop TERM INT
 backoff=1
 first=1

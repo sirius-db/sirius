@@ -114,8 +114,9 @@ class physical_planner : public sirius::planner::sirius_physical_plan_generator 
   }
 };
 
-/// Tables `big` and `big2` (100,000 rows each) and `small` (10 rows), with columns k and v, as
-/// Parquet files planned through read_parquet, and one-process plans of SQL over them.
+/// Tables `big` and `big2` (100,000 rows each), `huge` (1,000,000) and `small` (10 rows), with
+/// columns k and v, as Parquet files planned through read_parquet, and one-process plans of SQL
+/// over them.
 struct fixture {
   sirius::test::scratch_dir scratch{"distribute_plan"};
   std::unique_ptr<sirius::test::shared_test_env> env;
@@ -131,7 +132,7 @@ struct fixture {
       duckdb::DuckDB db(nullptr);
       duckdb::Connection gen(db);
       for (auto const& [name, rows] : std::vector<std::pair<std::string, int>>{
-             {"big", 100'000}, {"big2", 100'000}, {"small", 10}}) {
+             {"big", 100'000}, {"big2", 100'000}, {"huge", 1'000'000}, {"small", 10}}) {
         auto r = gen.Query("COPY (SELECT range AS k, range % 7 AS v FROM range(" +
                            std::to_string(rows) + ")) TO " + path(name) + " (FORMAT PARQUET)");
         REQUIRE_FALSE(r->HasError());
@@ -140,7 +141,7 @@ struct fixture {
     env = std::make_unique<sirius::test::shared_test_env>(config);
     con = std::make_unique<duckdb::Connection>(env->make_connection());
     REQUIRE_FALSE(con->Query("SET gpu_execution = false")->HasError());
-    for (auto const* name : {"big", "big2", "small"}) {
+    for (auto const* name : {"big", "big2", "huge", "small"}) {
       REQUIRE_FALSE(con
                       ->Query(std::string{"CREATE VIEW "} + name +
                               " AS SELECT * FROM read_parquet(" + path(name) + ")")
@@ -371,6 +372,24 @@ TEST_CASE("distribute_plan has a merged join's build CONCAT close its publicatio
               filters.max_bloom_bytes_per_gpu(), 3, filters.admitted_keys().size()));
       CHECK(closed_by_build_finalize(*join));
     }
+  }
+
+  SECTION("a merged Bloom is cut to the Bloom budget")
+  {
+    // The budget, 4x scan_task_batch_size, is 256 KiB: at 2 bytes a key and 4 Blooms a key on 3
+    // ranks, 2^15 keys, under the floor of 2^16. The build is estimated above 2^16 rows, so only
+    // a planner that applies the budget caps the Bloom at the floor.
+    REQUIRE_FALSE(f.con->Query("SET scan_task_batch_size = 65536")->HasError());
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(
+      f, "SELECT b.v, c.v FROM huge b JOIN huge c ON b.k = c.k WHERE b.v < 5 AND c.v < 5", 3);
+    REQUIRE(distribute(plans, c, f) == std::vector<std::string>(3));
+    auto* join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(join);
+    auto const& filters = join->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan();
+    REQUIRE(filters.cross_rank_merge());
+    REQUIRE(join->children.at(1)->estimated_cardinality > (std::size_t{1} << 16));
+    CHECK(filters.policy().scaled_bloom_max_keys == std::size_t{1} << 16);
   }
 
   SECTION("a broadcast join, and a plan for one process, wait for the join's own finalize")

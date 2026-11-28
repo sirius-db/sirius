@@ -123,8 +123,9 @@ class transport {
 
   struct options {
     /// send() blocks while its batch would put more than this in flight to peers; a larger batch
-    /// still goes once nothing else is queued. Bounds how long senders' batches stay pinned in
-    /// the queue (they are already in GPU memory, under their producers' reservations).
+    /// still goes once nothing else is queued, and a send that does not wait for room goes
+    /// whatever is queued. Bounds how long waiting senders' batches stay pinned in the queue
+    /// (they are already in GPU memory, under their producers' reservations).
     std::size_t max_queued_bytes = std::size_t{1} << 30;
     /// How long the engine may hold work, or wait for batches a peer's end promised, without
     /// progress before it fails: a lost peer is fail-stop (#2373), so this bounds how long one
@@ -179,8 +180,16 @@ class transport {
 
   /// Sends @p batch, on the GPU, to rank @p to on @p stream. Batches of one stream to one rank
   /// may be delivered in any order. A batch with no rows is dropped for a peer and not counted.
+  /// With @p wait_for_room false the batch is queued at once, behind what is already queued, and
+  /// counts toward options::max_queued_bytes: a sender that waits queues nothing more while the
+  /// queue, with its batch, is over that. For a collective's table, which is worth less the
+  /// later it arrives (a join's filter is for a scan that runs meanwhile); one unsliced batch
+  /// queued for every rank is pinned once.
   /// @throws the transport's error once it has failed.
-  void send(stream_id stream, rank_t to, std::shared_ptr<cucascade::data_batch> batch);
+  void send(stream_id stream,
+            rank_t to,
+            std::shared_ptr<cucascade::data_batch> batch,
+            bool wait_for_room = true);
 
   /// No more batches of @p stream to rank @p to. Call once per stream and rank, after its last
   /// send(): a second close, or a send after it, fails the transport on the peer. The stream's

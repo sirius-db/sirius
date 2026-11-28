@@ -16,6 +16,8 @@ cd "$SLURM_SUBMIT_DIR"
   exit 1
 }
 export SIRIUS_CLUSTER=$SLURM_JOB_ID SIRIUS_GATEWAY_MIN_RANKS=$SLURM_NTASKS
+# Every node starts its ranks in the submit directory: one Sirius log folder per rank.
+export SIRIUS_RANK_LOG_ROOT=${SIRIUS_RANK_LOG_ROOT:-$SLURM_SUBMIT_DIR/log}
 state=$HOME/.sirius/gateways/$SIRIUS_CLUSTER
 conf=$state/gateway.conf
 rm -f "$conf"

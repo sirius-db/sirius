@@ -39,7 +39,8 @@ class exchange_service;
  * @brief Every rank contributes one small table on @p stream; each gets all of them.
  *
  * Blocks until every rank's table has arrived, so every rank must call it with the same stream
- * id. Meant for small tables, such as sort samples and filters. Never call it on the transport's
+ * id. Meant for small tables, such as sort samples and filters; they are queued without waiting
+ * for room under transport::options::max_queued_bytes. Never call it on the transport's
  * engine thread (e.g. from an inbound callback or a finalize it triggers): that thread delivers
  * the tables this waits for. Tables copied back from host are ordered on @p cuda_stream.
  *

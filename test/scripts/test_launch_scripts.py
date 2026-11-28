@@ -149,7 +149,12 @@ class LauncherEnv(unittest.TestCase):
             Path(tmp, "sirius_net.sh").write_text(
                 f"sirius_rail_devices() {{ {found}; }}\n"
             )
-            show = "$UCX_TLS $UCX_NET_DEVICES ${SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING:-unset}"
+            # Every variable has a fallback: bash -u would end a case that left one unset, and
+            # the cases that expect a failure would pass on that.
+            show = (
+                "$UCX_TLS ${UCX_NET_DEVICES:-unset} "
+                "${SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING:-unset}"
+            )
             return subprocess.run(
                 [
                     "bash",
@@ -190,11 +195,13 @@ class LauncherEnv(unittest.TestCase):
         done = self.source("mlx5_0:1,mlx5_1:1", {"SIRIUS_UCX_RAILS": "rails"})
         self.assertNotEqual(done.returncode, 0)
         self.assertEqual(done.stdout, "")
+        self.assertIn("SIRIUS_UCX_RAILS takes 0 or 1", done.stderr)
 
     def test_rails_without_rail_nics_fail(self):
         done = self.source("", {"SIRIUS_UCX_RAILS": "1"})
         self.assertNotEqual(done.returncode, 0)
         self.assertEqual(done.stdout, "")
+        self.assertIn("needs GPU rail NICs", done.stderr)
 
 
 class RailDevices(unittest.TestCase):
@@ -227,14 +234,15 @@ class RailDevices(unittest.TestCase):
     def test_one_port_per_device(self):
         done = self.rails(
             [
-                ("mlx5_0", 1, "rail0", "4: ACTIVE", 400000, False),
+                ("mlx5_0", 1, "eth0", "4: ACTIVE", 200000, False),
                 ("mlx5_1", 1, "rail1", "4: ACTIVE", 400000, False),
-                ("mlx5_2", 1, "eth0", "4: ACTIVE", 200000, False),
-                ("mlx5_3", 1, "eth1", "4: ACTIVE", 400000, True),
+                ("mlx5_2", 1, "rail2", "4: ACTIVE", 400000, False),
+                ("mlx5_3", 1, "eth3", "4: ACTIVE", 400000, True),
                 ("mlx5_4", 1, "rail4", "1: DOWN", 400000, False),
+                ("mlx5_5", 1, "eth5", "4: ACTIVE", 200000, False),
             ]
         )
-        self.assertEqual(done.stdout, "mlx5_0:1,mlx5_1:1\n", done.stderr)
+        self.assertEqual(done.stdout, "mlx5_1:1,mlx5_2:1\n", done.stderr)
 
     def test_a_port_other_than_1(self):
         done = self.rails(
@@ -286,6 +294,19 @@ class RankCpus(unittest.TestCase):
         self.assertEqual(
             sorted(self.share("0000:83:00.0")), [4, 5, 6, 7, 12, 13, 14, 15]
         )
+
+    def test_a_rank_started_with_fewer_cpus_keeps_them(self):
+        with mock.patch.object(
+            sirius_rank_cpus.os, "sched_getaffinity", return_value={2, 3, 8}
+        ), mock.patch.object(
+            sirius_rank_cpus.os, "cpu_count", return_value=16
+        ), mock.patch.object(
+            sirius_rank_cpus.sys, "argv", ["sirius_rank_cpus.py", "auto", "0"]
+        ), mock.patch(
+            "builtins.print"
+        ) as printed:
+            sirius_rank_cpus.main()
+        printed.assert_called_once_with(3, "2-3,8")
 
     def test_ranges(self):
         self.assertEqual(sirius_rank_cpus.ranges({0, 1, 8, 9, 12}), "0-1,8-9,12")
