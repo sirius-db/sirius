@@ -258,8 +258,8 @@ std::string describe(const sirius::sirius_config& c, bool in_effect = false)
     "op.dense", o.enable_dense_count_join)("op.delim", o.enable_delim_aggregate_reuse)(
     "op.minmax", o.enable_exists_minmax_rewrite)(
     "op.partial", o.enable_partial_aggregate_below_join)("op.carry", o.enable_subquery_key_carry)(
-    "op.exists", o.enable_exists_from_aggregate)("op.footer_remote",
-                                                 o.parquet_footer_statistics_max_remote_reads)(
+    "op.exists", o.enable_exists_from_aggregate)("op.having", o.enable_complete_group_having)(
+    "op.footer_remote", o.parquet_footer_statistics_max_remote_reads)(
     "op.footer_local", o.parquet_footer_statistics_max_local_reads)(
     "op.dense_bytes", o.dense_count_join_max_bytes)("op.dense_fraction",
                                                     o.dense_count_join_memory_fraction)(
@@ -618,6 +618,7 @@ TEST_CASE("every key of a configuration reaches its runtime field", "[config][co
   CHECK_FALSE(o.enable_partial_aggregate_below_join);
   CHECK(o.enable_subquery_key_carry);
   CHECK(o.enable_exists_from_aggregate);
+  CHECK_FALSE(o.enable_complete_group_having);
   CHECK(o.parquet_footer_statistics_max_remote_reads == 64);
   CHECK(o.parquet_footer_statistics_max_local_reads == -1);
   CHECK(o.admission_bytes_per_gpu == 4 * GiB);

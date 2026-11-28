@@ -264,6 +264,11 @@ struct operator_options : block_base<operator_options> {
       .fallback(defaults().enable_exists_from_aggregate)
       .describe("drop a correlated EXISTS covered by an aggregate subquery")
       .build();
+  config_option<bool> enable_complete_group_having =
+    option<bool>("enable_complete_group_having")
+      .fallback(defaults().enable_complete_group_having)
+      .describe("apply a HAVING before the exchange to groups the Parquet footers prove whole")
+      .build();
   /// Uncached footers the footer-statistics pass reads for one scan: -1 no limit, 0 cached only.
   config_option<std::int64_t> parquet_footer_statistics_max_remote_reads =
     option<std::int64_t>("parquet_footer_statistics_max_remote_reads")
@@ -356,6 +361,7 @@ struct operator_options : block_base<operator_options> {
       enable_partial_aggregate_below_join,
       enable_subquery_key_carry,
       enable_exists_from_aggregate,
+      enable_complete_group_having,
       parquet_footer_statistics_max_remote_reads,
       parquet_footer_statistics_max_local_reads,
       admission_bytes_per_gpu,
