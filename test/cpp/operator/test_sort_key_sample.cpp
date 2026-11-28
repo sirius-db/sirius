@@ -217,7 +217,7 @@ TEST_CASE("Sort key sample holds its cap when several threads add batches", "[so
       try {
         rmm::cuda_stream stream;
         for (auto i = t; i < batches.size(); i += num_threads) {
-          add(sample, *batches[i], *space, stream.view());
+          add(sample, *batches[i], *space, ::cuda::stream_ref{stream.value()});
         }
       } catch (...) {
         errors[t] = std::current_exception();
