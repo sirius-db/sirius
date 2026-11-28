@@ -1217,6 +1217,9 @@ SET enable_dictionary_carrier = true;
 
 ### Pipeline / Operator
 
+The Iceberg equality-delete key-bound limits under [Operator Parameters](#operator-parameters)
+also accept connection-level `SET` overrides using the same names.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
@@ -1226,9 +1229,6 @@ SET enable_dictionary_carrier = true;
 | `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows × 16 B) |
 | `max_build_probe_resident_bytes` | 8× batch default | Max per-GPU decoded folded build payload kept GPU-resident by a BUILD_PROBE join |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
-| `iceberg_equality_key_bounds_max_bytes` | 256 MiB | Host bytes of Iceberg equality-delete key bounds one scan's plan keeps; `0` turns the pruning off |
-| `iceberg_equality_key_bounds_max_comparisons` | 4194304 | Comparisons of a key's bounds one plan makes; `0` turns the pruning off |
-| `iceberg_equality_key_bound_max_length` | 64 | Longest key bound, in bytes, a plan keeps and compares; `0` turns the pruning off |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
 | `enable_delim_aggregate_reuse` | true | Compute decorrelated subquery aggregates from the delim CTE's outer rows |
