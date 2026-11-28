@@ -145,6 +145,30 @@ bool sirius_physical_grouped_aggregate::has_stddev_samp() const
   return has_slot<stddev_samp_slot>(aggregate_slots);
 }
 
+std::set<std::size_t> sirius_physical_grouped_aggregate::value_read_inputs() const
+{
+  std::set<std::size_t> inputs;
+  auto const read = [&](int idx) {
+    if (idx >= 0) { inputs.insert(static_cast<std::size_t>(idx)); }
+  };
+  for (std::size_t i = 0; i < cudf_aggregates.size(); ++i) {
+    if (cudf_aggregates[i] == cudf::aggregation::Kind::COUNT_ALL ||
+        cudf_aggregates[i] == cudf::aggregation::Kind::COUNT_VALID) {
+      continue;
+    }
+    if (i < cudf_aggregate_idx.size()) { read(cudf_aggregate_idx[i]); }
+    if (i < cudf_aggregate_struct_col_indices.size()) {
+      for (auto const idx : cudf_aggregate_struct_col_indices[i]) {
+        read(idx);
+      }
+    }
+  }
+  for (auto const idx : make_carried_block_layout(aggregate_slots).inputs) {
+    read(idx);
+  }
+  return inputs;
+}
+
 std::vector<std::optional<cudf::data_type>>
 sirius_physical_grouped_aggregate::wide_integer_sum_partial_types() const
 {
@@ -182,7 +206,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
-  auto const carried = carried_inputs(aggregate_slots);
+  auto const carried = make_carried_block_layout(aggregate_slots);
   for (auto const& input_batch : input_batches) {
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
@@ -212,7 +236,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
       cudf_aggregates,
       cudf_aggregate_idx,
       cudf_aggregate_struct_col_indices,
-      carried,
+      carried.inputs,
+      carried.order,
       stream,
       *space,
       batch_telemetry(),

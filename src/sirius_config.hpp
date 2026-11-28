@@ -135,8 +135,9 @@ constexpr bool DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE = true;
 /// table into one scan and a per-key MIN/MAX aggregate.
 constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
 
-/// Aggregate below an inner join that only adds variable-width columns the aggregate groups by,
-/// and combine the partial results above it.
+/// Aggregate below a join that only adds variable-width columns the aggregate groups by, and
+/// combine the partial results above it. The join is an inner join, or an outer join that keeps
+/// every row of the aggregated side.
 constexpr bool DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN = true;
 
 /// Restrict every table a delim subquery ties to its correlation column by an equality, before
@@ -345,6 +346,12 @@ struct operator_params {
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
 
+  /// Keep a VARCHAR column whose Simpatico pin is dictionary-encoded as a cuDF DICTIONARY32 carrier
+  /// (keys plus codes) past the scan, so a grouped aggregate groups on its codes instead of decoded
+  /// strings. Independent of `enable_compressed_materialization`. A column the scan filters on
+  /// keeps its native carrier.
+  bool enable_dictionary_carrier = false;
+
   /// Prove pinned parquet columns distinct at pin time and let the join planner treat a build key
   /// proven distinct like a PRIMARY KEY, so the join takes the single-pass distinct hash join.
   /// When on, pin_table observes every column of a parquet pin (and of a native table's pin when
@@ -374,9 +381,10 @@ struct operator_params {
   /// `rewrite_correlated_inequality_exists`.
   bool enable_exists_minmax_rewrite = config::DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE;
 
-  /// Compute `SUM`/`MIN`/`MAX` per join key below an inner join whose other side only adds
+  /// Compute `SUM`/`MIN`/`MAX` per join key below a join whose other side only adds
   /// variable-width group-by columns, so the join repeats them once per key instead of once per
-  /// row. See `push_partial_aggregates_below_joins`.
+  /// row. The join is an inner join, or an outer join that keeps every row of the aggregated
+  /// side. See `push_partial_aggregates_below_joins`.
   bool enable_partial_aggregate_below_join = config::DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN;
 
   /// Under `delim_join_as_cte`, a subquery restricted to the outer rows' keys on one column also
@@ -413,6 +421,11 @@ struct operator_params {
   /// Bytes assumed per variable-width column (VARCHAR, LIST, etc.) when computing
   /// per-row byte estimates for admission. Only used when admission_bytes_per_gpu > 0.
   uint64_t avg_variable_column_bytes = 32;
+
+  /// Most uncached footers the footer-statistics pass reads for one scan, remote and local files
+  /// apart: -1 no limit, 0 cached only. Explicit analysis and pin warming are exempt.
+  std::int64_t parquet_footer_statistics_max_remote_reads = 1024;
+  std::int64_t parquet_footer_statistics_max_local_reads  = 16384;
 };
 
 struct telemetry_config {
@@ -496,6 +509,11 @@ class configuration_input_error : public std::runtime_error {
 };
 
 class parsed_sirius_config;
+
+namespace config {
+class node;
+struct user_config;
+}  // namespace config
 
 /// The egress NIC a REST pool would use (the configured @c rest.interface, else the default
 /// route's interface), as cuCascade discovers it; @c nullopt when there is none or it cannot be
@@ -716,9 +734,22 @@ struct sirius_config {
 class parsed_sirius_config {
  public:
   parsed_sirius_config();
+  /// The YAML file at @p path, which holds one document. @throws configuration_input_error naming
+  /// @p path when it cannot be read, is not well-formed YAML, or a value or a rule fails.
   static parsed_sirius_config from_file(const std::filesystem::path& path);
+  /// A document yaml-cpp has loaded; errors name @p source_path when given.
   static parsed_sirius_config from_node(const YAML::Node& root,
                                         const std::filesystem::path& source_path = {});
+  /// A document config::parse_yaml has read; errors name @p source_path when given.
+  /// @throws configuration_input_error when a value or a rule fails.
+  static parsed_sirius_config from_document(const config::node& document,
+                                            const std::filesystem::path& source_path = {});
+  /// The same intent from the typed user configuration: its user-defined values are read back, so
+  /// fallbacks fill in the rest and every block's rules hold, also for a configuration built in
+  /// code. @throws configuration_input_error when a value or a rule fails.
+  static parsed_sirius_config from_user_config(const config::user_config& user);
+  /// What the user configured, read back: the values the user defined, fallbacks for the rest.
+  [[nodiscard]] const config::user_config& get_user_config() const noexcept;
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
@@ -734,7 +765,53 @@ class parsed_sirius_config {
  private:
   struct Impl;
   explicit parsed_sirius_config(std::shared_ptr<const Impl> impl);
+  /// from_user_config, naming @p source_path in resolution errors.
+  static parsed_sirius_config from_user_config(const config::user_config& user,
+                                               const std::filesystem::path& source_path);
   std::shared_ptr<const Impl> impl_;
 };
+
+/**
+ * @brief Resolve what the user configured against this machine: memory spaces through the
+ * cuCascade configurator, hardware-derived defaults for every value the user left unset (thread
+ * and reactor counts, batch sizes, REST limits from the egress NIC), and the checks that need
+ * them.
+ *
+ * @param probe finds the egress NIC when a value derived from it is unset; tests inject one.
+ * @throws configuration_input_error when the configuration cannot work on @p topology.
+ */
+[[nodiscard]] sirius_config create_sirius_config(
+  const config::user_config& user,
+  const cucascade::memory::system_topology_info& topology,
+  const egress_nic_probe& probe = discover_egress_nic);
+
+/**
+ * @brief The user configuration that reproduces @p resolved: @p user's values and fallbacks, plus
+ * every value resolution derived from the machine for an option @p user left unset (thread and
+ * reactor counts, scan budgets, REST limits, preparation limits, batch sizes, the GPU count, and
+ * the initial host pools when every NUMA node got the same count). Resolving it again on the same
+ * machine gives a configuration that runs with the same values.
+ */
+[[nodiscard]] config::user_config effective_user_config(const config::user_config& user,
+                                                        const sirius_config& resolved);
+
+/**
+ * @brief The YAML text of the effective configuration of @p resolved, resolved from @p user:
+ * effective_user_config with every value spelled out, behind a comment saying what the file is.
+ * Developer-only settings the user did not define are left out unless @p developer; the rest
+ * still resolves to the same values, since only fallbacks and values derived alike are left out.
+ */
+[[nodiscard]] std::string effective_config_text(const sirius_config& resolved,
+                                                const config::user_config& user,
+                                                bool developer);
+
+/**
+ * @brief Write effective_config_text (developer-only settings in developer mode only) to @p path:
+ * creates the directory and replaces the file whole. @throws std::exception when it cannot be
+ * written.
+ */
+void write_effective_config(const std::filesystem::path& path,
+                            const sirius_config& resolved,
+                            const config::user_config& user);
 
 }  // namespace sirius

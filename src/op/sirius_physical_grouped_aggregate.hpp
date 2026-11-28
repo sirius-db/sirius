@@ -167,11 +167,15 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   [[nodiscard]] bool has_stddev_samp() const;
 
+  //! The input columns an aggregate or carried slot reads by value. COUNT(*) holds a placeholder
+  //! input index and COUNT reads only the validity mask, so neither is a value read.
+  [[nodiscard]] std::set<std::size_t> value_read_inputs() const;
+
   //! Alternate carriers of the local output, for set_alternate_physical_types(). The partial of a
   //! wide integer SUM, or of an aggregate whose result is HUGEINT, is INT64 or DECIMAL128 with
   //! scale 0; its column's alternate is whichever of the two is not its native carrier. Empty when
   //! no slot has two carriers or `types` is not one column per cuDF aggregate after the group
-  //! columns, followed by the FIRST carried columns.
+  //! columns, followed by the carried block that `make_carried_block_layout` describes.
   [[nodiscard]] std::vector<std::optional<cudf::data_type>> wide_integer_sum_partial_types() const;
 
   // Source interface

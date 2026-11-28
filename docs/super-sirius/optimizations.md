@@ -208,7 +208,7 @@ Because the merged plan reads one view fewer times than the original, `compare_r
 
 **Motivation:** TPC-H q10 sums `lineitem ⋈ orders` revenue and groups by seven keys, four of them `customer` strings. The join with `customer` repeats those strings for every matching lineitem row (0.7 GB becomes 9.7 GB at SF500), and every operator up to the group-by carries them. Summing each customer's rows first lets the join bring in each customer's strings once.
 
-**Mechanism:** `push_partial_aggregates_below_joins` runs on the transparent path's copy of DuckDB's optimized plan (`sirius_optimizer_hook`), after the subquery rewrites. For an aggregate over inner joins whose arguments all come from one subtree `S`:
+**Mechanism:** `push_partial_aggregates_below_joins` runs on the transparent path's copy of DuckDB's optimized plan (`sirius_optimizer_hook`), after the subquery rewrites. For an aggregate over joins whose arguments all come from one subtree `S`:
 
 ```
 AGGREGATE(groups; sum(x))                 AGGREGATE(groups; sum(partial))
@@ -221,20 +221,26 @@ AGGREGATE(groups; sum(x))                 AGGREGATE(groups; sum(partial))
 
 DuckDB's own `PARTIAL_AGGREGATE_PUSHDOWN` optimizer stays disabled (`unsupported_optimizers.hpp`). It carries aggregate states through `combine` and `finalize`, which the GPU cannot run, and it only considers the join directly under the aggregate, which in q10 is `nation`.
 
-**Measured** (TPC-H SF500 Parquet, one RTX PRO 6000, warm): q10's `customer` join outputs 21.0 M rows (3.8 GB) instead of 57.4 M (10.4 GB). The query runs in 0.30 s instead of 0.39 s with its columns pinned on the GPU, and in 1.52 s instead of 1.64 s unpinned. TPC-DS q11 at SF100 goes from 0.29 s to 0.18 s pinned, and the TPC-Havoc Q18 variants that filter a per-order total with `HAVING` from about 14.7 s to 10.3 s unpinned.
+**Measured** (TPC-H SF500 Parquet, one RTX PRO 6000, warm): q10's `customer` join outputs 21.0 M rows (3.8 GB) instead of 57.4 M (10.4 GB). The query runs in 0.30 s instead of 0.39 s with its columns pinned on the GPU, and in 1.52 s instead of 1.64 s unpinned. The TPC-Havoc Q18 variants that filter a per-order total with `HAVING` go from about 14.7 s to 10.3 s unpinned.
 
 **When it applies:**
-- Aggregates are `SUM` (or `sum_no_overflow`) over a DECIMAL stored in at most 64 bits, `MIN` or `MAX`, without DISTINCT, FILTER or ORDER BY. A sum of such sums is the same DECIMAL(38) total. COUNT and AVG would need a cast above the aggregate, integer sums combine through a 128-bit sum that is range-checked on every merge, and floating-point sums depend on the order of addition.
-- Arguments read only `S`, are not volatile, and use only columns, constants, `+`, `-`, `*` and sub-expressions that cannot throw, because they now run on rows a join above might have removed. Arithmetic can still overflow on such a row, as it can with DuckDB's own pushdown.
-- Only INNER comparison joins lie between the aggregate and `S`. Projections directly under the aggregate are inlined.
+- Aggregates are `SUM` (or `sum_no_overflow`) over an integer of up to 64 bits (TINYINT to BIGINT), a DECIMAL of up to 18 digits, a FLOAT or a DOUBLE, `MIN` or `MAX`, without DISTINCT, FILTER or ORDER BY. DuckDB sums such an integer into a HUGEINT and such a DECIMAL into a DECIMAL(38), and a sum of such sums is the same total in the same type. A `SUM` over a HUGEINT or a wider DECIMAL is left alone (`sum:hugeint`, `sum:decimal128`): the GPU refuses such a sum when a batch's row count times its largest value could pass 128 bits, and below the join the batch holds rows the join would have removed, so one huge value on a key that matches nothing would send the query to the CPU. COUNT and AVG would need a cast above the aggregate.
+- A floating-point `SUM` depends on the order of addition, which the GPU does not fix: the same query's sum already differs from one run to the next, in its last digits and by more where large values cancel or a running sum overflows. Adding per key first is one more order over the same values, since each group of the aggregate takes its rows from a single key (the condition on the keys below). A filter on such a sum, such as `HAVING sum(x) = 0`, can keep different groups for the same reason it can between two runs.
+- Arguments read only `S`, are not volatile, and can throw only through `+`, `-` and `*`, which may sit under `CASE`, `AND`, `OR` and functions that cannot fail themselves, such as comparisons. They now run on rows a join above might have removed. Arithmetic can still overflow on such a row. Accepting it is Sirius's own rule: DuckDB's pushdown declines an argument that can throw unless column statistics prove it cannot.
+- Only comparison joins that keep `S`'s matching rows lie between the aggregate and `S`: INNER joins, and LEFT or RIGHT joins on whose kept side `S` is. A join that pads `S` with NULLs, or a FULL join, declines. Projections directly under the aggregate are inlined.
 - The new group keys are fixed-width, fewer than the aggregate's own, and at most one more than the join's keys.
-- Every other side on the way up consists of scans estimated to keep at least 70% of their unfiltered rows, joined to each other. A join against a filtered side discards rows, and aggregating them first would be wasted. This leaves alone q10 when `lineitem` is joined last, and TPC-H q18, whose other side is restricted by its `IN` subquery.
+- The aggregate groups by every key of the new aggregate, or by the column a join on the way up equates with that key, as q10 groups by `c_custkey`. It then builds a group per key anyway, over wide columns, and the new aggregate spares it rows. An aggregate that groups more coarsely, such as a total per brand, is cheap as it is: a group per key below it pays only when keys repeat often, and costs up to 77% more time when they do not. A column of `S` that a join further up reads is a key as well: a join on the order key above would have the new aggregate group by every order. An outer join's equality does not count: it leaves the other side's column NULL for every key without a match, so an aggregate that groups by that column folds all of those keys into one group.
+- Failing that, the scan statistics show that the keys repeat: `S`'s row estimate divided by the most groups its keys can form is at least 8. On TPC-H SF500 the rewrite measured 22% slower on unpinned data at 4 rows per key, and from 10 rows per key between 8% slower and 91% faster, most where the aggregate above groups nearly as finely as the keys. The most values a key can hold comes from the scan it is read from: for a native table the distinct count DuckDB keeps for the column, for a Parquet scan the range `max - min + 1` of an integer, DATE or DECIMAL of up to 18 digits across its footers, and never more than the rows that scan is estimated to return. A key that an equality filter leaves one value counts once, and several keys multiply. A key the statistics do not limit shows nothing, and the aggregate is left alone (`keys:not-grouped`): a string in Parquet, integers spread over a range wider than the rows, or any column of a Parquet scan whose footers the planner did not read, because the scan is over `parquet_footer_statistics_max_remote_reads` or `parquet_footer_statistics_max_local_reads` or because `parquet_footer_statistics` is off. So is a floating-point `SUM` whatever the statistics show: where several keys share a group above, each key's sum can overflow where the sum of them all would not.
+- No key is proven to hold each value once (`keys:unique`): a column that the pinned copy of `S`'s Parquet files found distinct (`pin_table_prove_unique_keys`), or a native table's PRIMARY KEY, where `S` is that scan under filters and projections. Grouped by such a key the new aggregate would have a group for every row and combine nothing, whatever the aggregate above groups by.
+- Every other side of an inner join on the way up consists of scans estimated to keep at least 70% of their unfiltered rows, joined to each other. A join against a filtered side discards rows, and aggregating them first would be wasted. An outer join that keeps `S`'s rows discards none, so its other side is not judged. This leaves alone q10 when `lineitem` is joined last, and TPC-H q18, whose other side is restricted by its `IN` subquery.
 - A join that computes its key from a column of `S` (`1 / x`, a cast) does so only from integer, DECIMAL, BOOLEAN, DATE, TIME, TIMESTAMP or UUID columns. Values of other types can group together and still differ: `0.0` and `-0.0` are one group, but `1 / x` sends them to opposite infinities. A bare column of any fixed-width type is fine.
 - `S` is not already grouped.
 
+**When it does not apply:** an aggregate over a join that is left alone logs why at debug level, as `Not aggregating below a join that adds group-by payload: <reasons>`. The reasons are fixed names such as `aggregate:count_star`, `keys:not-grouped`, `keys:too-many-extra` or `other-side:filtered`, and every independent one is listed, so the line tells which of the conditions above would all have to be lifted for that aggregate. The smallest share of its rows a joined scan is estimated to keep is appended when it is known, and so is the number of rows per key the statistics show, at least. TPC-DS q11 and q74 are left alone (`keys:not-grouped`) although the rewrite would speed them up: q11 at SF100 runs in 0.29 s with its columns pinned, against 0.19 s rewritten. They group by `c_customer_id`, which is unique per customer but is not the join key, and their two keys, customer and year, can form more groups than there are rows.
+
 **Code path:** `src/planner/sirius_plan_partial_aggregate_pushdown.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp`, which plans without it if it throws.
 
-**Config:** `enable_partial_aggregate_below_join` (default `true`, see [Configuration](configuration.md)).
+**Config:** `enable_partial_aggregate_below_join` (default `true`, see [Configuration](configuration.md)). The 70% share, the one extra key and the 8 rows per key are the test-only settings `partial_aggregate_min_kept_share`, `partial_aggregate_max_extra_keys` and `partial_aggregate_min_rows_per_key`.
 
 ### Subquery Keys Carried Across an Equality
 
@@ -343,7 +349,7 @@ The aggregate has a group for a key exactly when `S` has a row for it, which is 
 3. For up to 8 groups, `group_ids_kernel` writes a one-byte group id per row and `aggregate_columns_kernel<MaxGroups>` aggregates one column at a time with per-thread register accumulators and predicated adds (no atomics), followed by 128-bit warp and block reductions. 9 to 64 groups use per-warp shared-memory accumulators instead.
 4. Per-block totals are combined into DECIMAL128 sums and INT64 counts, and the keys are gathered from the representative rows.
 
-It applies only to one or two non-null one-character STRING keys, at most 64 groups, and SUM, COUNT or COUNT(*) over non-null DECIMAL64 or INT64 columns whose values are small enough for 64-bit partial sums (checked per row). Anything else returns `nullptr` and the cuDF path runs unchanged.
+It applies only to one or two non-null keys that are one-character STRINGs or [dictionary carriers](#dictionary-carrier) of at most 256 keys (whose codes stand in for the character), at most 64 groups, and SUM, COUNT or COUNT(*) over non-null DECIMAL64 or INT64 columns whose values are small enough for 64-bit partial sums (checked per row). Anything else returns `nullptr` and the cuDF path runs unchanged.
 
 **Code path:**
 - `src/cuda/low_cardinality_groupby.cu` — kernels and host orchestration
@@ -592,6 +598,28 @@ result materialization restore native carriers.
 - `src/compression/simpatico_codegen/src/decode/jit/renderer.cpp` — `out_dtype` rendering
 
 **Config:** Always on. TPC-H SF1000 on a GB300: q1 0.769 s → 0.752 s (−17 ms); the other queries are unchanged within noise.
+
+### Dictionary Carrier
+
+**Motivation:** Many group-by keys are low-cardinality strings that a Simpatico pin already stores as a dictionary. Decoding them to a cuDF STRING column materializes every row's bytes, and the grouped aggregate then hashes those bytes (or dictionary-encodes them again for long keys).
+
+**Mechanism:** The planner marks such a VARCHAR scan output as a DICTIONARY32 carrier (keys plus INT32 codes) in the compressed-materialization sidecar. A column the scan filters on is never carried. The pin's decode then returns the keys and codes of the column's `dictionary` plan instead of gathering strings. At pin time the pin records the bytes of each chunk's dictionary keys in its `column_storage` matrix (`pinned_column_storage_meta::dictionary_keys_bytes`), and a column qualifies when some chunk's keys fit the carrier cap of 512 KiB (`dictionary_carrier_max_keys_bytes`). Both tiers qualify; the tier narrowing policy judges a host-tier pin's dictionary carriers but leaves its narrow numeric columns alone.
+
+A planned carrier is a hint, not a promise: any batch may carry the column as its STRING values instead, and every consumer planned for the carrier accepts either form (`sirius_physical_operator::is_alternate_physical_type`). The decode returns strings for a chunk stored without a dictionary or whose keys exceed the cap; an empty table of a carrier is an empty STRING column. Where forms could mix, the dictionaries are decoded: concatenation (`concatenate_carriers`, which also decodes a column whose merged keys exceed the cap) and late materialization. Whatever makes a carrier enforces the cap, so no consumer measures keys: an owned column's keys size (`dictionary_keys_bytes`) is known on the host, while measuring a view's would wait on the stream. A hash partition decodes a carrier key, so its rows hash as their strings do, and a carrier whose keys times the partition count exceed an eighth of the batch, since every partition copies the keys whole; it reads the keys size from its partitioned copy. A distributed query plans no carrier: the exchange wire cannot send a dictionary.
+
+The carrier lives from the scan through filters, projections, and hash-join payloads to the grouped aggregate, where it ends. The aggregate groups on the codes and decodes the output codes against the carrier's keys, so only one row per group is gathered and the partial results leave as STRING. COUNT requests over a carrier read its codes, since cuDF's hash group-by rejects dictionary value columns and would send the whole batch down the sort path. The low-cardinality kernel keys on the codes of a dictionary with at most 256 keys. Anything else that reads the column (expressions, join keys, results) restores it to STRING through `cast_through_rep`.
+
+**Code path:**
+- `src/planner/sirius_plan_get.cpp` — `scan_physical_schema()`
+- `src/pin_table.cpp` — `record_string_dictionaries()`
+- `src/compression/simpatico_codegen/src/plan/decompress.cpp` — dictionary output of the decode
+- `src/helper/numeric_narrowing.cpp` — `decode_dictionary_carrier()`, `concatenate_carriers()`
+- `src/op/partition/gpu_partition_impl.cpp` — `decode_costly_carriers()`
+- `src/op/aggregate/gpu_aggregate_impl.cpp`, `src/cuda/low_cardinality_groupby.cu` — grouping on codes
+
+**Config:** `enable_dictionary_carrier` (default: `false`), independent of `enable_compressed_materialization`. See [Configuration](configuration.md#scan). TPC-H SF1000 on one GB300, medians of 4 timed iterations after a warm-up, carrier off vs on:
+- GPU-tier pins: Q1 251 ms → 226 ms, Q4 106 ms → 97 ms, the suite −1.4%.
+- Host-tier pins: Q1 357 ms → 303 ms, Q2 60 ms → 54 ms, the suite −0.8%.
 
 ### Late Materialization
 

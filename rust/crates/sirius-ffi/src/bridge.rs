@@ -110,11 +110,13 @@ mod ffi {
         /// is a no-op. Fails on a malformed prefix without changing the published set.
         fn drop_object_store_prefix(ctx: &Context, uri_prefix: &CxxString) -> Result<()>;
 
-        /// The snapshot that would serve `uri`: the longest matching published prefix, then
-        /// the default scope; null when nothing is published or no scope matches. Whenever at
-        /// least one snapshot is published, a key that cannot be matched byte-for-byte (an
-        /// empty, `.` or `..` segment, or a raw `%` byte) fails before any scope is selected,
-        /// default scope included, as an execution would.
+        /// The snapshot that would serve `uri`: the longest matching published prefix. After
+        /// the raw-key check, the default scope matches only URIs beginning with `s3://` in
+        /// either ASCII case. A lookup with no matching scope returns a null snapshot, as does
+        /// a lookup when nothing is published. Whenever at least one snapshot is published, a
+        /// key that cannot be matched byte-for-byte (an empty, `.` or `..` segment, or a raw
+        /// `%` byte) fails before any scope is selected, default scope included, as an
+        /// execution would.
         fn object_store_config_for_uri(
             ctx: &Context,
             uri: &CxxString,

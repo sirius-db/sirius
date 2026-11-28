@@ -9,6 +9,9 @@
 #include "cudf/ast_compat.hpp"
 #include "io/parquet_helpers.hpp"
 #include "op/scan/parquet_materialize.hpp"
+#include "utils/held_bulk_reads.hpp"
+#include "utils/parquet_fixture_utils.hpp"
+#include "utils/test_validation_utility.hpp"
 #include "utils/utils.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -20,6 +23,7 @@
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <cucascade/cudf/datasource.hpp>
@@ -28,9 +32,11 @@
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <optional>
 #include <span>
@@ -620,4 +626,168 @@ TEST_CASE("column_chunk_range_cache matches column_chunk_ranges",
   }
   cache.clear();
   check(metadata.front(), all_columns, subsets.front());
+}
+
+namespace {
+using namespace std::chrono_literals;
+namespace scan = sirius::op::scan;
+
+struct bulk_fixture {
+  sirius::test::scratch_dir dir{"bulk_fetch"};
+  rmm::cuda_stream stream;
+  cudf::io::parquet_reader_options options = cudf::io::parquet_reader_options::builder().build();
+  std::shared_ptr<sirius::test::held_bulk_io> io;
+  sirius::test::bulk_target_resource resource;
+  std::vector<scan::parquet_source> bulk, general;
+  std::vector<std::vector<cudf::io::text::byte_range_info>> ranges;
+
+  explicit bulk_fixture(std::size_t n, bool setup_fault = false)
+    : io(std::make_shared<sirius::test::held_bulk_io>(setup_fault)),
+      resource(cudf::get_current_device_resource_ref(), *io)
+  {
+    auto [db, con] = sirius::make_test_db_and_connection();
+    auto plain     = std::make_shared<sirius::test::tracking_local_ioctx>(false);
+    require_ok(con.Query("SET threads=1"));
+    for (std::size_t i = 0; i < n; ++i) {
+      auto path = dir.file(std::to_string(i) + ".parquet");
+      auto id   = std::to_string(i * 10000);
+      require_ok(con.Query("COPY (SELECT (" + id + "+i)::INTEGER AS a, (-" + id +
+                           "-2*i-1)::INTEGER AS b FROM range(4097) t(i)) TO " +
+                           sirius::test::sql_literal(path) +
+                           " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)"));
+      auto meta = std::make_shared<cudf::io::parquet::FileMetaData const>(read_metadata(path));
+      cudf::io::parquet::experimental::hybrid_scan_reader reader(*meta, options);
+      auto groups = reader.all_row_groups(options);
+      REQUIRE(groups.size() >= 2);
+      auto object = io->open_io_object(path);
+      bulk.push_back({std::make_shared<cucascade::io::datasource>(io, object), meta, groups});
+      general.push_back({std::make_shared<cucascade::io::datasource>(plain, object), meta, groups});
+      ranges.push_back(scan::column_chunk_ranges(*meta, options, groups));
+    }
+    REQUIRE(scan::prefers_bulk_materialize(bulk, options));
+    REQUIRE_FALSE(scan::prefers_bulk_materialize(general, options));
+  }
+};
+
+struct bulk_run {
+  bulk_fixture& fixture;
+  std::future<std::unique_ptr<cudf::table>> result;
+  explicit bulk_run(bulk_fixture& f, bool supplied = true)
+    : fixture(f), result(std::async(std::launch::async, [&f, supplied] {
+        using ranges_view = std::span<std::vector<cudf::io::text::byte_range_info> const>;
+        return scan::materialize_parquet(f.bulk,
+                                         f.options,
+                                         supplied ? ranges_view{f.ranges} : ranges_view{},
+                                         f.stream,
+                                         rmm::device_async_resource_ref{f.resource});
+      }))
+  {
+  }
+  // Runs before the async future joins, including on REQUIRE/unwind.
+  ~bulk_run() { fixture.io->open(); }
+};
+
+void check_bulk_answer(bulk_fixture& f, bulk_run& run)
+{
+  f.io->open();
+  REQUIRE(run.result.wait_for(15s) == std::future_status::ready);
+  auto actual = run.result.get();
+  REQUIRE(actual);
+  auto expected = scan::materialize_parquet(
+    f.general, f.options, {}, f.stream, cudf::get_current_device_resource_ref());
+  REQUIRE(expected);
+  REQUIRE(expected->num_rows() == static_cast<cudf::size_type>(4097 * f.general.size()));
+  REQUIRE(expected->num_columns() == 2);
+  CHECK(sirius::test::expect_tables_equivalent_impl(actual->view(), expected->view(), f.stream));
+}
+}  // namespace
+
+TEST_CASE("bulk fetch reads one file with one call", "[scan][bulk_fetch]")
+{
+  bulk_fixture f(1);
+  bulk_run run(f);
+  REQUIRE(f.io->wait_issued(1, 10s) == 1);
+  check_bulk_answer(f, run);
+  CHECK(f.io->sample().calls == 1);
+}
+
+TEST_CASE("bulk fetch preserves ordered Parquet values with supplied or derived ranges",
+          "[scan][bulk_fetch]")
+{
+  auto supplied = GENERATE(false, true);
+  bulk_fixture f(2);
+  bulk_run run(f, supplied);
+  REQUIRE(f.io->wait_issued(1, 10s) >= 1);
+  REQUIRE(f.io->wait_issued(2, 2s) == 2);
+  f.io->release(1);
+  f.io->release(0);
+  check_bulk_answer(f, run);
+  CHECK(f.io->sample().calls == 2);
+}
+
+TEST_CASE("bulk fetch issues the initial window before the first completion", "[scan][bulk_fetch]")
+{
+  auto n = GENERATE(2u, 32u);
+  bulk_fixture f(n);
+  bulk_run run(f);
+  REQUIRE(f.io->wait_issued(1, 10s) >= 1);
+  auto const issued_while_held = f.io->wait_issued(n, 3s);
+  check_bulk_answer(f, run);
+  CHECK(issued_while_held == n);
+  CHECK(f.io->sample().peak <= 32);
+}
+
+TEST_CASE("bulk fetch caps and refills a 33 file split", "[scan][bulk_fetch]")
+{
+  bulk_fixture f(33);
+  bulk_run run(f);
+  REQUIRE(f.io->wait_issued(1, 10s) >= 1);
+  auto const initial = f.io->wait_issued(32, 3s);
+  bool refilled      = false;
+  if (initial == 32) {
+    // Keep the other 31 held: only a sliding window can admit file 33 now.
+    CHECK(f.io->wait_issued(33, 100ms) == 32);
+    f.io->release(0);
+    refilled = f.io->wait_issued(33, 3s) == 33;
+  }
+  check_bulk_answer(f, run);
+  CHECK(initial == 32);
+  CHECK(refilled);
+  CHECK(f.io->sample().calls == 33);
+  CHECK(f.io->sample().peak <= 32);
+}
+
+TEST_CASE("bulk fetch drains the held sibling before propagating a read error",
+          "[scan][bulk_fetch]")
+{
+  bulk_fixture f(2);
+  bulk_run run(f);
+  REQUIRE(f.io->wait_issued(1, 10s) >= 1);
+  auto const issued = f.io->wait_issued(2, 2s);
+  f.io->release(0, true);
+  if (issued == 2) {
+    CHECK(run.result.wait_for(150ms) == std::future_status::timeout);
+    auto const held = f.io->sample();
+    CHECK(held.sibling_targets > 0);
+    CHECK(held.sibling_releases == 0);
+    f.io->release(1);
+  }
+  f.io->open();
+  REQUIRE(run.result.wait_for(10s) == std::future_status::ready);
+  CHECK_THROWS_AS(run.result.get(), sirius::test::first_file_error);
+  auto const done = f.io->sample();
+  CHECK_FALSE(done.early_release);
+  CHECK(done.sibling_releases == done.sibling_targets);
+  CHECK(issued == 2);
+}
+
+TEST_CASE("bulk fetch preserves an earlier read error over a later setup error",
+          "[scan][bulk_fetch]")
+{
+  bulk_fixture f(2, true);
+  bulk_run run(f);
+  REQUIRE(run.result.wait_for(10s) == std::future_status::ready);
+  CHECK_THROWS_AS(run.result.get(), sirius::test::first_file_error);
+  CHECK(f.io->sample().calls == 1);
+  CHECK(f.io->sample().setup_fault);
 }

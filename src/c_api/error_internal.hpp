@@ -38,4 +38,19 @@ sirius_status invoke(sirius_error** error,
     return fail(exception_status, "Unknown Sirius failure", error);
   }
 }
+
+// invoke() for units whose diagnostics must not carry a caller's values: an exception's text
+// never reaches the diagnostic.
+template <typename F>
+sirius_status invoke_redacted(sirius_error** error, F&& operation) noexcept
+{
+  if (error) { *error = nullptr; }
+  try {
+    return operation();
+  } catch (const std::bad_alloc&) {
+    return fail(SIRIUS_ALLOCATION_FAILURE, "Allocation failed", error);
+  } catch (...) {
+    return fail(SIRIUS_INTERNAL_ERROR, "Unexpected failure", error);
+  }
+}
 }  // namespace sirius::c_api

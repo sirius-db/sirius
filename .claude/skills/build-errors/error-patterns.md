@@ -6,12 +6,8 @@
 
 **Cause:** Mismatch between the C++ standard library used by cuDF/conda and the system compiler.
 
-**Fix:**
-```bash
-export LDFLAGS="-Wl,-rpath,$CONDA_PREFIX/lib -L$CONDA_PREFIX/lib $LDFLAGS"
-rm -rf build
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
-```
+**Diagnosis:** Check the compiler, linked libraries, and Pixi environment. If a
+clean rebuild is necessary, confirm before removing existing build artifacts.
 
 ## CUDA Architecture Mismatch
 
@@ -29,8 +25,8 @@ CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
 
 **Fix:**
 ```bash
-sccache --stop-server
-sccache --start-server
+pixi run sccache --stop-server
+pixi run sccache --start-server
 ```
 
 ## Submodule Out of Sync
@@ -39,10 +35,15 @@ sccache --start-server
 
 **Cause:** Git submodules not at the expected commits.
 
-**Fix:**
+**Diagnosis:** Run `git submodule status`. Initialize each required checkout
+marked `-` using its path.
+
 ```bash
-git submodule update --init --recursive
+git submodule update --init -- path/to/submodule
 ```
+
+A `+` indicates a different revision. Preserve local work and ask before
+switching that checkout back to the pin.
 
 ## cuDF API Changes
 
@@ -80,14 +81,9 @@ git submodule update --init --recursive
 
 **Symptoms:** Various missing library or header errors, especially for cuDF, RMM, or spdlog.
 
-**Cause:** Build not running inside pixi shell.
+**Cause:** Build not running in the Pixi environment.
 
-**Fix:**
-```bash
-pixi shell
-source setup_sirius.sh
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
-```
+**Fix:** Run the build with `pixi run make`.
 
 ## OOM During Build
 
@@ -97,5 +93,5 @@ CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
 
 **Fix:**
 ```bash
-CMAKE_BUILD_PARALLEL_LEVEL=4 make
+CMAKE_BUILD_PARALLEL_LEVEL=4 pixi run make
 ```

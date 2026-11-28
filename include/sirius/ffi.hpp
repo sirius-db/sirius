@@ -80,14 +80,16 @@ struct SIRIUS_FFI_EXPORT ObjectStoreConfig {
   const std::string ca_bundle_path;
   /// Namespace this snapshot may read: empty = the default scope, serving any `s3://` object at
   /// the endpoint that no published prefix claims; `"s3://bucket/"` or `"s3://bucket/prefix/"`
-  /// limits reads to that prefix. Whenever at least one snapshot is published, a key that cannot
-  /// be matched byte-for-byte — an empty object key, an empty, `.` or `..` segment, or a raw `%`
-  /// byte — is refused before binding (`object_store_scope`) regardless of which scope would
-  /// serve it: the store or transport may normalize such a key into a published prefix's
-  /// namespace, so even the default scope does not serve it. The gate classifies the raw key
-  /// suffix when a scheme and bucket/key separator are present; scope resolution is not full URI
-  /// validation. URI key spellings containing `%` are unsupported by this resolver. Key bytes are
-  /// never rewritten, and only the scheme is case-folded for matching.
+  /// limits reads to that prefix. A nonempty prefix is written with the lowercase `s3://` scheme,
+  /// and its bucket consists of ASCII letters, digits, `.`, `_` or `-` and is not `.` or `..`.
+  /// Whenever at least one snapshot is published, a key that cannot be matched byte-for-byte — an
+  /// empty object key, an empty, `.` or `..` segment, or a raw `%` byte — is refused before
+  /// binding (`object_store_scope`) regardless of which scope would serve it: the store or
+  /// transport may normalize such a key into a published prefix's namespace, so even the default
+  /// scope does not serve it. The gate classifies the raw key suffix when a scheme and bucket/key
+  /// separator are present; scope resolution is not full URI validation. URI key spellings
+  /// containing `%` are unsupported by this resolver. Key bytes are never rewritten, and only the
+  /// scheme is case-folded for matching.
   const std::string uri_prefix;
 
   /// A new snapshot with these credentials and every other field copied from `*this`, which is
@@ -133,8 +135,9 @@ class SIRIUS_FFI_EXPORT Context {
 
   /// The published snapshot that would serve `uri`: after the key gate below, the one with the
   /// longest `uri_prefix` the URI starts with (scheme compared case-insensitively, the rest
-  /// byte-exact; the default scope matches any remaining URI — which schemes a route supports is
-  /// decided by the route), or nullptr when nothing is published or no scope matches.
+  /// byte-exact). After the raw-key check, the default scope matches only URIs beginning with
+  /// `s3://` in either ASCII case. A lookup with no matching scope returns a null snapshot, as
+  /// does a lookup when nothing is published.
   /// Administrative observation only: executions resolve against the set they captured when
   /// their binding began. Thread-safe.
   /// @throws std::runtime_error (`object_store_scope:`) when at least one snapshot is published
