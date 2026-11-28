@@ -170,7 +170,9 @@ The residency gate decides what can be narrow; `apply_tier_narrowing_policy` —
 HOST-tier serve pays a host→GPU upload per batch that
 narrowing always shrinks, so host-tier-backed sidecars are never touched: only scans stamped
 `sidecar_from_gpu_tier_pin` at sidecar install time seed the analysis, making unpinned,
-pinned-native, and host-tier scans structurally invisible to the pass. A GPU-tier serve has no
+pinned-native, and host-tier scans structurally invisible to the pass. A host-tier pin's
+[dictionary carriers](optimizations.md#dictionary-carrier) are the exception and are judged: its
+chunks upload the same compressed bytes whether or not the decode keeps the dictionary. A GPU-tier serve has no
 upload term, so each narrow column must justify itself through the plan.
 
 The pass walks the physical tree bottom-up with the same traversal and per-operator column maps
@@ -322,7 +324,13 @@ the finished sidecars at wrap time rather than through a propagation case:
   partial batch layout deviates from the declared output — multiple grouping sets, grouping
   functions, AVG (SUM + COUNT decomposition adds a partial column), COUNT(DISTINCT) (LIST partial
   column) — keep the native boundary. So does any `FIRST`: its carried columns are copied out of
-  the chosen row rather than aggregated, which this model does not describe.
+  the chosen row rather than aggregated, which this model does not describe. A
+  [dictionary carrier](optimizations.md#dictionary-carrier) key is the exception: the partial
+  aggregate groups on its codes and emits STRING keys, so its PARTITION and MERGE_GROUP_BY never
+  see a dictionary.
+- A dictionary carrier is a hint: a batch may carry it as STRING. Any PARTITION decodes a carrier
+  key before hashing, and decodes a carrier payload when its keys bytes times the partition count
+  exceed an eighth of the batch's bytes, since every partition would copy the keys.
 - Distinct- and sort-side exchanges are native because their inputs are restored at the
   boundary.
 

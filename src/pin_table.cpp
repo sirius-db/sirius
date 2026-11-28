@@ -620,6 +620,21 @@ bool pin_below_min_size(cudf::table const& tbl,
   return below;
 }
 
+/// Record the keys bytes of each column of the compressed chunk @p ct with a string `dictionary`
+/// value root.
+void record_string_dictionaries(simpatico::compressed_table const& ct,
+                                std::vector<pinned_column_storage_meta>& column_storage)
+{
+  auto const count = std::min(column_storage.size(), ct.columns.size());
+  for (std::size_t i = 0; i < count; ++i) {
+    auto const& tree = ct.columns[i].plan_tree;
+    if (tree) {
+      column_storage[i].dictionary_keys_bytes =
+        simpatico::probe_column(*tree).dictionary_keys_bytes;
+    }
+  }
+}
+
 /// Shared compress step for the host and device pin drivers: compress @p tbl per
 /// @p compression on @p stream, and when the batch qualifies (compression on and
 /// >= the size threshold) AND the compressed footprint saves enough (<=
@@ -805,7 +820,7 @@ host_pin_result materialize_pin_to_host(
             compression,
             stream,
             "materialize_pin_to_host",
-            [&](simpatico::compressed_table&& /*ct*/,
+            [&](simpatico::compressed_table&& ct,
                 std::vector<std::uint8_t>&& header,
                 std::vector<simpatico::payload_buffer_ref> const& buffers,
                 std::uint64_t payload_bytes,
@@ -846,6 +861,7 @@ host_pin_result materialize_pin_to_host(
                 uncompressed_bytes,
                 static_cast<int64_t>(tbl->num_rows()),
                 std::move(column_sizes)));
+              record_string_dictionaries(ct, out.column_storage.back());
             });
         } catch (const std::exception& e) {
           compression_failed = true;
@@ -934,7 +950,7 @@ device_pin_result materialize_all_batches_compressed(
             compression,
             stream,
             "materialize_all_batches_compressed",
-            [&](simpatico::compressed_table&& /*ct*/,
+            [&](simpatico::compressed_table&& ct,
                 std::vector<std::uint8_t>&& header,
                 std::vector<simpatico::payload_buffer_ref> const& buffers,
                 std::uint64_t payload_bytes,
@@ -1062,6 +1078,7 @@ device_pin_result materialize_all_batches_compressed(
                 uncompressed_bytes,
                 chunk_rows,
                 std::move(column_sizes));
+              record_string_dictionaries(ct, out.column_storage.back());
             });
         } catch (const std::exception& e) {
           if (!tbl) { throw; }  // source released inside callback — no fallback possible

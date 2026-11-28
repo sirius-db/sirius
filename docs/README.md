@@ -169,6 +169,10 @@ pixi run python example.py
 
 For an example using TPC-H data from Parquet files or a DuckDB database, see the
 [Python benchmark script](../test/tpch_performance/performance_test.py).
+The same runner supports `--benchmark scale_bench` for named workloads over
+existing local Parquet datasets. See the
+[scale_bench guide](../test/tpch_performance/README.md#scale_bench) for examples,
+the prepared table-C path and cleanup, result formats, and validation limits.
 
 The Python benchmark and power/throughput runners require a Python DuckDB client
 built from the pinned v2 revision, as described above. The CLI-based scripts use
@@ -200,6 +204,10 @@ CALL unpin_table('lineitem');
 
 `tier = 'gpu'` pins columns in GPU memory for the fastest scans; `tier = 'host'` pins them in
 pinned host memory instead, for tables larger than GPU memory.
+
+A DuckDB table must be stored in a database file, not in memory, and checkpointed (`CHECKPOINT`)
+before it is pinned. Pinning one turns off WAL auto-checkpointing for the database instance;
+unpinning does not turn it back on.
 
 Deletes and committed inserts on pinned DuckDB tables are reconciled per query. `UPDATE`,
 `MERGE ... UPDATE`, and `INSERT ... ON CONFLICT DO UPDATE` are rejected while the target table is
@@ -249,6 +257,20 @@ From Python, execute the same SQL with `con.execute(...)` after loading the exte
 querying. See the [compressed pinning guide](super-sirius/compressed-pinning.md) for plan selection
 and tuning.
 
+## Footer Statistics for Large Parquet Tables
+
+During planning, Sirius reads and caches statistics from the Parquet footers of a multi-file scan
+and passes them to DuckDB's optimizer, but only for scans with at most 1,024 uncached `s3://` files
+(or 16,384 local). For a table consisting of more files than that, you can still read all the
+footers ahead of the queries explicitly by running:
+
+```sql
+SELECT files FROM sirius_analyze_parquet('s3://my-bucket/my-table/*.parquet');
+```
+
+Later scans of the same glob in that process find them cached. See the
+[scan settings](super-sirius/configuration.md#scan) to change or remove the limits.
+
 ## Configuration
 
 Sirius loads its settings from a YAML config file, searched in this order:
@@ -257,7 +279,7 @@ Sirius loads its settings from a YAML config file, searched in this order:
 2. `./sirius.yaml` (current working directory)
 3. `~/.sirius/sirius.yaml`
 
-If no config file is found, built-in defaults apply (95% GPU memory, 8 GiB pinned host memory per NUMA node). See the [Configuration reference](super-sirius/configuration.md) for all options: memory tiers, thread pools, operator parameters, and runtime `SET` variables. An example config is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
+If no config file is found, built-in defaults apply (95% of GPU memory, and 90% of each NUMA node's RAM as pinned host memory). See the [Configuration reference](super-sirius/configuration.md) for all options: memory tiers, thread pools, operator parameters, and runtime `SET` variables. An example config is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
 ## Disk Spilling
 

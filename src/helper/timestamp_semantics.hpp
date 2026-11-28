@@ -65,7 +65,8 @@ namespace sirius::temporal {
   rmm::device_async_resource_ref mr);
 
 // Applies a bound DATE/day signature. Offsets preserve NULL and infinity and
-// throw invalid_input_exception on finite overflow. Differences subtract raw day
+// throw invalid_input_exception on finite overflow, on an infinity-sentinel result,
+// and on an input or result day count below -infinity. Differences subtract raw day
 // counts in INT64. Column inputs must have row_count rows; scalar inputs broadcast
 // their single row. The caller retains input ownership; overflow checks synchronize
 // the supplied stream.

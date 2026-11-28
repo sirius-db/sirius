@@ -21,6 +21,7 @@
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/node.hpp"
 #include "helper/numeric_narrowing.hpp"
+#include "op/cudf_sort_order.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/fixed_point/fixed_point.hpp>
@@ -59,6 +60,20 @@ namespace {
                              : std::format("Unsupported aggregate function: {} {}", name, detail));
 }
 
+// The width of make_carried_block_layout(slots).inputs, without building it.
+std::size_t carried_column_count(std::span<aggregate_slot const> slots) noexcept
+{
+  std::size_t count    = 0;
+  std::size_t num_keys = 0;
+  for (auto const& slot : slots) {
+    if (auto const* first = std::get_if<first_slot>(&slot)) {
+      ++count;
+      if (num_keys == 0) { num_keys = first->order.size(); }
+    }
+  }
+  return count + num_keys;
+}
+
 }  // namespace
 
 std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id)
@@ -90,11 +105,7 @@ bool is_wide_integer_sum(sirius::aggregate_id id, sirius::logical_type const& in
 grouped_aggregate_layout::grouped_aggregate_layout(std::size_t num_keys,
                                                    std::size_t num_partials,
                                                    std::span<aggregate_slot const> slots)
-  : grouped_aggregate_layout(
-      num_keys,
-      num_partials,
-      static_cast<std::size_t>(std::ranges::count_if(
-        slots, [](auto const& slot) { return std::holds_alternative<first_slot>(slot); })))
+  : grouped_aggregate_layout(num_keys, num_partials, carried_column_count(slots))
 {
 }
 
@@ -120,6 +131,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
 {
   CudfAggregateDefinitions result;
   duckdb::vector<sirius::logical_type> carried_types;
+  duckdb::vector<sirius::logical_type> order_key_types;
 
   // 1. Extract group_idx from groups_p
   for (const auto& group : groups_p) {
@@ -142,6 +154,9 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
 
     if (fid == sirius::aggregate_id::stddev_samp && aggr.distinct()) {
       throw_unsupported_aggregate(fid, "with DISTINCT");
+    }
+    if (fid != sirius::aggregate_id::first && !aggr.order().empty()) {
+      throw_unsupported_aggregate(fid, "with an ORDER BY");
     }
 
     // Handle AVG specially: it expands into SUM + COUNT_VALID
@@ -225,12 +240,28 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
 
     // FIRST adds no cuDF aggregation; it reads input_idx into the carried block.
     if (fid == sirius::aggregate_id::first) {
-      if (children.size() != 1 || !children[0]->is_reference()) {
-        throw_unsupported_aggregate(fid, "over anything but a single column reference");
+      auto const& modifiers = aggr.order();
+      if (children.size() != 1 + modifiers.size() ||
+          !std::ranges::all_of(children, [](auto const& child) { return child->is_reference(); })) {
+        throw_unsupported_aggregate(fid, "over anything but column references");
       }
-      result.aggregate_slots.push_back(
-        first_slot{.input_idx   = static_cast<int>(children[0]->as_reference().column_index),
-                   .carried_idx = carried_types.size()});
+      auto const column = [&](std::size_t i) {
+        return static_cast<cudf::size_type>(children[i]->as_reference().column_index);
+      };
+      first_slot slot{.input_idx = column(0), .carried_idx = carried_types.size()};
+      for (std::size_t i = 0; i < modifiers.size(); ++i) {
+        auto const [column_order, null_precedence] = to_cudf_sort_order(modifiers[i]);
+        slot.order.push_back(order_key{.input_idx       = column(i + 1),
+                                       .column_order    = column_order,
+                                       .null_precedence = null_precedence});
+      }
+      // One ordered FIRST's keys are appended; make_carried_block_layout checks the others match.
+      if (order_key_types.empty()) {
+        for (std::size_t i = 1; i < children.size(); ++i) {
+          order_key_types.push_back(children[i]->return_type());
+        }
+      }
+      result.aggregate_slots.push_back(std::move(slot));
       carried_types.push_back(aggr.return_type());
       continue;
     }
@@ -271,6 +302,10 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       result.local_types.push_back(aggr.return_type());
     }
   }
+  // Throws for FIRSTs under different orders, so the operator refuses them when it is built.
+  [[maybe_unused]] auto const block = make_carried_block_layout(result.aggregate_slots);
+  carried_types.insert(carried_types.end(), order_key_types.begin(), order_key_types.end());
+  D_ASSERT(carried_types.size() == block.inputs.size());
   auto const layout = grouped_aggregate_layout{
     result.group_idx.size(), result.cudf_aggregates.size(), result.aggregate_slots};
   D_ASSERT(result.local_types.size() == layout.carried_column(0));
@@ -283,16 +318,32 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   return result;
 }
 
-std::vector<int> carried_inputs(std::vector<aggregate_slot> const& aggregate_slots)
+carried_block_layout make_carried_block_layout(std::span<aggregate_slot const> aggregate_slots)
 {
-  std::vector<int> inputs;
+  carried_block_layout block;
+  std::vector<order_key> const* order = nullptr;
   for (auto const& slot : aggregate_slots) {
-    if (auto const* first = std::get_if<first_slot>(&slot)) {
-      D_ASSERT(first->carried_idx == inputs.size());
-      inputs.push_back(first->input_idx);
+    auto const* first = std::get_if<first_slot>(&slot);
+    if (first == nullptr) { continue; }
+    D_ASSERT(first->carried_idx == block.inputs.size());
+    block.inputs.push_back(first->input_idx);
+    if (first->order.empty()) { continue; }
+    if (order == nullptr) {
+      order = &first->order;
+    } else if (first->order != *order) {
+      throw sirius::internal_exception(
+        "make_carried_block_layout: two FIRSTs carry different ORDER BYs in one aggregate");
     }
   }
-  return inputs;
+  if (order != nullptr) {
+    for (auto const& key : *order) {
+      block.order.positions.push_back(static_cast<cudf::size_type>(block.inputs.size()));
+      block.order.column_order.push_back(key.column_order);
+      block.order.null_precedence.push_back(key.null_precedence);
+      block.inputs.push_back(key.input_idx);
+    }
+  }
+  return block;
 }
 
 bool all_slots_plain(std::vector<aggregate_slot> const& aggregate_slots)
