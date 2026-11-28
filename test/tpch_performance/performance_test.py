@@ -19,6 +19,7 @@ import glob
 import json
 import math
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -167,7 +168,7 @@ PARQUET_PIN_CACHE = {
 
 ENGINE_CHOICES = ("gpu", "cpu", "both")
 PIN_CHOICES = ("none", "gpu", "host", "parquet")
-DATA_SOURCE_CHOICES = ("parquet", "duckdb")
+DATA_SOURCE_CHOICES = ("parquet", "duckdb", "iceberg")
 PRECMD_CHOICES = ("none", "nsys", "gdb")
 TPCH_TABLES = (
     "customer",
@@ -216,6 +217,11 @@ def get_git_info():
     )
 
 
+def query_name(query):
+    """Preserve TPC-H q<N> names and accept named benchmark queries."""
+    return f"q{query}" if isinstance(query, int) else query
+
+
 def setup_benchmark_dir(
     output_root,
     profile_label,
@@ -232,6 +238,7 @@ def setup_benchmark_dir(
     duckdb_results_source=None,
     concurrency=1,
     concurrency_mode="identical",
+    benchmark="tpch",
 ):
     """Create the benchmark output directory and return its paths.
 
@@ -239,6 +246,7 @@ def setup_benchmark_dir(
       <output_root>/
         <benchmark_name>/
           config.yml         (copy of Sirius config, if provided)
+          resolved_config.yaml  (what Sirius ran with, written by Sirius at startup)
           metadata.json
           queries/q<N>.sql           (effective query text)
           csv/runtimes.csv
@@ -252,10 +260,10 @@ def setup_benchmark_dir(
     """
     ts = datetime.now().strftime(
         "%Y%m%d_%H%M%S_%f"
-        if concurrency > 1 or concurrency_mode == "cooperative"
+        if benchmark != "tpch" or concurrency > 1 or concurrency_mode == "cooperative"
         else "%Y%m%d_%H%M%S"
     )
-    benchmark_name = f"tpch_{ts}_{profile_label}_{engine}_iter{iterations}"
+    benchmark_name = f"{benchmark}_{ts}_{profile_label}_{engine}_iter{iterations}"
     if concurrency > 1 or concurrency_mode == "cooperative":
         benchmark_name += f"_c{concurrency}"
     if concurrency_mode == "cooperative":
@@ -271,8 +279,8 @@ def setup_benchmark_dir(
     query_sql_dir = os.path.join(benchmark_dir, "queries")
     os.makedirs(query_sql_dir, exist_ok=True)
     for qnum in queries:
-        with open(os.path.join(query_sql_dir, f"q{qnum}.sql"), "w") as f:
-            f.write(query_texts[f"q{qnum}"].rstrip().rstrip(";") + ";\n")
+        with open(os.path.join(query_sql_dir, f"{query_name(qnum)}.sql"), "w") as f:
+            f.write(query_texts[query_name(qnum)].rstrip().rstrip(";") + ";\n")
 
     runtime_csv = os.path.join(csv_dir, "runtimes.csv")
 
@@ -281,6 +289,7 @@ def setup_benchmark_dir(
 
     commit, branch = get_git_info()
     metadata = {
+        "benchmark": benchmark,
         "commit": commit,
         "branch_name": branch,
         "date": datetime.now().isoformat(timespec="seconds"),
@@ -289,7 +298,7 @@ def setup_benchmark_dir(
         "engine": engine,
         "scale_factor": scale_factor,
         "data_source": data_source,
-        "queries": [f"q{q}" for q in queries],
+        "queries": [query_name(q) for q in queries],
         "pin": pin,
         "compression_plan_dir": PIN_COMPRESSION_PLAN_DIR,
         "precmd": precmd,
@@ -521,6 +530,8 @@ DEFAULT_OUTPUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 # points pin_table at those plan files. Whether pins are compressed at all is the
 # engine's setting (pin_table_compression, on by default).
 PIN_COMPRESSION_PLAN_DIR = None
+# SQL file that attaches the Iceberg catalog for --data-source iceberg. Never logged.
+CATALOG_SETUP_PATH = None
 
 
 def _load_yaml(path):
@@ -684,7 +695,7 @@ def derive_profile_config(overrides, config_path, benchmark_dir):
     return effective_path
 
 
-def drop_os_cache(source, data_source="parquet"):
+def drop_os_cache(source, data_source="parquet", workload=None):
     """Evict the benchmark data files from the OS page cache.
 
     Uses posix_fadvise(DONTNEED) per data file instead of writing to
@@ -692,11 +703,15 @@ def drop_os_cache(source, data_source="parquet"):
     only covers the benchmark's own files (not dentries/inodes or unrelated
     cached files), and filesystems that ignore the hint will stay warm.
     """
-    if is_s3_input(source):
-        log("Skipping OS cache drop for S3 input (remote objects are not local files)")
+    if is_s3_input(source) or data_source == "iceberg":
+        log(
+            "Skipping OS cache drop for remote input (remote objects are not local files)"
+        )
         return
 
-    if data_source == "duckdb":
+    if workload is not None:
+        files = workload.input_files()
+    elif data_source == "duckdb":
         files = [source]
     else:
         files = []
@@ -763,7 +778,45 @@ def _build_views_sql(parquet_dir, s3_input=None):
     return "\n".join(parts) + "\n"
 
 
-def open_connection(source, gpu_execution=False, data_source="parquet", s3_input=None):
+def _build_catalog_views_sql(schema):
+    """Return CREATE OR REPLACE VIEW SQL over the 8 TPC-H tables of an attached catalog schema."""
+    return "".join(
+        f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM {schema}.{table};\n"
+        for table in TPCH_TABLES
+    )
+
+
+def _run_catalog_setup(con):
+    """Run the statements of CATALOG_SETUP_PATH on @p con, in order.
+
+    The file holds credentials, and a DuckDB error quotes the statement it
+    failed on. A failure is therefore reported by position and error class
+    only, with the DuckDB error dropped rather than chained.
+    """
+    with open(CATALOG_SETUP_PATH) as f:
+        text = f.read()
+    withheld = "the DuckDB error is withheld because it quotes the file, which holds credentials"
+    try:
+        # DuckDB splits the file: a ';' inside a quoted value or a comment
+        # ends no statement.
+        statements = con.extract_statements(text)
+    except duckdb.Error as error:
+        raise RuntimeError(
+            f"{CATALOG_SETUP_PATH} does not parse ({type(error).__name__}); {withheld}"
+        ) from None
+    for index, statement in enumerate(statements, start=1):
+        try:
+            con.execute(statement).fetchall()
+        except duckdb.Error as error:
+            raise RuntimeError(
+                f"{CATALOG_SETUP_PATH}: statement {index} of {len(statements)} failed "
+                f"({type(error).__name__}); {withheld}"
+            ) from None
+
+
+def open_connection(
+    source, gpu_execution=False, data_source="parquet", s3_input=None, workload=None
+):
     """Open a DuckDB connection over the benchmark source, optionally LOAD Sirius.
 
     parquet: in-memory DB with CREATE VIEW ... read_parquet over the directory.
@@ -771,6 +824,10 @@ def open_connection(source, gpu_execution=False, data_source="parquet", s3_input
              are already present in the `main` schema, so no views are registered.
              Read-only avoids write locks / accidental WAL and is correct for a
              read-only benchmark; it mirrors how run_tpch_duckdb.sh opens the file.
+    iceberg: `source` is the catalog.schema of an Iceberg REST catalog. The SQL in
+             CATALOG_SETUP_PATH attaches it on every connection, before Sirius is
+             loaded; httpfs supplies the catalog client, and Sirius still reads the
+             s3:// bytes itself.
     """
     config = {"allow_unsigned_extensions": "true"}
     s3_source = data_source != "duckdb" and is_s3_source(source)
@@ -785,8 +842,37 @@ def open_connection(source, gpu_execution=False, data_source="parquet", s3_input
         log(f"Opening DuckDB database file {source} (read-only)")
         con = duckdb.connect(source, read_only=True, config=config)
     else:
-        log(f"Opening DuckDB connection over parquet dir {source}")
-        con = duckdb.connect(":memory:", config=config)
+        if data_source == "iceberg":
+            log(f"Opening DuckDB connection for the Iceberg catalog schema {source}")
+        else:
+            log(f"Opening DuckDB connection over parquet dir {source}")
+        con = duckdb.connect(
+            workload.database(gpu_execution) if workload else ":memory:", config=config
+        )
+
+    if workload is not None:
+        workload.connection = con
+    try:
+        return _configure_connection(
+            con, source, gpu_execution, data_source, s3_input, workload
+        )
+    except BaseException:
+        if workload is not None:
+            workload.close_connection(con)
+        else:
+            con.close()
+        raise
+
+
+def _configure_connection(con, source, gpu_execution, data_source, s3_input, workload):
+    """Configure a connection; the caller closes it if any setup fails."""
+
+    if data_source == "iceberg":
+        # The setup file holds credentials and Sirius logs statement text, so
+        # run it before Sirius is loaded.
+        for extension in ("httpfs", "avro", "iceberg"):
+            con.execute(f"LOAD {extension}")
+        _run_catalog_setup(con)
 
     # Load Sirius before registering S3 views. GPU execution stays on while the
     # views bind: sirius_httpfs serves S3 only under gpu_execution=true.
@@ -794,20 +880,28 @@ def open_connection(source, gpu_execution=False, data_source="parquet", s3_input
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
         con.execute(f"LOAD {_sql_literal(EXTENSION_PATH)}")
         log("Sirius extension loaded")
+        if workload is not None:
+            con.execute("SET enable_duckdb_fallback = false")
     elif s3_input is not None:
         con.execute("LOAD httpfs")
 
     if s3_input is not None:
         s3_input.refresh_secret(con, gpu_execution)
 
-    if data_source != "duckdb":
-        log("Registering TPC-H parquet views")
-        for stmt in _build_views_sql(source, s3_input).split(";\n"):
+    if data_source == "iceberg":
+        log(f"Registering TPC-H views over catalog schema {source}")
+        _execute_multi(con, _build_catalog_views_sql(source))
+    elif data_source != "duckdb":
+        log("Registering benchmark parquet views")
+        views_sql = (
+            workload.views_sql() if workload else _build_views_sql(source, s3_input)
+        )
+        for stmt in views_sql.split(";\n"):
             stmt = stmt.strip()
             if not stmt:
                 continue
             con.execute(stmt)
-        log("All TPC-H views registered")
+        log("All benchmark views registered")
     if gpu_execution:
         if PIN_COMPRESSION_PLAN_DIR:
             log(f"Simpatico pin compression plans: {PIN_COMPRESSION_PLAN_DIR}")
@@ -831,11 +925,21 @@ def _execute_multi(con, sql):
         con.execute(stmt).fetchall()
 
 
-def time_query(con, qnum, query_sql, use_gpu, profile_path=None):
+def time_query(
+    con,
+    qnum,
+    query_sql,
+    use_gpu,
+    profile_path=None,
+    workload=None,
+    result_format="rows",
+):
     engine_label = "GPU/sirius" if use_gpu else "CPU/duckdb"
     if use_gpu:
         log("  SET gpu_execution = true (GPU/sirius)")
         con.execute("SET gpu_execution = true;")
+        if workload is not None:
+            con.execute("SET enable_duckdb_fallback = false")
     elif profile_path is not None:
         # DuckDB CPU profiling: emit a per-operator JSON profile for the next
         # query. 'detailed' mode includes the physical operator tree (with
@@ -846,22 +950,33 @@ def time_query(con, qnum, query_sql, use_gpu, profile_path=None):
         con.execute("PRAGMA enable_profiling='json';")
         con.execute("PRAGMA profiling_mode='detailed';")
         con.execute(f"PRAGMA profiling_output='{profile_path}';")
-    log(f"  Executing q{qnum} on {engine_label}…")
+    log(f"  Executing {query_name(qnum)} on {engine_label}…")
     # Time con.execute() only: it plans and runs the query to completion and materializes the
     # result inside DuckDB. The rows for result.txt are fetched afterwards, because converting a
     # large result into Python objects (Q11 at SF1000 returns ~937K rows) costs far more than
     # executing the query and is not engine time. Both the DuckDB 1.5 and the v2 Python clients
     # support execute() + fetchall(); the v2 client has no Arrow export on execute() results.
     start = time.perf_counter()
+    if workload is not None:
+        from scale_bench import GRAPH_QUERIES
+
+        if qnum in GRAPH_QUERIES:
+            source_sql = workload.run_graph(con, qnum, use_gpu)
+            query_sql = workload.result_sql(qnum, result_format, source_sql)
     result = con.execute(query_sql)
     elapsed = time.perf_counter() - start
     rows = result.fetchall()
-    log(f"  q{qnum} executed in {elapsed:.4f}s, fetched {len(rows)} rows")
+    if workload is not None and profile_path is not None and not use_gpu:
+        # Untimed graph checks must not overwrite the final timed statement's
+        # CPU profile. An iterative workload's profile covers that statement,
+        # whereas runtime_s includes the preceding materialization steps too.
+        con.execute("PRAGMA disable_profiling;")
+    log(f"  {query_name(qnum)} executed in {elapsed:.4f}s, fetched {len(rows)} rows")
     return elapsed, rows
 
 
 def _query_dir(benchmark_dir, engine_name, qnum):
-    qdir = os.path.join(benchmark_dir, engine_name, f"q{qnum}")
+    qdir = os.path.join(benchmark_dir, engine_name, query_name(qnum))
     os.makedirs(qdir, exist_ok=True)
     return qdir
 
@@ -892,8 +1007,8 @@ class RuntimeCsv:
         self._writer.writerow(row)
 
     def record(self, name, qnum, it, runtime):
-        self.writerow([name, f"q{qnum}", it, f"{runtime:.6f}"])
-        log(f"[{name}] q{qnum} iter{it}: {runtime:.4f}s")
+        self.writerow([name, query_name(qnum), it, f"{runtime:.6f}"])
+        log(f"[{name}] {query_name(qnum)} iter{it}: {runtime:.4f}s")
         if math.isfinite(runtime):
             total, n = self._totals.get((name, it), (0.0, 0))
             self._totals[(name, it)] = (total + runtime, n + 1)
@@ -917,6 +1032,11 @@ def _run_one(
     duckdb_profiling=False,
     s3_input=None,
 ):
+    workload = getattr(writer, "workload", None)
+    result_format = getattr(writer, "result_format", "rows")
+    query_sql = query_texts[query_name(qnum)]
+    if workload is not None and qnum in workload.query_metadata:
+        query_sql = workload.result_sql(qnum, result_format, query_sql)
     if s3_input is not None:
         s3_input.refresh_secret(con, use_gpu)
     profile_path = None
@@ -933,7 +1053,7 @@ def _run_one(
         if os.path.lexists(directory):
             raise RuntimeError(f"Export directory already exists: {directory}")
         setup, copy_sql, cleanup = copy_statements(
-            con, query_texts[f"q{qnum}"], directory, writer.parquet_compression
+            con, query_sql, directory, writer.parquet_compression
         )
         with open(directory + ".sql", "w") as saved_sql:
             saved_sql.write(copy_sql + "\n")
@@ -959,18 +1079,34 @@ def _run_one(
         writer.record(name, qnum, it, elapsed)
         return
     elapsed, rows = time_query(
-        con, qnum, query_texts[f"q{qnum}"], use_gpu, profile_path=profile_path
+        con,
+        qnum,
+        query_sql,
+        use_gpu,
+        profile_path=profile_path,
+        **({"workload": workload, "result_format": result_format} if workload else {}),
     )
     writer.record(name, qnum, it, elapsed)
     _write_result(benchmark_dir, name, qnum, rows)
+    if workload is not None:
+        from scale_bench import GRAPH_QUERIES
+
+        metadata = dict(workload.query_metadata.get(qnum, {}))
+        if qnum in GRAPH_QUERIES:
+            metadata["invariants"] = workload.check_graph(con, qnum, use_gpu)
+        path = Path(_query_dir(benchmark_dir, name, qnum)) / f"metadata_iter{it}.json"
+        path.write_text(json.dumps(metadata, indent=2) + "\n")
+        workload._save_metadata()
 
 
-def _flush_between_runs(con, profile, use_gpu, source, data_source):
+def _flush_between_runs(con, profile, use_gpu, source, data_source, workload=None):
     """Flush whatever this profile wants gone before a query run, including the
     first -- otherwise the first run would be the odd one out."""
     if profile["drop_os_cache_between"]:
         log("  Dropping OS page cache")
-        drop_os_cache(source, data_source)
+        drop_os_cache(
+            source, data_source, **({"workload": workload} if workload else {})
+        )
     if profile["reset_cache_between"] and use_gpu:
         # Sirius's own prefetching cache survives an OS cache drop -- it holds
         # its chunks in pinned host memory, not the page cache -- so a cold run
@@ -1012,14 +1148,25 @@ def run_grouped(
     pin_enabled = pin != "none"
     for name, use_gpu in engine_modes:
         con = open_connection(
-            source, gpu_execution=use_gpu, data_source=data_source, s3_input=s3_input
+            source,
+            gpu_execution=use_gpu,
+            data_source=data_source,
+            s3_input=s3_input,
+            workload=getattr(writer, "workload", None),
         )
         try:
             for qnum in queries:
                 pinned = False
                 if drop_scope == "group":
-                    log(f"--- q{qnum} group flush engine={name} ---")
-                    _flush_between_runs(con, profile, use_gpu, source, data_source)
+                    log(f"--- {query_name(qnum)} group flush engine={name} ---")
+                    _flush_between_runs(
+                        con,
+                        profile,
+                        use_gpu,
+                        source,
+                        data_source,
+                        getattr(writer, "workload", None),
+                    )
                 try:
                     for it in range(iterations):
                         if (
@@ -1028,7 +1175,9 @@ def run_grouped(
                             and not pinned
                             and it >= pin_after_iteration
                         ):
-                            log(f"  Pinning tables for q{qnum} (from iter{it})")
+                            log(
+                                f"  Pinning tables for {query_name(qnum)} (from iter{it})"
+                            )
                             _execute_multi(
                                 con,
                                 emit_pin(
@@ -1039,10 +1188,15 @@ def run_grouped(
                                 ),
                             )
                             pinned = True
-                        log(f"--- q{qnum} iter{it} engine={name} ---")
+                        log(f"--- {query_name(qnum)} iter{it} engine={name} ---")
                         if drop_scope == "run":
                             _flush_between_runs(
-                                con, profile, use_gpu, source, data_source
+                                con,
+                                profile,
+                                use_gpu,
+                                source,
+                                data_source,
+                                getattr(writer, "workload", None),
                             )
                         _run_one(
                             writer,
@@ -1058,11 +1212,15 @@ def run_grouped(
                         )
                 finally:
                     if pinned:
-                        log(f"  Unpinning tables for q{qnum}")
+                        log(f"  Unpinning tables for {query_name(qnum)}")
                         _execute_multi(con, emit_unpin(qnum))
         finally:
             log("Closing connection")
-            con.close()
+            workload = getattr(writer, "workload", None)
+            if workload is not None:
+                workload.close_connection(con)
+            else:
+                con.close()
 
 
 def run_sequential(
@@ -1095,7 +1253,11 @@ def run_sequential(
     pin_enabled = pin != "none"
     for name, use_gpu in engine_modes:
         con = open_connection(
-            source, gpu_execution=use_gpu, data_source=data_source, s3_input=s3_input
+            source,
+            gpu_execution=use_gpu,
+            data_source=data_source,
+            s3_input=s3_input,
+            workload=getattr(writer, "workload", None),
         )
         try:
             pinned = False
@@ -1121,12 +1283,24 @@ def run_sequential(
                         pinned = True
                     if drop_scope == "iteration":
                         log(f"--- iter{it} flush engine={name} ---")
-                        _flush_between_runs(con, profile, use_gpu, source, data_source)
+                        _flush_between_runs(
+                            con,
+                            profile,
+                            use_gpu,
+                            source,
+                            data_source,
+                            getattr(writer, "workload", None),
+                        )
                     for qnum in queries:
-                        log(f"--- q{qnum} iter{it} engine={name} ---")
+                        log(f"--- {query_name(qnum)} iter{it} engine={name} ---")
                         if drop_scope == "run":
                             _flush_between_runs(
-                                con, profile, use_gpu, source, data_source
+                                con,
+                                profile,
+                                use_gpu,
+                                source,
+                                data_source,
+                                getattr(writer, "workload", None),
                             )
                         _run_one(
                             writer,
@@ -1146,7 +1320,11 @@ def run_sequential(
                     _execute_multi(con, emit_unpin_all())
         finally:
             log("Closing connection")
-            con.close()
+            workload = getattr(writer, "workload", None)
+            if workload is not None:
+                workload.close_connection(con)
+            else:
+                con.close()
 
 
 # Keyed by a profile's "ordering", not by a user-facing choice --
@@ -1390,7 +1568,7 @@ def run_nsys_profile(
         if s3_input is None:
             sql_path = _build_precmd_temp_sql(
                 qnum,
-                query_texts[f"q{qnum}"],
+                query_texts[query_name(qnum)],
                 source,
                 iterations,
                 pin,
@@ -1430,7 +1608,7 @@ def run_nsys_profile(
                 pin,
                 qdir,
                 PIN_COMPRESSION_PLAN_DIR or "",
-                query_texts[f"q{qnum}"],
+                query_texts[query_name(qnum)],
             ]
         else:
             duckdb_invocation = [DUCKDB_BIN]
@@ -1462,7 +1640,7 @@ def run_nsys_profile(
             env["SIRIUS_PIN_TIER"] = pin
         env["SIRIUS_LOG_DIR"] = sub_log_dir
 
-        log(f"--- q{qnum} (nsys, iterations={iterations}) ---")
+        log(f"--- {query_name(qnum)} (nsys, iterations={iterations}) ---")
         log(f"  output: {nsys_output}.nsys-rep / .sqlite")
         start = time.perf_counter()
         try:
@@ -1477,17 +1655,19 @@ def run_nsys_profile(
         except subprocess.TimeoutExpired:
             wall = time.perf_counter() - start
             log(
-                f"  q{qnum} TIMED OUT after {wall:.1f}s "
+                f"  {query_name(qnum)} TIMED OUT after {wall:.1f}s "
                 f"(timeout={query_timeout + 10}s)"
             )
             for it in range(iterations):
                 writer.record("sirius", qnum, it, float("nan"))
             continue
         wall = time.perf_counter() - start
-        log(f"  q{qnum} subprocess returned in {wall:.2f}s (exit={proc.returncode})")
+        log(
+            f"  {query_name(qnum)} subprocess returned in {wall:.2f}s (exit={proc.returncode})"
+        )
 
         if proc.returncode != 0:
-            log(f"  q{qnum} FAILED — last lines of {stdout_path}:")
+            log(f"  {query_name(qnum)} FAILED — last lines of {stdout_path}:")
             try:
                 with open(stdout_path) as f:
                     tail = f.readlines()[-5:]
@@ -1506,7 +1686,7 @@ def run_nsys_profile(
         # The 'views' row is skipped; subsequent rows map to iter=0,1,...
         timing_path = os.path.join(qdir, "timings.csv")
         if not os.path.isfile(timing_path):
-            log(f"  q{qnum} WARNING: no timings.csv produced; recording NaN")
+            log(f"  {query_name(qnum)} WARNING: no timings.csv produced; recording NaN")
             for it in range(iterations):
                 writer.record("sirius", qnum, it, float("nan"))
             continue
@@ -1570,7 +1750,7 @@ def run_gdb(
 
         sql_path = _build_precmd_temp_sql(
             qnum,
-            query_texts[f"q{qnum}"],
+            query_texts[query_name(qnum)],
             source,
             iterations,
             pin,
@@ -1607,7 +1787,7 @@ def run_gdb(
             env["SIRIUS_PIN_TIER"] = pin
         env["SIRIUS_LOG_DIR"] = sub_log_dir
 
-        log(f"--- q{qnum} (gdb, iterations={iterations}) ---")
+        log(f"--- {query_name(qnum)} (gdb, iterations={iterations}) ---")
         log(f"  output: {stdout_path}")
         start = time.perf_counter()
         try:
@@ -1622,17 +1802,19 @@ def run_gdb(
         except subprocess.TimeoutExpired:
             wall = time.perf_counter() - start
             log(
-                f"  q{qnum} TIMED OUT after {wall:.1f}s "
+                f"  {query_name(qnum)} TIMED OUT after {wall:.1f}s "
                 f"(timeout={query_timeout + 10}s)"
             )
             for it in range(iterations):
                 writer.record("sirius", qnum, it, float("nan"))
             continue
         wall = time.perf_counter() - start
-        log(f"  q{qnum} subprocess returned in {wall:.2f}s (exit={proc.returncode})")
+        log(
+            f"  {query_name(qnum)} subprocess returned in {wall:.2f}s (exit={proc.returncode})"
+        )
 
         if proc.returncode != 0:
-            log(f"  q{qnum} FAILED — inspect {stdout_path}")
+            log(f"  {query_name(qnum)} FAILED — inspect {stdout_path}")
             for it in range(iterations):
                 writer.record("sirius", qnum, it, float("nan"))
             continue
@@ -1642,7 +1824,7 @@ def run_gdb(
 
         timing_path = os.path.join(qdir, "timings.csv")
         if not os.path.isfile(timing_path):
-            log(f"  q{qnum} WARNING: no timings.csv produced; recording NaN")
+            log(f"  {query_name(qnum)} WARNING: no timings.csv produced; recording NaN")
             for it in range(iterations):
                 writer.record("sirius", qnum, it, float("nan"))
             continue
@@ -1751,7 +1933,7 @@ def split_sirius_log(log_dir, benchmark_dir, queries, iterations, query_texts):
         # and lowercase so the match is exact but tolerant of formatting differences.
         return " ".join(sql.split()).rstrip(";").strip().lower()
 
-    known = {_norm(query_texts[f"q{q}"]): q for q in queries}
+    known = {_norm(query_texts[query_name(q)]): q for q in queries}
 
     begin_marker = "QueryBegin: "
     sql_marker = " SQL: "
@@ -1786,7 +1968,7 @@ def split_sirius_log(log_dir, benchmark_dir, queries, iterations, query_texts):
     for q, span_list in per_query_spans.items():
         if not span_list:
             continue
-        qdir = os.path.join(benchmark_dir, "sirius", f"q{q}")
+        qdir = os.path.join(benchmark_dir, "sirius", query_name(q))
         os.makedirs(qdir, exist_ok=True)
         out_path = os.path.join(qdir, "sirius.log")
         with open(out_path, "w") as out:
@@ -1795,7 +1977,7 @@ def split_sirius_log(log_dir, benchmark_dir, queries, iterations, query_texts):
     log(f"Per-query Sirius logs written under {os.path.join(benchmark_dir, 'sirius')}/")
 
 
-def validate(sirius_dir, duckdb_dir, queries):
+def validate(sirius_dir, duckdb_dir, queries, workload=None):
     """Compare saved Sirius vs DuckDB result.txt files under two independent directories.
 
     Each is a directory of q<N>/result.txt files — sirius_dir and duckdb_dir
@@ -1816,7 +1998,27 @@ def validate(sirius_dir, duckdb_dir, queries):
     log(f"Validating {sirius_dir} against {duckdb_dir}")
     results = {}
     for qnum in queries:
-        qname = f"q{qnum}"
+        qname = query_name(qnum)
+        if workload is not None and qnum == "pagerank":
+            # The unordered edge sample can differ between engines. Do not
+            # compare IDs/checksums from different samples as exact references.
+            try:
+                for directory in (sirius_dir, duckdb_dir):
+                    files = sorted(
+                        (Path(directory) / qname).glob("metadata_iter*.json")
+                    )
+                    if len(files) != workload.iterations:
+                        raise ValueError("Missing per-iteration PageRank checks")
+                    for path in files:
+                        if not json.loads(path.read_text())["invariants"]["passed"]:
+                            raise ValueError(f"PageRank invariants failed: {path}")
+                results[qnum] = {
+                    "status": "success",
+                    "detail": "rank invariants only; unordered samples may differ",
+                }
+            except (OSError, ValueError, KeyError) as exc:
+                results[qnum] = {"status": "validation", "detail": str(exc)}
+            continue
         duck_path = os.path.join(duckdb_dir, qname, "result.txt")
         sir_path = os.path.join(sirius_dir, qname, "result.txt")
         if not os.path.exists(duck_path) or not os.path.exists(sir_path):
@@ -1867,7 +2069,7 @@ def validate(sirius_dir, duckdb_dir, queries):
             results[qnum] = {"status": "validation", "detail": detail}
 
     passed = sum(1 for v in results.values() if v["status"] == "success")
-    failed = [f"q{q}" for q, v in results.items() if v["status"] != "success"]
+    failed = [query_name(q) for q, v in results.items() if v["status"] != "success"]
     print(f"\n{'=' * 60}")
     print(f"Validation Summary: {passed}/{len(results)} queries passed")
     if failed:
@@ -1877,7 +2079,19 @@ def validate(sirius_dir, duckdb_dir, queries):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Run TPC-H performance tests")
+    p = argparse.ArgumentParser(
+        description="Run TPC-H or scale_bench performance tests"
+    )
+    p.add_argument(
+        "--benchmark",
+        choices=("tpch", "scale_bench"),
+        default="tpch",
+        help="Benchmark query/table family (default: tpch)",
+    )
+    p.add_argument(
+        "--temp-dir",
+        help="scale_bench scratch parent; only a unique owned child is removed (default: beneath the run directory)",
+    )
     p.add_argument(
         "--concurrency",
         type=int,
@@ -1910,9 +2124,9 @@ def parse_args():
     )
     p.add_argument(
         "--result-format",
-        choices=("rows", "parquet"),
-        default=os.environ.get("TPCH_RESULT_FORMAT", "rows"),
-        help="Export full results with COPY to per-iteration Parquet directories",
+        choices=("rows", "fingerprint", "parquet"),
+        default=None,
+        help="Result format (tpch default: rows; scale_bench default: fingerprint). Parquet exports full results per iteration",
     )
     p.add_argument(
         "--parquet-compression",
@@ -1923,9 +2137,20 @@ def parse_args():
         "--input",
         type=str,
         required=True,
-        help="TPC-H input: a parquet directory (--data-source parquet; one .parquet "
+        help="Input: a parquet directory (--data-source parquet; one .parquet "
         "file or subdir per table), an s3://bucket/prefix parquet directory, "
         "or a single .duckdb file (--data-source duckdb)",
+    )
+    p.add_argument(
+        "--catalog-setup",
+        type=str,
+        default=None,
+        help=(
+            "--data-source iceberg: SQL file run on every connection to attach the "
+            "catalog (CREATE SECRET ...; ATTACH ...). It holds credentials: keep it "
+            "outside the repository. It runs before Sirius is loaded, so it cannot "
+            "create SIRIUS_S3 secrets."
+        ),
     )
     p.add_argument(
         "--scale-factor",
@@ -1945,7 +2170,10 @@ def parse_args():
             "Input data source/format: 'parquet' (a directory of TPC-H parquet "
             "files scanned via read_parquet -> GPU_PARQUET_SCAN) or 'duckdb' (a "
             "single .duckdb file whose native TPC-H tables are scanned via the "
-            "GPU-native seq_scan). Pinning works for both. NOTE: this is a 2-value "
+            "GPU-native seq_scan). Pinning works for both. 'iceberg' reads the TPC-H "
+            "tables of an attached Iceberg REST catalog: --input is its catalog.schema "
+            "and --catalog-setup attaches it; serial runs without pinning only. "
+            "NOTE: this is a "
             "flag, distinct from the legacy benchmark_and_validate.sh --data-source "
             "(which also has a redundant 'duckdb-native' alias). (default: parquet)"
         ),
@@ -2042,7 +2270,7 @@ def parse_args():
         "--queries",
         type=str,
         default=None,
-        help="Comma-separated query list, e.g. '1,3,6-10' (default: all 22)",
+        help="Comma-separated queries: TPC-H '1,3,6-10', scale_bench 'gb2,workflow' or 'all' (default: all in selected family)",
     )
     p.add_argument(
         "--config",
@@ -2135,10 +2363,17 @@ def parse_args():
             "without --validation."
         ),
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.result_format is None:
+        args.result_format = (
+            "fingerprint"
+            if args.benchmark == "scale_bench"
+            else os.environ.get("TPCH_RESULT_FORMAT", "rows")
+        )
+    return args
 
 
-def _resolve_duckdb_results_dir(path):
+def _resolve_duckdb_results_dir(path, queries=None):
     """Resolve --duckdb-results to a directory of q<N>/result.txt files."""
     candidate = path
     if os.path.isdir(os.path.join(path, "duckdb")):
@@ -2148,17 +2383,21 @@ def _resolve_duckdb_results_dir(path):
     count = sum(
         1
         for entry in os.listdir(candidate)
-        if entry.startswith("q")
+        if (
+            entry in {query_name(q) for q in queries}
+            if queries is not None
+            else entry.startswith("q")
+        )
         and os.path.isfile(os.path.join(candidate, entry, "result.txt"))
     )
     if count == 0:
         raise SystemExit(
-            f"--duckdb-results: no query results (q*/result.txt) found in {candidate}"
+            f"--duckdb-results: no selected query results found in {candidate}"
         )
     return candidate
 
 
-def main():
+def _main(args, workload=None):
     if len(sys.argv) > 1 and sys.argv[1] == "--_nsys-s3-child":
         if len(sys.argv) != 9:
             raise SystemExit("Invalid internal nsys S3 invocation")
@@ -2179,19 +2418,24 @@ def main():
         )
         return
 
-    args = parse_args()
     from concurrent_benchmark import check_arguments, uses_concurrent_runner
 
     check_arguments(args)
-    if args.scale_factor is None:
+    if workload is None and args.scale_factor is None:
         log(
             "WARNING: --scale-factor was not provided; defaulting to SF1. "
             "Pass the dataset's scale factor so Q11 uses 0.0001 / SF."
         )
         args.scale_factor = "1"
     try:
-        query_texts = queries_for_scale_factor(args.scale_factor)
-        scale_factor = scale_factor_metadata_value(args.scale_factor)
+        query_texts = (
+            workload.query_texts()
+            if workload
+            else queries_for_scale_factor(args.scale_factor)
+        )
+        scale_factor = (
+            None if workload else scale_factor_metadata_value(args.scale_factor)
+        )
     except ValueError as exc:
         raise SystemExit(f"--scale-factor: {exc}") from exc
     source = args.input
@@ -2204,6 +2448,26 @@ def main():
                 f"--data-source duckdb requires --input to be a .duckdb file; "
                 f"got {source!r}"
             )
+    elif args.data_source == "iceberg":
+        global CATALOG_SETUP_PATH
+        if not args.catalog_setup or not os.path.isfile(args.catalog_setup):
+            raise SystemExit(
+                "--data-source iceberg requires --catalog-setup <sql file>"
+            )
+        if not re.fullmatch(r"\w+\.\w+", source):
+            raise SystemExit(
+                f"--data-source iceberg requires --input catalog.schema; got {source!r}"
+            )
+        if (
+            args.pin != "none"
+            or args.precmd != "none"
+            or args.nsys_profile
+            or uses_concurrent_runner(args)
+        ):
+            raise SystemExit(
+                "--data-source iceberg supports serial runs without --pin or --precmd"
+            )
+        CATALOG_SETUP_PATH = os.path.abspath(args.catalog_setup)
     elif is_s3_input(source):
         s3_input = S3Input(source)
     elif not os.path.isdir(source):
@@ -2211,7 +2475,7 @@ def main():
             f"--data-source parquet requires --input to be a parquet directory "
             f"or an s3:// prefix; got {source!r}"
         )
-    queries = parse_query_spec(args.queries)
+    queries = workload.queries if workload else parse_query_spec(args.queries)
     engine_modes = resolve_engine_modes(args.engine)
     output_root = args.output or DEFAULT_OUTPUT_ROOT
     os.environ["TPCH_RESULT_FORMAT"] = args.result_format
@@ -2231,7 +2495,7 @@ def main():
                 "--duckdb-results reuses DuckDB results in place of running them; "
                 "--engine must be 'gpu' (got: " + args.engine + ")"
             )
-        duckdb_results_dir = _resolve_duckdb_results_dir(args.duckdb_results)
+        duckdb_results_dir = _resolve_duckdb_results_dir(args.duckdb_results, queries)
 
     # Plan files apply at pin time, so they need pinned input, and a directory
     # naming no TPC-H table would change nothing.
@@ -2365,8 +2629,16 @@ def main():
         duckdb_results_source=duckdb_results_dir,
         concurrency=args.concurrency,
         concurrency_mode=args.concurrency_mode,
+        benchmark=args.benchmark,
     )
+    if workload is not None:
+        log("Preparing scale_bench inputs outside query timing")
+        workload.prepare(benchmark_dir)
     os.environ["SIRIUS_LOG_DIR"] = log_dir
+    # Have Sirius write the configuration it resolved at startup.
+    os.environ["SIRIUS_WRITE_EFFECTIVE_CONFIG"] = os.path.join(
+        benchmark_dir, "resolved_config.yaml"
+    )
     if uses_concurrent_runner(args):
         runtime_csv = os.path.join(benchmark_dir, "csv", "concurrent_runtimes.csv")
     with open(os.path.join(benchmark_dir, "result_mode.json"), "w") as result_mode:
@@ -2377,7 +2649,13 @@ def main():
                 "timing": (
                     "query_and_export" if args.result_format == "parquet" else "query"
                 ),
-                "gpu_fallback_allowed": args.result_format != "parquet",
+                "gpu_fallback_allowed": workload is None
+                and args.result_format != "parquet",
+                "validation_scope": (
+                    "count and scalar sums; nested outputs excluded"
+                    if args.result_format == "fingerprint"
+                    else "full output"
+                ),
             },
             result_mode,
             indent=2,
@@ -2433,11 +2711,14 @@ def main():
         )
 
     log("Dropping OS page cache")
-    drop_os_cache(source, args.data_source)
+    drop_os_cache(
+        source, args.data_source, **({"workload": workload} if workload else {})
+    )
     with open(runtime_csv, "w", newline="") as f:
         writer = RuntimeCsv(csv.writer(f), len(queries))
         writer.result_format = args.result_format
         writer.parquet_compression = args.parquet_compression
+        writer.workload = workload
         writer.writerow(["engine", "query", "iteration", "runtime_s"])
         f.flush()
         if precmd == "nsys":
@@ -2491,7 +2772,30 @@ def main():
     # the long-running Python connection. External runners already isolate each
     # query under <bench>/sirius/q<N>/log_dir/.
     if not uses_precmd and any(use_gpu for _, use_gpu in engine_modes):
-        split_sirius_log(log_dir, benchmark_dir, queries, args.iterations, query_texts)
+        logged_queries = dict(query_texts)
+        if workload is not None:
+            if args.result_format == "fingerprint":
+                logged_queries.update(
+                    {
+                        q: d["fingerprint_sql"]
+                        for q, d in workload.query_metadata.items()
+                    }
+                )
+            # Include the complete iterative algorithm, starting at its first
+            # explicit GPU SELECT rather than just the final summary SELECT.
+            if "bfs" in queries:
+                logged_queries["bfs"] = (
+                    "CREATE OR REPLACE TABLE scale_next_bfs_visited AS SELECT * FROM "
+                    "gpu_execution('SELECT 1000::BIGINT AS vertex, 0::INTEGER AS distance')"
+                )
+            if "pagerank" in queries:
+                logged_queries["pagerank"] = (
+                    "CREATE OR REPLACE TABLE scale_next_pr_sample AS SELECT * FROM "
+                    "gpu_execution('SELECT col_b, col_d FROM table_a LIMIT 10000')"
+                )
+        split_sirius_log(
+            log_dir, benchmark_dir, queries, args.iterations, logged_queries
+        )
 
     if do_validate:
         log("Starting validation")
@@ -2503,8 +2807,8 @@ def main():
             for qnum in queries:
                 try:
                     compare_exports(
-                        os.path.join(benchmark_dir, "sirius", f"q{qnum}"),
-                        os.path.join(duckdb_dir_for_validation, f"q{qnum}"),
+                        os.path.join(benchmark_dir, "sirius", query_name(qnum)),
+                        os.path.join(duckdb_dir_for_validation, query_name(qnum)),
                     )
                     results[qnum] = {"status": "success"}
                 except Exception as exc:
@@ -2514,6 +2818,7 @@ def main():
                 os.path.join(benchmark_dir, "sirius"),
                 duckdb_dir_for_validation,
                 queries,
+                **({"workload": workload} if workload else {}),
             )
         validation_csv = os.path.join(benchmark_dir, "validation.csv")
         with open(validation_csv, "w", newline="") as f:
@@ -2521,11 +2826,40 @@ def main():
             csv_writer.writerow(["query", "status"])
             for qnum in queries:
                 status = results.get(qnum, {}).get("status", "error")
-                csv_writer.writerow([f"Q{qnum}", status])
+                csv_writer.writerow(
+                    [f"Q{qnum}" if isinstance(qnum, int) else qnum, status]
+                )
         log(f"Wrote {validation_csv}")
         log("Validation complete")
+        if workload is not None and any(
+            r["status"] != "success" for r in results.values()
+        ):
+            raise SystemExit("scale_bench validation failed; inspect validation.csv")
 
     print_runtime_summary(runtime_csv)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--_nsys-s3-child":
+        return _main(None)
+    args = parse_args()
+    if args.benchmark == "scale_bench":
+        from scale_bench import ScaleBench, check_arguments
+
+        try:
+            queries = check_arguments(args)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        with ScaleBench(args.input, queries, args.temp_dir) as workload:
+            workload.iterations = args.iterations
+            return _main(args, workload)
+    if args.temp_dir is not None:
+        raise SystemExit("--temp-dir currently applies only to --benchmark scale_bench")
+    if args.result_format == "fingerprint":
+        raise SystemExit(
+            "--result-format fingerprint currently applies only to --benchmark scale_bench"
+        )
+    return _main(args)
 
 
 if __name__ == "__main__":

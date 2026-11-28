@@ -30,6 +30,7 @@ enum class reason : std::uint8_t {
   prefix_shape,
   prefix_no_trailing_slash,
   prefix_query_or_fragment,
+  prefix_bucket,
   prefix_unmatchable_segment,
   transport_unavailable,
 };
@@ -62,6 +63,9 @@ struct violation {
 
 /// Shape of a scope key: empty (the default scope), `s3://bucket/` or `s3://bucket/prefix/`.
 [[nodiscard]] std::optional<violation> check_uri_prefix(std::string_view uri_prefix);
+
+/// Whether @p why is a reason `check_uri_prefix()` gives.
+[[nodiscard]] bool is_prefix_reason(reason why) noexcept;
 
 /// The fixed reason text of @p refused, without the field name.
 [[nodiscard]] std::string describe(const violation& refused);

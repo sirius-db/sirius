@@ -37,6 +37,8 @@
 #include "sirius_config.hpp"
 
 #include <cudf/join/hash_join.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/device_uvector.hpp>
@@ -45,7 +47,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -135,7 +139,8 @@ struct build_probe_decision {
 ///
 /// MARK joins partition like SEMI joins. A null-propagating MARK's global build facts (any NULL
 /// key, any row) are observed while the build is hash-partitioned, before any probe task runs; see
-/// sirius_physical_hash_join::observe_partitioned_build_batch.
+/// sirius_physical_hash_join::observe_partitioned_build_batch. A correlated MARK needs none: see
+/// sirius_physical_hash_join::prepared_keys.
 ///
 /// BUILD_PROBE requires measured rows, a full build within cudf::size_type's row limit, and a
 /// build-side CONCAT. Two independent bounds charge each GPU for the estimated cuco table (rows x
@@ -159,6 +164,12 @@ struct build_probe_decision {
 /// A kept-build join (@p kept_build_streaming) streams its probe, which only BUILD_PROBE does, so
 /// it always takes BUILD_PROBE, never broadcast (a replica would see only its GPU's probe rows),
 /// and uses the natural partition count when the build exceeds either BUILD_PROBE budget.
+///
+/// A correlated MARK slot (@p correlated_mark, see sirius_physical_hash_join::mark_is_correlated)
+/// can hold three tables over its build rows: the primary filter, the filter over the groups with
+/// a NULL IN key, and the filter over every group that the first probe with a NULL IN key builds.
+/// It also copies the correlation keys of the NULL-IN-key rows, at most the whole build. The
+/// BUILD_PROBE bounds charge three tables per row and the build twice.
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
   uint64_t total_bytes,
   std::optional<uint64_t> total_rows,
@@ -174,13 +185,30 @@ struct build_probe_decision {
   HASH_JOIN_MODE join_mode,
   double estimated_probe_to_build_ratio,
   std::optional<uint64_t> resident_bytes = std::nullopt,
-  bool kept_build_streaming              = false);
+  bool kept_build_streaming              = false,
+  bool correlated_mark                   = false);
 
 /**
  * @brief Select never-probed build slots that can be reclaimed after the probe producer closes.
  */
 [[nodiscard]] std::vector<std::size_t> build_probe_slots_to_reclaim(
   std::vector<build_probe_slot_view> const& slots, bool probe_finished);
+
+/// Per-group NULL facts of one build of a correlated MARK join (see
+/// sirius_physical_hash_join::mark_is_correlated): a BUILD_PROBE slot's, or a STANDARD task's.
+/// The build's key columns must outlive it.
+struct correlated_mark_build {
+  /// The build's correlation key columns.
+  cudf::table_view group_keys;
+  /// Correlation keys of the build rows whose IN key is NULL, and the filter over them; null when
+  /// no IN key is NULL.
+  std::unique_ptr<cudf::table> null_in_key_group_keys;
+  std::unique_ptr<cudf::filtered_join> null_in_key_groups;
+  /// The filter over every group, built by the first probe batch with a NULL IN key. Guarded by
+  /// groups_mutex.
+  std::unique_ptr<cudf::filtered_join> groups;
+  std::mutex groups_mutex;
+};
 
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
@@ -282,12 +310,27 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
    * condition. For mixed joins (equality + inequality), also requires that no column referenced
    * by an equality condition appears in any inequality condition on the same side — cuDF's
    * mixed_join API requires disjoint equality and conditional table columns. A MARK join mixing
-   * null-safe and plain keys is rejected; see mark_join_mixes_null_safe_keys.
+   * null-safe keys with another key is supported only as a correlated quantified comparison (see
+   * mark_is_correlated).
    *
    * @param join_type Used to exclude MARK joins from null-safe routing.
+   * @param delim_key_count Number of correlated columns of a MARK join (DuckDB's `mark_types`),
+   * which identifies a correlated quantified comparison.
    */
   static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions,
-                                       duckdb::JoinType join_type);
+                                       duckdb::JoinType join_type,
+                                       std::size_t delim_key_count = 0);
+
+  /**
+   * @brief Whether a MARK join's conditions form a correlated IN / ANY / ALL (see
+   * mark_is_correlated): @p delim_key_count null-safe correlation keys, then the IN key under a
+   * null-propagating comparison, in DuckDB's positions.
+   *
+   * @param comparisons The comparison of each join condition, in condition order.
+   * @param delim_key_count Number of correlated columns (DuckDB's `mark_types`).
+   */
+  [[nodiscard]] static bool is_correlated_mark(std::span<sirius::comparison_type const> comparisons,
+                                               std::size_t delim_key_count);
 
   [[nodiscard]] bool is_right_family() const
   {
@@ -342,7 +385,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// @brief Called by the build-side PARTITION's observer for every build batch it hash-partitions
   /// (before scattering). For a MARK join with null-propagating keys this records, join-wide,
   /// whether the build has any row and whether any build key is NULL, so every partition's marks
-  /// follow the global three-valued rule. Idempotent, so OOM retries are harmless.
+  /// follow the global three-valued rule. A correlated MARK records nothing; its rule is per
+  /// group. Idempotent, so OOM retries are harmless.
   void observe_partitioned_build_batch(cucascade::read_only_data_batch const& batch);
 
   /// @brief Records that the build PARTITION carries this join's observer, so a hash-partitioned
@@ -484,12 +528,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// @p local_build_empty), which is the whole build unless the build is hash-partitioned.
   [[nodiscard]] mark_null_state resolve_mark_null_state(bool local_build_has_null,
                                                         bool local_build_empty) const;
+  /// A MARK join whose NULL rule is join-wide: a NULL build key anywhere makes every unmatched
+  /// mark NULL. Excludes all-null-safe (definite marks) and correlated (per-group rule) MARKs.
+  [[nodiscard]] bool mark_propagates_build_nulls() const
+  {
+    return join_type == duckdb::JoinType::MARK && !mark_is_null_safe() && !mark_is_correlated();
+  }
   /// A null-propagating MARK on a hash-partitioned build: no probe task may run until the whole
   /// build has been observed.
   [[nodiscard]] bool mark_waits_for_whole_build() const
   {
-    return join_type == duckdb::JoinType::MARK && !mark_is_null_safe() &&
-           _mark_build_partitioned.load(std::memory_order_acquire);
+    return mark_propagates_build_nulls() && _mark_build_partitioned.load(std::memory_order_acquire);
   }
 
   // Per-partition build/probe state for BUILD_PROBE mode. Each partition owns one cuco hash table
@@ -504,6 +553,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
       distinct_hash_table;  // used instead of hash_table when build keys are proven unique
     std::unique_ptr<cudf::filtered_join>
       filtered_table;  // reusable build-on-right object for MARK/SEMI/ANTI joins
+    std::unique_ptr<correlated_mark_build>
+      correlated_mark;  // per-group NULL facts of a correlated MARK's build
     std::optional<::cucascade::read_only_data_batch>
       build_table;  // owned build table, to materialize build-side results at probe time
     std::vector<std::unique_ptr<cudf::column>>
@@ -535,8 +586,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// when EVERY equi-key is IS NOT DISTINCT FROM; a plain `=` key (including a join
   /// that mixes the two kinds) forces UNEQUAL. A MARK join follows the same rule:
   /// all-null-safe keys use EQUAL and emit definite marks (see mark_is_null_safe),
-  /// anything containing a plain key uses UNEQUAL and the IN/EXISTS three-valued
-  /// result logic. A MARK join *mixing* the two is rejected at plan time.
+  /// all-plain keys use UNEQUAL and the IN/EXISTS three-valued result logic. A MARK
+  /// join *mixing* the two runs only as a correlated quantified comparison, under
+  /// EQUAL (see mark_is_correlated); any other mixture is rejected at plan time.
   cudf::null_equality compare_nulls() const { return compare_nulls_; }
   cudf::null_equality compare_nulls_ = cudf::null_equality::UNEQUAL;
 
@@ -544,6 +596,14 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// so every mark is definite and the result carries no null mask.
   [[nodiscard]] bool mark_is_null_safe() const { return mark_is_null_safe_; }
   bool mark_is_null_safe_ = false;
+
+  /// A correlated IN / ANY / ALL: one null-safe correlation key per `delim_types` entry, then the
+  /// IN key under `=` or an inequality, as in DuckDB's PhysicalHashJoin::InitializeHashTable. The
+  /// build rows sharing a probe row's correlation keys are its group, and the quantifier's rule
+  /// applies within it: TRUE on a match, FALSE for an empty group, else NULL if the probe or a
+  /// group IN key is NULL. An `=` IN key is a hash key; an inequality one makes this a MIXED_JOIN.
+  [[nodiscard]] bool mark_is_correlated() const { return mark_is_correlated_; }
+  bool mark_is_correlated_ = false;
 
   /// SINGLE join: DuckDB's `scalar_subquery_error_on_multiple_rows`. When set, a probe row with
   /// more than one build match is an error, as in DuckDB's hash join; otherwise one match is kept.
@@ -564,7 +624,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     cudf::data_type type;
     bool hash_key;
   };
-  /// Includes routed NULL-safe equalities for the existing partition-routing contract.
+  /// The keys both inputs are hash-partitioned on. Includes routed NULL-safe equalities for the
+  /// existing partition-routing contract. A correlated MARK lists its correlation keys only, so a
+  /// group never spans partitions.
   [[nodiscard]] std::vector<prepared_key> const& prepared_keys() const { return _prepared_keys; }
 
  protected:

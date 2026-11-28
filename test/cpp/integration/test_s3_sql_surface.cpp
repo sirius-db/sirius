@@ -6,15 +6,21 @@
  */
 
 #include "catch.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
 #include "io/s3/sirius_httpfs.hpp"
 #include "op/scan/field_id_mapping.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
+#include "planner/connector_registry.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 #include "utils/isolated_checkpoint_test.hpp"
+#include "utils/log_test_utils.hpp"
+#include "utils/mock_iceberg_rest_catalog.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
@@ -31,8 +37,11 @@
 #include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
 #include <cucascade/io/rest/s3/static_credentials.hpp>
 #include <duckdb/catalog/catalog.hpp>
+#include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
+#include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <duckdb/common/multi_file/table_function_multi_file.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
@@ -58,6 +67,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -305,6 +315,8 @@ struct sirius_memory_limits {
   std::optional<sirius::scan_manager::io_backend> backend;
   std::optional<std::string> rest_footer_probe_bytes;
   std::optional<std::size_t> rest_list_max_matches;
+  std::optional<std::int64_t> footer_remote_reads;
+  std::optional<std::int64_t> footer_local_reads;
 };
 
 sirius_memory_limits large_sirius_memory_limits(std::string cache_mode)
@@ -399,6 +411,17 @@ class sirius_config_env_guard {
     }
     if (limits.rest_list_max_matches.has_value()) {
       out << "        list_max_matches: " << *limits.rest_list_max_matches << "\n";
+    }
+    if (limits.footer_remote_reads || limits.footer_local_reads) {
+      out << "  operator_params:\n";
+      if (limits.footer_remote_reads) {
+        out << "    parquet_footer_statistics_max_remote_reads: " << *limits.footer_remote_reads
+            << '\n';
+      }
+      if (limits.footer_local_reads) {
+        out << "    parquet_footer_statistics_max_local_reads: " << *limits.footer_local_reads
+            << '\n';
+      }
     }
     out.close();
     REQUIRE(out);
@@ -1091,6 +1114,53 @@ TEST_CASE("S3 SQL config guard keeps object-store credentials out of YAML", "[s3
   }
 }
 
+TEST_CASE("Statements that carry credentials are logged without their text", "[s3][sql][log]")
+{
+  // No object store is contacted: this is about what the QueryBegin callback writes.
+  s3_test_env env{"http://127.0.0.1:9000",
+                  "",
+                  "",
+                  "us-east-1",
+                  "temporary-access-key",
+                  "temporary-secret-key",
+                  "sirius-test",
+                  "",
+                  fs::temp_directory_path()};
+  sirius_config_env_guard guard(env);
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  load_sirius_extension(db);
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  // Each statement creates a secret and holds the same synthetic value as a literal. DuckDB
+  // hands the callback the statement as written, so a classifier that reads only its first
+  // words, or ends a nested comment at the first "*/", logs the literal.
+  auto const value      = std::string{"synthetic-credential-9c2e"};
+  auto const secret_sql = "SECRET logged (TYPE SIRIUS_S3, KEY_ID 'k', SECRET '" + value + "')";
+  std::vector<std::string> const statements{
+    "CREATE /* a /* nested */ comment */ OR REPLACE " + secret_sql,
+    "EXPLAIN CREATE OR REPLACE " + secret_sql,
+    "EXPLAIN ANALYZE CREATE OR REPLACE " + secret_sql,
+    "EXPLAIN ANALYSE CREATE OR REPLACE " + secret_sql,
+    "EXPLAIN (ANALYZE) /* why */ CREATE OR REPLACE " + secret_sql,
+  };
+  sirius::test::scoped_recording_log_sink logs{"trace"};
+  for (auto const& sql : statements) {
+    INFO(sql.substr(0, sql.find("SECRET logged")));
+    require_query_ok(con, sql);
+  }
+  // A statement of no such kind is the control: its text is logged.
+  require_query_ok(con, "SELECT 'logged-in-full' AS control");
+  auto const records = logs.records();
+  auto const logged  = [&](std::string_view text) {
+    return std::ranges::count_if(
+      records, [&](auto const& record) { return record.message.find(text) != std::string::npos; });
+  };
+  CHECK(logged(value) == 0);
+  CHECK(logged("SQL: CREATE SECRET <text withheld") == statements.size());
+  CHECK(logged("SQL: SELECT 'logged-in-full' AS control") == 1);
+}
+
 TEST_CASE("S3 bench STS session token reaches presigned URLs", "[s3][sigv4]")
 {
   cucascade::io::rest::s3::static_credentials creds;
@@ -1526,6 +1596,346 @@ TEST_CASE("S3 LIST keeps its REST context alive while credentials rotate",
   CHECK(pages >= 2);
 }
 
+TEST_CASE("S3 planned read opens with its own config after the path's is replaced",
+          "[s3][integration][filesystem][secret][rotation]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto sirius_ctx =
+    fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& manager   = sirius_ctx->get_scan_manager();
+  auto const path = s3_uri(env->bucket, "parquet/nation.parquet");
+  using signing   = cucascade::io::object_store_config::signing_mode;
+
+  // Differs from every other installed config, so this path alone maps to its snapshot.
+  auto own = fixture.config_env.object_store();
+  own.s3_signing_mode =
+    own.s3_signing_mode == signing::header ? signing::presigned : signing::header;
+  auto const planned = manager.install_s3_config(path, own);
+  REQUIRE(planned);
+  // Another connection resolves the same path to credentials that cannot read it.
+  auto other       = fixture.config_env.object_store();
+  other.secret_key = "wrong";
+  manager.install_s3_config(path, other);
+
+  CHECK_THROWS(manager.create_datasource(path));
+  auto opened = manager.create_datasource(path, cucascade::io::open_hint::generic, &*planned);
+  REQUIRE(opened);
+  // No path maps to that config any more, so nothing would retire a context the manager kept.
+  std::weak_ptr<cucascade::io::ioctx> context = opened->io_ctx();
+  opened.reset();
+  CHECK(context.expired());
+
+  // The bind-time footer read and the LIST of a glob take the caller's config the same way.
+  CHECK_THROWS(manager.describe_parquet(path));
+  CHECK(manager.describe_parquet(path, &*planned).total_num_rows == 25);
+  auto const pattern = s3_uri(env->bucket, "parquet/nation*.parquet");
+  auto const listed  = manager.install_s3_config(pattern, own);
+  REQUIRE(listed);
+  manager.install_s3_config(pattern, other);
+  CHECK_THROWS(sirius::io::s3::expand_glob(pattern, manager));
+  CHECK_FALSE(sirius::io::s3::expand_glob(pattern, manager, std::nullopt, &*listed).empty());
+  manager.install_s3_config(pattern, fixture.config_env.object_store());
+  manager.install_s3_config(path, fixture.config_env.object_store());
+
+  // The same through SQL. Between the bind's or the glob's install and its read, another
+  // connection resolves the path to the credentials that cannot read it.
+  //
+  // Each statement sums a column, so that it scans its files: DuckDB answers a bare count(*)
+  // over Parquet from the footers. With the fallback off, a scan that cannot open a file is
+  // the statement's error.
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con, "SET enable_duckdb_fallback=false");
+  auto const glob_query =
+    "SELECT sum(n_nationkey) FROM " + s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const glob_rows = collect_rows(*require_query_ok(fixture.con, glob_query));
+  using rows_t         = std::vector<std::vector<std::string>>;
+  // Every data file the three statements scan.
+  std::vector<std::string> const scanned{path,
+                                         s3_uri(env->bucket, "glob/multi/nation_a.parquet"),
+                                         s3_uri(env->bucket, "glob/multi/nation_b.parquet")};
+  auto const counters = sirius_ctx->physical_counters();
+  // The install callback below runs wherever a file is opened, and DuckDB may read the footers
+  // of a glob's files on several of its workers: every access to `replaced` takes the mutex.
+  std::mutex replaced_mutex;
+  std::vector<std::string> replaced;
+  auto const installs_of = [&](std::string const& installed) {
+    std::lock_guard lock{replaced_mutex};
+    return std::ranges::count(replaced, installed);
+  };
+  std::size_t planned_statements = 0;
+  struct reset_hooks {
+    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
+    ~reset_hooks()
+    {
+      counters->s3_config_installed_for_testing = {};
+      counters->after_lowering_for_testing      = {};
+    }
+  } reset{counters};
+  // Fires after every install that a read follows: the bind, the glob, and each file DuckDB's
+  // own reader opens through sirius_httpfs.
+  counters->s3_config_installed_for_testing = [&](std::string const& installed) {
+    {
+      std::lock_guard lock{replaced_mutex};
+      replaced.push_back(installed);
+    }
+    manager.install_s3_config(installed, other);
+  };
+  // Fires once every scan of a statement is lowered. By then the statement has installed and
+  // recorded the configuration of every data file it scans, and installs none again; the
+  // scans open the files afterwards, and must do so with what was recorded.
+  counters->after_lowering_for_testing = [&] {
+    ++planned_statements;
+    for (auto const& file : scanned)
+      manager.install_s3_config(file, other);
+  };
+  auto const executions_before = sirius::test::get_transparent_execution_stats(fixture.con);
+  auto bound =
+    fixture.con.Query("SELECT sum(n_nationkey) FROM " + s3_sirius_parquet_scan(*env, "nation"));
+  auto const planned_after_bound = planned_statements;
+  auto globbed                   = fixture.con.Query(glob_query);
+  auto const bind_installs       = installs_of(path);
+  auto const glob_installs       = installs_of(s3_uri(env->bucket, "glob/multi/nation_*.parquet"));
+  // A transparent read of the one file: DuckDB's binder opens it through sirius_httpfs before
+  // the statement is planned, and the GPU scan opens it again when it runs.
+  {
+    std::lock_guard lock{replaced_mutex};
+    replaced.clear();
+  }
+  auto direct =
+    fixture.con.Query("SELECT sum(n_nationkey) FROM " + s3_parquet_scan(*env, "nation"));
+  auto const opened_by_duckdb               = installs_of(path);
+  auto const planned_at_end                 = planned_statements;
+  counters->s3_config_installed_for_testing = {};
+  counters->after_lowering_for_testing      = {};
+  auto const executions_after = sirius::test::get_transparent_execution_stats(fixture.con);
+  // Every path is left on the configuration that cannot read it.
+  for (auto const& file : scanned)
+    CHECK_THROWS(manager.create_datasource(file));
+  for (auto const& file : scanned)
+    manager.install_s3_config(file, fixture.config_env.object_store());
+  manager.install_s3_config(s3_uri(env->bucket, "glob/multi/nation_*.parquet"),
+                            fixture.config_env.object_store());
+  CHECK(bind_installs > 0);
+  CHECK(glob_installs > 0);
+  CHECK(planned_after_bound == 1);
+  CHECK(planned_at_end == 3);
+  CHECK(opened_by_duckdb > 0);
+  // All three ran on the GPU, on the configurations they planned. Each is checked by itself,
+  // so that one failing does not hide the others; a failed statement shows its error.
+  CHECK(executions_after.executions == executions_before.executions + 3);
+  auto const rows_of = [](duckdb::QueryResult& result) {
+    return result.HasError() ? rows_t{{result.GetError()}} : collect_rows(result);
+  };
+  CHECK(rows_of(*bound) == rows_t{{"300"}});
+  CHECK(rows_of(*globbed) == glob_rows);
+  CHECK(rows_of(*direct) == rows_t{{"300"}});
+}
+
+TEST_CASE("S3 idle REST contexts are bounded while credentials rotate",
+          "[s3][integration][filesystem][secret][rotation]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto sirius_ctx =
+    fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& manager = sirius_ctx->get_scan_manager();
+  // A planned query latches the counters' test hooks.
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con,
+                   "SELECT count(*) FROM read_parquet(" +
+                     sql_quote(s3_uri(env->bucket, "parquet/nation.parquet")) + ")");
+  auto const counters = sirius_ctx->physical_counters();
+  struct reset_limit {
+    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
+    ~reset_limit() { counters->idle_rest_context_limit_for_testing.reset(); }
+  } reset{counters};
+  counters->idle_rest_context_limit_for_testing = 1;
+
+  // Four configurations that all reach the store, each for a path of its own that is opened
+  // once and not again: what a catalog vending new credentials on every load leaves behind.
+  using signing = cucascade::io::object_store_config::signing_mode;
+  std::vector<cucascade::io::object_store_config> rotated;
+  for (auto const mode : {signing::presigned, signing::header}) {
+    for (bool const verify : {true, false}) {
+      rotated.push_back(fixture.config_env.object_store());
+      rotated.back().s3_signing_mode = mode;
+      rotated.back().tls_verify      = verify;
+    }
+  }
+  std::array<std::uint8_t, 1> const byte{0};
+  auto const open = [&](std::size_t index) {
+    auto const key = "rotation/object-" + std::to_string(index);
+    REQUIRE(sirius::test::put_s3_test_object(key, byte));
+    auto const path = s3_uri(env->bucket, key);
+    manager.install_s3_config(path, rotated.at(index));
+    auto source = manager.create_datasource(path);
+    REQUIRE(source);
+    return source;
+  };
+
+  auto const in_flight                           = open(0);
+  std::weak_ptr<cucascade::io::ioctx> first_idle = open(1)->io_ctx();
+  open(2);
+  open(3);
+  // The read in flight, the context just built, and one idle context. Without the bound every
+  // configuration keeps its own.
+  CHECK(manager.rest_context_count() <= 3);
+  CHECK(first_idle.expired());
+  // The read in flight kept its context in the manager: the same one serves its path again.
+  CHECK(manager.create_datasource(s3_uri(env->bucket, "rotation/object-0"))->io_ctx() ==
+        in_flight->io_ctx());
+  // A dropped context is rebuilt when one of its paths is opened again.
+  CHECK(manager.create_datasource(s3_uri(env->bucket, "rotation/object-1")));
+}
+
+TEST_CASE("S3 idle REST contexts are released when the statement that held them ends",
+          "[s3][integration][sql][secret][rotation]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto sirius_ctx =
+    fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& manager = sirius_ctx->get_scan_manager();
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con, "SET enable_duckdb_fallback=false");
+  // Two tables, each under a secret of its own. The secrets differ in a field the store does
+  // not check, so each resolves to a configuration, and so a REST context, of its own.
+  auto const nation = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto const region = s3_uri(env->bucket, "parquet/region.parquet");
+  auto const secret = [&](std::string const& name, std::string const& scope, bool verify_ssl) {
+    auto sql = create_sirius_s3_secret_sql(*env, name, scope);
+    sql.pop_back();
+    return sql + ", VERIFY_SSL " + (verify_ssl ? "true" : "false") + ")";
+  };
+  require_query_ok(fixture.con, secret("rotation_nation", nation, true));
+  require_query_ok(fixture.con, secret("rotation_region", region, false));
+  // One statement reads both, so its scans hold both contexts for as long as it runs.
+  auto const both = "SELECT count(*) FROM read_parquet(" + sql_quote(nation) +
+                    ") JOIN read_parquet(" + sql_quote(region) + ") ON n_regionkey = r_regionkey";
+  auto const run = [&] {
+    auto const before = sirius::test::get_transparent_execution_stats(fixture.con);
+    auto result       = require_query_ok(fixture.con, both);
+    auto const after  = sirius::test::get_transparent_execution_stats(fixture.con);
+    CHECK(collect_rows(*result) == std::vector<std::vector<std::string>>{{"25"}});
+    CHECK(after.executions == before.executions + 1);
+  };
+  // A planned query latches the counters' test hooks.
+  run();
+  auto const counters = sirius_ctx->physical_counters();
+  struct reset_limit {
+    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
+    ~reset_limit() { counters->idle_rest_context_limit_for_testing.reset(); }
+  } reset{counters};
+
+  // Within the bound both stay cached once the statement has ended.
+  counters->idle_rest_context_limit_for_testing = 2;
+  run();
+  CHECK(manager.rest_context_count() == 2);
+  std::weak_ptr<cucascade::io::ioctx> const nation_context =
+    manager.create_datasource(nation)->io_ctx();
+  std::weak_ptr<cucascade::io::ioctx> const region_context =
+    manager.create_datasource(region)->io_ctx();
+  REQUIRE_FALSE(nation_context.expired());
+  REQUIRE_FALSE(region_context.expired());
+  CHECK(nation_context.lock() != region_context.lock());
+
+  // The same statement again, with the bound lowered once its scans are lowered. By then its
+  // bind has closed its file handles, so nothing gives a context back before the scans take
+  // both; while it runs, both are in use and neither can be dropped. Once its scans are
+  // released, one of the two is given back, without a later statement having to ask.
+  struct reset_hook {
+    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
+    ~reset_hook() { counters->after_lowering_for_testing = {}; }
+  } reset_lowering{counters};
+  counters->after_lowering_for_testing = [&] { counters->idle_rest_context_limit_for_testing = 1; };
+  run();
+  CHECK(manager.rest_context_count() == 1);
+  CHECK(nation_context.expired() != region_context.expired());
+}
+
+TEST_CASE(
+  "S3 idle REST contexts are released when a file handle closes or retained Parquet sources "
+  "are dropped",
+  "[s3][integration][sql][secret][rotation]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("sirius"));
+  auto sirius_ctx =
+    fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& manager = sirius_ctx->get_scan_manager();
+  set_gpu_execution(fixture.con, true);
+  // Two files, each under a secret of its own. The secrets differ in a field the store does not
+  // check, so each file has a REST context of its own.
+  auto const nation = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto const region = s3_uri(env->bucket, "parquet/region.parquet");
+  auto const secret = [&](std::string const& name, std::string const& scope, bool verify_ssl) {
+    auto sql = create_sirius_s3_secret_sql(*env, name, scope);
+    sql.pop_back();
+    return sql + ", VERIFY_SSL " + (verify_ssl ? "true" : "false") + ")";
+  };
+  require_query_ok(fixture.con, secret("reader_nation", nation, true));
+  require_query_ok(fixture.con, secret("reader_region", region, false));
+  // A planned query latches the counters' test hooks.
+  require_query_ok(fixture.con,
+                   "SELECT sum(n_nationkey) FROM read_parquet(" + sql_quote(nation) + ")");
+  auto const counters = sirius_ctx->physical_counters();
+  struct reset_limit {
+    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
+    ~reset_limit() { counters->idle_rest_context_limit_for_testing.reset(); }
+  } reset{counters};
+  counters->idle_rest_context_limit_for_testing = 1;
+
+  // From here on no statement runs, and no context is built after the readers of a step are
+  // open: a context that goes is given back because its last reader went.
+  {
+    auto& fs           = duckdb::FileSystem::GetFileSystem(*fixture.con.context);
+    auto nation_handle = fs.OpenFile(nation, duckdb::FileFlags::FILE_FLAGS_READ);
+    auto region_handle = fs.OpenFile(region, duckdb::FileFlags::FILE_FLAGS_READ);
+    // Each handle holds its context: neither is idle.
+    CHECK(manager.rest_context_count() == 2);
+    nation_handle.reset();
+    // One idle context is within the bound.
+    CHECK(manager.rest_context_count() == 2);
+    region_handle.reset();
+    CHECK(manager.rest_context_count() == 1);
+  }
+  // The same for Parquet pins, which hold the datasources of their files until removed.
+  REQUIRE(manager.pin_parquet_ranges("reader_nation", {nation}, std::nullopt) > 0);
+  REQUIRE(manager.pin_parquet_ranges("reader_region", {region}, std::nullopt) > 0);
+  CHECK(manager.rest_context_count() == 2);
+  manager.remove_pinned_entry("reader_nation");
+  CHECK(manager.rest_context_count() == 2);
+  manager.remove_pinned_entry("reader_region");
+  CHECK(manager.rest_context_count() == 1);
+  // Resetting the caches drops the datasources of every pin.
+  REQUIRE(manager.pin_parquet_ranges("reader_nation", {nation}, std::nullopt) > 0);
+  REQUIRE(manager.pin_parquet_ranges("reader_region", {region}, std::nullopt) > 0);
+  CHECK(manager.rest_context_count() == 2);
+  sirius_ctx->reset_caches();
+  CHECK(manager.rest_context_count() == 1);
+  // Pinning a name again drops the datasources it held. With no idle context allowed, the
+  // context that only they held goes.
+  REQUIRE(manager.pin_parquet_ranges("reader_nation", {nation}, std::nullopt) > 0);
+  REQUIRE(manager.pin_parquet_ranges("reader_region", {region}, std::nullopt) > 0);
+  CHECK(manager.rest_context_count() == 2);
+  counters->idle_rest_context_limit_for_testing = 0;
+  REQUIRE(manager.pin_parquet_ranges("reader_nation", {region}, std::nullopt) > 0);
+  CHECK(manager.rest_context_count() == 1);
+}
+
 TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
           "[s3][integration][sql][transparent][glob]")
 {
@@ -1546,6 +1956,319 @@ TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
   auto const after_stats = sirius::test::get_transparent_execution_stats(fixture.con);
   sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
+}
+
+namespace {
+
+duckdb::LogicalGet const* footer_admission_scan(duckdb::LogicalOperator const& plan)
+{
+  if (plan.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto const& get  = plan.Cast<duckdb::LogicalGet>();
+    auto const& name = get.function.GetName().GetIdentifierName();
+    if (name == "read_parquet" || name == "parquet_scan") { return &get; }
+  }
+  for (auto const& child : plan.children) {
+    if (auto const* get = footer_admission_scan(*child)) { return get; }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+TEST_CASE("Footer admission preflight binds a mixed local and SeaweedFS scan",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_probe]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env.has_value());
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con, "SET parquet_footer_statistics=true");
+  sirius::test::scratch_dir directory("footer_admission_probe");
+  duckdb::DuckDB writer_db(nullptr);
+  duckdb::Connection writer(writer_db);
+  require_query_ok(writer,
+                   "COPY (SELECT range AS x FROM range(10)) TO " +
+                     directory.file_literal("local.parquet") + " (FORMAT PARQUET)");
+  require_query_ok(writer,
+                   "COPY (SELECT range AS x FROM range(100, 110)) TO " +
+                     directory.file_literal("remote.parquet") + " (FORMAT PARQUET)");
+  auto const key = "footer-admission-probe/" + std::to_string(::getpid()) + "/remote.parquet";
+  REQUIRE(
+    sirius::test::put_s3_test_object(key, read_binary_file(directory.file("remote.parquet"))));
+  auto const remote = s3_uri(env->bucket, key);
+  REQUIRE(duckdb::FileSystem::IsRemoteFile(remote));
+  auto plan = fixture.con.ExtractPlan("SELECT x FROM read_parquet([" +
+                                      directory.file_literal("local.parquet") + ", " +
+                                      sql_quote(remote) + "])");
+  REQUIRE(plan);
+  auto const* get = footer_admission_scan(*plan);
+  REQUIRE(get != nullptr);
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get->bind_data.get());
+  REQUIRE(bind != nullptr);
+  REQUIRE(bind->file_list->GetAllFiles().size() == 2);
+  CHECK_FALSE(bind->file_options.column_statistics.IsNull());
+  CHECK(sirius::transparent::parquet_scan_row_count(*get) == std::optional<std::size_t>{20});
+}
+
+namespace {
+
+namespace remote_footer_detail = sirius::transparent::detail;
+
+struct remote_footer_cache_scope {
+  remote_footer_detail::cache_capacities previous =
+    remote_footer_detail::set_cache_capacities_for_testing(
+      remote_footer_detail::default_cache_capacities);
+  remote_footer_cache_scope() { remote_footer_detail::clear_caches_for_testing(); }
+  ~remote_footer_cache_scope()
+  {
+    remote_footer_detail::clear_caches_for_testing();
+    (void)remote_footer_detail::set_cache_capacities_for_testing(previous);
+  }
+};
+
+struct footer_remote_files {
+  sirius::test::scratch_dir directory{"footer_admission"};
+  std::string glob;
+  std::vector<std::string> remote;
+  std::vector<std::string> local;
+
+  footer_remote_files(s3_test_env const& env, int remote_count, int local_count = 0)
+  {
+    static std::atomic<unsigned> sequence{0};
+    auto const prefix =
+      "footer-admission-" + std::to_string(::getpid()) + "-" + std::to_string(sequence++) + "/";
+    glob = s3_uri(env.bucket, prefix + "*.parquet");
+    duckdb::DuckDB writer_db(nullptr);
+    duckdb::Connection writer(writer_db);
+    for (int index = 0; index < remote_count + local_count; ++index) {
+      bool const upload = index < remote_count;
+      auto const first  = upload ? 1000 + index * 100 : (index - remote_count) * 100;
+      auto const name   = "part-" + std::to_string(index) + ".parquet";
+      require_query_ok(writer,
+                       "COPY (SELECT range AS x FROM range(" + std::to_string(first) + ", " +
+                         std::to_string(first + 100) + ")) TO " + directory.file_literal(name) +
+                         " (FORMAT PARQUET)");
+      if (upload) {
+        REQUIRE(
+          sirius::test::put_s3_test_object(prefix + name, read_binary_file(directory.file(name))));
+        remote.push_back(s3_uri(env.bucket, prefix + name));
+        REQUIRE(duckdb::FileSystem::IsRemoteFile(remote.back()));
+      } else {
+        local.push_back(directory.file(name));
+        fs::last_write_time(local.back(), fs::file_time_type::clock::now() - std::chrono::hours(1));
+        REQUIRE_FALSE(duckdb::FileSystem::IsRemoteFile(local.back()));
+      }
+    }
+  }
+
+  std::string relation(bool mixed = false) const
+  {
+    if (!mixed) { return "read_parquet(" + sql_quote(glob) + ")"; }
+    std::string paths;
+    for (auto const* list : {&local, &remote}) {
+      for (auto const& path : *list) {
+        if (!paths.empty()) { paths += ", "; }
+        paths += sql_quote(path);
+      }
+    }
+    return "read_parquet([" + paths + "])";
+  }
+};
+
+void check_remote_footer(duckdb::LogicalOperator const& plan,
+                         std::size_t files,
+                         std::optional<std::size_t> rows)
+{
+  auto const* get = footer_admission_scan(plan);
+  REQUIRE(get != nullptr);
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get->bind_data.get());
+  REQUIRE(bind != nullptr);
+  CHECK(bind->file_list->GetAllFiles().size() == files);
+  CHECK(bind->file_options.column_statistics.IsNull() == !rows.has_value());
+  CHECK(sirius::transparent::parquet_scan_row_count(*get) == rows);
+}
+
+class footer_version_mask final : public sirius::io::s3::sirius_httpfs {
+ public:
+  explicit footer_version_mask(bool weak) : weak_(weak) {}
+  std::string GetVersionTag(duckdb::FileHandle& handle) override
+  {
+    auto const tag = sirius::io::s3::sirius_httpfs::GetVersionTag(handle);
+    return weak_ ? "W/" + tag : "";
+  }
+  duckdb::vector<duckdb::OpenFileInfo> Glob(std::string const& path,
+                                            duckdb::FileOpener* opener) override
+  {
+    auto files = sirius::io::s3::sirius_httpfs::Glob(path, opener);
+    for (auto& file : files) {
+      if (!file.extended_info) { continue; }
+      auto& options    = file.extended_info->options;
+      auto const found = options.find("etag");
+      if (found == options.end()) { continue; }
+      if (weak_) {
+        found->second = duckdb::Value("W/" + found->second.GetValue<std::string>());
+      } else {
+        options.erase(found);
+      }
+    }
+    return files;
+  }
+
+ private:
+  bool weak_;
+};
+
+}  // namespace
+
+TEST_CASE("Footer admission counts remote misses at both sides of the boundary",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_feature]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env);
+  auto const count = GENERATE(2, 3, 4);
+  CAPTURE(count);
+  s3_sql_fixture fixture(*env);
+  remote_footer_cache_scope caches;
+  footer_remote_files files(*env, count);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=3");
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_local_reads=0");
+  auto const before = remote_footer_detail::footer_read_count();
+  auto plan         = fixture.con.ExtractPlan("SELECT x FROM " + files.relation());
+  REQUIRE(plan);
+  bool const admitted = count <= 3;
+  CHECK(remote_footer_detail::footer_read_count() - before == (admitted ? count : 0));
+  check_remote_footer(
+    *plan, count, admitted ? std::optional<std::size_t>{count * 100} : std::nullopt);
+  auto result = require_query_ok(
+    fixture.con, "SELECT count(*)::BIGINT, sum(x)::BIGINT FROM " + files.relation());
+  auto const rows = count * 100;
+  std::vector<std::vector<std::string>> expected{
+    {std::to_string(rows), std::to_string(rows * (2000 + rows - 1) / 2)}};
+  CHECK(collect_rows(*result) == expected);
+}
+
+TEST_CASE("Footer admission skips a mixed scan when either independent cap is exceeded",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_feature]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env);
+  auto const exceeded = std::string(GENERATE("local", "remote", "neither"));
+  CAPTURE(exceeded);
+  s3_sql_fixture fixture(*env);
+  remote_footer_cache_scope caches;
+  footer_remote_files files(*env, 2, 2);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con,
+                   "SET parquet_footer_statistics_max_remote_reads=" +
+                     std::string(exceeded == "remote" ? "1" : "2"));
+  require_query_ok(fixture.con,
+                   "SET parquet_footer_statistics_max_local_reads=" +
+                     std::string(exceeded == "local" ? "1" : "2"));
+  auto const before = remote_footer_detail::footer_read_count();
+  auto plan         = fixture.con.ExtractPlan("SELECT x FROM " + files.relation(true));
+  REQUIRE(plan);
+  auto const admitted = exceeded == "neither";
+  CHECK(remote_footer_detail::footer_read_count() - before == (admitted ? 4 : 0));
+  check_remote_footer(*plan, 4, admitted ? std::optional<std::size_t>{400} : std::nullopt);
+  auto result = require_query_ok(
+    fixture.con, "SELECT count(*)::BIGINT, sum(x)::BIGINT FROM " + files.relation(true));
+  CHECK(collect_rows(*result) == std::vector<std::vector<std::string>>{{"400", "239800"}});
+}
+
+TEST_CASE("Footer admission treats weak and missing remote validators as repeated misses",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_feature]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env);
+  auto const weak = GENERATE(false, true);
+  CAPTURE(weak);
+  s3_sql_fixture fixture(*env);
+  remote_footer_cache_scope caches;
+  footer_remote_files files(*env, 2);
+  set_gpu_execution(fixture.con, true);
+  fixture.db.GetFileSystem().UnregisterSubSystem("SiriusHttpFS");
+  fixture.db.GetFileSystem().RegisterSubSystem(duckdb::make_uniq<footer_version_mask>(weak));
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=2");
+  for (int iteration = 0; iteration < 2; ++iteration) {
+    auto const before = remote_footer_detail::footer_read_count();
+    auto plan         = fixture.con.ExtractPlan("SELECT x FROM " + files.relation());
+    REQUIRE(plan);
+    CHECK(remote_footer_detail::footer_read_count() - before == 2);
+    check_remote_footer(*plan, 2, 200);
+  }
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=1");
+  auto const before = remote_footer_detail::footer_read_count();
+  auto skipped      = fixture.con.ExtractPlan("SELECT x FROM " + files.relation());
+  REQUIRE(skipped);
+  CHECK(remote_footer_detail::footer_read_count() == before);
+  check_remote_footer(*skipped, 2, std::nullopt);
+}
+
+TEST_CASE("Footer admission counts cached remote files of an explicit list as reads",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_feature]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env);
+  s3_sql_fixture fixture(*env);
+  remote_footer_cache_scope caches;
+  footer_remote_files files(*env, 2);
+  set_gpu_execution(fixture.con, true);
+  for (auto const& path : files.remote) {
+    auto analyzed = require_query_ok(
+      fixture.con, "SELECT files FROM sirius_analyze_parquet(" + sql_quote(path) + ")");
+    CHECK(analyzed->Collection().GetValue(0, 0).GetValue<uint64_t>() == 1);
+  }
+  REQUIRE(remote_footer_detail::statistics_cache_size() == 2);
+  auto const before = remote_footer_detail::footer_read_count();
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=1");
+  auto skipped = fixture.con.ExtractPlan("SELECT x FROM " + files.relation(true));
+  REQUIRE(skipped);
+  check_remote_footer(*skipped, 2, std::nullopt);
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=2");
+  auto admitted = fixture.con.ExtractPlan("SELECT x FROM " + files.relation(true));
+  REQUIRE(admitted);
+  check_remote_footer(*admitted, 2, 200);
+  CHECK(remote_footer_detail::footer_read_count() == before);
+}
+
+TEST_CASE("Footer admission inherits the remote engine cap until a connection overrides it",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_feature]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env);
+  sirius_memory_limits limits;
+  limits.footer_remote_reads = 1;
+  limits.footer_local_reads  = 3;
+  s3_sql_fixture fixture(*env, limits);
+  remote_footer_cache_scope caches;
+  footer_remote_files files(*env, 2);
+  duckdb::Connection second(fixture.db);
+  set_gpu_execution(fixture.con, true);
+  set_gpu_execution(second, true);
+  auto expect = [&](duckdb::Connection& connection, bool admitted) {
+    remote_footer_detail::clear_caches_for_testing();
+    auto const before = remote_footer_detail::footer_read_count();
+    auto plan         = connection.ExtractPlan("SELECT x FROM " + files.relation());
+    REQUIRE(plan);
+    check_remote_footer(*plan, 2, admitted ? std::optional<std::size_t>{200} : std::nullopt);
+    CHECK(remote_footer_detail::footer_read_count() - before == (admitted ? 2 : 0));
+  };
+  auto initial = require_query_ok(
+    fixture.con, "SELECT current_setting('parquet_footer_statistics_max_remote_reads')");
+  CHECK(initial->Collection().GetValue(0, 0).IsNull());
+  expect(fixture.con, false);
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=2");
+  expect(fixture.con, true);
+  expect(second, false);
+  auto other = require_query_ok(
+    second, "SELECT current_setting('parquet_footer_statistics_max_remote_reads')");
+  CHECK(other->Collection().GetValue(0, 0).IsNull());
+  require_query_ok(fixture.con, "RESET parquet_footer_statistics_max_remote_reads");
+  expect(fixture.con, false);
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=2");
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=NULL");
+  expect(fixture.con, false);
 }
 
 TEST_CASE("transparent S3 footer statistics follow an equal-size overwrite",
@@ -4116,4 +4839,668 @@ TEST_CASE("S3 metadata-only provenance skips pruned sources and data readers",
   REQUIRE(output);
   CHECK(output->num_rows() == 8193);
   CHECK(reader->reader_calls() == 0);
+}
+
+TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credentials",
+          "[s3][integration][iceberg][catalog]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  // No programmatic or static S3 credential: every read must use what the catalog vends.
+  sirius_config_env_guard config_env(*env);
+  duckdb::DBConfig db_config{{{"allow_unsigned_extensions", duckdb::Value::BOOLEAN(true)}}, false};
+  duckdb::DuckDB db(nullptr, &db_config);
+  duckdb::Connection con(db);
+  load_sirius_extension(db);
+  setenv("SIRIUS_DISABLE", "1", 1);
+  for (auto const* extension : {"httpfs", "avro", "iceberg"}) {
+    auto loaded = con.Query(std::string("LOAD ") + extension);
+    if (sirius::test::s3::skip_or_fail_unless(
+          loaded && !loaded->HasError(),
+          "the httpfs, avro and iceberg extensions must be installed"))
+      return;
+  }
+
+  // A committed local table, relocated under the bucket by rewriting its paths and uploaded.
+  // @p omit, relative to the table root, is written locally and never uploaded.
+  auto const relocate = [&](std::string const& table,
+                            fs::path const& out,
+                            std::string const& to,
+                            std::string const& omit = {}) {
+    auto const command = "python3 -B test/cpp/integration/data/generate_remote_table_fixture.py " +
+                         table + " '" + out.string() + "' '" + to + "'";
+    REQUIRE(std::system(command.c_str()) == 0);
+    for (auto const& entry : fs::recursive_directory_iterator(out)) {
+      if (!entry.is_regular_file()) continue;
+      auto const relative = fs::relative(entry.path(), out).generic_string();
+      if (relative == omit) continue;
+      auto const key = to.substr(("s3://" + env->bucket + "/").size()) + "/" + relative;
+      if (!sirius::test::put_s3_test_object(key, read_binary_file(entry.path()))) return false;
+    }
+    return true;
+  };
+  // Every hook a block of this test installs captures its locals: clear them all when the
+  // block ends, however it ends.
+  struct reset_hooks {
+    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
+    ~reset_hooks()
+    {
+      counters->iceberg_dv_phase_for_testing      = {};
+      counters->iceberg_equality_open_for_testing = {};
+      counters->after_lowering_for_testing        = {};
+      counters->idle_rest_context_limit_for_testing.reset();
+    }
+  };
+  auto const source = std::string{"test/cpp/integration/data/iceberg_v1"};
+  auto const remote = "s3://" + env->bucket + "/catalog-form/fruit";
+  sirius::test::scratch_dir directory("s3_catalog");
+  if (sirius::test::s3::skip_or_fail_unless(
+        relocate(source, directory.path(), remote),
+        "managed S3 backend required for the catalog table upload"))
+    return;
+
+  std::map<std::string, std::string> vended{{"s3.access-key-id", env->access_key},
+                                            {"s3.secret-access-key", env->secret_key},
+                                            {"s3.endpoint", env->endpoint},
+                                            {"s3.path-style-access", "true"},
+                                            {"client.region", env->region}};
+  if (!env->session_token.empty()) vended["s3.session-token"] = env->session_token;
+  sirius::test::mock_iceberg_rest_catalog catalog(vended);
+  auto const metadata = [&](char const* name) {
+    return sirius::test::mock_iceberg_rest_catalog::table{
+      remote + "/metadata/" + name, read_text_file(directory.path() / "metadata" / name)};
+  };
+  catalog.put("ns", "fruit", metadata("v1.metadata.json"));
+  catalog.put("ns", "fruit_again", metadata("v1.metadata.json"));
+  catalog.put("ns", "empty", metadata("empty.metadata.json"));
+  {
+    sirius::test::scoped_recording_log_sink logs{"info"};
+    require_query_ok(con,
+                     "ATTACH '' AS lake (TYPE ICEBERG, AUTHORIZATION_TYPE 'none', ENDPOINT '" +
+                       catalog.uri() + "')");
+    // A broader static secret with wrong credentials stays in place throughout: the vended
+    // secret is more specific and must win, for the statement and for connections reading on
+    // its behalf.
+    // The nested comment sits between the two keywords that name the statement. DuckDB hands
+    // the callback the statement with it in place, so a classifier that ends the comment at
+    // the first "*/" reads `still` where SECRET stands and logs the whole text.
+    require_query_ok(con,
+                     "CREATE /* setup /* nested */ still a comment */ SECRET broad (TYPE S3, "
+                     "KEY_ID 'wrong', SECRET 'synthetic-credential-5e1f', REGION " +
+                       sql_quote(env->region) + ", ENDPOINT " + sql_quote(env->endpoint) +
+                       ", URL_STYLE 'path', USE_SSL " +
+                       (env->endpoint.rfind("https://", 0) == 0 ? "true" : "false") + ")");
+    // Both statements hold credentials as literals: the log names their kind, not their text.
+    auto const records = logs.records();
+    auto const logged  = [&](std::string_view text) {
+      return std::ranges::any_of(records, [&](auto const& record) {
+        return record.message.find(text) != std::string::npos;
+      });
+    };
+    CHECK(logged("SQL: ATTACH <text withheld"));
+    CHECK(logged("SQL: CREATE SECRET <text withheld"));
+    CHECK_FALSE(logged("AUTHORIZATION_TYPE"));
+    CHECK_FALSE(logged("synthetic-credential-5e1f"));
+  }
+
+  using rows_t = std::vector<std::vector<std::string>>;
+  rows_t const fruit{{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}};
+  auto const query = std::string{"SELECT fruit, count FROM lake.ns.fruit ORDER BY count"};
+  auto const data_file =
+    remote + "/data/00000-0-a1b2c3d4-0001-0001-0001-000000000003-00001.parquet";
+  auto const no_snapshot =
+    static_cast<size_t>(sirius::op::scan::verdict_reason::iceberg_no_snapshot_id);
+  auto const stats = [&] { return sirius::test::get_transparent_execution_stats(con); };
+  // One GPU execution reading only @p file, with @p walks delete-discovery walks and no fallback.
+  auto const expect_gpu =
+    [&](std::string const& sql, rows_t const& expected, uint64_t walks, std::string const& file) {
+      INFO(sql);
+      auto const before = stats();
+      auto result       = require_query_ok(con, sql);
+      auto const after  = stats();
+      CHECK(collect_rows(*result) == expected);
+      CHECK(after.executions == before.executions + 1);
+      CHECK(after.fallbacks == before.fallbacks);
+      CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+      CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + walks);
+      auto reads = after.parquet_reader_calls;
+      for (auto const& [file, count] : before.parquet_reader_calls)
+        reads[file] -= count;
+      std::erase_if(reads, [](auto const& entry) { return entry.second == 0; });
+      CHECK(reads.size() == 1);
+      CHECK(reads.count(file) == 1);
+    };
+  // DuckDB without Sirius reads the committed local table these fixtures were relocated from.
+  auto const cpu_rows = [&](std::string const& table) {
+    duckdb::DuckDB cpu_db(nullptr, &db_config);
+    duckdb::Connection cpu(cpu_db);
+    require_query_ok(cpu, "LOAD avro");
+    require_query_ok(cpu, "LOAD iceberg");
+    return collect_rows(*require_query_ok(cpu,
+                                          "SELECT fruit, count FROM iceberg_scan('" + table +
+                                            "/metadata/v1.metadata.json') ORDER BY count"));
+  };
+
+  set_gpu_execution(con, true);
+  require_query_ok(con, "SET enable_duckdb_fallback=false");
+  auto const loads_before = catalog.load_table_requests();
+  expect_gpu(query, fruit, 1, data_file);
+  // The binding and the delete discovery each resolve the table through the catalog.
+  CHECK(catalog.load_table_requests() - loads_before >= 2);
+  CHECK(cpu_rows(source) == fruit);
+
+  // httpfs is loaded only for the catalog client and the secret type: s3:// stays GPU-only.
+  set_gpu_execution(con, false);
+  auto refused = con.Query(query);
+  REQUIRE(refused);
+  REQUIRE(refused->HasError());
+  CHECK(refused->GetError().find("S3 is GPU-only") != std::string::npos);
+  // The refusal leaves the connection usable, and each table vends its own secret.
+  set_gpu_execution(con, true);
+  expect_gpu("SELECT count(*) FROM lake.ns.fruit a JOIN lake.ns.fruit_again b USING (fruit)",
+             {{"3"}},
+             2,
+             data_file);
+  // Those two tables share a location, so one vended secret serves both. A copy under another
+  // prefix is a table of its own, and the catalog vends it the same credentials for another
+  // region, which this store does not check. One statement reads both tables: each data file
+  // then resolves, in the statement's transaction, to what its own table vended.
+  {
+    auto const sirius_ctx =
+      con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx);
+    auto const counters = sirius_ctx->physical_counters();
+    reset_hooks const reset{counters};
+    auto const copy_remote = "s3://" + env->bucket + "/catalog-form-copy/fruit";
+    sirius::test::scratch_dir copy_directory("s3_catalog_copy");
+    REQUIRE(relocate(source, copy_directory.path(), copy_remote));
+    auto const copy_file =
+      copy_remote + "/data/00000-0-a1b2c3d4-0001-0001-0001-000000000003-00001.parquet";
+    auto const vend_copy = [&](std::string const& region) {
+      auto copy_vended             = vended;
+      copy_vended["client.region"] = region;
+      catalog.put("ns",
+                  "fruit_copy",
+                  {copy_remote + "/metadata/v1.metadata.json",
+                   read_text_file(copy_directory.path() / "metadata/v1.metadata.json"),
+                   std::move(copy_vended)});
+    };
+    auto const region_of = [&](std::string const& file) {
+      return sirius::io::s3::resolve_duckdb_s3_secret(*con.context, file, {}).region;
+    };
+    vend_copy("eu-central-1");
+    REQUIRE(env->region != "eu-central-1");
+    require_query_ok(con, "BEGIN TRANSACTION");
+    auto const before_both = stats();
+    auto both              = require_query_ok(
+      con, "SELECT count(*) FROM lake.ns.fruit a JOIN lake.ns.fruit_copy b USING (fruit)");
+    CHECK(collect_rows(*both) == rows_t{{"3"}});
+    CHECK(stats().executions == before_both.executions + 1);
+    CHECK(region_of(data_file) == env->region);
+    CHECK(region_of(copy_file) == "eu-central-1");
+    require_query_ok(con, "COMMIT");
+
+    // The catalog rotates what it vends for the copy between loads. Each statement reads with
+    // the credentials of its own load, on a REST context of its own; the ones earlier
+    // statements left behind are given back once the statement that follows has ended.
+    counters->idle_rest_context_limit_for_testing = 1;
+    for (auto const* region : {"eu-west-1", "ap-south-1", "eu-west-1"}) {
+      INFO(region);
+      vend_copy(region);
+      require_query_ok(con, "BEGIN TRANSACTION");
+      expect_gpu("SELECT fruit, count FROM lake.ns.fruit_copy ORDER BY count", fruit, 1, copy_file);
+      CHECK(region_of(copy_file) == region);
+      require_query_ok(con, "COMMIT");
+      CHECK(sirius_ctx->get_scan_manager().rest_context_count() <= 1);
+    }
+  }
+  require_query_ok(con, "SET sirius_s3_header_signing=true");
+  expect_gpu(query, fruit, 1, data_file);
+  require_query_ok(con, "SET sirius_s3_header_signing=false");
+
+  // A V3 deletion-vector table: its manifests and its Puffin file are opened by path, after
+  // the binding, with the vended credentials.
+  {
+    sirius::test::scratch_dir dv_directory("s3_catalog_dv");
+    auto const dv_prefix = std::string{"catalog-form-dv"};
+    auto const dv_remote = "s3://" + env->bucket + "/" + dv_prefix + "/dv_bounded";
+    auto const generate  = "python3 -B test/cpp/integration/data/generate_inventory_fixtures.py '" +
+                          dv_directory.path().string() + "' 's3://" + env->bucket + "/" +
+                          dv_prefix + "'";
+    REQUIRE(std::system(generate.c_str()) == 0);
+    auto const local = dv_directory.path() / "dv_bounded";
+    for (auto const& entry : fs::recursive_directory_iterator(local)) {
+      if (!entry.is_regular_file()) continue;
+      auto const key =
+        dv_prefix + "/" + fs::relative(entry.path(), dv_directory.path()).generic_string();
+      REQUIRE(sirius::test::put_s3_test_object(key, read_binary_file(entry.path())));
+    }
+    catalog.put("ns",
+                "dv",
+                {dv_remote + "/metadata/v1.metadata.json",
+                 read_text_file(local / "metadata/v1.metadata.json")});
+    rows_t const kept{{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}};
+    // Just before the statement opens its Puffin file, a second connection resolves the same
+    // path. It sees only the broad secret, whose credentials cannot read the file; the statement
+    // must still open it with the credentials it planned with.
+    auto const sirius_ctx =
+      con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx);
+    auto const counters = sirius_ctx->physical_counters();
+    reset_hooks const reset{counters};
+    duckdb::Connection other(db);
+    std::string replaced_with;
+    counters->iceberg_dv_phase_for_testing = [&](std::string const& puffin, bool start) {
+      if (!start) return;
+      auto config   = sirius::io::s3::resolve_duckdb_s3_secret(*other.context, puffin, {});
+      replaced_with = config.access_key;
+      sirius_ctx->get_scan_manager().install_s3_config(puffin, std::move(config));
+    };
+    expect_gpu(
+      "SELECT fruit, count FROM lake.ns.dv ORDER BY count", kept, 1, dv_remote + "/data/a.parquet");
+    counters->iceberg_dv_phase_for_testing = {};
+    CHECK(replaced_with == "wrong");
+    // The same for a data file. The hook runs on the planning thread once every scan of the
+    // statement is lowered: by then the statement has installed and recorded the configuration
+    // of every file it scans, and no scan has opened one. There the second connection resolves
+    // the data file's path to the broad secret. The scan then opens the file with what the
+    // statement recorded.
+    replaced_with.clear();
+    std::size_t lowered                  = 0;
+    counters->after_lowering_for_testing = [&] {
+      ++lowered;
+      auto replaced = sirius::io::s3::resolve_duckdb_s3_secret(*other.context, data_file, {});
+      replaced_with = replaced.access_key;
+      sirius_ctx->get_scan_manager().install_s3_config(data_file, std::move(replaced));
+    };
+    auto const rebuilds_before = stats().execution_rebuilds;
+    expect_gpu(query, fruit, 1, data_file);
+    counters->after_lowering_for_testing = {};
+    CHECK(lowered == 1);
+    CHECK(replaced_with == "wrong");
+    // The plan was not built a second time, which would have installed the good one again.
+    CHECK(stats().execution_rebuilds == rebuilds_before);
+    CHECK(cpu_rows("test/cpp/integration/data/iceberg_v3_deletion_vector") == kept);
+  }
+
+  // Equality deletes on S3. Both delete files are read while planning, with the credentials
+  // this statement resolved for them.
+  {
+    auto const eq_source = std::string{"test/cpp/integration/data/iceberg_v2_eq_multi_delete_file"};
+    auto const eq_remote = "s3://" + env->bucket + "/catalog-form-eq";
+    sirius::test::scratch_dir eq_directory("s3_catalog_eq");
+    REQUIRE(relocate(eq_source, eq_directory.path(), eq_remote));
+    // No manifest lists this object. Opening it would fail the statement.
+    std::array<std::uint8_t, 4> const not_parquet{'P', 'A', 'R', '1'};
+    REQUIRE(sirius::test::put_s3_test_object("catalog-form-eq/data/delete-eq-unlisted.parquet",
+                                             not_parquet));
+    auto const eq_metadata = [&](char const* name) {
+      return sirius::test::mock_iceberg_rest_catalog::table{
+        eq_remote + "/metadata/" + name, read_text_file(eq_directory.path() / "metadata" / name)};
+    };
+    catalog.put("ns", "eq", eq_metadata("v1.metadata.json"));
+    rows_t const kept{{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}};
+    auto const eq_query = std::string{"SELECT fruit, count FROM lake.ns.eq ORDER BY count"};
+    auto const eq_data =
+      eq_remote + "/data/00000-0-e5f6a7b8-0005-0005-0005-000000000001-00001.parquet";
+    auto const eq_delete =
+      std::string{"data/delete-eq-1-e5f6a7b8-0005-0005-0005-000000000002-00001.parquet"};
+    auto const remote_declines = [&] {
+      return stats().semantic_declines[static_cast<size_t>(
+        sirius::op::scan::verdict_reason::iceberg_equality_remote)];
+    };
+
+    // Just before each delete file is opened, a second connection resolves its path to the
+    // broad secret, which cannot read it. The statement opens it with what it planned with.
+    auto const sirius_ctx =
+      con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx);
+    auto const counters = sirius_ctx->physical_counters();
+    reset_hooks const reset{counters};
+    duckdb::Connection other(db);
+    std::vector<std::string> replaced_with;
+    counters->iceberg_equality_open_for_testing = [&](std::string const& path) {
+      auto config = sirius::io::s3::resolve_duckdb_s3_secret(*other.context, path, {});
+      replaced_with.push_back(config.access_key);
+      sirius_ctx->get_scan_manager().install_s3_config(path, std::move(config));
+    };
+    auto const before          = stats();
+    auto const declines_before = remote_declines();
+    auto const eq_loads_before = catalog.load_table_requests();
+    expect_gpu(eq_query, kept, 1, eq_data);
+    counters->iceberg_equality_open_for_testing = {};
+    CHECK(replaced_with == std::vector<std::string>{"wrong", "wrong"});
+    CHECK(stats().iceberg_delete_payload_loads == before.iceberg_delete_payload_loads + 2);
+    CHECK(remote_declines() == declines_before);
+    // The binding and the delete lookup each ask the catalog once. Checking that the lookup
+    // resolved the bound table asks it nothing more.
+    CHECK(catalog.load_table_requests() - eq_loads_before == 2);
+    CHECK(cpu_rows(eq_source) == kept);
+
+    // The load holds the context that reads the delete files until it ends, and an execution
+    // need not follow it: a load that fails ends the statement. With no idle context allowed,
+    // the load gives its contexts back when it ends. When it succeeds, none is left once the
+    // statement's scans are lowered, before any of them has opened a file. When it fails
+    // before its second file, none is left after the statement.
+    counters->idle_rest_context_limit_for_testing = 0;
+    std::optional<std::size_t> contexts_after_load;
+    counters->after_lowering_for_testing = [&] {
+      contexts_after_load = sirius_ctx->get_scan_manager().rest_context_count();
+    };
+    auto const loads_before = stats().iceberg_delete_payload_loads;
+    expect_gpu(eq_query, kept, 1, eq_data);
+    counters->after_lowering_for_testing = {};
+    CHECK(stats().iceberg_delete_payload_loads == loads_before + 2);
+    REQUIRE(contexts_after_load);
+    CHECK(*contexts_after_load == 0);
+    std::size_t opened                          = 0;
+    counters->iceberg_equality_open_for_testing = [&](std::string const&) {
+      if (++opened == 2) { throw std::runtime_error("injected: second delete file"); }
+    };
+    auto const failed                           = con.Query(eq_query);
+    counters->iceberg_equality_open_for_testing = {};
+    REQUIRE(failed);
+    CHECK(failed->HasError());
+    CHECK(opened == 2);
+    CHECK(sirius_ctx->get_scan_manager().rest_context_count() == 0);
+    counters->idle_rest_context_limit_for_testing.reset();
+
+    // The path form reads the same files with a static secret.
+    require_query_ok(con,
+                     "CREATE SECRET eq_static (TYPE S3, KEY_ID " + sql_quote(env->access_key) +
+                       ", SECRET " + sql_quote(env->secret_key) + ", REGION " +
+                       sql_quote(env->region) + ", ENDPOINT " + sql_quote(env->endpoint) +
+                       ", URL_STYLE 'path', USE_SSL " +
+                       (env->endpoint.rfind("https://", 0) == 0 ? "true" : "false") + ", SCOPE " +
+                       sql_quote(eq_remote + "/") + ")");
+    expect_gpu("SELECT fruit, count FROM iceberg_scan('" + eq_remote +
+                 "/metadata/v1.metadata.json') ORDER BY count",
+               kept,
+               1,
+               eq_data);
+    require_query_ok(con, "DROP SECRET eq_static");
+
+    // A delete file that is not the size its manifest records is refused before its keys are
+    // decoded. The statement fails: the rows that file removes are not returned.
+    auto const intact = read_binary_file(eq_directory.path() / eq_delete);
+    REQUIRE(sirius::test::put_s3_test_object("catalog-form-eq/" + eq_delete,
+                                             std::span(intact).first(intact.size() - 1)));
+    auto truncated = con.Query(eq_query);
+    REQUIRE(truncated);
+    REQUIRE(truncated->HasError());
+    CHECK(truncated->GetError().find("size differs from its manifest entry") != std::string::npos);
+    REQUIRE(sirius::test::put_s3_test_object("catalog-form-eq/" + eq_delete, intact));
+    expect_gpu(eq_query, kept, 1, eq_data);
+
+    // A delete file that cannot be opened at all: the same table under a prefix where that
+    // object was never uploaded. The statement fails. It does not go on without the file,
+    // which would return the rows the file removes.
+    {
+      auto const missing_remote = "s3://" + env->bucket + "/catalog-form-eq-missing";
+      sirius::test::scratch_dir missing_directory("s3_catalog_eq_missing");
+      REQUIRE(relocate(eq_source, missing_directory.path(), missing_remote, eq_delete));
+      catalog.put("ns",
+                  "eq_missing",
+                  {missing_remote + "/metadata/v1.metadata.json",
+                   read_text_file(missing_directory.path() / "metadata/v1.metadata.json")});
+      auto const before_missing = stats();
+      auto missing = con.Query("SELECT fruit, count FROM lake.ns.eq_missing ORDER BY count");
+      auto const after_missing = stats();
+      REQUIRE(missing);
+      INFO((missing->HasError() ? missing->GetError() : "returned rows"));
+      REQUIRE(missing->HasError());
+      CHECK(missing->GetError().find(fs::path(eq_delete).filename().string()) != std::string::npos);
+      CHECK(after_missing.executions == before_missing.executions);
+    }
+
+    // Table names that only work quoted. The delete lookup addresses the table by its qualified
+    // name on a connection of its own, where that name is split at dots outside quotes: with a
+    // dot in it, an unquoted name is another table's, and a quote in it must be escaped. A
+    // keyword or a space would not do: they split the same with and without quotes.
+    for (auto const* name : {"fruit.v2", "the \"fruit\" table"}) {
+      INFO(name);
+      catalog.put("ns", name, eq_metadata("v1.metadata.json"));
+      expect_gpu("SELECT fruit, count FROM lake.ns." +
+                   duckdb::KeywordHelper::WriteQuotedAndEscaped(name, '"') + " ORDER BY count",
+                 kept,
+                 1,
+                 eq_data);
+    }
+
+    // The table replaced under its name once the statement has bound it: another table UUID, a
+    // snapshot of the same ID over the same data file, and no deletes. The delete lookup
+    // resolves the name to the replacement on its own connection. Its inventory would return
+    // the rows the bound table deleted, so the statement is refused instead.
+    auto const unverified = static_cast<size_t>(sirius::op::scan::verdict_reason::evidence_missing);
+    catalog.replace_after_next_load("ns", "eq", eq_metadata("replaced.metadata.json"));
+    auto const before_replaced = stats();
+    auto replaced              = con.Query(eq_query);
+    auto const after_replaced  = stats();
+    REQUIRE(replaced);
+    REQUIRE(replaced->HasError());
+    // An Iceberg build that accepts expected_table_uuid on iceberg_metadata() refuses the lookup
+    // itself; with any other, Sirius's comparison does. Both say "Table UUID mismatch", and
+    // Sirius's also says what the name now resolves to.
+    // A catalog function over nested columns: not a query for the GPU.
+    set_gpu_execution(con, false);
+    auto const uuid_probe = require_query_ok(
+      con,
+      "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'iceberg_metadata' AND "
+      "list_contains(parameters, 'expected_table_uuid')");
+    set_gpu_execution(con, true);
+    bool const extension_checks_uuid = uuid_probe->Fetch()->GetValue(0, 0).GetValue<int64_t>() > 0;
+    auto const mismatch              = replaced->GetError();
+    CAPTURE(extension_checks_uuid, mismatch);
+    CHECK(mismatch.find("Table UUID mismatch") != std::string::npos);
+    if (!extension_checks_uuid) {
+      CHECK(mismatch.find("now resolves to table 00000000-0000-4000-8000-0000000000ff") !=
+            std::string::npos);
+      CHECK(mismatch.find("would be read from another table") != std::string::npos);
+      CHECK(mismatch.find("could not read this table's metadata") == std::string::npos);
+    }
+    CHECK(after_replaced.semantic_declines[unverified] ==
+          before_replaced.semantic_declines[unverified] + 1);
+    CHECK(after_replaced.executions == before_replaced.executions);
+    // Bound afresh, the replacement is a table of its own, without deletes.
+    expect_gpu(
+      eq_query,
+      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}},
+      1,
+      eq_data);
+
+    // The table dropped once the statement has bound it. The delete lookup finds no table under
+    // the name: which table it would read is unknown, not known to be another one, and the
+    // refusal says that rather than reporting a mismatch. The table sits in a namespace of its
+    // own: this catalog answers 404 for a namespace as well, and the client then takes the
+    // whole namespace for missing.
+    catalog.put("dropped", "eq", eq_metadata("v1.metadata.json"));
+    catalog.remove_after_next_load("dropped", "eq");
+    auto const before_dropped = stats();
+    auto dropped             = con.Query("SELECT fruit, count FROM lake.dropped.eq ORDER BY count");
+    auto const after_dropped = stats();
+    REQUIRE(dropped);
+    REQUIRE(dropped->HasError());
+    auto const unknown = dropped->GetError();
+    CAPTURE(unknown);
+    if (!extension_checks_uuid) {
+      CHECK(unknown.find("could not identify the table") != std::string::npos);
+      CHECK(unknown.find("Table UUID mismatch") == std::string::npos);
+      CHECK(unknown.find("another table") == std::string::npos);
+    }
+    CHECK(after_dropped.semantic_declines[unverified] ==
+          before_dropped.semantic_declines[unverified] + 1);
+    CHECK(after_dropped.executions == before_dropped.executions);
+  }
+
+  // An internal connection reads by path with the secret of the statement that opened it; an
+  // ordinary second connection has no credential for the same path.
+  auto const manifest = remote + "/metadata/a1b2c3d4-0001-0001-0001-000000000002-m0.avro";
+  auto const by_path  = "SELECT count(*) FROM read_avro('" + manifest + "')";
+  require_query_ok(con, "BEGIN TRANSACTION");
+  expect_gpu(query, fruit, 1, data_file);
+  {
+    auto internal = duckdb::SiriusContext::open_internal_connection(*con.context);
+    auto read     = internal.Query(by_path);
+    REQUIRE(read);
+    INFO((read->HasError() ? read->GetError() : ""));
+    REQUIRE_FALSE(read->HasError());
+    CHECK(read->Fetch()->GetValue(0, 0).GetValue<int64_t>() == 1);
+    duckdb::Connection unrelated(db);
+    auto denied = unrelated.Query(by_path);
+    REQUIRE(denied);
+    CHECK(denied->HasError());
+    // What it resolves for the path is the broad secret, not what the catalog vended.
+    CHECK(sirius::io::s3::resolve_duckdb_s3_secret(*unrelated.context, manifest, {}).access_key ==
+          "wrong");
+  }
+  // A connection reading for this statement resolves its vended secret and signs the same way.
+  require_query_ok(con, "SET sirius_s3_header_signing=true");
+  {
+    duckdb::Connection reader(db);
+    auto const state = duckdb::get_sirius_connection_state(*reader.context);
+    REQUIRE(state);
+    state->set_internal_outer(con.context);
+    auto const resolved = sirius::io::s3::resolve_duckdb_s3_secret(*reader.context, manifest, {});
+    CHECK(resolved.access_key == env->access_key);
+    CHECK(resolved.s3_signing_mode == cucascade::io::object_store_config::signing_mode::header);
+  }
+  require_query_ok(con, "SET sirius_s3_header_signing=false");
+  require_query_ok(con, "COMMIT");
+
+  // The lookup accepts scan info only on a catalog table's binding, with the extension's callbacks.
+  con.BeginTransaction();
+  auto logical = con.ExtractPlan(query);
+  auto* node   = logical.get();
+  while (node->type != duckdb::LogicalOperatorType::LOGICAL_GET)
+    node = node->children.front().get();
+  auto& get = node->Cast<duckdb::LogicalGet>();
+  REQUIRE(get.function.function_info);
+  CHECK(sirius::planner::lookup_connector(get, *con.context) != nullptr);
+  auto const table_entry       = get.function.get_table_entry;
+  get.function.get_table_entry = nullptr;
+  CHECK(sirius::planner::lookup_connector(get, *con.context) == nullptr);
+  get.function.get_table_entry = table_entry;
+  // A callback that is not the extension's is compared with the registered one, never called.
+  static int foreign_bind_info_calls = 0;
+  auto const bind_info               = get.function.get_bind_info;
+  get.function.get_bind_info         = [](duckdb::TableFunctionGetBindInfoInput&) {
+    ++foreign_bind_info_calls;
+    return duckdb::BindInfo(duckdb::ScanType::TABLE);
+  };
+  CHECK(sirius::planner::lookup_connector(get, *con.context) == nullptr);
+  CHECK(foreign_bind_info_calls == 0);
+  get.function.get_bind_info = bind_info;
+  // Scan info of another type on a genuine table binding: the scan kind alone would accept it.
+  struct foreign_info : duckdb::TableFunctionInfo {};
+  auto const scan_info       = get.function.function_info;
+  get.function.function_info = duckdb::make_shared_ptr<foreign_info>();
+  CHECK(sirius::planner::lookup_connector(get, *con.context) == nullptr);
+  get.function.function_info = scan_info;
+  CHECK(sirius::planner::lookup_connector(get, *con.context) != nullptr);
+  // Two genuine catalog bindings carry scan info of one type, which the hook cannot tell apart.
+  // Nothing Sirius reads comes from it: with the two infos swapped, the lookup accepts both
+  // bindings, and each still names the table, snapshot and files it was bound to. Its delete
+  // lookup addresses that table and finds the UUID it bound.
+  {
+    auto other_plan = con.ExtractPlan("SELECT fruit, count FROM lake.ns.dv ORDER BY count");
+    auto* other     = other_plan.get();
+    while (other->type != duckdb::LogicalOperatorType::LOGICAL_GET)
+      other = other->children.front().get();
+    auto& other_get = other->Cast<duckdb::LogicalGet>();
+    struct bound_to {
+      std::string table;
+      std::string table_uuid;
+      int64_t snapshot_id;
+      std::string read_view;
+      std::optional<std::string> selector;
+      std::string inventory_table;
+      std::vector<std::string> data_files;
+      bool operator==(bound_to const&) const = default;
+    };
+    auto const bound = [&](duckdb::LogicalGet& scan) {
+      auto const* connector = sirius::planner::lookup_connector(scan, *con.context);
+      REQUIRE(connector);
+      auto const snapshot = sirius::op::scan::capture_iceberg_snapshot(
+        scan.function, scan.bind_data.get(), *con.context);
+      REQUIRE(snapshot);
+      auto const view = sirius::op::scan::capture_bound_read_view(scan, *con.context);
+      REQUIRE(view.identity);
+      sirius::planner::scan_contract_provenance provenance;
+      auto const pre = connector->decline_reason(scan, *con.context, provenance);
+      INFO((pre.decline ? pre.decline->text : ""));
+      REQUIRE_FALSE(pre.decline);
+      REQUIRE(pre.inventory);
+      bound_to result{scan.GetTable()->name.GetIdentifierName(),
+                      snapshot->table_uuid,
+                      snapshot->snapshot_id,
+                      sirius::op::scan::canonical_read_view_text(view),
+                      view.logical_selector_evidence,
+                      pre.inventory->table,
+                      {}};
+      for (auto const& entry : pre.inventory->entries)
+        if (entry.content == "DATA") result.data_files.push_back(entry.file_path);
+      std::ranges::sort(result.data_files);
+      return result;
+    };
+    auto const fruit_bound = bound(get);
+    auto const other_bound = bound(other_get);
+    CHECK(fruit_bound.table == "fruit");
+    CHECK(fruit_bound.inventory_table == R"("lake"."ns"."fruit")");
+    CHECK(fruit_bound.data_files == std::vector<std::string>{data_file});
+    CHECK(other_bound.table == "dv");
+    CHECK(other_bound.table_uuid != fruit_bound.table_uuid);
+    CHECK(other_bound.data_files != fruit_bound.data_files);
+    REQUIRE(other_get.function.function_info);
+    REQUIRE(other_get.function.function_info != get.function.function_info);
+    std::swap(get.function.function_info, other_get.function.function_info);
+    CHECK(bound(get) == fruit_bound);
+    CHECK(bound(other_get) == other_bound);
+    std::swap(get.function.function_info, other_get.function.function_info);
+  }
+  logical.reset();
+  con.Rollback();
+  con.BeginTransaction();
+  auto by_path_plan =
+    con.ExtractPlan("SELECT fruit FROM iceberg_scan('" + source + "/metadata/v1.metadata.json')");
+  node = by_path_plan.get();
+  while (node->type != duckdb::LogicalOperatorType::LOGICAL_GET)
+    node = node->children.front().get();
+  auto& path_get = node->Cast<duckdb::LogicalGet>();
+  CHECK(sirius::planner::lookup_connector(path_get, *con.context) != nullptr);
+  path_get.function.function_info = scan_info;
+  CHECK(sirius::planner::lookup_connector(path_get, *con.context) == nullptr);
+  by_path_plan.reset();
+  con.Rollback();
+
+  // A table whose only snapshot is retained and not current. Read by version, the statement
+  // binds that snapshot; the delete lookup resolves the name without a version and binds none.
+  // The lookup still learns which table it reached, so the scan is not refused.
+  catalog.put("ns", "detached", metadata("detached.metadata.json"));
+  auto const mismatches_before =
+    stats()
+      .semantic_declines[static_cast<size_t>(sirius::op::scan::verdict_reason::evidence_missing)];
+  expect_gpu(
+    "SELECT fruit, count FROM lake.ns.detached AT (VERSION => 1000000000000000001) ORDER BY count",
+    fruit,
+    1,
+    data_file);
+  CHECK(stats().semantic_declines[static_cast<size_t>(
+          sirius::op::scan::verdict_reason::evidence_missing)] == mismatches_before);
+
+  // A table without a snapshot publishes no snapshot identity, so the GPU path declines it.
+  require_query_ok(con, "SET enable_duckdb_fallback=true");
+  auto const before_empty = stats();
+  auto empty             = require_query_ok(con, "SELECT fruit FROM lake.ns.empty WHERE count > 1");
+  auto const after_empty = stats();
+  CHECK(collect_rows(*empty).empty());
+  CHECK(after_empty.semantic_declines[no_snapshot] ==
+        before_empty.semantic_declines[no_snapshot] + 1);
+  CHECK(after_empty.executions == before_empty.executions);
+  // Without the fallback the refusal names the table, not arguments the query never wrote.
+  require_query_ok(con, "SET enable_duckdb_fallback=false");
+  auto unread = con.Query("SELECT fruit FROM lake.ns.empty WHERE count > 1");
+  REQUIRE(unread->HasError());
+  CHECK(unread->GetError().find(R"(Iceberg table "lake"."ns"."empty" has no committed snapshot)") !=
+        std::string::npos);
+  CHECK(unread->GetError().find("snapshot_from_id") == std::string::npos);
 }

@@ -20,6 +20,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/error.hpp>
 
@@ -50,10 +51,12 @@ constexpr int max_sum_columns         = 16;
 constexpr std::size_t max_shared_size = 48 * 1024;
 constexpr uint8_t absent_group        = 0xFF;
 
-/// Device view of the up to two one-character key columns.
+/// Device view of the up to two key columns: one-character strings, or dictionaries of at most 256
+/// keys whose INT32 codes stand in for the character.
 struct key_columns {
   int32_t const* offsets[2];
   char const* chars[2];
+  int32_t const* codes[2];  ///< Non-null for a dictionary key.
   int num_keys;
 };
 
@@ -62,6 +65,10 @@ __device__ inline int row_code(key_columns const& keys, int64_t row_idx)
 {
   int code = 0;
   for (int key_idx = 0; key_idx < keys.num_keys; ++key_idx) {
+    if (keys.codes[key_idx] != nullptr) {
+      code |= keys.codes[key_idx][row_idx] << (8 * key_idx);
+      continue;
+    }
     int32_t const begin = keys.offsets[key_idx][row_idx];
     if (keys.offsets[key_idx][row_idx + 1] - begin != 1) { return -1; }
     code |= static_cast<int>(static_cast<unsigned char>(keys.chars[key_idx][begin]))
@@ -79,6 +86,10 @@ __device__ inline int validated_row_code(key_columns const& keys, int64_t row_id
 {
   int code = 0;
   for (int key_idx = 0; key_idx < keys.num_keys; ++key_idx) {
+    if (keys.codes[key_idx] != nullptr) {
+      code |= keys.codes[key_idx][row_idx] << (8 * key_idx);
+      continue;
+    }
     int32_t const first = keys.offsets[key_idx][0];
     code |= static_cast<int>(static_cast<unsigned char>(keys.chars[key_idx][first + row_idx]))
             << (8 * key_idx);
@@ -309,7 +320,17 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
   keys.num_keys = static_cast<int>(group_idx.size());
   for (int key_idx = 0; key_idx < keys.num_keys; ++key_idx) {
     auto const& column = input.column(group_idx[key_idx]);
-    if (column.type().id() != cudf::type_id::STRING || column.has_nulls()) { return nullptr; }
+    if (column.has_nulls()) { return nullptr; }
+    if (column.type().id() == cudf::type_id::DICTIONARY32) {
+      cudf::dictionary_column_view const dictionary(column);
+      auto const codes = dictionary.get_indices_annotated();
+      if (dictionary.keys_size() > 256 || codes.type().id() != cudf::type_id::INT32) {
+        return nullptr;
+      }
+      keys.codes[key_idx] = codes.data<int32_t>();
+      continue;
+    }
+    if (column.type().id() != cudf::type_id::STRING) { return nullptr; }
     cudf::strings_column_view const strings(column);
     if (strings.offsets().type().id() != cudf::type_id::INT32 ||
         strings.chars_size(stream) != num_rows) {

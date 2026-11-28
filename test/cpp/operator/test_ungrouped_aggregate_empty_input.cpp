@@ -71,7 +71,7 @@ std::unique_ptr<sirius::ast::node> aggregate(aggregate_id kind,
     children.push_back(std::make_unique<sirius::ast::node>(sirius::ast::reference{0, input}));
   }
   return std::make_unique<sirius::ast::node>(
-    sirius::ast::aggregate{kind, std::move(children), result, distinct});
+    sirius::ast::aggregate{kind, std::move(children), result, distinct, /*order=*/{}});
 }
 
 expressions count_star()

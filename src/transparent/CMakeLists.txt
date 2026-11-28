@@ -6,5 +6,6 @@ target_sources(
           connection_provenance.cpp
           physical_sirius_execution.cpp
           parquet_footer_statistics.cpp
+          parquet_footer_statistics_limits.cpp
           push_narrowing_expressions.cpp
           sirius_optimizer_extension.cpp)

@@ -213,7 +213,8 @@ std::unique_ptr<sirius::ast::node> make_aggregate(uint32_t input_idx, sirius::ag
     sirius::ast::aggregate{function,
                            std::move(arguments),
                            sirius::logical_type::make(sirius::type_id::BIGINT),
-                           /*distinct=*/false});
+                           /*distinct=*/false,
+                           /*order=*/{}});
 }
 
 // A HASH_GROUP_BY over @p child grouping on @p group_columns with `functions[i]` over
