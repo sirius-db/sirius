@@ -271,6 +271,14 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     }
     SIRIUS_LOG_DEBUG("[late-mat] pin-time exact uniqueness check abandoned: {}", why);
   };
+  // Takes one column out of the exact stage and gives back what it retained.
+  auto decline_exact = [&](std::size_t column_pos, std::string const& why) {
+    SIRIUS_LOG_DEBUG(
+      "[late-mat] pin-time exact uniqueness check skipped for column {}: {}", column_pos, why);
+    exact_declined[column_pos] = true;
+    release_exact_column(column_pos);
+    unique_probe.exact_unavailable(column_pos);
+  };
 
   // Materialize one coalesced batch into a GPU-resident cudf::table and hand it to on_batch
   // together with its GPU placement and decode stream. There is no downstream scan operator, so the
@@ -333,6 +341,31 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
       chunk_stats = scan_manager::compute_pinned_chunk_stats(
         tbl->view(), pinned_column_types, stream, target->get_default_allocator());
     }
+    // The exact stage needs every chunk of a column on one device. Tell the probe before it looks
+    // at this chunk, so that it does not sort it for a column only the exact stage could settle.
+    if (exact_retaining && exact_gpu.has_value() && *exact_gpu != gpu_id) {
+      abandon_exact("the pin spans devices");
+    }
+    // Likewise for a column whose own values no longer fit under the cap: it is declined below
+    // whatever this chunk holds, so decline it before the probe sorts the chunk. Whether a
+    // column fits beside those of higher priority is known only once the probe has said which
+    // of them remain, so that is still decided below.
+    if (exact_retaining &&
+        static_cast<std::size_t>(tbl->num_columns()) == options.probe_unique_columns.size()) {
+      if (!exact_byte_cap.has_value()) {
+        exact_byte_cap = late_mat::exact_uniqueness_byte_cap(options.unique_exact_max_bytes,
+                                                             target->get_max_memory());
+      }
+      for (std::size_t i = 0; i < exact_bytes.size(); ++i) {
+        if (!unique_probe.candidate(i) || exact_declined[i]) { continue; }
+        auto const chunk_bytes = tbl->get_column(static_cast<cudf::size_type>(i)).alloc_size();
+        if (exact_bytes[i] + chunk_bytes > *exact_byte_cap) {
+          decline_exact(i,
+                        "its own values come to more than " + std::to_string(*exact_byte_cap) +
+                          " bytes (pin_table_unique_exact_max_bytes)");
+        }
+      }
+    }
     // Observe BEFORE narrowing: the proof is about values, and same-family
     // narrowing preserves them, so the native carriers are both cheaper to
     // reduce and equally conclusive.
@@ -342,15 +375,17 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
       // let the probe drop the column when the memory space cannot grant one.
       decltype(target->make_reservation_or_null(std::size_t{})) sort_reservation;
       unique_probe.observe(tbl->view(), stream, [&](std::size_t bytes) {
+        // The sort before this one is over. Its pledge goes back first, so that a column's
+        // request never has to fit beside the one before it: a string chunk's is far larger than
+        // an integer key's.
+        sort_reservation.reset();
         sort_reservation = target->make_reservation_or_null(bytes);
         return sort_reservation != nullptr;
       });
     }
     if (exact_retaining) {
-      if (exact_gpu.has_value() && *exact_gpu != gpu_id) {
-        abandon_exact("the pin spans devices");
-      } else if (exact_rows + static_cast<std::size_t>(tbl->num_rows()) >
-                 static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
+      if (exact_rows + static_cast<std::size_t>(tbl->num_rows()) >
+          static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
         abandon_exact("the pin has more rows than a cuDF column holds");
       } else if (static_cast<std::size_t>(tbl->num_columns()) !=
                  options.probe_unique_columns.size()) {
@@ -358,10 +393,6 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
       } else {
         exact_gpu = gpu_id;
         exact_rows += static_cast<std::size_t>(tbl->num_rows());
-        if (!exact_byte_cap.has_value()) {
-          exact_byte_cap = late_mat::exact_uniqueness_byte_cap(options.unique_exact_max_bytes,
-                                                               target->get_max_memory());
-        }
         // The optional copies must not crowd out the batches the pin still has to decode and
         // store, so each one is kept only if room for the next batch is left beside it.
         std::size_t batch_bytes = 0;
@@ -382,14 +413,6 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
         for (std::size_t i = 0; i < exact_chunks.size(); ++i) {
           if (!unique_probe.candidate(i) || exact_declined[i]) { release_exact_column(i); }
         }
-        auto const decline = [&](std::size_t column_pos, std::string const& why) {
-          SIRIUS_LOG_DEBUG("[late-mat] pin-time exact uniqueness check skipped for column {}: {}",
-                           column_pos,
-                           why);
-          exact_declined[column_pos] = true;
-          release_exact_column(column_pos);
-          unique_probe.exact_unavailable(column_pos);
-        };
         for (auto const i : exact_priority) {
           if (!unique_probe.candidate(i) || exact_declined[i]) { continue; }
           auto const chunk_bytes = tbl->get_column(static_cast<cudf::size_type>(i)).alloc_size();
@@ -402,22 +425,23 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
               fits,
               [&](std::size_t c) { return exact_bytes[c] > 0; },
               [&](std::size_t c) {
-                decline(c,
-                        "its retained values were released for column " + std::to_string(i) +
-                          ", of higher priority");
+                decline_exact(c,
+                              "its retained values were released for column " + std::to_string(i) +
+                                ", of higher priority");
               });
           };
           if (!make_room([&] { return exact_total_bytes + chunk_bytes <= *exact_byte_cap; })) {
-            decline(i,
-                    "more than " + std::to_string(*exact_byte_cap) +
-                      " bytes retained across columns (pin_table_unique_exact_max_bytes)");
+            decline_exact(i,
+                          "more than " + std::to_string(*exact_byte_cap) +
+                            " bytes retained across columns (pin_table_unique_exact_max_bytes)");
             continue;
           }
           if (!make_room([&] {
                 return late_mat::retention_has_headroom(
                   target->get_available_memory(), chunk_bytes, batch_bytes);
               })) {
-            decline(i, "not enough free GPU memory would be left for the next required batch");
+            decline_exact(i,
+                          "not enough free GPU memory would be left for the next required batch");
             continue;
           }
           decltype(target->make_reservation_or_null(chunk_bytes)) reservation;
@@ -425,7 +449,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
                 reservation = target->make_reservation_or_null(chunk_bytes);
                 return reservation != nullptr;
               })) {
-            decline(
+            decline_exact(
               i, "no GPU memory could be reserved for " + std::to_string(chunk_bytes) + " bytes");
             continue;
           }
@@ -438,7 +462,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
                                              reservation->get_memory_resource()));
           } catch (std::exception const& e) {
             // A failed copy must cost the optimization, never the pin.
-            decline(i, std::string{"copying the chunk failed: "} + e.what());
+            decline_exact(i, std::string{"copying the chunk failed: "} + e.what());
             continue;
           }
           exact_reservations[i].push_back(std::move(reservation));

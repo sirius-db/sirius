@@ -29,6 +29,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -243,8 +244,8 @@ TEST_CASE("the exact check decides what the range test could not", "[late_mat][p
 TEST_CASE("a column is settled by its first chunk where it can be", "[late_mat][pin_uniqueness]")
 {
   // Observing every column of a fact table must not hand each of them to the exact stage's sort,
-  // so an unsorted chunk is sorted on the spot to find a repeat, and a non-integer column goes no
-  // further than a small table (below).
+  // so an unsorted chunk is sorted on the spot to find a repeat, and a column that is neither an
+  // integer nor a string goes no further than a small table (below).
   ::cuda::stream_ref const stream{cudaStream_t{}};
   using sirius::late_mat::unique_verdict;
 
@@ -270,7 +271,7 @@ TEST_CASE("a non-integer column stays in the running only for a small table",
 {
   // A dimension's name column (nation.n_name) can prove a group-by-rowid ride, so a non-integer
   // column is left to the exact stage while its table is small, whatever its type. Past the row cap
-  // it is refused at the chunk that crosses it.
+  // a column that is not a string is refused at the chunk that crosses it.
   ::cuda::stream_ref const stream{cudaStream_t{}};
   using sirius::late_mat::unique_verdict;
   auto const mr = cudf::get_current_device_resource_ref();
@@ -290,14 +291,196 @@ TEST_CASE("a non-integer column stays in the running only for a small table",
   REQUIRE(probe.candidate(1));
 
   // At exactly the cap the column is still in the running; the next chunk pushes it over.
-  std::vector<std::string> big(sirius::late_mat::small_table_max_rows, "x");
-  auto big_names = sirius::test::operator_utils::make_string_column(big, stream, mr);
+  auto big_floats =
+    cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                              static_cast<cudf::size_type>(sirius::late_mat::small_table_max_rows),
+                              cudf::mask_state::UNALLOCATED,
+                              stream);
   unique_probe big_probe{std::vector<bool>{true}};
-  std::vector<cudf::column_view> big_cols{big_names->view()};
+  std::vector<cudf::column_view> big_cols{big_floats->view()};
   big_probe.observe(cudf::table_view{big_cols}, stream);
   REQUIRE(big_probe.candidate(0));
   big_probe.observe(cudf::table_view{big_cols}, stream);
   REQUIRE(big_probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused});
+}
+
+TEST_CASE("a big table's string column stays in the running while its chunks hold no repeat",
+          "[late_mat][pin_uniqueness]")
+{
+  // A big dimension's second identifier (TPC-DS customer.c_customer_id) is a string that no row
+  // repeats. Past the row cap such a column is left to the exact stage as long as each chunk is
+  // distinct in itself; a column of any other type is refused there, as before.
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+  auto const mr = cudf::get_current_device_resource_ref();
+
+  auto const rows = sirius::late_mat::small_table_max_rows + 1;
+  std::vector<std::string> ids;
+  ids.reserve(rows);
+  for (std::size_t i = 0; i < rows; ++i) {
+    // Descending, so the chunk is unsorted and the probe has to sort it.
+    ids.push_back("ID" + std::to_string(10'000'000 - i));
+  }
+  std::size_t chars = 0;
+  for (auto const& id : ids) {
+    chars += id.size();
+  }
+  // What a sort of a string chunk is asked memory for: its characters and 64-bit offsets, times
+  // the scratch factor.
+  auto const sort_bytes = [&](std::size_t characters) {
+    return (characters + (rows + 1) * sizeof(std::int64_t)) * sirius::late_mat::sort_scratch_factor;
+  };
+  auto distinct = sirius::test::operator_utils::make_string_column(ids, stream, mr);
+  std::vector<cudf::column_view> const only_distinct{distinct->view()};
+
+  SECTION("a distinct chunk keeps the column, a repeat or another type ends its chances")
+  {
+    auto floats    = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                            static_cast<cudf::size_type>(rows),
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream);
+    ids.back()     = ids.front();
+    auto repeating = sirius::test::operator_utils::make_string_column(ids, stream, mr);
+    std::vector<cudf::column_view> cols{distinct->view(), repeating->view(), floats->view()};
+    unique_probe probe{std::vector<bool>{true, true, true}};
+    std::vector<std::size_t> asked;
+    probe.observe(cudf::table_view{cols}, stream, [&](std::size_t bytes) {
+      asked.push_back(bytes);
+      return true;
+    });
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided,
+                                                            unique_verdict::refused,
+                                                            unique_verdict::refused});
+    // Each string chunk was sorted, with memory asked for its characters and offsets. The
+    // repeating column's last id is its first, which is one character longer.
+    REQUIRE(asked == std::vector<std::size_t>{sort_bytes(chars), sort_bytes(chars + 1)});
+  }
+
+  SECTION("without memory for the sort the column is dropped")
+  {
+    unique_probe probe{std::vector<bool>{true}};
+    probe.observe(cudf::table_view{only_distinct}, stream, [](std::size_t) { return false; });
+    REQUIRE(probe.verdicts()[0] == unique_verdict::refused);
+  }
+
+  SECTION("with the exact stage out of reach nothing can settle it")
+  {
+    unique_probe probe{std::vector<bool>{true}};
+    probe.exact_unavailable(0);
+    probe.observe(cudf::table_view{only_distinct}, stream);
+    REQUIRE(probe.verdicts()[0] == unique_verdict::refused);
+  }
+
+  SECTION("a NULL ends its chances before anything is sorted")
+  {
+    auto const size = static_cast<cudf::size_type>(rows);
+    distinct->set_null_mask(cudf::create_null_mask(size, cudf::mask_state::ALL_NULL, stream, mr),
+                            size);
+    std::vector<cudf::column_view> const with_nulls{distinct->view()};
+    unique_probe probe{std::vector<bool>{true}};
+    std::vector<std::size_t> asked;
+    probe.observe(cudf::table_view{with_nulls}, stream, [&](std::size_t bytes) {
+      asked.push_back(bytes);
+      return true;
+    });
+    REQUIRE(probe.verdicts()[0] == unique_verdict::refused);
+    REQUIRE(asked.empty());
+  }
+}
+
+TEST_CASE("a big chunk's first rows are judged before the whole chunk",
+          "[late_mat][pin_uniqueness]")
+{
+  // A column of few values repeats one within its first rows. On a chunk of twice the screen's
+  // rows or more those rows are judged first, so that such a column pays for a sort of them and
+  // never for a sort of the chunk.
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::chunk_screen_rows;
+  using sirius::late_mat::sort_scratch_factor;
+  using sirius::late_mat::unique_verdict;
+
+  auto const rows = 2 * chunk_screen_rows;
+  // Descending, so that neither the chunk nor its first rows are sorted.
+  std::vector<std::int64_t> values(rows);
+  for (std::size_t i = 0; i < rows; ++i) {
+    values[i] = static_cast<std::int64_t>(rows - i);
+  }
+  auto distinct = int64_column(values, stream);
+  // A repeat within the first rows.
+  values[1]          = values[0];
+  auto repeats_early = int64_column(values, stream);
+  // A repeat that only the whole chunk shows: its last value is its first.
+  values[1]         = static_cast<std::int64_t>(rows - 1);
+  values[rows - 1]  = values[0];
+  auto repeats_late = int64_column(values, stream);
+  std::vector<cudf::column_view> cols{
+    distinct->view(), repeats_early->view(), repeats_late->view()};
+
+  unique_probe probe{std::vector<bool>{true, true, true}};
+  std::vector<std::size_t> asked;
+  probe.observe(cudf::table_view{cols}, stream, [&](std::size_t bytes) {
+    asked.push_back(bytes);
+    return true;
+  });
+  REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::proven,
+                                                          unique_verdict::refused,
+                                                          unique_verdict::refused});
+  // Memory was asked for a sort of the first rows of each column, and for a sort of the whole
+  // chunk only where those rows held no repeat.
+  auto const first_rows = chunk_screen_rows * sizeof(std::int64_t) * sort_scratch_factor;
+  auto const whole      = rows * sizeof(std::int64_t) * sort_scratch_factor;
+  REQUIRE(asked == std::vector<std::size_t>{first_rows, whole, first_rows, first_rows, whole});
+
+  // A string column's first rows are asked memory for their own characters, not the chunk's.
+  auto const mr = cudf::get_current_device_resource_ref();
+  std::vector<std::string> ids;
+  ids.reserve(rows);
+  for (std::size_t i = 0; i < rows; ++i) {
+    ids.push_back("ID" + std::to_string(10'000'000 - i));
+  }
+  ids[1]                  = ids[0];
+  std::size_t first_chars = 0;
+  for (std::size_t i = 0; i < chunk_screen_rows; ++i) {
+    first_chars += ids[i].size();
+  }
+  auto names = sirius::test::operator_utils::make_string_column(ids, stream, mr);
+  std::vector<cudf::column_view> const name_cols{names->view()};
+  unique_probe name_probe{std::vector<bool>{true}};
+  std::vector<std::size_t> name_asked;
+  name_probe.observe(cudf::table_view{name_cols}, stream, [&](std::size_t bytes) {
+    name_asked.push_back(bytes);
+    return true;
+  });
+  REQUIRE(name_probe.verdicts()[0] == unique_verdict::refused);
+  REQUIRE(name_asked ==
+          std::vector<std::size_t>{(first_chars + (chunk_screen_rows + 1) * sizeof(std::int64_t)) *
+                                   sort_scratch_factor});
+}
+
+TEST_CASE("the exact check judges strings across chunks", "[late_mat][pin_uniqueness]")
+{
+  // What settles a big table's string id: a value that is in two chunks, and twice in neither,
+  // passes every chunk's own check and is found only here.
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::exact_distinct_over_chunks;
+  auto const mr      = cudf::get_current_device_resource_ref();
+  auto const strings = [&](std::vector<std::string> const& values) {
+    return sirius::test::operator_utils::make_string_column(values, stream, mr);
+  };
+
+  auto first  = strings({"id_b", "id_d"});
+  auto second = strings({"id_c", "id_a"});
+  std::vector<cudf::column_view> const distinct{first->view(), second->view()};
+  REQUIRE(exact_distinct_over_chunks(distinct, stream) == std::optional<bool>{true});
+
+  auto shares_one = strings({"id_c", "id_b"});
+  std::vector<cudf::column_view> const repeating{first->view(), shares_one->view()};
+  REQUIRE(exact_distinct_over_chunks(repeating, stream) == std::optional<bool>{false});
+
+  // A chunk with a NULL is a question the check does not answer.
+  shares_one->set_null_mask(cudf::create_null_mask(2, cudf::mask_state::ALL_NULL, stream, mr), 2);
+  std::vector<cudf::column_view> const with_nulls{first->view(), shares_one->view()};
+  REQUIRE_FALSE(exact_distinct_over_chunks(with_nulls, stream).has_value());
 }
 
 TEST_CASE("a column is dropped, not the pin, when its sort cannot be reserved",

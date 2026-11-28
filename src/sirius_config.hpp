@@ -337,10 +337,10 @@ struct operator_params {
   /// Prove pinned parquet columns distinct at pin time and let the join planner treat a build key
   /// proven distinct like a PRIMARY KEY, so the join takes the single-pass distinct hash join.
   /// When on, pin_table observes every column of a parquet pin (and of a native table's pin when
-  /// late materialization is on); an observed column must be an integer column without a repeated
-  /// value in any chunk, or any column of a table under late_mat::small_table_max_rows rows, to
-  /// stay a candidate. When off, the planner ignores pin-time facts and the pin observes nothing,
-  /// so late materialization gets no proof either.
+  /// late materialization is on); an observed column must be an integer or string column without
+  /// a repeated value in any chunk, or any column of a table under
+  /// late_mat::small_table_max_rows rows, to stay a candidate. When off, the planner ignores
+  /// pin-time facts and the pin observes nothing, so late materialization gets no proof either.
   bool prove_unique_keys{true};
 
   /// Cap, in bytes, on what a pin retains across all columns for the exact uniqueness check, which

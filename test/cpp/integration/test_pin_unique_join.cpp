@@ -239,6 +239,68 @@ void generate_overlapping_named_dim(fs::path const& dir)
   }
 }
 
+/// What the string `id` of generate_big_named_dim holds.
+enum class big_dim_id {
+  distinct,              ///< No value twice.
+  repeats_across_files,  ///< No value twice within a file, and one value in both files.
+  has_null,              ///< No value twice, and one NULL.
+};
+
+/// A dimension past the probe's small-table row cap, in the shape of TPC-DS customer: a join key
+/// `k`, a string `id` that is not in the rows' order, a string `label` that many rows share and
+/// an integer `tier`. It is written as two files in @p dim_dir, so the pin holds at least two
+/// chunks and only the exact stage can judge the id across them. The fact holds each key twice,
+/// too few for its statistics to show that the keys repeat.
+constexpr std::int64_t big_dim_rows = 1'200'000;
+void generate_big_named_dim(fs::path const& dim_dir, fs::path const& fact, big_dim_id id)
+{
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(nullptr);
+  duckdb::Connection gen(gen_db);
+  auto const rows = std::to_string(big_dim_rows);
+  // 7919 is prime and does not divide the row count, so the ids are a permutation of the rows.
+  std::string id_of_row = "'id_' || lpad(((range * 7919) % " + rows + ")::VARCHAR, 7, '0')";
+  switch (id) {
+    case big_dim_id::distinct: break;
+    case big_dim_id::repeats_across_files:
+      // The last row, in the second file, takes the id of the first row, in the first.
+      id_of_row = "CASE WHEN range = " + rows + " - 1 THEN 'id_0000000' ELSE " + id_of_row + " END";
+      break;
+    case big_dim_id::has_null:
+      id_of_row = "CASE WHEN range = 7 THEN NULL ELSE " + id_of_row + " END";
+      break;
+  }
+  auto const half = big_dim_rows / 2;
+  for (int part = 0; part < 2; ++part) {
+    run_generator(gen,
+                  "COPY (SELECT range AS k, " + id_of_row +
+                    " AS id, 'label_' || (range % 100) AS label, (range % 3)::INTEGER AS tier "
+                    "FROM range(" +
+                    std::to_string(part * half) + ", " + std::to_string((part + 1) * half) +
+                    ")) TO " +
+                    sirius::test::sql_literal(
+                      (dim_dir / ("part." + std::to_string(part) + ".parquet")).string()) +
+                    " (FORMAT PARQUET);");
+  }
+  run_generator(gen,
+                "COPY (SELECT range % " + rows + " AS f_k, range % 7 AS v FROM range(" +
+                  std::to_string(2 * big_dim_rows) + ")) TO " +
+                  sirius::test::sql_literal(fact.string()) + " (FORMAT PARQUET);");
+}
+
+/// The fact's least and greatest value per group of the big dimension's columns, summed up so
+/// that one row answers for every group. Every grouping used holds the label.
+std::string per_group_of_big_dim(fs::path const& fact,
+                                 fs::path const& dim_glob,
+                                 std::string const& groups)
+{
+  return "SELECT count(*), sum(low), sum(top), max(label) FROM (SELECT d.label AS label, "
+         "min(f.v) AS low, max(f.v) AS top FROM read_parquet(" +
+         sirius::test::sql_literal(fact.string()) + ") f JOIN read_parquet(" +
+         sirius::test::sql_literal(dim_glob.string()) + ") d ON f.f_k = d.k GROUP BY " + groups +
+         ")";
+}
+
 /// The pin's per-column uniqueness facts for the pinned entry @p name.
 std::vector<bool> proven_columns_of(duckdb::Connection& con, std::string const& name)
 {
@@ -308,10 +370,16 @@ void write_config(fs::path const& yaml_path, std::string const& extra_sections =
   f << extra_sections;
 }
 
-void pin(duckdb::Connection& con, fs::path const& file, std::string const& name)
+/// Pins @p file on the GPU as @p name: every column, or only those of @p cols, a list of quoted
+/// names.
+void pin(duckdb::Connection& con,
+         fs::path const& file,
+         std::string const& name,
+         std::string const& cols = "")
 {
   auto result = con.Query("CALL pin_table(" + sirius::test::sql_literal(file.string()) +
-                          ", tier='gpu', name='" + name + "');");
+                          ", tier='gpu', name='" + name + "'" +
+                          (cols.empty() ? "" : ", cols=[" + cols + "]") + ");");
   REQUIRE(result);
   if (result->HasError()) { UNSCOPED_INFO("pin_table error: " << result->GetError()); }
   REQUIRE_FALSE(result->HasError());
@@ -581,6 +649,184 @@ TEST_CASE("a proven string column ahead of an integer key neither hides nor crow
   }
 
   con.Query("CALL unpin_table('pin_unique_join_named_dim');");
+}
+
+TEST_CASE("a big dimension's string id is proven at pin time and fixes the key of its join",
+          "[integration][pin_unique_join]")
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  sirius::test::scratch_dir scratch{"pin_unique_join_big_named_dim"};
+  auto const& tmp    = scratch.path();
+  auto const dim_dir = tmp / "big_named_dim";
+  auto const fact    = tmp / "big_fact.parquet";
+  fs::create_directories(dim_dir);
+  generate_big_named_dim(dim_dir, fact, big_dim_id::distinct);
+  auto const dim_glob = dim_dir / "*.parquet";
+
+  auto const yaml_path = tmp / "pin_unique_join_big_named_dim.yaml";
+  write_config(yaml_path,
+               "  operator_params:\n"
+               "    scan_task_batch_size: 8MiB\n");
+  sirius::test::shared_test_env local_env(yaml_path);
+  auto con = local_env.make_connection();
+  set_option(con, "SET enable_duckdb_fallback = false;");
+
+  pin(con, dim_glob, "pin_unique_join_big_named_dim");
+  // The key and the id are proven. The label and the tier repeat.
+  CHECK(proven_columns_of(con, "pin_unique_join_big_named_dim") ==
+        std::vector<bool>{true, true, false, false});
+
+  auto const pushdowns = [&] {
+    return sirius::test::get_transparent_execution_stats(con).partial_aggregate_pushdowns;
+  };
+
+  SECTION("grouped by the id, the aggregate goes below the join")
+  {
+    // As TPC-DS q11 groups by c_customer_id: not by the join key, but one id is one row of the
+    // dimension and so one key.
+    auto const sql    = per_group_of_big_dim(fact, dim_glob, "d.id, d.label");
+    auto const before = pushdowns();
+    CHECK(gpu_answer(con, sql) == cpu_answer(sql));
+    CHECK(pushdowns() > before);
+  }
+
+  SECTION("grouped by columns that repeat, it stays above")
+  {
+    auto const sql    = per_group_of_big_dim(fact, dim_glob, "d.label, d.tier");
+    auto const before = pushdowns();
+    CHECK(gpu_answer(con, sql) == cpu_answer(sql));
+    CHECK(pushdowns() == before);
+  }
+
+  SECTION("with pin_table_prove_unique_keys off the id proves nothing")
+  {
+    set_option(con, "SET pin_table_prove_unique_keys = false;");
+    auto const sql    = per_group_of_big_dim(fact, dim_glob, "d.id, d.label");
+    auto const before = pushdowns();
+    CHECK(gpu_answer(con, sql) == cpu_answer(sql));
+    CHECK(pushdowns() == before);
+    set_option(con, "RESET pin_table_prove_unique_keys;");
+  }
+
+  con.Query("CALL unpin_table('pin_unique_join_big_named_dim');");
+}
+
+TEST_CASE("a big dimension's string id that repeats or holds a NULL proves nothing",
+          "[integration][pin_unique_join]")
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  // An id that repeats only across the pin's chunks passes every chunk's own check, so nothing
+  // but the exact stage's sort of the whole column finds it. An id with a NULL is refused at
+  // the chunk that holds it.
+  auto id = big_dim_id::repeats_across_files;
+  SECTION("an id that repeats only across the pin's chunks") {}
+  SECTION("an id with a NULL") { id = big_dim_id::has_null; }
+
+  sirius::test::scratch_dir scratch{"pin_unique_join_big_unproven_dim"};
+  auto const& tmp    = scratch.path();
+  auto const dim_dir = tmp / "big_unproven_dim";
+  auto const fact    = tmp / "big_fact.parquet";
+  fs::create_directories(dim_dir);
+  generate_big_named_dim(dim_dir, fact, id);
+  auto const dim_glob = dim_dir / "*.parquet";
+
+  auto const yaml_path = tmp / "pin_unique_join_big_unproven_dim.yaml";
+  write_config(yaml_path,
+               "  operator_params:\n"
+               "    scan_task_batch_size: 8MiB\n");
+  sirius::test::shared_test_env local_env(yaml_path);
+  auto con = local_env.make_connection();
+  set_option(con, "SET enable_duckdb_fallback = false;");
+
+  pin(con, dim_glob, "pin_unique_join_big_unproven_dim");
+  // Only the key is proven.
+  CHECK(proven_columns_of(con, "pin_unique_join_big_unproven_dim") ==
+        std::vector<bool>{true, false, false, false});
+
+  // Grouped by the id, the aggregate stays above the join, and the two rows that share an id,
+  // or the row without one, are grouped as DuckDB groups them.
+  auto const sql = per_group_of_big_dim(fact, dim_glob, "d.id, d.label");
+  auto const before =
+    sirius::test::get_transparent_execution_stats(con).partial_aggregate_pushdowns;
+  CHECK(gpu_answer(con, sql) == cpu_answer(sql));
+  CHECK(sirius::test::get_transparent_execution_stats(con).partial_aggregate_pushdowns == before);
+
+  con.Query("CALL unpin_table('pin_unique_join_big_unproven_dim');");
+}
+
+TEST_CASE("a pin that lacks a column the scan reads proves nothing for that scan",
+          "[integration][pin_unique_join]")
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  sirius::test::scratch_dir scratch{"pin_unique_join_key_only"};
+  auto const& tmp       = scratch.path();
+  auto const unique_dim = tmp / "unique_dim.parquet";
+  auto const dup_dim    = tmp / "dup_dim.parquet";
+  auto const fact       = tmp / "fact.parquet";
+  generate_parquet(unique_dim, dup_dim, fact);
+
+  auto const yaml_path = tmp / "pin_unique_join_key_only.yaml";
+  write_config(yaml_path);
+  sirius::test::shared_test_env local_env(yaml_path);
+  auto con = local_env.make_connection();
+  set_option(con, "SET enable_duckdb_fallback = false;");
+
+  // The pin holds the key alone. A scan that also reads the payload cannot be served from it and
+  // reads the file, which need not be what was pinned, so the pin's proof does not speak for it.
+  pin(con, unique_dim, "pin_unique_join_key_only", "'k'");
+  auto const reads_payload = join_query(fact, unique_dim);
+  auto const reads_key     = "SELECT count(*), sum(f.v) FROM read_parquet(" +
+                         sirius::test::sql_literal(fact.string()) + ") f JOIN read_parquet(" +
+                         sirius::test::sql_literal(unique_dim.string()) + ") d ON f.f_k = d.k";
+
+  SECTION("a scan that reads a column the pin lacks is not proven")
+  {
+    CHECK_FALSE(join_proven_unique(con, reads_payload));
+    CHECK(gpu_answer(con, reads_payload) == cpu_answer(reads_payload));
+  }
+
+  SECTION("a scan the pin holds every column of is proven")
+  {
+    CHECK(join_proven_unique(con, reads_key));
+    CHECK(gpu_answer(con, reads_key) == cpu_answer(reads_key));
+  }
+
+  SECTION("a second pin of the file that holds the scan's columns proves it")
+  {
+    pin(con, unique_dim, "pin_unique_join_whole");
+    CHECK(join_proven_unique(con, reads_payload));
+    CHECK(gpu_answer(con, reads_payload) == cpu_answer(reads_payload));
+    con.Query("CALL unpin_table('pin_unique_join_whole');");
+  }
+
+  con.Query("CALL unpin_table('pin_unique_join_key_only');");
 }
 
 TEST_CASE("a Hive partition column is not proven unique by a same-named file column",

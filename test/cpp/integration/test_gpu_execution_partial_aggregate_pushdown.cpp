@@ -318,6 +318,44 @@ TEST_CASE_METHOD(PartialAggregatePushdownFixture,
 }
 
 TEST_CASE_METHOD(PartialAggregatePushdownFixture,
+                 "gpu_execution aggregate below a join grouped by a unique column of its table",
+                 "[integration][gpu_execution][partial_agg_pushdown]")
+{
+  // Members are grouped by their id, the PRIMARY KEY, and joined on a customer key that is not
+  // one: members 61 and 62 share key 5, member 63 has none, and keys 41 to 80 have no member.
+  run_ok(
+    "CREATE TABLE members (m_custkey BIGINT, m_id VARCHAR PRIMARY KEY, m_name VARCHAR, "
+    "m_tier INTEGER);");
+  run_ok(
+    "INSERT INTO members SELECT range, 'M' || range, 'Member#' || (range % 7), range % 3 "
+    "FROM range(1, 41);");
+  run_ok(
+    "INSERT INTO members VALUES (5, 'M61', 'Member#5', 1), (5, 'M62', 'Member#5', 2), "
+    "(NULL, 'M63', 'Nobody', 0);");
+  run_ok("CHECKPOINT;");
+  // Going by the grouping alone: the statistics would push these as well.
+  sirius::test::scoped_sirius_setting by_grouping{*con, "partial_aggregate_min_rows_per_key", 0.0};
+  compare_pushed_and_not(
+    "SELECT m_id, m_name, sum(o_totalprice) AS total, max(o_orderdate) AS latest "
+    "FROM members, orders WHERE m_custkey = o_custkey GROUP BY m_id, m_name",
+    true);
+  // With a second key that is grouped by itself, and a floating-point sum.
+  compare_pushed_and_not(
+    "SELECT m_id, m_name, o_shippriority, sum(o_totalprice) AS total, "
+    "sum(o_shippriority * 0.3::DOUBLE) AS tenths FROM members, orders "
+    "WHERE m_custkey = o_custkey GROUP BY m_id, m_name, o_shippriority",
+    true,
+    {4});
+  // Grouped by the name and the tier, which several members share, the rule has no grounds. Two
+  // groups, so that the one key below them is fewer and nothing else stands in the way.
+  auto const before = pushdowns();
+  compare_gpu_vs_cpu(
+    "SELECT m_name, m_tier, sum(o_totalprice) AS total FROM members, orders "
+    "WHERE m_custkey = o_custkey GROUP BY m_name, m_tier");
+  CHECK(pushdowns() == before);
+}
+
+TEST_CASE_METHOD(PartialAggregatePushdownFixture,
                  "gpu_execution aggregate below a join whose keys the statistics show repeat",
                  "[integration][gpu_execution][partial_agg_pushdown]")
 {
