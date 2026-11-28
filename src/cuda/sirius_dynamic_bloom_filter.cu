@@ -55,6 +55,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -445,10 +446,24 @@ std::shared_ptr<sirius_dynamic_bloom_filter> sirius_dynamic_bloom_filter::make_a
 
 namespace {
 
-__global__ void or_words(std::uint32_t* into, std::uint32_t const* from, std::size_t count)
+constexpr std::size_t words_per_bloom_block = bloom_bytes_per_block / sizeof(std::uint32_t);
+
+/// ORs into word w of block b the same word of blocks [b * fold, (b + 1) * fold) of @p from.
+__global__ void or_folded_words(std::uint32_t* into,
+                                std::uint32_t const* from,
+                                std::size_t count,
+                                std::size_t fold)
 {
   auto const i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i < count) { into[i] |= from[i]; }
+  if (i >= count) { return; }
+  auto const block   = i / words_per_bloom_block;
+  auto const word    = i % words_per_bloom_block;
+  auto const* run    = from + block * fold * words_per_bloom_block + word;
+  std::uint32_t bits = 0;
+  for (std::size_t j = 0; j < fold; ++j) {
+    bits |= run[j * words_per_bloom_block];
+  }
+  into[i] |= bits;
 }
 
 }  // namespace
@@ -481,8 +496,15 @@ void sirius_dynamic_bloom_filter::merge_from(void const* words,
                                              std::size_t bytes,
                                              ::cuda::stream_ref stream)
 {
-  if (bytes != storage_bytes() || bytes % sizeof(std::uint32_t) != 0) {
+  auto const own = storage_bytes();
+  if (own == 0 || bytes % own != 0 || !std::has_single_bit(bytes / own) ||
+      own % bloom_bytes_per_block != 0) {
     throw std::invalid_argument("[sirius_dynamic_bloom_filter] merging a filter of another size");
+  }
+  auto const fold = bytes / own;
+  if (fold > 1 && !std::has_single_bit(own / bloom_bytes_per_block)) {
+    throw std::invalid_argument(
+      "[sirius_dynamic_bloom_filter] folding needs a power-of-two number of blocks");
   }
   // Distributed ranks run on one GPU each, so a merged filter has no other replica to update.
   if (replica_count() > 1) {
@@ -495,12 +517,36 @@ void sirius_dynamic_bloom_filter::merge_from(void const* words,
   }
   rmm::cuda_set_device_raii guard{rmm::cuda_device_id{_impl->source_device}};
   auto* into                 = static_cast<std::uint32_t*>(const_cast<void*>(storage()));
-  auto const count           = bytes / sizeof(std::uint32_t);
+  auto const count           = own / sizeof(std::uint32_t);
   constexpr unsigned threads = 256;
   auto const blocks          = static_cast<unsigned>(::cuda::ceil_div(count, std::size_t{threads}));
-  or_words<<<blocks, threads, 0, stream.get()>>>(
-    into, static_cast<std::uint32_t const*>(words), count);
+  or_folded_words<<<blocks, threads, 0, stream.get()>>>(
+    into, static_cast<std::uint32_t const*>(words), count, fold);
   CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+std::shared_ptr<sirius_dynamic_bloom_filter> sirius_dynamic_bloom_filter::folded_to(
+  std::size_t bytes, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+{
+  auto const own = storage_bytes();
+  if (bytes == 0 || bytes % bloom_bytes_per_block != 0 ||
+      !std::has_single_bit(bytes / bloom_bytes_per_block) || own % bytes != 0 ||
+      !std::has_single_bit(own / bytes)) {
+    throw std::invalid_argument(
+      "[sirius_dynamic_bloom_filter] folding to a size that does not fold");
+  }
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{_impl->source_device}};
+  auto empty           = std::make_unique<impl>();
+  empty->source_device = _impl->source_device;
+  detail::dispatch_key_rep(_domain.rep, [&]<class Key>(Key) {
+    empty->replicas.push_back(std::make_unique<bloom_replica>(
+      empty->source_device,
+      make_bloom<sirius_bloom<Key>>(bytes / bloom_bytes_per_block, mr, stream)));
+  });
+  std::shared_ptr<sirius_dynamic_bloom_filter> folded{
+    new sirius_dynamic_bloom_filter{_domain, std::move(empty)}};
+  folded->merge_from(storage(), own, stream);
+  return folded;
 }
 
 void sirius_dynamic_bloom_filter::replicate_to_devices(

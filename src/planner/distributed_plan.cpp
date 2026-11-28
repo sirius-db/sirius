@@ -75,12 +75,6 @@ enum class placement {
   rank0,   ///< On rank 0; what other ranks hold is not part of the result.
 };
 
-/// A join's Bloom filters are sized for its estimated build rows, within these bounds and
-/// merged_bloom_keys()'s budget: the same size on every rank, since every rank plans the same
-/// estimate and, with like GPUs and settings, the same budget. Where the budgets differ the sizes
-/// do, and the key publishes nothing.
-constexpr std::size_t min_bloom_keys = std::size_t{1} << 16;
-constexpr std::size_t max_bloom_keys = std::size_t{1} << 30;
 /// A hash join whose estimated build has fewer rows publishes no merged Bloom filters.
 constexpr std::size_t min_merged_build_rows = std::size_t{1} << 14;
 /// A join's build side is broadcast, and its probe side stays where it is, when the whole build
@@ -222,12 +216,12 @@ struct rewriter {
     auto const first = exchange::make_stream_id(query, next_stream);
     auto const keys  = join.dynamic_filter_plan().admitted_keys().size();
     next_stream += static_cast<std::uint32_t>(keys);
-    install_filter_merge(join,
-                         std::make_shared<op::bloom_all_gather_merge>(service, first, keys, *gpu),
-                         merged_bloom_keys(build_rows,
-                                           join.dynamic_filter_plan().max_bloom_bytes_per_gpu(),
-                                           service->world_size(),
-                                           keys));
+    install_filter_merge(
+      join,
+      std::make_shared<op::bloom_all_gather_merge>(service, first, keys, *gpu),
+      service->world_size(),
+      merged_bloom_key_cap(
+        join.dynamic_filter_plan().max_bloom_bytes_per_gpu(), service->world_size(), keys));
     shape += "F";
   }
 
@@ -595,24 +589,23 @@ void check_distributed_scan(op::sirius_physical_table_scan const& scan,
   }
 }
 
-std::size_t merged_bloom_keys(std::size_t build_rows,
-                              std::uint64_t budget_bytes,
-                              std::size_t world,
-                              std::size_t keys)
+std::size_t merged_bloom_key_cap(std::uint64_t budget_bytes, std::size_t world, std::size_t keys)
 {
   constexpr std::size_t bytes_per_key = op::bloom_target_bits_per_key / 8;
   auto const within_budget =
     static_cast<std::size_t>(budget_bytes / ((world + 1) * keys) / bytes_per_key);
-  return std::clamp(
-    build_rows, min_bloom_keys, std::clamp(within_budget, min_bloom_keys, max_bloom_keys));
+  return std::clamp(within_budget, op::merged_bloom_min_keys, op::merged_bloom_max_keys);
 }
 
 void install_filter_merge(op::sirius_physical_hash_join& join,
                           std::shared_ptr<op::cross_rank_filter_merge> merge,
-                          std::size_t bloom_keys)
+                          std::size_t ranks,
+                          std::size_t max_keys)
 {
   join.dynamic_filter_session().set_cross_rank_merge(
-    std::move(merge), op::merged_bloom_policy(join.dynamic_filter_plan().policy(), bloom_keys));
+    std::move(merge),
+    op::merged_bloom_policy(
+      join.dynamic_filter_plan().policy(), ranks, op::merged_bloom_min_keys, max_keys));
   // finish_input() never waits: a publication not yet started leaves each key's merge, and one
   // already running completes on its own.
   join.children[1]->add_finalize_listener(

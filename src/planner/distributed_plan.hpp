@@ -139,23 +139,25 @@ void check_distributed_scan(op::sirius_physical_table_scan const& scan,
                             connector const& source,
                             duckdb::ClientContext& context);
 
-/// The keys a join's Blooms are sized for when @p world ranks merge them: its estimated
-/// @p build_rows, within fixed bounds and within @p budget_bytes of Bloom arrays on one GPU. The
-/// publisher's per-GPU cap does not apply to a fixed size, and a rank holds, for each of the
-/// join's @p keys keys, its own Bloom, the copy it sends and one from every other rank: a peer
-/// sends its next key's while this rank still merges the one before.
-[[nodiscard]] std::size_t merged_bloom_keys(std::size_t build_rows,
-                                            std::uint64_t budget_bytes,
-                                            std::size_t world,
-                                            std::size_t keys);
+/// The most keys a join's Blooms are sized for when @p world ranks merge them: within fixed bounds
+/// and within @p budget_bytes of Bloom arrays on one GPU. The publisher's per-GPU cap does not
+/// apply to a scaled size, and a rank holds, for each of the join's @p keys keys, its own Bloom,
+/// the copy it sends and one from every other rank: a peer sends its next key's while this rank
+/// still merges the one before.
+[[nodiscard]] std::size_t merged_bloom_key_cap(std::uint64_t budget_bytes,
+                                               std::size_t world,
+                                               std::size_t keys);
 
-/// Has @p join merge its dynamic filters across ranks with @p merge, its Blooms sized for
-/// @p bloom_keys keys, and close its publication when its build CONCAT (`children[1]`) finalizes:
+/// Has @p join merge its dynamic filters across ranks with @p merge, each of the @p ranks ranks
+/// sizing its Blooms from its own build rows, for at most @p max_keys keys
+/// (op::merged_bloom_policy), and close its publication when its build CONCAT (`children[1]`)
+/// finalizes:
 /// a peer's merge waits on this rank's part, and that peer's probe may be what this rank's probe
 /// waits on, so the join's own finalize is too late.
 void install_filter_merge(op::sirius_physical_hash_join& join,
                           std::shared_ptr<op::cross_rank_filter_merge> merge,
-                          std::size_t bloom_keys);
+                          std::size_t ranks,
+                          std::size_t max_keys);
 
 /// Has @p sample take its boundaries from every rank's sample, all-gathered on @p stream, and
 /// give the range exchange's boundaries to @p sink, the EXCHANGE_SINK after it, in whose order
