@@ -1057,6 +1057,9 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
                                                    "        coalesce_gap_ratio: 0.5\n"
                                                    "        read_slots_per_lane: 3\n"
                                                    "        register_per_slot: false\n"
+                                                   "        high_priority_copies: false\n"
+                                                   "        async_copies: false\n"
+                                                   "        copy_poll_us: 25\n"
                                                    "        devices: [1]\n"));
   CHECK(cfg.backend == io_backend::cufile);
   auto const io = cfg.to_io_config();
@@ -1067,6 +1070,9 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
   CHECK(cfg.cufile.coalesce_gap_ratio == 0.5);
   CHECK(cfg.cufile.read_slots_per_lane == 3);
   CHECK_FALSE(cfg.cufile.register_per_slot);
+  CHECK_FALSE(cfg.cufile.high_priority_copies);
+  CHECK_FALSE(cfg.cufile.async_copies);
+  CHECK(cfg.cufile.copy_poll_us == 25);
   CHECK(cfg.cufile.devices == std::vector<int>{1});
 #ifdef CUCASCADE_HAS_CUFILE
   CHECK(io.cufile.lanes == cfg.cufile.lanes);
@@ -1075,6 +1081,9 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
   CHECK(io.cufile.coalesce_gap_ratio == cfg.cufile.coalesce_gap_ratio);
   CHECK(io.cufile.read_slots_per_lane == cfg.cufile.read_slots_per_lane);
   CHECK(io.cufile.register_per_slot == cfg.cufile.register_per_slot);
+  CHECK(io.cufile.high_priority_copies == cfg.cufile.high_priority_copies);
+  CHECK(io.cufile.async_copies == cfg.cufile.async_copies);
+  CHECK(io.cufile.copy_poll_us == cfg.cufile.copy_poll_us);
   CHECK(io.cufile.devices == cfg.cufile.devices);
 #endif
 }
@@ -1094,7 +1103,12 @@ TEST_CASE("sirius_config rejects invalid cuFile settings with key context",
         std::pair{"      cufile:\n        read_slots_per_lane: 576460752303423488\n",
                   "cufile.read_slots_per_lane"},
         std::pair{"      cufile:\n        register_per_slot: maybe\n", "cufile.register_per_slot"},
-        std::pair{"      cufile:\n        copy_poll_us: 5\n", "copy_poll_us"},
+        std::pair{"      cufile:\n        high_priority_copies: maybe\n",
+                  "cufile.high_priority_copies"},
+        std::pair{"      cufile:\n        async_copies: maybe\n", "cufile.async_copies"},
+        // 0 would leave the completion thread spinning.
+        std::pair{"      cufile:\n        copy_poll_us: 0\n", "cufile.copy_poll_us"},
+        std::pair{"      cufile:\n        copy_poll_us: -1\n", "cufile.copy_poll_us"},
         std::pair{"      cufile:\n        n_max_concurrent_scans: 0\n", "not configurable"},
         std::pair{"      cufile:\n        n_max_concurrent_scans: 4\n", "not configurable"},
         std::pair{"      cufile:\n        devices: [-1]\n", "cufile.devices"},

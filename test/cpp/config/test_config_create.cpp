@@ -484,6 +484,9 @@ TEST_CASE("every key of a configuration reaches its runtime field", "[config][co
   CHECK(sm.cufile.coalesce_gap_ratio == 0.25);
   CHECK(sm.cufile.read_slots_per_lane == 3);
   CHECK_FALSE(sm.cufile.register_per_slot);
+  CHECK_FALSE(sm.cufile.high_priority_copies);
+  CHECK_FALSE(sm.cufile.async_copies);
+  CHECK(sm.cufile.copy_poll_us == 20);
   CHECK(sm.cufile.devices == std::vector<int>{0});
 
   auto const& r = sm.rest;

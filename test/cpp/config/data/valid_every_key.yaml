@@ -50,6 +50,9 @@ sirius:
         coalesce_gap_ratio: 0.25
         read_slots_per_lane: 3
         register_per_slot: false
+        high_priority_copies: false
+        async_copies: false
+        copy_poll_us: 20
         devices: [0]
       rest:
         n_max_concurrent_scans: 12

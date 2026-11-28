@@ -402,6 +402,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 | `disk_id` | int | -1 | Identifier for the disk space. |
 | `mount_path` | string | "" | Spill directory. |
 | `memory_capacity` | bytes | space default | Reservation / in-flight conversion bound, not a stored-file quota. |
+| `allow_gds` | bool | true | As `sirius.memory.disk.allow_gds`: whether this space's spills may use GPUDirect Storage. |
 
 These spaces use the same [lazy DISK I/O default](#disk-memory-siriusmemorydisk),
 independent of the scan contexts; the low-level YAML surface adds no I/O selection knobs.
@@ -780,13 +781,14 @@ sirius:
 | `coalesce_gap_ratio` | fraction in [0, 1] | 0.15 | Most of such a read that may be gaps. |
 | `read_slots_per_lane` | int (**> 0**) | 2 | Read slots in the arena per read lane. A slot stays taken until the copies out of it are done, so 2 lets a lane read again while its last copies drain; 1 shrinks the arena by a third. The arena, `(read_slots_per_lane + 1) × lanes × lane_bytes`, must be representable. |
 | `register_per_slot` | bool | true | Register every arena slot with cuFile on its own (`(read_slots_per_lane + 1) × lanes` registrations per GPU) instead of the arena as one buffer. GPFS / WekaFS userspace RDMA keeps a read direct only while its registration has no other I/O in flight. |
+| `high_priority_copies` | bool | true | Run the copies out of the lane slots on streams at the GPU's greatest priority, so they are not queued behind the caller's compute (e.g. Parquet decode); a lane holds its slot until its copy has drained. |
+| `async_copies` | bool | true | Hand a read's slot-to-destination copies to the GPU's completion thread, which frees the slot once they finish, so a lane only blocks in `cuFileRead`. `false`: the lane waits for its copies before its next read. |
+| `copy_poll_us` | int (**> 0**) | 10 | Microseconds the completion thread sleeps between polls while none of the copies it watches has finished. |
 | `devices` | list of CUDA ordinals | empty | GPUs the context serves, one reactor and one arena each. Empty means the GPUs Sirius reads into (not every visible GPU). Ids must be non-negative, unique, and exactly the GPUs Sirius reads into, in any order (scans are placed on every one of them, and a device read on a GPU the context does not serve fails); startup fails otherwise. |
 
 Unknown keys are rejected, including the keys of the previous cuFile pool
 (`reactors_per_device`, `staging_*`, `max_inflight`, `gds_threshold`, `compat_mode`,
-`fused_reads`, `host_batch`, ...) and `scan_manager.cufile_n_reactors`. The copy-completion
-internals of `cucascade::io::cufile::config` (`async_copies`, `copy_poll_us`,
-`high_priority_copies`) keep cuCascade's defaults and are not YAML settings.
+`fused_reads`, `host_batch`, ...) and `scan_manager.cufile_n_reactors`.
 
 cuFile cannot fill fragmented pinned-cache destinations, so it never arms `fs_cache`
 or scan readahead, **even with `cache.mode: cucs`**. Neither `max_readahead_scans` nor

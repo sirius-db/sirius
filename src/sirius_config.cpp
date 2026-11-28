@@ -561,15 +561,18 @@ try {
   uring.slices_per_pass    = sm.uring.slices_per_pass.get();
   uring.range_batch_slices = sm.uring.range_batch_slices.get();
 
-  auto const& f              = sm.cufile;
-  auto& cufile               = sm_cfg.cufile;
-  cufile.lanes               = f.lanes.get();
-  cufile.lane_bytes          = f.lane_bytes.get().count();
-  cufile.coalesce_gap_bytes  = f.coalesce_gap_bytes.get().count();
-  cufile.coalesce_gap_ratio  = f.coalesce_gap_ratio.get();
-  cufile.read_slots_per_lane = f.read_slots_per_lane.get();
-  cufile.register_per_slot   = f.register_per_slot.get();
-  cufile.devices             = f.devices.get();
+  auto const& f               = sm.cufile;
+  auto& cufile                = sm_cfg.cufile;
+  cufile.lanes                = f.lanes.get();
+  cufile.lane_bytes           = f.lane_bytes.get().count();
+  cufile.coalesce_gap_bytes   = f.coalesce_gap_bytes.get().count();
+  cufile.coalesce_gap_ratio   = f.coalesce_gap_ratio.get();
+  cufile.read_slots_per_lane  = f.read_slots_per_lane.get();
+  cufile.register_per_slot    = f.register_per_slot.get();
+  cufile.high_priority_copies = f.high_priority_copies.get();
+  cufile.async_copies         = f.async_copies.get();
+  cufile.copy_poll_us         = static_cast<std::size_t>(f.copy_poll.get().count());
+  cufile.devices              = f.devices.get();
 
   auto const& r = sm.rest;
   auto& rest    = sm_cfg.rest;
@@ -775,6 +778,7 @@ try {
     cfg.disk_id         = space.disk_id.get();
     cfg.mount_paths     = space.mount_path.get();
     cfg.memory_capacity = space.memory_capacity.get().count();
+    cfg.allow_gds       = space.allow_gds.get();
     settings._memory_space_configs.emplace_back(std::move(cfg));
   }
   impl->use_effective_gpu_capacity = settings._memory_space_configs.empty()

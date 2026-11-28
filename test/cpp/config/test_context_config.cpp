@@ -619,6 +619,36 @@ TEST_CASE("configuration resolver applies memory.disk.allow_gds", "[context_conf
                       Catch::Matchers::ContainsSubstring("allow_gds"));
 }
 
+TEST_CASE("configuration resolver applies space.disk[].allow_gds", "[context_config][config]")
+{
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                             /*with_runtime_attributes=*/true));
+  const auto& topology = discovery.get_topology();
+
+  auto disk_allow_gds = [&](std::string const& extra) {
+    auto config = sirius::parsed_sirius_config::from_node(
+                    YAML::Load("sirius: {space: {gpu: [{device_id: 0}], host: [{numa_id: 0}], "
+                               "disk: [{disk_id: 1, mount_path: /tmp/sirius_disk_memory, "
+                               "memory_capacity: 1GiB" +
+                               extra + "}]}}"))
+                    .resolve(topology);
+    const auto& spaces = config.get_memory_space_configs();
+    auto disk          = std::find_if(spaces.begin(), spaces.end(), [](const auto& space) {
+      return std::holds_alternative<cucascade::memory::disk_memory_space_config>(space);
+    });
+    REQUIRE(disk != spaces.end());
+    return std::get<cucascade::memory::disk_memory_space_config>(*disk).allow_gds;
+  };
+
+  CHECK(disk_allow_gds(""));
+  CHECK(disk_allow_gds(", allow_gds: true"));
+  CHECK_FALSE(disk_allow_gds(", allow_gds: false"));
+  REQUIRE_THROWS_WITH(disk_allow_gds(", allow_gds: maybe"),
+                      Catch::Matchers::ContainsSubstring("space.disk") &&
+                        Catch::Matchers::ContainsSubstring("allow_gds"));
+}
+
 TEST_CASE("dynamic-filter Bloom budget always follows resolved scan size",
           "[context_config][config][dynamic_filter]")
 {

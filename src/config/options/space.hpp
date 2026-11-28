@@ -163,8 +163,13 @@ struct disk_space_options : block_base<disk_space_options> {
       .fallback(ubytes(detail::disk_space_defaults().memory_capacity))
       .describe("maximum disk space for spill files")
       .build();
+  /// false: the spill files are always read and written through io_uring.
+  config_option<bool> allow_gds = option<bool>("allow_gds")
+                                    .fallback(detail::disk_space_defaults().allow_gds)
+                                    .describe("let spills use GPUDirect Storage where it is served")
+                                    .build();
 
-  auto fields() { return field_list(disk_id, mount_path, memory_capacity); }
+  auto fields() { return field_list(disk_id, mount_path, memory_capacity, allow_gds); }
 };
 
 /// `sirius.space`: memory spaces listed one by one (the low-level alternative to sirius.memory).

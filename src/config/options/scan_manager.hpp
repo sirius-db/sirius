@@ -124,6 +124,23 @@ struct cufile_options : block_base<cufile_options> {
       .fallback(defaults().register_per_slot)
       .describe("register every arena slot with cuFile instead of the arena as one buffer")
       .build();
+  config_option<bool> high_priority_copies =
+    option<bool>("high_priority_copies")
+      .fallback(defaults().high_priority_copies)
+      .describe("run the slot-to-destination copies at the GPU's greatest stream priority")
+      .build();
+  config_option<bool> async_copies =
+    option<bool>("async_copies")
+      .fallback(defaults().async_copies)
+      .describe("let the completion thread settle a read's copies instead of its lane")
+      .build();
+  /// Positive: 0 would leave the completion thread spinning.
+  config_option<std::chrono::microseconds> copy_poll =
+    option<std::chrono::microseconds>("copy_poll_us")
+      .validate(positive<std::chrono::microseconds>{})
+      .fallback(std::chrono::microseconds(defaults().copy_poll_us))
+      .describe("sleep of the completion thread between polls of unfinished copies")
+      .build();
   /// Empty: the GPUs Sirius reads into.
   config_option<std::vector<int>> devices =
     option<std::vector<int>>("devices")
@@ -153,6 +170,9 @@ struct cufile_options : block_base<cufile_options> {
                       coalesce_gap_ratio,
                       read_slots_per_lane,
                       register_per_slot,
+                      high_priority_copies,
+                      async_copies,
+                      copy_poll,
                       devices);
   }
 
