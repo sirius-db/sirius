@@ -110,6 +110,31 @@ struct membership_choice_inputs {
   return static_cast<double>(build_rows) / static_cast<double>(domain_cardinality) >= threshold;
 }
 
+/// The share of its scan's rows at or above which a build counts as unreduced.
+inline constexpr double unreduced_build_fraction = 0.9;
+
+/**
+ * @brief Tests whether a build that was expected to arrive reduced kept its scan's rows
+ *
+ * A join whose only evidence is a dynamic filter expected on the scan its build consists of
+ * publishes nothing when the build holds at least `unreduced_build_fraction` of that scan's
+ * @p scan_rows: the expected filter then removed next to nothing, and a filter over nearly every
+ * key would keep nearly every probe row. A zero @p scan_rows (no such expectation) and an empty
+ * build disable the gate. The fraction is fixed: it does not follow
+ * `dynamic_filter_domain_coverage_threshold`, so turning the coverage gate off leaves this one on.
+ *
+ * @p scan_rows may be an upper bound (a native table's catalog count includes deleted rows not yet
+ * vacuumed). The gate then misses a build that is whole but below the fraction of the bound, and
+ * the join publishes as it would without the gate.
+ */
+[[nodiscard]] constexpr bool unreduced_build_gate_fires(std::size_t build_rows,
+                                                        std::size_t scan_rows) noexcept
+{
+  if (build_rows == 0 || scan_rows == 0) { return false; }
+  return static_cast<double>(build_rows) >=
+         unreduced_build_fraction * static_cast<double>(scan_rows);
+}
+
 /**
  * @brief Tests whether inclusive `[min_value, max_value]` covers the threshold of a known domain
  *

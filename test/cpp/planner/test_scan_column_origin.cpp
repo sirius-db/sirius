@@ -543,6 +543,102 @@ TEST_CASE("row-wise tracing crosses joins but not operators that choose rows",
   }
 }
 
+TEST_CASE("filter-route tracing follows the dynamic-filter target walk",
+          "[planner][scan_column_origin]")
+{
+  constexpr auto kRoute = origin_policy::filter_route;
+  SECTION("INNER, LEFT, RIGHT and OUTER joins forward both sides")
+  {
+    for (auto const type : {duckdb::JoinType::INNER,
+                            duckdb::JoinType::LEFT,
+                            duckdb::JoinType::RIGHT,
+                            duckdb::JoinType::OUTER}) {
+      auto join = make_join(type, make_get(0, 2), make_get(1, 1));
+      join->ResolveOperatorTypes();
+      CHECK(origin_of(*join, 1, kRoute) == at{0, 1});
+      CHECK(origin_of(*join, 2, kRoute) == at{1, 0});
+    }
+  }
+  SECTION("SEMI, ANTI and MARK joins forward the probe side")
+  {
+    for (auto const type :
+         {duckdb::JoinType::SEMI, duckdb::JoinType::ANTI, duckdb::JoinType::MARK}) {
+      auto join = make_join(type, make_get(0, 2), make_get(1, 1));
+      join->ResolveOperatorTypes();
+      CHECK(origin_of(*join, 1, kRoute) == at{0, 1});
+      CHECK_FALSE(origin_of(*join, 2, kRoute).has_value());
+    }
+  }
+  SECTION("SINGLE and right semi/anti joins refuse")
+  {
+    for (auto const type :
+         {duckdb::JoinType::SINGLE, duckdb::JoinType::RIGHT_SEMI, duckdb::JoinType::RIGHT_ANTI}) {
+      auto join = make_join(type, make_get(0, 1), make_get(1, 1));
+      join->ResolveOperatorTypes();
+      for (std::size_t ordinal = 0; ordinal < join->types.size(); ++ordinal) {
+        CHECK_FALSE(origin_of(*join, ordinal, kRoute).has_value());
+      }
+    }
+  }
+  SECTION("a cross product refuses")
+  {
+    auto product = duckdb::make_uniq<duckdb::LogicalCrossProduct>(make_get(0, 1), make_get(1, 1));
+    product->ResolveOperatorTypes();
+    CHECK_FALSE(origin_of(*product, 0, kRoute).has_value());
+    CHECK_FALSE(origin_of(*product, 1, kRoute).has_value());
+  }
+  SECTION("sorts, limits and DISTINCT refuse")
+  {
+    auto order =
+      duckdb::make_uniq<duckdb::LogicalOrder>(duckdb::vector<duckdb::BoundOrderByNode>{});
+    order->children.push_back(make_get(0, 2));
+    order->ResolveOperatorTypes();
+    CHECK_FALSE(origin_of(*order, 0, kRoute).has_value());
+    auto limit = duckdb::make_uniq<duckdb::LogicalLimit>(duckdb::BoundLimitNode::ConstantValue(10),
+                                                         duckdb::BoundLimitNode());
+    limit->children.push_back(make_get(0, 2));
+    limit->ResolveOperatorTypes();
+    CHECK_FALSE(origin_of(*limit, 0, kRoute).has_value());
+    auto top_n = duckdb::make_uniq<duckdb::LogicalTopN>(
+      duckdb::vector<duckdb::BoundOrderByNode>{}, /*limit=*/10, /*offset=*/0);
+    top_n->children.push_back(make_get(0, 2));
+    top_n->ResolveOperatorTypes();
+    CHECK_FALSE(origin_of(*top_n, 0, kRoute).has_value());
+    auto distinct = duckdb::make_uniq<duckdb::LogicalDistinct>(duckdb::DistinctType::DISTINCT);
+    distinct->children.push_back(make_get(0, 2));
+    distinct->ResolveOperatorTypes();
+    CHECK_FALSE(origin_of(*distinct, 0, kRoute).has_value());
+  }
+  SECTION("filters, bare projections and single-set group keys forward; a join chain composes")
+  {
+    // PROJECTION([ref 2]) over FILTER over (GET0 ⨝ (GET1 ⨝ GET2)): output 0 is the inner join's
+    // probe column, reached through the outer join's build block.
+    auto inner  = make_join(duckdb::JoinType::INNER, make_get(1, 2), make_get(2, 1));
+    auto outer  = make_join(duckdb::JoinType::INNER, make_get(0, 1), std::move(inner));
+    auto filter = duckdb::make_uniq<duckdb::LogicalFilter>();
+    filter->children.push_back(std::move(outer));
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
+    expressions.push_back(make_ref(2));
+    expressions.push_back(make_computed());
+    auto projection = make_projection(std::move(filter), std::move(expressions));
+    projection->ResolveOperatorTypes();
+    CHECK(origin_of(*projection, 0, kRoute) == at{1, 1});
+    CHECK_FALSE(origin_of(*projection, 1, kRoute).has_value());
+
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
+    aggregates.push_back(make_computed());
+    auto aggregate = duckdb::make_uniq<duckdb::LogicalAggregate>(
+      duckdb::TableIndex(50), duckdb::TableIndex(51), std::move(aggregates));
+    aggregate->groups.push_back(make_ref(1));
+    aggregate->children.push_back(make_get(0, 2));
+    aggregate->ResolveOperatorTypes();
+    CHECK(origin_of(*aggregate, 0, kRoute) == at{0, 1});
+    aggregate->grouping_sets.push_back(duckdb::GroupingSet{duckdb::ProjectionIndex(0)});
+    aggregate->grouping_sets.push_back(duckdb::GroupingSet{});
+    CHECK_FALSE(origin_of(*aggregate, 0, kRoute).has_value());
+  }
+}
+
 TEST_CASE("walk locates join ordinals through non-empty projection maps",
           "[planner][scan_column_origin]")
 {

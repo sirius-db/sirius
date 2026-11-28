@@ -604,7 +604,8 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
                  domain,
                  value_domain,
                  unique,
-                 preserve_nulls]                             = expected_key(3);
+                 preserve_nulls,
+                 expected_reduced_scan_rows]                 = expected_key(3);
     auto const [cardinality, domain_source, declared_unique] = expected_key(3).build_key_domain;
     (void)planner_condition_index;
     (void)build_key_ordinal;
@@ -616,6 +617,7 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     (void)value_domain;
     (void)unique;
     (void)preserve_nulls;
+    (void)expected_reduced_scan_rows;
     (void)cardinality;
     (void)domain_source;
     (void)declared_unique;
@@ -625,6 +627,10 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     auto vary_null_policy           = base;
     vary_null_policy.preserve_nulls = true;
     REQUIRE_FALSE(base == vary_null_policy);
+
+    auto vary_expected_scan_rows                       = base;
+    vary_expected_scan_rows.expected_reduced_scan_rows = 1'000;
+    REQUIRE_FALSE(base == vary_expected_scan_rows);
 
     auto vary_planner_condition_index                    = base;
     vary_planner_condition_index.planner_condition_index = 4;

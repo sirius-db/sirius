@@ -321,6 +321,22 @@ class sirius_physical_plan_generator {
   //! plan was not captured with proofs; then no read is treated as restrictable.
   std::shared_ptr<delim_cte_proofs const> cte_reader_proofs;
 
+  //! Base scans that joins above the operator being planned expect to bind a dynamic filter to
+  //! (see expected_probe_targets). A join adds its own while it plans its probe side.
+  std::vector<duckdb::LogicalGet const*> expected_filter_targets;
+  //! An expected target a join published on as its only build evidence.
+  struct relied_filter_target {
+    std::string name;        ///< for the planner log
+    bool confirmed = false;  ///< a join has since bound a dynamic filter to the scan
+  };
+  //! Those targets. One still unconfirmed when planning ends is counted in
+  //! `expected_targets_unbound`.
+  duckdb::unordered_map<duckdb::LogicalGet const*, relied_filter_target> relied_filter_targets;
+  //! The logical scan each table scan planned so far came from, so that a join binding a dynamic
+  //! filter to a scan can confirm a relied-on target. Valid only while this plan is generated.
+  duckdb::unordered_map<sirius::op::sirius_physical_operator const*, duckdb::LogicalGet const*>
+    planned_scan_sources;
+
   std::shared_ptr<sirius::transparent::read_view_registry> read_views;
   uint64_t next_scan_node_id = 0;
   scan_contract_provenance contract_provenance;

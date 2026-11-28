@@ -1478,6 +1478,39 @@ TEST_CASE("an unknown domain source cannot authorize a declared uniqueness gate"
   REQUIRE(decisions == outcome.keys_considered);
 }
 
+TEST_CASE("a join wired on an expected filter publishes nothing from an unreduced build",
+          "[dynamic_filter][publisher][filter_target]")
+{
+  // The build holds 95 rows. Its scan held 100 (the expected filter removed next to nothing),
+  // 1000 (it did its work), or the join had other evidence and expects nothing (0).
+  auto const expected_scan_rows = GENERATE(std::size_t{100}, std::size_t{1000}, std::size_t{0});
+  bool const unreduced          = expected_scan_rows == 100;
+  CAPTURE(expected_scan_rows);
+  publisher_fixture fixture;
+  fixture.add_key_column(95);
+  auto const base                         = make_single_replica_plan(fixture);
+  auto keys                               = base.admitted_keys();
+  keys.front().expected_reduced_scan_rows = expected_scan_rows;
+  dynamic_filter_publish_plan plan{std::move(keys), base.probe_targets(), base.replica_spaces()};
+  sirius::test::scoped_recording_log_sink logs{"debug"};
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
+  REQUIRE(outcome.keys_considered == 1);
+  REQUIRE(outcome.keys_skipped_unreduced_build == (unreduced ? 1 : 0));
+  REQUIRE(outcome.keys_skipped_domain_gate == 0);
+  REQUIRE(outcome.membership_filters_built == (unreduced ? 0 : 1));
+  REQUIRE(outcome.filters_pushed == (unreduced ? 0 : 1));
+  std::size_t decisions = 0;
+  for (auto const& record : logs.records()) {
+    if (!record.message.starts_with("[dynamic_filter_domain] path=ordinary ")) { continue; }
+    INFO(record.message);
+    REQUIRE(record.message.find(unreduced ? "gate=unreduced-build" : "gate=none") !=
+            std::string::npos);
+    REQUIRE(record.message.ends_with(unreduced ? "decision=skip" : "decision=keep"));
+    ++decisions;
+  }
+  REQUIRE(decisions == outcome.keys_considered);
+}
+
 TEST_CASE("dynamic-filter publisher suppresses zone maps for floating-point keys",
           "[dynamic_filter][publisher]")
 {

@@ -111,21 +111,34 @@ enum class publication_path : std::uint8_t { ordinary, accumulated };
   return "invalid";
 }
 
+/// The run-time gate that skips a bound key, if any.
+enum class key_gate : std::uint8_t { none, coverage, unreduced_build };
+
+[[nodiscard]] constexpr char const* to_string(key_gate gate) noexcept
+{
+  switch (gate) {
+    case key_gate::none: return "none";
+    case key_gate::coverage: return "coverage";
+    case key_gate::unreduced_build: return "unreduced-build";
+  }
+  return "invalid";
+}
+
 /**
  * @brief Counts a bound @p key of a build with @p build_rows rows in `keys_considered`,
  * `keys_with_known_domain` and `keys_build_exceeded_domain`.
  *
- * @param publishable False when the path has already rejected the key, so the gate never skips
- * it
- * @return Whether the domain coverage gate skips the key; the caller counts the skip where its own
- * checks order it
+ * @param publishable False when the path has already rejected the key, so no gate skips it
+ * @return The gate that skips the key: the domain coverage gate, or the unreduced-build gate of a
+ * join wired on filter-target evidence alone. The caller counts the skip with `count_gated_key`
+ * where its own checks order it.
  */
-bool consider_bound_key(dynamic_filter_stats_snapshot& counts,
-                        dynamic_filter_publish_plan const& plan,
-                        dynamic_filter_publish_plan::admitted_key const& key,
-                        std::size_t build_rows,
-                        publication_path path,
-                        bool publishable) noexcept
+key_gate consider_bound_key(dynamic_filter_stats_snapshot& counts,
+                            dynamic_filter_publish_plan const& plan,
+                            dynamic_filter_publish_plan::admitted_key const& key,
+                            std::size_t build_rows,
+                            publication_path path,
+                            bool publishable) noexcept
 {
   ++counts.keys_considered;
   auto const& domain = key.build_key_domain;
@@ -134,12 +147,18 @@ bool consider_bound_key(dynamic_filter_stats_snapshot& counts,
     if (build_rows > domain.cardinality) { ++counts.keys_build_exceeded_domain; }
   }
   bool const eligible = publishable && key.domain_gate_eligible();
-  bool const gated    = domain_coverage_gate_fires(
-    build_rows, domain.cardinality, eligible, plan.domain_coverage_threshold());
+  auto gate           = key_gate::none;
+  if (domain_coverage_gate_fires(
+        build_rows, domain.cardinality, eligible, plan.domain_coverage_threshold())) {
+    gate = key_gate::coverage;
+  } else if (publishable &&
+             unreduced_build_gate_fires(build_rows, key.expected_reduced_scan_rows)) {
+    gate = key_gate::unreduced_build;
+  }
   log::log_noexcept([&] {
     SIRIUS_LOG_DEBUG(
       "[dynamic_filter_domain] path={} condition={} rows={} domain={} provenance={} eligible={} "
-      "threshold={} decision={}",
+      "threshold={} expected_scan_rows={} gate={} decision={}",
       to_string(path),
       key.planner_condition_index,
       build_rows,
@@ -147,9 +166,21 @@ bool consider_bound_key(dynamic_filter_stats_snapshot& counts,
       to_string(domain.source),
       static_cast<int>(eligible),
       plan.domain_coverage_threshold(),
-      gated ? "skip" : "keep");
+      key.expected_reduced_scan_rows,
+      to_string(gate),
+      gate == key_gate::none ? "keep" : "skip");
   });
-  return gated;
+  return gate;
+}
+
+/// Counts a key that @p gate skipped under that gate's counter.
+void count_gated_key(dynamic_filter_stats_snapshot& counts, key_gate gate) noexcept
+{
+  switch (gate) {
+    case key_gate::none: break;
+    case key_gate::coverage: ++counts.keys_skipped_domain_gate; break;
+    case key_gate::unreduced_build: ++counts.keys_skipped_unreduced_build; break;
+  }
 }
 
 /// The share of the key's value domain that @p build_rows build keys cover, a static estimate of
@@ -700,12 +731,12 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
                (domain && membership_probe_compatible(*domain, probe));
       };
       bool const has_readable_binding = std::ranges::any_of(bindings, readable);
-      bool const gated                = consider_bound_key(selection,
-                                            plan,
-                                            key,
-                                            rows,
-                                            publication_path::accumulated,
-                                            type_matches && supported && has_readable_binding);
+      auto const gate                 = consider_bound_key(selection,
+                                           plan,
+                                           key,
+                                           rows,
+                                           publication_path::accumulated,
+                                           type_matches && supported && has_readable_binding);
       if (!type_matches) {
         ++selection.keys_skipped_type_mismatch;
         continue;
@@ -718,8 +749,8 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
         selection.bindings_skipped_incompatible_probe += bindings.size();
         continue;
       }
-      if (gated) {
-        ++selection.keys_skipped_domain_gate;
+      if (gate != key_gate::none) {
+        count_gated_key(selection, gate);
         continue;
       }
       if (rows == 0) { continue; }
@@ -1167,13 +1198,14 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       if (probe_types[admitted_key_index].empty()) { continue; }
       auto const& admitted_key = admitted_keys[admitted_key_index];
       auto& filters            = per_key[admitted_key_index];
-      if (consider_bound_key(outcome,
-                             plan,
-                             admitted_key,
-                             build_rows,
-                             publication_path::ordinary,
-                             /*publishable=*/true)) {
-        ++outcome.keys_skipped_domain_gate;
+      if (auto const gate = consider_bound_key(outcome,
+                                               plan,
+                                               admitted_key,
+                                               build_rows,
+                                               publication_path::ordinary,
+                                               /*publishable=*/true);
+          gate != key_gate::none) {
+        count_gated_key(outcome, gate);
         continue;
       }
 

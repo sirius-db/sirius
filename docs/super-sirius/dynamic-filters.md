@@ -55,7 +55,7 @@ flowchart LR
 
 The main components are:
 
-- **Evidence and key admission.** `build_subtree_is_filtering`, `build_relation_is_opaque` and `build_subtree_has_filtering_join` decide whether discovery should run. `admit_dynamic_filter_keys` accepts supported equality keys and records the build/probe metadata needed at runtime.
+- **Evidence and key admission.** `build_subtree_is_filtering`, `build_relation_is_opaque`, `build_subtree_has_filtering_join` and `expected_target_behind_build` decide whether discovery should run; `expected_probe_targets` supplies the scans the last one looks for. `admit_dynamic_filter_keys` accepts supported equality keys and records the build/probe metadata needed at runtime.
 - **Target discovery.** `trace_probe_key` follows a key through physical operators only while its value and row semantics remain safe. A reachable GPU scan wins; otherwise `place_endpoint` may insert a membership-only `sirius_physical_dynamic_filter` at the deepest safe point. Unknown or unsafe transformations stop descent.
 - **Publication plan.** `dynamic_filter_publish_plan` binds admitted build keys to target channels and target output ordinals, carries filter policy, and identifies the admitted GPU/HOST replica spaces.
 - **Publication session.** `dynamic_filter_publication_session` owns the whole-build claim, source pin/readiness, one-shot construction, terminal outcome, and producer completion rights. The session claims and pins a whole-build delivery, invokes the join's existing repository deposit synchronously, then validates readiness and publishes inline. An eligible PARTITION or BUILD_FILTER stage can instead accumulate a Bloom filter from every certified build batch (see [Multi-partition build accumulation](#multi-partition-build-accumulation)).
@@ -67,6 +67,27 @@ The probe key's entry ordinal and a target's output ordinal are different coordi
 For build evidence, projections and a plain deduplication aggregate over a `CTE_REF` retain the underlying opaque-relation evidence. The aggregate must have no aggregate expressions or grouping functions and use ordinary grouping over all its keys. This permits filters built from the deduplicated output; it does not trace scan lineage through a CTE reference.
 
 A SEMI or ANTI comparison join anywhere in the build subtree (either side variant) is also evidence. Such a join only removes rows, so the build it feeds is reduced like a filtered one. DuckDB's own join-filter test does not count it. DuckDB attaches a correlated subquery's outer keys with a semi join on one table; this evidence lets the join above that table publish the reduction to its probe side.
+
+A base scan that a join above expects to filter is the fourth kind of evidence (`filter-target` in the planner log), when the build side is that scan. Joins are planned top-down but bind their targets bottom-up, so a join is decided before any join above it has bound a target. Each join with evidence therefore predicts its scan targets on the logical plan (`expected_probe_targets`, tracing each probe key with `origin_policy::filter_route`) and hands them to the joins it plans in its probe side. A join below publishes too when its build side is such a scan behind projections and filters only (`expected_target_behind_build`), so the reduction continues down a chain of any length:
+
+```sql
+SELECT n.n_name FROM nation n, region r
+WHERE n.n_regionkey = r.r_regionkey AND r.r_name = 'EUROPE'
+  AND EXISTS (SELECT 1 FROM customer c, orders o, lineitem l, supplier s
+              WHERE c.c_custkey = o.o_custkey AND l.l_orderkey = o.o_orderkey
+                AND l.l_suppkey = s.s_suppkey AND c.c_nationkey = s.s_nationkey
+                AND s.s_nationkey = n.n_nationkey
+                AND o.o_orderdate >= DATE '1997-01-01' AND o.o_orderdate < DATE '1998-01-01');
+```
+
+A join above filters `supplier` by the region's nation keys (5.0M to 1.0M rows at SF500). `lineitem ⨝ supplier` has `supplier`, an expected target, as its build side, and filters `lineitem` with the reduced supplier keys (458M to 92M rows).
+
+The expected filter is a prediction, checked twice:
+
+- **When planning ends.** A join that binds a filter to a scan confirms it. A scan that a join published on as its only evidence and that stays unconfirmed is counted in `expected_targets_unbound` and named in the planner log. The prediction applies the planning-time rules it can: a plain equality, a bare probe column, no cast on either side, a key type the membership filters support and can compare with the probe column (and that the accumulator supports, for a right semi or anti join), a join type that binds scans, and a GPU and a HOST memory space. It cannot know whether the join becomes a hash join or whether the physical plan has the route.
+- **When the build arrives.** The filter above reaches the scan under the timing rules of [Transitive scan targets and publication timing](#transitive-scan-targets-and-publication-timing), it may not be published at all, and it may remove nothing. A join whose only evidence is `filter-target` therefore carries the row count of the scan it relied on (`admitted_key::expected_reduced_scan_rows`). When its build holds at least nine tenths of those rows (`unreduced_build_gate_fires`), it publishes no filter and counts the key in `keys_skipped_unreduced_build`. The fraction is fixed and does not follow `dynamic_filter_domain_coverage_threshold`. Because the build is the scan's own rows, the comparison is exact for a Parquet scan, whose count comes from the file footers. A native table's count comes from the catalog and includes deleted rows not yet vacuumed; on such a table the check can miss an unreduced build, and the join then publishes as it would without the check.
+
+Not counted as this kind of evidence: a scan whose row count is unknown; a build with a sort, an aggregate, DISTINCT, a limit or a join between it and the scan; null-safe keys; join-edge endpoints; scans inside a delim CTE's body; anything behind a `CTE_REF` or a set operation; and every scan of a distributed plan, where a rank holds only its share of a build.
 
 Probe-side discovery descends through a materialized `CTE` operator into its rest (`children[1]`) with the same ordinal, so a join above a CTE places its filter next to the `CTE_SCAN` reader and not above the whole CTE subtree. A `CTE_SCAN` is otherwise a terminal; `RECURSIVE_CTE` and `RECURSIVE_KEY_CTE` are never looked through.
 
@@ -205,7 +226,7 @@ Native scans retain their catalog row bounds and genuine uniqueness proofs. With
 
 The domain is a row count, not a `[min,max]` range: holes in key values do not enlarge it. Unknown or zero domains, builds larger than their domain, and keys without eligibility disable this optional gate. A false declaration can skip a useful filter, but cannot change join results: declarations never feed late-materialization proofs, distinct joins, or deduplication. The default threshold remains `0.9`; `0.45` is an explicit measurement profile, not a new default. The Bloom allocation cap and publication transport are unchanged.
 
-At DEBUG level, each considered bound key emits `[dynamic_filter_domain] path=ordinary|accumulated condition=N rows=N domain=N provenance=unknown|catalog_bound|pinned_parquet_exact eligible=0|1 threshold=X decision=skip|keep`. `condition` is the original join-condition index. `eligible` reports only the uniqueness proof or backed declaration; `domain` and `decision` show the coverage check. Accumulated type mismatches report `eligible=0 decision=keep`; `skip` means the domain gate actually applies. Use separate INFO runs for timings.
+At DEBUG level, each considered bound key emits `[dynamic_filter_domain] path=ordinary|accumulated condition=N rows=N domain=N provenance=unknown|catalog_bound|pinned_parquet_exact eligible=0|1 threshold=X expected_scan_rows=N gate=coverage|unreduced-build|none decision=skip|keep`. `condition` is the original join-condition index. `eligible` reports only the uniqueness proof or backed declaration; `domain` and `decision` show the coverage check. `expected_scan_rows` is non-zero for a join wired on `filter-target` evidence alone, and `gate` names the check that skipped the key (the unreduced-build check counts in `keys_skipped_unreduced_build`, not in `keys_skipped_domain_gate`). Accumulated type mismatches report `eligible=0 decision=keep`; `skip` means the domain gate actually applies. Use separate INFO runs for timings.
 
 ### Key types
 
@@ -322,6 +343,8 @@ The settings live under `sirius.operator_params`:
 ## Limitations and future work
 
 - Hash-join builds are the only producers, and publication is a single immutable snapshot.
+- `filter-target` evidence is a planning-time prediction. It covers only a build that is one scan of known size behind projections and filters, and it is off in distributed plans (see the list after the evidence rules above). A join wired on it gives its probe scan a filter channel when the plan is built, as any wired join does, even if the run-time check then publishes nothing.
+- A newly published filter competes for the fused decode's membership slot (`fused_scan_max_membership_sources`), which is filled by a fixed ranking and not by measured selectivity, so it can displace a more selective filter there.
 - Routing is deliberately allowlisted by join type, key shape, and lineage; unsupported shapes lose optimization rather than results.
 - Membership filters currently support integer keys (`INT8`..`INT64`, `UINT8`..`UINT64`), `DATE` and same-unit `TIMESTAMP` keys, fixed-point keys (`DECIMAL32`/`64`, and `DECIMAL128` whose unscaled build values fit int64), and `STRING` keys (as 64-bit fingerprints, no false negatives), nullable or not; floating-point, duration, and nested keys are declined (see "Key types" for where a family plugs in).
 - A `DECIMAL128` key whose build values exceed int64 receives no membership filter (only the zone map); a 16-byte Bloom rep would lift this and is not implemented.

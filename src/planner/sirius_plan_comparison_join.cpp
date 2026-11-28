@@ -582,7 +582,29 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);
   bool const build_join_filtered =
     dynamic_filter_enabled && build_subtree_has_filtering_join(*op.children[1]);
-  bool const build_evidence = build_filtered || build_opaque || build_join_filtered;
+  auto const scan_rows = [&](duckdb::LogicalGet const& get) {
+    auto const rows = transparent::parquet_scan_row_count(get);
+    return rows ? rows : duckdb_base_table_cardinality{context}(get);
+  };
+  // The build is a scan that a join above expects to filter, which reduces it at run time. Only a
+  // scan of known size counts: the build is checked against that size when it arrives.
+  auto const* const build_target =
+    dynamic_filter_enabled ? expected_target_behind_build(*op.children[1], expected_filter_targets)
+                           : nullptr;
+  auto const build_target_rows =
+    build_target != nullptr ? scan_rows(*build_target).value_or(std::size_t{0}) : std::size_t{0};
+  // Named now: planning the build side moves parts of the logical scan away.
+  auto build_target_name    = build_target != nullptr
+                                ? build_target->function.GetName().GetIdentifierName() +
+                                 " (table index " +
+                                 std::to_string(build_target->table_index.index) + ")"
+                                : std::string{};
+  bool const build_targeted = build_target_rows != 0;
+  bool const build_evidence =
+    build_filtered || build_opaque || build_join_filtered || build_targeted;
+  // Only a join with no other evidence depends on the prediction.
+  bool const relies_on_expected_filter =
+    build_targeted && !(build_filtered || build_opaque || build_join_filtered);
 
   // Capture domain and uniqueness evidence before create_plan() moves the logical children.
   auto condition_domains =
@@ -591,17 +613,31 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   // The coverage gate needs a domain that bounds rows. A filter's keep-ratio estimate needs only a
   // bound on the values, which survive any join, and can use a Parquet scan's footer row count.
   auto condition_value_domains =
-    build_evidence ? build_key_domain_cardinalities(
-                       op,
-                       [&](duckdb::LogicalGet const& get) {
-                         auto const rows = transparent::parquet_scan_row_count(get);
-                         return rows ? rows : duckdb_base_table_cardinality{context}(get);
-                       },
-                       origin_policy::value_preserving)
+    build_evidence ? build_key_domain_cardinalities(op, scan_rows, origin_policy::value_preserving)
                    : std::vector<std::size_t>{};
 
-  auto build_side_unique_keys  = prove_unique_columns(pin_facts_of(context).get(), *op.children[1]);
-  auto left                    = create_plan(*op.children[0]);
+  auto build_side_unique_keys = prove_unique_columns(pin_facts_of(context).get(), *op.children[1]);
+  // Tell the joins below which scans this join expects to filter, while its probe side is planned.
+  std::vector<duckdb::LogicalGet const*> own_targets;
+  if (build_evidence) {
+    auto& memory = sirius_context->get_memory_manager();
+    // Without a GPU and a HOST memory space this join wires no filter.
+    if (!memory.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).empty() &&
+        !memory.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).empty()) {
+      own_targets = expected_probe_targets(op, *duckdb::query_operator_options(context));
+    }
+  }
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> left;
+  {
+    struct expected_target_scope {
+      std::vector<duckdb::LogicalGet const*>& targets;
+      std::size_t outer_count;
+      ~expected_target_scope() { targets.resize(outer_count); }
+    } const scope{expected_filter_targets, expected_filter_targets.size()};
+    expected_filter_targets.insert(
+      expected_filter_targets.end(), own_targets.begin(), own_targets.end());
+    left = create_plan(*op.children[0]);
+  }
   auto right                   = create_plan(*op.children[1]);
   left->estimated_cardinality  = lhs_cardinality;
   right->estimated_cardinality = rhs_cardinality;
@@ -716,6 +752,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                                    build_side_unique_column,
                                                    condition_value_domains);
 
+    // With no other evidence, the filter is worth building only if the expected one arrived.
+    if (relies_on_expected_filter) {
+      for (auto& key : admitted_keys) {
+        key.expected_reduced_scan_rows = build_target_rows;
+      }
+    }
+
     // Prefer scan binding; each key uses one route.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
@@ -777,6 +820,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
              .channel_push_ordinal = terminal.ordinal,
              .probe_storage_type   = sirius::get_cudf_type(scan.types[terminal.ordinal])
                                      .value_or(cudf::data_type{cudf::type_id::EMPTY})});
+          // A filter is now bound to this scan. Whichever join binds it, a join below whose
+          // build is this scan gets the reduction it relied on.
+          if (auto const source = planned_scan_sources.find(terminal.node);
+              source != planned_scan_sources.end()) {
+            if (auto const relied = relied_filter_targets.find(source->second);
+                relied != relied_filter_targets.end()) {
+              relied->second.confirmed = true;
+            }
+          }
           // A body scan is an addition to the reader's endpoint, not a replacement for it.
           scan_bound = scan_bound || !terminal.in_cte_body;
         }
@@ -829,10 +881,17 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       }
     }
     if (!targets.empty()) {
+      // This join publishes on the strength of a filter that a join above predicted for its
+      // build scan; a join that binds a filter to that scan confirms it.
+      if (relies_on_expected_filter) {
+        relied_filter_targets.try_emplace(
+          build_target, relied_filter_target{.name = std::move(build_target_name)});
+      }
       std::string evidence;
       for (auto const& [present, name] : {std::pair{build_filtered, "filtered"},
                                           std::pair{build_opaque, "opaque"},
-                                          std::pair{build_join_filtered, "semi-join"}}) {
+                                          std::pair{build_join_filtered, "semi-join"},
+                                          std::pair{build_targeted, "filter-target"}}) {
         if (!present) { continue; }
         if (!evidence.empty()) { evidence += '+'; }
         evidence += name;
@@ -853,7 +912,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     } else if (dynamic_filter_enabled && !build_evidence && !admitted_keys.empty()) {
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side carries "
-        "no filter, opaque-build or semi-join evidence (build est {} rows).",
+        "no filter, opaque-build, semi-join or filter-target evidence (build est {} rows).",
         rhs_cardinality);
     }
 

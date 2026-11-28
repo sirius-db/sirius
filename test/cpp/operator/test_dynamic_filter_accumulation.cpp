@@ -227,6 +227,57 @@ TEST_CASE("begin allocates zeroed partials under exact per-GPU leases",
   REQUIRE(fixture.stats.snapshot().accumulations_skipped_error == 0);
 }
 
+TEST_CASE("an unreduced build of a join wired on an expected filter gates accumulation",
+          "[dynamic_filter][multi_partition][filter_target]")
+{
+  // The two batches hold 2000 build rows: all of a 2000-row scan, or a fifth of a 10000-row one.
+  auto const expected_scan_rows = GENERATE(std::size_t{2000}, std::size_t{10000});
+  bool const unreduced          = expected_scan_rows == 2000;
+  CAPTURE(expected_scan_rows);
+  acc::fixture fixture;
+  auto const first  = fixture.make_batch(0, 0, 1000);
+  auto const second = fixture.make_batch(0, 5000, 1000);
+  auto const before = fixture.allocated_bytes();
+  auto plan         = [&] {
+    auto const base = fixture.make_plan(256 * mib);
+    auto keys       = base.admitted_keys();
+    for (auto& key : keys) {
+      // No uniqueness and no domain: the coverage gate cannot be what skips the key.
+      key.build_key_proven_unique    = false;
+      key.build_key_domain           = {};
+      key.expected_reduced_scan_rows = expected_scan_rows;
+    }
+    return op::dynamic_filter_publish_plan{
+      std::move(keys),
+      base.probe_targets(),
+      base.replica_spaces(),
+              {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = 256 * mib}};
+  }();
+  REQUIRE(fixture.begin({first, second}, std::move(plan)) == !unreduced);
+  auto const selection = fixture.stats.snapshot();
+  REQUIRE(selection.keys_considered == 2);
+  REQUIRE(selection.keys_skipped_unreduced_build == (unreduced ? 2 : 0));
+  REQUIRE(selection.keys_skipped_domain_gate == 0);
+  REQUIRE(selection.accumulations_started == (unreduced ? 0 : 1));
+  // The gate runs before any partial array is allocated.
+  if (unreduced) { REQUIRE(fixture.allocated_bytes()[0] == before[0]); }
+  require_no_tracker(fixture);
+
+  if (unreduced) {
+    fixture.session->finish_input();
+    REQUIRE(fixture.channel->snapshot().empty());
+    REQUIRE(fixture.stats.snapshot().accumulation_publications_finished == 0);
+  } else {
+    fixture.contribute(first);
+    fixture.contribute(second);
+    fixture.publish(0, second->get_batch_id());
+    REQUIRE(fixture.stats.snapshot().accumulation_publications_finished == 1);
+  }
+  REQUIRE(fixture.channel->snapshot().terminal());
+  REQUIRE(fixture.stats.snapshot().accumulations_skipped_error == 0);
+  require_no_tracker(fixture);
+}
+
 TEST_CASE("declared domain coverage gates accumulation before partial allocation",
           "[dynamic_filter][multi_partition][domain_evidence]")
 {

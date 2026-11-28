@@ -1022,3 +1022,79 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(deltas.on.filters_pushed > 0);
   compare_gpu_vs_cpu(query);
 }
+
+namespace {
+
+// chain_top's filter reaches chain_mid through the upper join. chain_mid has no filter of its own
+// and is the lower join's build side, so only the filter expected on it lets the lower join
+// publish to chain_fact.
+void create_chain_tables(sirius::test::GpuExecutionFixture& fixture)
+{
+  fixture.run_ok("SET gpu_execution = false");
+  fixture.run_ok(
+    "CREATE TABLE chain_fact AS SELECT (range % 1000)::INTEGER sk, range::INTEGER v "
+    "FROM range(100000)");
+  fixture.run_ok(
+    "CREATE TABLE chain_mid AS SELECT range::INTEGER sk, (range % 50)::INTEGER nk "
+    "FROM range(1000)");
+  fixture.run_ok(
+    "CREATE TABLE chain_top AS SELECT range::INTEGER nk, (range < 5)::INTEGER keep "
+    "FROM range(50)");
+  fixture.run_ok("CHECKPOINT");
+}
+
+// Keeps (chain_fact JOIN chain_mid) JOIN chain_top as written. Left to itself DuckDB joins
+// chain_mid with chain_top first, and that build is filtered, so nothing would depend on the
+// expected filter.
+constexpr auto k_keep_chain_shape = "statistics_propagation,join_order,build_side_probe_side";
+
+std::string chain_query(std::string const& predicate)
+{
+  return "SELECT sum(f.v), count(*) FROM chain_fact f JOIN chain_mid m ON f.sk = m.sk "
+         "JOIN chain_top t ON m.nk = t.nk WHERE " +
+         predicate;
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - a chain of joins filters each scan in turn",
+                 "[integration][gpu_execution][dynamic_filter][filter_target]")
+{
+  create_chain_tables(*this);
+  sirius::test::disabled_optimizers_guard shape(*con, k_keep_chain_shape);
+  auto const query  = chain_query("t.keep = 1");
+  auto const before = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+  auto const deltas = require_switch_result_equivalence(*con, query);
+  auto const after  = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+  // Both joins are wired; on the lower one, only the expected filter counts as evidence.
+  CHECK(deltas.on.producers_enabled == 2);
+  CHECK(after.expected_targets_unbound == before.expected_targets_unbound);
+  // The lower join publishes, unless chain_mid was read before the upper filter arrived, in
+  // which case the unreduced-build gate declines it. Either way it was wired to publish.
+  auto const lower_join_declined =
+    after.keys_skipped_unreduced_build - before.keys_skipped_unreduced_build;
+  CHECK(deltas.on.filters_pushed + lower_join_declined >= 2);
+  compare_gpu_vs_cpu(query);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - a join publishes nothing from a build its expected filter left "
+                 "whole",
+                 "[integration][gpu_execution][dynamic_filter][filter_target]")
+{
+  create_chain_tables(*this);
+  sirius::test::disabled_optimizers_guard shape(*con, k_keep_chain_shape);
+  // Turning the coverage gate off must not turn this check off.
+  sirius::test::coverage_gate_disable_guard coverage_gate_off(*con);
+  // Every chain_top row passes its filter, so chain_mid arrives whole whenever its scan runs.
+  auto const query = chain_query("t.keep >= 0");
+  run_ok("SET gpu_execution = true");
+  dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+  auto const before = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+  compare_gpu_vs_cpu(query);
+  auto const after = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+  CHECK(after.expected_targets_unbound == before.expected_targets_unbound);
+  CHECK(after.keys_skipped_unreduced_build > before.keys_skipped_unreduced_build);
+  CHECK(after.keys_skipped_domain_gate == before.keys_skipped_domain_gate);
+}

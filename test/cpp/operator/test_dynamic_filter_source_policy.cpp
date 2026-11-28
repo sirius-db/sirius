@@ -294,6 +294,25 @@ TEST_CASE("domain-coverage gate requires per-key uniqueness eligibility",
   REQUIRE_FALSE(domain_coverage_gate_fires(100, 1'000'000, true, 0.9));
 }
 
+TEST_CASE("unreduced-build gate skips a build that kept its scan's rows",
+          "[dynamic_filter][source_policy]")
+{
+  using sirius::op::unreduced_build_gate_fires;
+  // The expected filter removed nothing, or next to nothing: publish no filter.
+  REQUIRE(unreduced_build_gate_fires(750'000'000, 750'000'000));
+  REQUIRE(unreduced_build_gate_fires(900, 1'000));
+  // A stale row count can be below the build; the build was not reduced either.
+  REQUIRE(unreduced_build_gate_fires(2'000, 1'000));
+  // The expected filter did its work.
+  REQUIRE_FALSE(unreduced_build_gate_fires(1'000'000, 5'000'000));
+  REQUIRE_FALSE(unreduced_build_gate_fires(899, 1'000));
+  // No expectation (zero rows) and an empty build pass.
+  REQUIRE_FALSE(unreduced_build_gate_fires(1'000, 0));
+  REQUIRE_FALSE(unreduced_build_gate_fires(0, 1'000));
+  // The fraction is fixed and does not follow the coverage threshold.
+  STATIC_REQUIRE(sirius::op::unreduced_build_fraction == 0.9);
+}
+
 TEST_CASE("domain-coverage gate treats a threshold above 1.0 as disabled outright",
           "[dynamic_filter][source_policy]")
 {

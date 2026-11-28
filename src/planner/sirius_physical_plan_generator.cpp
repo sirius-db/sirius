@@ -2506,6 +2506,28 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     throw;
   }
 
+  // Every scan a join relied on must have had a dynamic filter bound to it by a join above.
+  std::uint64_t unconfirmed = 0;
+  for (auto const& relied : relied_filter_targets) {
+    if (relied.second.confirmed) { continue; }
+    ++unconfirmed;
+    SIRIUS_LOG_INFO(
+      "[sirius_physical_plan_generator] Scan {} was counted as dynamic-filter build evidence, but "
+      "no join bound a filter to it.",
+      relied.second.name);
+  }
+  if (unconfirmed > 0) {
+    auto sirius_ctx = context.registered_state
+                        ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                        : nullptr;
+    if (sirius_ctx) {
+      sirius_ctx->get_dynamic_filter_stats().expected_targets_unbound.fetch_add(
+        unconfirmed, std::memory_order_relaxed);
+    }
+  }
+  relied_filter_targets.clear();
+  planned_scan_sources.clear();
+
   plan = fold_adjacent_projections(std::move(plan));
   if (physical_sidecars_enabled(context)) {
     auto const retracted = apply_compressed_schema_passes(plan);

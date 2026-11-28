@@ -1244,7 +1244,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       std::move(op.virtual_columns),
       projected_output_count,
       op.returned_types);
-    node->named_parameters             = std::move(op.named_parameters);
+    node->named_parameters = std::move(op.named_parameters);
+    planned_scan_sources.insert_or_assign(node.get(), &op);
     node->read_views                   = read_views;
     node->scan_node_id                 = next_scan_node_id++;
     node->table_index                  = op.table_index.index;
@@ -1329,7 +1330,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         sirius::event::compressed_materialization_activity::scan_sidecar_installed);
     }
   }
-  node->named_parameters             = std::move(op.named_parameters);
+  node->named_parameters = std::move(op.named_parameters);
+  planned_scan_sources.insert_or_assign(node.get(), &op);
   node->read_views                   = read_views;
   node->scan_node_id                 = next_scan_node_id++;
   node->table_index                  = op.table_index.index;

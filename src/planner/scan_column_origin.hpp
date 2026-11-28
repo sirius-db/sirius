@@ -46,6 +46,13 @@ enum class origin_policy {
   /// joins that pick a match by order, SINGLE joins and operators that evaluate an expression
   /// that can throw are refused.
   row_wise,
+  /// A dynamic filter on the output column can be applied at the scan instead: the logical
+  /// counterpart of the physical target walk (`descent_steps`). Joins forward the probe side for
+  /// INNER, LEFT, RIGHT, OUTER, SEMI, ANTI and MARK and the build side for INNER, LEFT, RIGHT and
+  /// OUTER; sorts, limits, DISTINCT, grouping sets, cross products, SINGLE and right semi/anti
+  /// joins are refused. It predicts the walk on the plan not yet built, so a caller must tolerate
+  /// a route the physical plan turns out not to have.
+  filter_route,
 };
 
 /**
