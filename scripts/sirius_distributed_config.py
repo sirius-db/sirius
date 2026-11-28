@@ -22,11 +22,22 @@ KEYS = {
     ("gateway", "join_wait"): "SIRIUS_GATEWAY_JOIN_WAIT",
     ("gateway", "statement_timeout"): "SIRIUS_GATEWAY_STATEMENT_TIMEOUT",
     ("node", "gpus"): "SIRIUS_NODE_GPUS",
+    ("node", "cpus"): "SIRIUS_NODE_CPUS",
     ("node", "networks"): "SIRIUS_NODE_NETWORKS",
     ("node", "quack_port"): "SIRIUS_NODE_QUACK_PORT",
     ("node", "exchange_port"): "SIRIUS_NODE_EXCHANGE_PORT",
+    ("exchange", "host_staging"): "SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING",
+    ("exchange", "tcp_lanes"): "SIRIUS_GATEWAY_EXCHANGE_TCP_LANES",
+    ("exchange", "mnnvl"): "SIRIUS_GATEWAY_EXCHANGE_MNNVL",
+    ("exchange", "frame_bytes"): "SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES",
+    ("exchange", "send_frames"): "SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES",
+    (
+        "exchange",
+        "recv_frames_per_peer",
+    ): "SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER",
     ("ucx", "tls"): "UCX_TLS",
     ("ucx", "net_devices"): "UCX_NET_DEVICES",
+    ("ucx", "rails"): "SIRIUS_UCX_RAILS",
 }
 # A group may be there with every key commented out; YAML then gives it no value.
 GROUPS = {keys[:-1] for keys in KEYS}
@@ -94,6 +105,9 @@ def main():
         if var is None:
             known = ", ".join(".".join(k) for k in KEYS)
             sys.exit(f"{path}: unknown key {name} (known: {known})")
+        # YAML 1.1 reads a bare off as False.
+        if keys == ("exchange", "mnnvl") and value is False:
+            value = "off"
         text = shell_value(value)
         if text is None:
             sys.exit(f"{path}: {name} must be a string, a number or a list of them")

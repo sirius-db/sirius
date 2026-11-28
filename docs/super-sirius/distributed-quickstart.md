@@ -60,12 +60,23 @@ sirius:
       # host: 10.87.140.52      # or on this address; wins over networks
     node:
       gpus: all                 # all, a list such as [0, 1], or slurm
+      cpus: auto                # auto: each rank on its own CPUs, next to its GPU; all: shared
       networks: 10.87.140.0/24  # each rank's listen and exchange address
       quack_port: 9500          # rank i: 9500 + i
       exchange_port: 27000      # rank i: 27000 + i
-    ucx:
-      tls: cuda_copy,cuda_ipc,tcp,self
-      # net_devices: bond0      # default: the interface that holds the rank's address
+    exchange:                   # the gateway gives every rank these
+      # host_staging: auto      # auto: NVLink where the fabric reaches (mnnvl), else TCP lanes
+      #                         # to ranks on other hosts. Leave it unset with ucx.rails: true,
+      #                         # which makes it never (RDMA from the GPU)
+      tcp_lanes: 0              # 0: 16 shared by the ranks of a host
+      mnnvl: auto               # auto | require | off: NVLink between nodes (fabric memory)
+      # For NVLink between nodes: larger rings (2.25 GiB of GPU memory per rank at 8 ranks,
+      # against 576 MiB) and, under ucx, rails: true
+      # frame_bytes: 16777216
+      # send_frames: 32
+      # recv_frames_per_peer: 16  # over TCP lanes, one frame in flight per lane
+    # ucx:                      # default: tcp on the interface that holds the rank's address
+    #   rails: true             # every transport on the GPU rail NICs
 ```
 
 Each key sets an environment variable that the scripts read. A variable you export wins over
@@ -83,11 +94,19 @@ number or list, stops the scripts before they apply any of it. `gateway.min_rank
 | `gateway.host` | `SIRIUS_GATEWAY_HOST` | | The address the gateway listens on |
 | `gateway.networks` | `SIRIUS_GATEWAY_PRIORITY_NETWORKS` | | Or this host's first address in these CIDRs (`;` or `,` between them). Without either, the address of the default route's interface; with ranks spawned on this host, 127.0.0.1 |
 | `node.gpus` | `SIRIUS_NODE_GPUS` | `all` | The GPUs that get a rank: `all` (the entries of `CUDA_VISIBLE_DEVICES` when that is set), a list, or `slurm` (the GPU Slurm gave the task) |
-| `node.networks` | `SIRIUS_NODE_NETWORKS` | the gateway's subnet | Each rank listens on this node's first address in these CIDRs, and UCX uses that address's interface |
+| `node.cpus` | `SIRIUS_NODE_CPUS` | `auto` | The CPUs of each rank. `auto`: its GPU's share of the cores next to that GPU (on a GB200 node, 36 of the 72 on the GPU's socket), or the CPUs the node script was started with when those are fewer than the host's, as under a Slurm that binds tasks to cores. `all`: every CPU the script was started with, shared by the host's ranks |
+| `node.networks` | `SIRIUS_NODE_NETWORKS` | the gateway's subnet | Each rank listens on this node's first address in these CIDRs, and UCX uses that address's interface unless `ucx.net_devices` names others or `ucx.rails` takes the rail NICs |
 | `node.quack_port` | `SIRIUS_NODE_QUACK_PORT` | 9500 | First rank's Quack port |
 | `node.exchange_port` | `SIRIUS_NODE_EXCHANGE_PORT` | 27000 | First rank's exchange port |
-| `ucx.tls` | `UCX_TLS` | `cuda_copy,cuda_ipc,tcp,self` | UCX transports; the default is `scripts/launcher_env.sh`'s |
-| `ucx.net_devices` | `UCX_NET_DEVICES` | the interface of the rank's address | UCX devices, for example `mlx5_0:1` |
+| `exchange.host_staging` | `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING` | `auto`; `never` with `ucx.rails: true` | `sirius_gateway_exchange_host_staging`, which the gateway sets as `sirius_exchange_host_staging` on every rank. `auto` reaches ranks on other hosts over the NVLink fabric where it reaches, else over TCP lanes. With RDMA between hosts on other devices than the rails, set `never` |
+| `exchange.tcp_lanes` | `SIRIUS_GATEWAY_EXCHANGE_TCP_LANES` | 0 | `sirius_gateway_exchange_tcp_lanes`: TCP lanes per rank, at most 64. 0 shares 16 among the ranks of a host, at least 2 each |
+| `exchange.mnnvl` | `SIRIUS_GATEWAY_EXCHANGE_MNNVL` | `auto` | `sirius_gateway_exchange_mnnvl`, which the gateway sets as `sirius_exchange_mnnvl` on every rank: ranks on other nodes of the NVLink domain exchange over NVLink |
+| `exchange.frame_bytes` | `SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES` | 8388608 | `sirius_gateway_exchange_frame_bytes`: the exchange's frame size |
+| `exchange.send_frames` | `SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES` | 16 | `sirius_gateway_exchange_send_frames`: send frames shared by a rank's peers |
+| `exchange.recv_frames_per_peer` | `SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER` | 8 | `sirius_gateway_exchange_recv_frames_per_peer`: receive frames each peer may fill; over TCP lanes, one frame in flight per lane |
+| `ucx.tls` | `UCX_TLS` | `cuda_copy,cuda_ipc,tcp,self`; `all` with `ucx.rails: true` | UCX transports; the default is `scripts/launcher_env.sh`'s |
+| `ucx.net_devices` | `UCX_NET_DEVICES` | the interface of the rank's address; the rail NICs with `ucx.rails: true` | UCX devices, for example `mlx5_0:1`. Never list bond0 with rail NICs: UCX then hangs reaching a peer's bond0 address from a rail NIC |
+| `ucx.rails` | `SIRIUS_UCX_RAILS` | `false` | `true` puts UCX on the host's GPU rail NICs: `ucx.tls` then defaults to `all` and `ucx.net_devices` to the active RDMA ports in no bond at the highest link speed (on GB200 nodes `mlx5_0:1,mlx5_1:1,mlx5_4:1,mlx5_5:1`). Notifications over RC on them let the exchange over NVLink reach full speed. A launcher that starts ranks fails on a host without such NICs; a gateway that starts none only takes `exchange.host_staging: never` from it |
 
 A gateway on an address other than loopback serves TLS. It writes the subnet of its address to
 `gateway.conf`, and nodes without `node.networks` pick their address in that subnet.
@@ -119,7 +138,10 @@ pixi run sirius-node
 `node ready for gateway <cluster>`. `sirius-node` starts one rank per GPU, each under
 `scripts/sirius_rank_node.sh`, which starts the rank again whenever it exits and registers it
 with the gateway. Ranks started before the gateway wait for its `gateway.conf`. Logs are in
-`/tmp/sirius_node_<user>_<cluster>/rank_<port>/rank.log` and `register.log`. Ctrl-C stops the
+`/tmp/sirius_node_<user>_<cluster>/rank_<port>/rank.log` and `register.log`. Sirius's own log
+of every rank goes to `log/` under the directory the node was started in; export
+`SIRIUS_RANK_LOG_ROOT=<dir>` to give each rank `<dir>/<short hostname>-<quack port>/`, which
+nodes that share a file system need (the Slurm launcher sets it). Ctrl-C stops the
 node's ranks. If one rank's script exits on an error it cannot retry, the node stops all its
 ranks.
 
@@ -209,7 +231,9 @@ exchange port 27000 + `SLURM_LOCALID`. The script asks for 4 tasks per node;
 `sbatch -N2 --ntasks-per-node=2 scripts/sirius_slurm.sbatch` uses 2 GPUs per node. The gateway
 serves until the job ends. If either the gateway's step or the ranks' step exits, the job stops
 the other and ends with exit code 1. At exit the script removes `~/.sirius/gateways/<job id>/`,
-so the job's token, keys and DDL log go with it. It needs a shared `$HOME`.
+so the job's token, keys and DDL log go with it. It needs a shared `$HOME`. Each rank's
+Sirius log goes to `log/<short hostname>-<quack port>/` under the submit directory; an exported
+`SIRIUS_RANK_LOG_ROOT` names another root.
 
 Tested on two GB200 nodes with 2 GPUs each (`sbatch -N2 --ntasks-per-node=2`): a count at SF100
 and TPC-H Q12 were correct, and cancelling the gateway's step ended the job with exit code 1.
@@ -236,7 +260,7 @@ and TPC-H Q12 were correct, and cancelling the gateway's step ended the job with
 | `rank N (<name>) still runs the process the gateway asked to exit` | The rank was asked to exit to join the new set of ranks, and did not within 10 minutes. See its `rank.log` |
 | `rank <name>'s exchange address 127.x.x.x is a loopback address, which the other ranks cannot reach` | The node's name resolves to a loopback address, which happens with `--gateway` and no networks. Pass `--networks` (or set `node.networks`) to pick a routable address |
 | `rank N failed its session setup: ...` | Usually the exchange: the ranks could not connect to each other. Check that the exchange ports are open, and `ucx.tls` and `ucx.net_devices` |
-| `Endpoint timeout` in a rank's log | UCX picked an InfiniBand port that the ranks cannot connect through. Keep the default `ucx.tls`, or set `ucx.net_devices` |
+| `Endpoint timeout` in a rank's log | UCX picked a port that the ranks cannot connect through. Keep the default `ucx.tls` and `ucx.net_devices`, or set `ucx.net_devices` to ports that reach every node |
 | `unknown key sirius.distributed.<key>`, `sirius.distributed.<key> must be a string, a number or a list of them` | Fix that key in `sirius.yaml`; the scripts apply none of the section until it is right. The first message lists the known keys |
 | `'sirius.topology.num_gpus': must be all or a positive count` | `num_gpus: 0` is an error; use `num_gpus: all` or leave the key out |
 

@@ -33,6 +33,10 @@ Environment:
                                     none): a client cannot set it
   SIRIUS_GATEWAY_ALLOW_JOIN         1 lets ranks register themselves (default: 1 with 0 ranks)
   SIRIUS_GATEWAY_GPUS               with N ranks, each rank's GPU (e.g. 0,0)
+  SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING, SIRIUS_GATEWAY_EXCHANGE_TCP_LANES,
+  SIRIUS_GATEWAY_EXCHANGE_MNNVL, SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES,
+  SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES, SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER
+                                    set sirius_gateway_exchange_*, which every rank takes
 
 Needs the gateway build (make -C gateway release).
 USAGE
@@ -67,9 +71,28 @@ if ! [[ ${SIRIUS_GATEWAY_MIN_RANKS:-1} =~ ^[0-9]+$ && ${SIRIUS_GATEWAY_JOIN_WAIT
   exit 2
 fi
 
+if ! [[ ${SIRIUS_GATEWAY_EXCHANGE_MNNVL:-auto} =~ ^(auto|require|off)$ &&
+  ${SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES:-0} =~ ^[0-9]+$ &&
+  ${SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES:-0} =~ ^[0-9]+$ &&
+  ${SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER:-0} =~ ^[0-9]+$ ]]; then
+  echo "SIRIUS_GATEWAY_EXCHANGE_MNNVL takes auto, require or off; _FRAME_BYTES, _SEND_FRAMES and _RECV_FRAMES_PER_PEER a number" >&2
+  exit 2
+fi
+if ! [[ ${SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING:-auto} =~ ^(auto|always|never|remote)$ &&
+  ${SIRIUS_GATEWAY_EXCHANGE_TCP_LANES:-0} =~ ^[0-9]+$ ]]; then
+  echo "SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING takes auto, always, never or remote; SIRIUS_GATEWAY_EXCHANGE_TCP_LANES a number" >&2
+  exit 2
+fi
+
 here=$(cd "$(dirname "$0")" && pwd)
-source "$here/launcher_env.sh"
 source "$here/sirius_net.sh"
+# A gateway that starts no rank runs no UCX: on a host without rail NICs it takes only the rails'
+# host_staging.
+if [ "$ranks" -eq 0 ] && [[ ${SIRIUS_UCX_RAILS:-0} =~ ^(1|true)$ ]] && ! sirius_rail_devices > /dev/null; then
+  export SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING=${SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING:-never}
+  SIRIUS_UCX_RAILS=0
+fi
+source "$here/launcher_env.sh"
 build="$here/../sirius-duckdb/build/release"
 gateway="$here/../gateway/build/release/duckdb"
 [ -x "$gateway" ] || {
@@ -176,10 +199,23 @@ init="$logs/gateway.init.sql"
   echo "SET GLOBAL sirius_gateway_log_dir = $(sirius_sql_quote "$logs");"
   echo "SET GLOBAL sirius_gateway_state_dir = $(sirius_sql_quote "$state");"
   echo "SET GLOBAL sirius_gateway_min_ranks = ${SIRIUS_GATEWAY_MIN_RANKS:-1};"
+  # The gateway's own default applies to each exchange setting whose variable is not set.
+  [ -z "${SIRIUS_GATEWAY_EXCHANGE_MNNVL:-}" ] ||
+    echo "SET GLOBAL sirius_gateway_exchange_mnnvl = '$SIRIUS_GATEWAY_EXCHANGE_MNNVL';"
+  [ -z "${SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES:-}" ] ||
+    echo "SET GLOBAL sirius_gateway_exchange_frame_bytes = $SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES;"
+  [ -z "${SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES:-}" ] ||
+    echo "SET GLOBAL sirius_gateway_exchange_send_frames = $SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES;"
+  [ -z "${SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER:-}" ] ||
+    echo "SET GLOBAL sirius_gateway_exchange_recv_frames_per_peer = $SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER;"
   echo "SET GLOBAL sirius_gateway_allow_join = $([ "$allow_join" = 1 ] && echo true || echo false);"
   [ -z "${SIRIUS_GATEWAY_JOIN_WAIT:-}" ] || echo "SET GLOBAL sirius_gateway_join_wait = $SIRIUS_GATEWAY_JOIN_WAIT;"
   [ -z "${SIRIUS_GATEWAY_STATEMENT_TIMEOUT:-}" ] ||
     echo "SET GLOBAL sirius_gateway_statement_timeout = $SIRIUS_GATEWAY_STATEMENT_TIMEOUT;"
+  [ -z "${SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING:-}" ] ||
+    echo "SET GLOBAL sirius_gateway_exchange_host_staging = '$SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING';"
+  [ -z "${SIRIUS_GATEWAY_EXCHANGE_TCP_LANES:-}" ] ||
+    echo "SET GLOBAL sirius_gateway_exchange_tcp_lanes = $SIRIUS_GATEWAY_EXCHANGE_TCP_LANES;"
   # replay_saved: a restarted gateway replays the DDL saved in the state dir, instead of
   # deleting it as an explicit start from the console does.
   [ "$ranks" -eq 0 ] ||

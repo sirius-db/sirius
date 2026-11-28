@@ -87,20 +87,24 @@ struct cluster {
   }
 };
 
-/// Rank 0's transport, and rank 1 as a bare fabric endpoint that notifies rank 0 what it likes.
+/// Rank 0's transport in a world of @p world ranks, and rank @p forger as a bare fabric endpoint
+/// that notifies rank 0 what it likes.
 struct forged_peer {
-  loopback_hub hub{2};
+  loopback_hub hub;
   frame_ring send{4, 64 * KiB};
   frame_ring recv{4, 64 * KiB};
   frame_ring peer_send{4, 64 * KiB};
   frame_ring peer_recv{4, 64 * KiB};
-  std::unique_ptr<fabric> fab  = hub.attach(0, send, recv);
-  std::unique_ptr<fabric> peer = hub.attach(1, peer_send, peer_recv);
+  std::unique_ptr<fabric> fab;
+  std::unique_ptr<fabric> peer;
   received got;
   std::unique_ptr<transport> t;
 
-  explicit forged_peer(transport::options opts = {})
-    : t(std::make_unique<transport>(*fab, send, recv, *env().gpu, env().host, recording(got), opts))
+  explicit forged_peer(transport::options opts = {}, rank_t world = 2, rank_t forger = 1)
+    : hub(world),
+      fab(hub.attach(0, send, recv)),
+      peer(hub.attach(forger, peer_send, peer_recv)),
+      t(std::make_unique<transport>(*fab, send, recv, *env().gpu, env().host, recording(got), opts))
   {
   }
   ~forged_peer() { t.reset(); }
@@ -163,12 +167,115 @@ TEST_CASE("one credit per peer and one send frame still deliver many-frame batch
   all_to_all(c, {1}, 2, 30'000);
 }
 
+TEST_CASE("one write covers consecutive frames, up to half a peer's credits",
+          "[exchange][transport]")
+{
+  // 8 credits per peer: writes of up to 4 frames, so two can be in flight to a peer. About
+  // 1.2 MB a batch: 19 frames of 64 KiB.
+  cluster c(2, /*send_frames=*/16, /*recv_frames=*/8);
+  all_to_all(c, {1, 2}, 3, 30'000);
+  CHECK(c.hub.largest_write() == 4 * 64 * KiB);
+}
+
+TEST_CASE("one write per frame when a peer has one credit", "[exchange][transport]")
+{
+  cluster c(2, /*send_frames=*/16, /*recv_frames=*/1);
+  all_to_all(c, {1}, 2, 30'000);
+  CHECK(c.hub.largest_write() == 64 * KiB);
+}
+
+TEST_CASE("one write per frame to a peer whose fabric takes a frame at a time",
+          "[exchange][transport]")
+{
+  // As over TCP lanes: 8 credits per peer would allow writes of 4 frames.
+  cluster c(2, 16, 8, {.max_write_bytes = 64 * KiB}, env().host);
+  all_to_all(c, {1, 2}, 3, 30'000);
+  CHECK(c.hub.largest_write() == 64 * KiB);
+}
+
+TEST_CASE("a write past the frames a peer holds fails the receiver", "[exchange][transport]")
+{
+  // Rank 1 holds rank 0's receive frames 0 to 3; frames 2 to 4 are not all its own.
+  forged_peer f;
+  sirius::exchange::frame_message m{1, 0, 0, 2, 3 * 64 * KiB, many_frame_header()};
+  m.frames = 3;
+  f.forge(m);
+  f.fails_with("which it does not hold");
+}
+
+TEST_CASE("a write into another peer's receive frames fails the receiver", "[exchange][transport]")
+{
+  // Three ranks, so 2 of rank 0's 4 receive frames each: rank 1 holds 0 and 1, rank 2 holds 2
+  // and 3. Both runs are inside the ring.
+  SECTION("a run that ends in the next peer's frames")
+  {
+    forged_peer f({}, 3, 1);
+    sirius::exchange::frame_message m{1, 0, 0, 1, 2 * 64 * KiB, many_frame_header()};
+    m.frames = 2;
+    f.forge(m);
+    f.fails_with("which it does not hold");
+  }
+  SECTION("a run that starts in the previous peer's frames")
+  {
+    forged_peer f({}, 3, 2);
+    f.forge(sirius::exchange::frame_message{1, 0, 0, 1, 64 * KiB, many_frame_header()});
+    f.fails_with("which it does not hold");
+  }
+}
+
 TEST_CASE("notifications may arrive in any order", "[exchange][transport]")
 {
   // Several notifications arrive together and shuffled: frames before their header, ends
   // before the batches they count, credits late.
   cluster c(4, 3, 6, {.shuffle = true, .deliver_every = 5}, env().host);
   all_to_all(c, {1, 2}, 2, 8'000);
+}
+
+TEST_CASE("writes of several frames survive shuffled notifications", "[exchange][transport]")
+{
+  // 8 credits per peer: writes of up to 4 frames, with credits returned out of order, so a
+  // staged run is split over the runs of consecutive credits a peer has left.
+  cluster c(3, 16, 16, {.shuffle = true, .deliver_every = 5}, env().host);
+  all_to_all(c, {1, 2}, 3, 30'000);
+}
+
+TEST_CASE("a peer that returns no credits leaves send frames for the other peers",
+          "[exchange][transport]")
+{
+  // Rank 0's transport, and ranks 1 and 2 as bare endpoints, which never return a credit. A
+  // batch is several frames. 8 credits per peer and 8 send frames, then 1 and 1: one send
+  // frame is never staged ahead of a credit.
+  auto const frames = GENERATE(std::uint32_t{8}, std::uint32_t{1});
+  loopback_hub hub{3};
+  frame_ring send{frames, 64 * KiB};
+  frame_ring recv{2 * frames, 64 * KiB};
+  frame_ring unused{1, 64 * KiB};
+  frame_ring recv1{2 * frames, 64 * KiB};
+  frame_ring recv2{2 * frames, 64 * KiB};
+  auto fab        = hub.attach(0, send, recv);
+  auto const one  = hub.attach(1, unused, recv1);
+  auto const two  = hub.attach(2, unused, recv2);
+  auto const took = [](fabric& peer, std::uint32_t frames) {
+    std::uint32_t seen  = 0;
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (seen < frames && std::chrono::steady_clock::now() < deadline) {
+      std::vector<fabric_notification> in;
+      peer.poll(in);
+      for (auto const& n : in) {
+        seen += std::get<sirius::exchange::frame_message>(sirius::exchange::decode(n.body)).frames;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return seen;
+  };
+  received got;
+  transport t(*fab, send, recv, *env().gpu, env().host, recording(got));
+  t.send(1, 1, exchange_batch(0, 1, 1, 0, 30'000));
+  // Rank 1's credits are spent; what rank 0 stages for it from here on is never written.
+  REQUIRE(took(*one, frames) == frames);
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  t.send(1, 2, exchange_batch(0, 2, 1, 0, 30'000));
+  CHECK(took(*two, frames) == frames);
 }
 
 TEST_CASE("a receiver with no room holds the frames until room appears", "[exchange][transport]")
@@ -229,6 +336,40 @@ TEST_CASE("send blocks while queued bytes exceed the cap, then delivers everythi
   REQUIRE(got.wait_for([&] { return got.ended.size() == 1; }));
   std::lock_guard lock{got.mutex};
   CHECK(got.batches[{0, 5}].size() == 2);
+}
+
+TEST_CASE("a send that does not wait for room is queued over the cap, ahead of a sender that waits",
+          "[exchange][transport]")
+{
+  cluster c(2, 4, 4, {}, /*host=*/nullptr, {.max_queued_bytes = 64 * KiB});
+  auto& sender = *c.ranks[0].t;
+  auto& got    = *c.ranks[1].got;
+  auto first   = gpu_batch(sample_table(30'000));
+  auto second  = gpu_batch(sample_table(30'001));
+  auto third   = gpu_batch(sample_table(30'002));
+  // Declared before the hold: a send that waits after all is joined once the hold is released.
+  std::future<void> blocked;
+  std::future<void> unblocked;
+  {
+    auto const hold = hold_gpu();
+    sender.send(5, 1, std::move(first));
+    blocked = std::async(std::launch::async, [&] { sender.send(5, 1, std::move(second)); });
+    CHECK(blocked.wait_for(std::chrono::milliseconds{500}) == std::future_status::timeout);
+    unblocked = std::async(std::launch::async, [&] {
+      sender.send(6, 1, std::move(third), /*wait_for_room=*/false);
+      sender.close(6, 1);
+    });
+    REQUIRE(unblocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+    unblocked.get();
+    CHECK(blocked.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout);
+  }
+  REQUIRE(blocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+  blocked.get();
+  sender.close(5, 1);
+  REQUIRE(got.wait_for([&] { return got.ended.size() == 2; }));
+  std::lock_guard lock{got.mutex};
+  CHECK(got.batches[{0, 5}].size() == 2);
+  CHECK(got.batches[{0, 6}].size() == 1);
 }
 
 TEST_CASE("a cancelled query's sender stops waiting for room, and the transport carries on",
@@ -442,8 +583,11 @@ TEST_CASE("a transport destroyed right after close and abort still sends them",
 TEST_CASE("exchange messages round-trip and refuse malformed bytes", "[exchange][transport]")
 {
   using namespace sirius::exchange;
+  frame_message several{7, 3, 4, 2, 3 * 1024, {}};
+  several.frames = 3;
   std::vector<message> const all{frame_message{7, 3, 0, 5, 1024, {1, 2, 3}},
                                  frame_message{7, 3, 4, 6, 99, {}},
+                                 several,
                                  credit_message{{1, 2, 3}},
                                  credit_message{},
                                  end_message{7, 12},
@@ -462,6 +606,10 @@ TEST_CASE("exchange messages round-trip and refuse malformed bytes", "[exchange]
                   sirius::invalid_input_exception);
   CHECK_THROWS_AS(decode(encode(frame_message{1, 1, 0, 0, 8, {}})),
                   sirius::invalid_input_exception);
+  // A write of no frames.
+  frame_message none{1, 1, 2, 0, 8, {}};
+  none.frames = 0;
+  CHECK_THROWS_AS(decode(encode(none)), sirius::invalid_input_exception);
   // A frame and an end with a byte too many, a credit with one too few.
   auto frame = encode(frame_message{7, 3, 0, 5, 1024, {1, 2, 3}});
   frame.push_back('\0');
@@ -579,13 +727,15 @@ TEST_CASE("a malformed notification from a peer fails the receiver", "[exchange]
   }
 }
 
-TEST_CASE("sirius_exchange_host_staging takes auto, always or never", "[exchange][transport]")
+TEST_CASE("sirius_exchange_host_staging takes auto, always, never or remote",
+          "[exchange][transport]")
 {
   using sirius::exchange::host_staging;
   using sirius::exchange::parse_host_staging;
   CHECK(parse_host_staging("auto") == host_staging::automatic);
   CHECK(parse_host_staging("always") == host_staging::always);
   CHECK(parse_host_staging("never") == host_staging::never);
+  CHECK(parse_host_staging("remote") == host_staging::remote);
   CHECK_THROWS_AS(parse_host_staging(""), sirius::invalid_input_exception);
   CHECK_THROWS_AS(parse_host_staging("Always"), sirius::invalid_input_exception);
 }

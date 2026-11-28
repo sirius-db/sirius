@@ -66,7 +66,12 @@ kept in `~/.sirius/gateways/<cluster>/tls`. A registered rank listens on its nod
 address in its `priority_networks`, by default the gateway's subnet from `gateway.conf`, and
 `UCX_NET_DEVICES` defaults to that address's interface. `scripts/launcher_env.sh` defaults
 `UCX_TLS` to `cuda_copy,cuda_ipc,tcp,self`: left to itself, UCX picks InfiniBand ports that GB200
-hosts cannot connect through.
+hosts cannot connect through. `SIRIUS_UCX_RAILS=1` takes the host's GPU rail NICs with
+`UCX_TLS=all` instead, which the exchange over the NVLink fabric needs for its notifications at
+full speed. `scripts/sirius_gateway.sh` then starts the gateway with
+`sirius_gateway_exchange_host_staging = 'never'`, unless `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING`
+is set: ranks on other hosts then get GPU memory written directly over RDMA, about twice as fast
+as lanes when every rank sends to every other.
 
 ## How a statement runs
 
@@ -161,6 +166,19 @@ runs alone.
 `sirius_rank_exit` replies, shuts the exchange down (freeing its port and shared-memory mirrors)
 and exits with code 0; a watchdog ends it with code 1 if that hangs.
 
+**CPUs.** `sirius_rank_node.sh` runs each rank on CPUs of its own (`node.cpus`, default `auto`):
+the rank's GPU's share of the cores next to that GPU, divided among the GPUs there. A rank
+started with fewer CPUs than the host has keeps those instead, and ranks started together inside
+one such set share it. The rank's DuckDB gets that many threads and does not bind them to single
+CPUs (`pin_threads`). Ranks that share CPUs while DuckDB binds its threads stall: with 143 bound
+threads per rank on the 144 CPUs of a GB200 node, a thread of one rank waited behind a busy
+thread of another on the same CPU, and 8 of 13 TPC-H runs at scale factor 3000 on 8 ranks had a
+query take 1 to 13 minutes instead of seconds. With `auto`, 0 of 14 runs did. `all` leaves the
+host's CPUs shared and only stops the binding: 0 of 14 runs stalled, and the warm run took
+85.5 s against 68.6 s. Spawned ranks, and those of `scripts/distributed_run_sql.sh`, get neither
+their own CPUs nor unbound threads: on a host with 64 CPUs or more, start several ranks with the
+node script.
+
 Joins run in parallel. The first join that fails ends the others' retries, and its error is the
 one reported.
 
@@ -213,18 +231,33 @@ abandoned.
 | `sirius_gateway_status()` | One row per rank: process, name, state, cluster state and its `error` (why it is stopped or failed, what it waits for, or a note while it is `ready`: a skipped saved entry, or a log it could not save), `last_error` (the rank's last failure to join, to answer, or to keep running), query numbers, queue |
 | `sirius_gateway_log()` | The DDL log. A statement that carries credentials shows as `-- not shown: this statement carries credentials` |
 | `sirius_gateway_route(user, sql)` | Quack's authorization callback that routes each client statement: `SET GLOBAL quack_authorization_function = 'sirius_gateway_route'` |
-| `sirius_gateway_test_signal(rank, signal)`, `sirius_gateway_test_serve(port, token, init)` | Test hooks |
+| `sirius_gateway_test_signal(rank, signal)`, `sirius_gateway_test_serve(port, token, init)`, `sirius_gateway_test_rank_setup(peers, rank)` | Test hooks |
 
 On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid`, its
 `boot_id`, and whether it has `joined` a set of ranks (its exchange connected to its peers, or
 the gateway set it up as its only rank), and `sirius_rank_exit()`
 (`src/exchange/rank_control.cpp`).
 
+The gateway reads the settings that shape a start (`sirius_gateway_duckdb_binary`,
+`sirius_gateway_sirius_extension`, `sirius_gateway_rank_init`, the six
+`sirius_gateway_exchange_*`, `sirius_gateway_log_dir` and the three
+`sirius_gateway_rank_*_sql`) when `sirius_gateway_start` runs, or when a statement starts the
+registered ranks: the first statement, and a later one that finds no rank running after a
+start that failed. `sirius_gateway_restart` and the gateway's own restarts of running ranks
+reuse what it read then; a restart before any start reads them. The other settings are read
+when they are used, so a change applies from the next statement.
+
 | Setting | Default | What |
 |---|---|---|
 | `sirius_gateway_duckdb_binary` | | DuckDB that runs each spawned rank |
 | `sirius_gateway_sirius_extension` | | Sirius extension the ranks load; empty runs CPU ranks, for tests |
-| `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings |
+| `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings. It must not change them: a rank whose exchange settings differ from the ones it connected with fails every distributed query |
+| `sirius_gateway_exchange_host_staging` | `auto` | `sirius_exchange_host_staging` for every rank: `auto` (the NVLink fabric where it reaches, else TCP lanes to ranks on other hosts), `always`, `never` (the fabric, else NIXL to every peer) or `remote` |
+| `sirius_gateway_exchange_tcp_lanes` | 0 | `sirius_exchange_tcp_lanes` for every rank, at most 64; 0 shares 16 lanes among the ranks of a host |
+| `sirius_gateway_exchange_mnnvl` | `auto` | `sirius_exchange_mnnvl` for every rank: `auto`, `require` or `off` put the rings in fabric memory, for NVLink between nodes |
+| `sirius_gateway_exchange_frame_bytes` | 8388608 | `sirius_exchange_frame_bytes` for every rank |
+| `sirius_gateway_exchange_send_frames` | 16 | `sirius_exchange_send_frames` for every rank |
+| `sirius_gateway_exchange_recv_frames_per_peer` | 8 | `sirius_exchange_recv_frames_per_peer` for every rank; over TCP lanes, one frame in flight per lane |
 | `sirius_gateway_log_dir` | temporary | Rank init files and logs. One gateway per directory: the default is per process, so a program that opens two gateway databases must set it for each |
 | `sirius_gateway_allow_join` | false | Lets clients call `sirius_gateway_add_rank` and `sirius_gateway_drop_rank`, for nodes to register their ranks |
 | `sirius_gateway_min_ranks` | 1 | Registered ranks the first statement waits for before it starts them |
@@ -332,6 +365,7 @@ The query-number rules, and `sirius_rank_info`'s boot id and `joined`, are unit-
 | `scripts/sirius_client.sh` | A DuckDB shell attached to the gateway (`pixi run sirius-client`), through `~/.sirius/gateways/<cluster>/client.init.sql` (mode 600, with the token) |
 | `scripts/sirius_slurm.sbatch` | A gateway and one rank per task in a Slurm job |
 | `scripts/sirius_distributed_config.py` | Reads `sirius.distributed` from `sirius.yaml` for the scripts |
+| `scripts/sirius_rank_cpus.py` | Picks the CPUs a rank runs on, for `sirius_rank_node.sh` |
 | `scripts/sirius_rank_node.sh` | Runs a registered rank, restarts it when it exits, and registers it with the gateway by feeding `<dir>/register.sql` (mode 600, with both tokens) to DuckDB on stdin |
 | `scripts/sirius_rank_node.conf.example` | A config file for one rank; `sirius_node.sh` writes these |
 | `scripts/sirius_net.sh` | Picks this host's address and interface in `priority_networks` |

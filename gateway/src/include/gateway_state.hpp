@@ -38,6 +38,13 @@ struct start_options {
   std::string sirius_extension;
   /// SQL every rank's session runs after the exchange settings.
   std::string rank_init;
+  /// The exchange settings every rank takes before it connects (`sirius_gateway_exchange_*`).
+  std::string host_staging = "auto";
+  uint32_t tcp_lanes       = 0;
+  std::string mnnvl        = "auto";
+  uint64_t frame_bytes     = 8ull << 20;
+  uint32_t send_frames     = 16;
+  uint32_t recv_frames     = 8;
   std::string log_dir;
   /// How a registered rank names its process, whether that process already joined a set of
   /// ranks, and how it is asked to exit for its launcher to restart it
@@ -164,6 +171,9 @@ class gateway_state {
     std::optional<duckdb::ErrorData> error;
     /// The gateway gave up on the call, so the rank is lost.
     bool abandoned = false;
+    /// The call was still running when the fan-out cancelled its calls, so its error can be the
+    /// cancel's own.
+    bool cancelled = false;
   };
   /// When a fan-out cancels its calls: the client interrupting, and the statement timeout.
   struct fan_out_policy {
@@ -272,6 +282,13 @@ class gateway_state {
 
 /// Fills @p options from the `sirius_gateway_*` settings of @p context.
 void read_settings(duckdb::ClientContext& context, start_options& options);
+
+/// The SQL rank @p index's session runs to join the exchange of @p peers ("host:port" of every
+/// rank, by rank): with Sirius, the exchange settings, then the peers, then the rank, which
+/// connects; last, options.rank_init.
+std::vector<std::string> rank_setup_sql(start_options const& options,
+                                        std::string const& peers,
+                                        uint32_t index);
 
 /// Rank process lifecycle; `rank_supervisor.cpp`.
 /// Runs the DuckDB binary on this host; @p init_sql runs before the rank serves Quack.

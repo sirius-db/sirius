@@ -335,6 +335,15 @@ bool rank_unreachable(std::string const& message)
          message.find("Invalid connection id") != std::string::npos;
 }
 
+/// Whether @p message is a rank's connect giving up on peers it never heard from: what the other
+/// ranks report when one rank was refused before it listened, so never the cause when another
+/// error is at hand.
+bool waited_for_peers(std::string const& message)
+{
+  return message.find("exchange NIXL: rank ") != std::string::npos &&
+         message.find(" peers in ") != std::string::npos;
+}
+
 /// One fan-out's calls, shared with the threads that run them so a call the gateway gives up on
 /// can finish on its own.
 struct fan_out_shared {
@@ -433,15 +442,50 @@ char const* to_string(cluster_state state)
   return "unknown";
 }
 
+std::vector<std::string> rank_setup_sql(start_options const& options,
+                                        std::string const& peers,
+                                        uint32_t index)
+{
+  std::vector<std::string> sql;
+  if (!options.sirius_extension.empty()) {
+    sql.push_back("SET enable_duckdb_fallback = false");
+    // The same on every rank: two ranks that would reach each other in different ways never
+    // finish connecting. With 'auto', ranks tell other hosts apart by boot id and reach them
+    // over the NVLink fabric where it reaches, else over TCP lanes.
+    sql.push_back("SET sirius_exchange_host_staging = " +
+                  KeywordHelper::WriteQuoted(options.host_staging));
+    sql.push_back("SET sirius_exchange_tcp_lanes = " + std::to_string(options.tcp_lanes));
+    sql.push_back("SET sirius_exchange_mnnvl = " + KeywordHelper::WriteQuoted(options.mnnvl));
+    sql.push_back("SET sirius_exchange_frame_bytes = " + std::to_string(options.frame_bytes));
+    sql.push_back("SET sirius_exchange_send_frames = " + std::to_string(options.send_frames));
+    sql.push_back("SET sirius_exchange_recv_frames_per_peer = " +
+                  std::to_string(options.recv_frames));
+    sql.push_back("SET sirius_exchange_peers = " + KeywordHelper::WriteQuoted(peers));
+    sql.push_back("SET sirius_exchange_rank = " + std::to_string(index));
+  }
+  if (!options.rank_init.empty()) { sql.push_back(options.rank_init); }
+  return sql;
+}
+
 void read_settings(ClientContext& context, start_options& options)
 {
   options.duckdb_binary    = setting(context, "sirius_gateway_duckdb_binary", "");
   options.sirius_extension = setting(context, "sirius_gateway_sirius_extension", "");
   options.rank_init        = setting(context, "sirius_gateway_rank_init", "");
-  options.log_dir          = setting(context, "sirius_gateway_log_dir", "");
-  options.boot_id_sql      = setting(context, "sirius_gateway_rank_boot_id_sql", "");
-  options.joined_sql       = setting(context, "sirius_gateway_rank_joined_sql", "");
-  options.exit_sql         = setting(context, "sirius_gateway_rank_exit_sql", "");
+  options.host_staging     = setting(context, "sirius_gateway_exchange_host_staging", "auto");
+  options.tcp_lanes =
+    static_cast<uint32_t>(std::stoull(setting(context, "sirius_gateway_exchange_tcp_lanes", "0")));
+  options.mnnvl = setting(context, "sirius_gateway_exchange_mnnvl", "auto");
+  options.frame_bytes =
+    std::stoull(setting(context, "sirius_gateway_exchange_frame_bytes", "8388608"));
+  options.send_frames = static_cast<uint32_t>(
+    std::stoull(setting(context, "sirius_gateway_exchange_send_frames", "16")));
+  options.recv_frames = static_cast<uint32_t>(
+    std::stoull(setting(context, "sirius_gateway_exchange_recv_frames_per_peer", "8")));
+  options.log_dir     = setting(context, "sirius_gateway_log_dir", "");
+  options.boot_id_sql = setting(context, "sirius_gateway_rank_boot_id_sql", "");
+  options.joined_sql  = setting(context, "sirius_gateway_rank_joined_sql", "");
+  options.exit_sql    = setting(context, "sirius_gateway_rank_exit_sql", "");
   if (options.log_dir.empty()) {
     options.log_dir =
       (std::filesystem::temp_directory_path() / ("sirius_gateway_" + std::to_string(getpid())))
@@ -613,6 +657,15 @@ gateway_state::rank_plan gateway_state::plan_ranks(start_options const& options)
     throw InvalidInputException("the base ports of %d ranks must stay within 1 to 65535",
                                 options.ranks);
   }
+  // Sirius ranks refuse this pair when they connect to a peer, after the running ranks stopped.
+  if (!options.sirius_extension.empty() && options.ranks + registered.size() > 1 &&
+      options.mnnvl == "require" &&
+      (options.host_staging == "always" || options.host_staging == "remote")) {
+    throw InvalidInputException(
+      "sirius_gateway_exchange_mnnvl is require, but sirius_gateway_exchange_host_staging = %s "
+      "stages every peer",
+      options.host_staging);
+  }
 
   // With no gpus argument, Sirius ranks stay inside the gateway's own CUDA_VISIBLE_DEVICES.
   std::vector<std::string> visible;
@@ -745,32 +798,29 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
     if (give_up) { throw duckdb::InterruptException(); }
 
     // Each session's setup. With Sirius, SET sirius_exchange_rank connects NIXL and waits for
-    // every peer, so the ranks run it in parallel. Shared-memory staging reaches only processes
-    // on one host, and 'auto' can take a GPU on another host for one here, so ranks on several
-    // hosts never stage.
-    auto const several_hosts = std::any_of(
-      ranks_.begin(), ranks_.end(), [&](rank const& r) { return r.host != ranks_[0].host; });
+    // every peer, so the ranks run it in parallel.
     std::vector<std::vector<std::string>> setup(ranks_.size());
     for (auto& r : ranks_) {
-      auto& sql = setup[r.index];
-      if (!options_.sirius_extension.empty()) {
-        sql.push_back("SET enable_duckdb_fallback = false");
-        if (several_hosts) { sql.push_back("SET sirius_exchange_host_staging = 'never'"); }
-        sql.push_back("SET sirius_exchange_peers = " + KeywordHelper::WriteQuoted(plan.peers));
-        sql.push_back("SET sirius_exchange_rank = " + std::to_string(r.index));
-      }
-      if (!options_.rank_init.empty()) { sql.push_back(options_.rank_init); }
+      setup[r.index] = rank_setup_sql(options_, plan.peers, r.index);
     }
     auto const setup_done = fan_out(context, setup, client_policy(context));
+    // A rank refused at connect (several GPUs, no fabric memory under 'require') answers at once
+    // and never listens, so every other rank waits out its connect timeout: report the refusal.
+    // A rank whose call the gateway cancelled (timeout, interrupt) is not the cause either.
+    std::string earliest;
+    std::string cause;
     for (uint32_t i = 0; i < setup_done.outcomes.size(); ++i) {
-      if (setup_done.outcomes[i].error) {
-        auto const what = "rank " + std::to_string(i) + " failed its session setup: " +
-                          setup_done.outcomes[i].error->RawMessage();
-        std::lock_guard lock{state_mutex_};
-        last_errors_[ranks_[i].name] = what;
-        throw IOException(what);
+      if (!setup_done.outcomes[i].error) { continue; }
+      auto const& message = setup_done.outcomes[i].error->RawMessage();
+      auto const what     = "rank " + std::to_string(i) + " failed its session setup: " + message;
+      std::lock_guard lock{state_mutex_};
+      last_errors_[ranks_[i].name] = what;
+      if (earliest.empty()) { earliest = what; }
+      if (cause.empty() && !setup_done.outcomes[i].cancelled && !waited_for_peers(message)) {
+        cause = what;
       }
     }
+    if (!earliest.empty()) { throw IOException(cause.empty() ? earliest : cause); }
     std::lock_guard lock{state_mutex_};
     state_ = cluster_state::ready;
   } catch (std::exception& e) {
@@ -1341,6 +1391,7 @@ gateway_state::fan_out_result gateway_state::fan_out(
 
   fan_out_result out;
   std::vector<std::shared_ptr<canceller>> cancelling;
+  std::vector<bool> running_at_cancel(ranks_.size(), false);
   auto const started = steady_clock::now();
   std::optional<steady_clock::time_point> cancelled_at;
   std::optional<steady_clock::time_point> killed_at;
@@ -1360,6 +1411,12 @@ gateway_state::fan_out_result gateway_state::fan_out(
       }
       cancelled_at   = now;
       shared->cancel = true;
+      {
+        std::lock_guard lock{shared->mutex};
+        for (std::size_t i = 0; i < ranks_.size(); ++i) {
+          running_at_cancel[i] = !shared->calls[i].done;
+        }
+      }
       for (auto const& r : ranks_) {
         auto one     = std::make_shared<canceller>();
         one->shared  = shared;
@@ -1396,7 +1453,8 @@ gateway_state::fan_out_result gateway_state::fan_out(
   std::lock_guard lock{shared->mutex};
   out.outcomes.resize(ranks_.size());
   for (std::size_t i = 0; i < ranks_.size(); ++i) {
-    auto& call = shared->calls[i];
+    auto& call                = shared->calls[i];
+    out.outcomes[i].cancelled = running_at_cancel[i];
     if (call.done) {
       threads[i].join();
       out.outcomes[i].result = std::move(call.result);

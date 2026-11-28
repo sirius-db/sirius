@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exchange/fabric.hpp"
+#include "sirius/exception.hpp"
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/detail/error.hpp>
@@ -24,6 +25,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -53,10 +55,15 @@ class loopback_hub {
     unsigned deliver_every = 1;
     /// Fail every write after this many succeeded.
     std::optional<std::uint64_t> fail_after_writes;
+    /// The most bytes one write may carry, as fabric::max_write_bytes() reports it.
+    std::optional<std::size_t> max_write_bytes;
   };
 
   loopback_hub(rank_t world, options opts) : _opts(opts), _inboxes(world), _recv(world, nullptr) {}
   explicit loopback_hub(rank_t world) : loopback_hub(world, options{}) {}
+
+  /// The most bytes one write has carried.
+  [[nodiscard]] std::size_t largest_write() const noexcept { return _largest_write.load(); }
 
   std::unique_ptr<fabric> attach(rank_t rank, frame_ring& send, frame_ring& recv)
   {
@@ -98,6 +105,15 @@ class loopback_hub {
         std::lock_guard lock{_hub._mutex};
         recv = _hub._recv.at(peer);
       }
+      if (src + bytes > _send.bytes() || dst + bytes > recv->bytes() ||
+          bytes > max_write_bytes(peer)) {
+        throw sirius::invalid_input_exception(
+          "loopback: a {}-byte write from {} to {} of rank {} is out of bounds",
+          bytes,
+          src,
+          dst,
+          peer);
+      }
       pending w{peer, std::move(notification), nullptr, false};
       if (_hub._opts.fail_after_writes && _posted >= *_hub._opts.fail_after_writes) {
         w.failed = true;
@@ -111,13 +127,23 @@ class loopback_hub {
         RMM_CUDA_TRY(cudaEventRecord(w.done, _stream.value()));
       }
       ++_posted;
+      for (auto seen = _hub._largest_write.load();
+           bytes > seen && !_hub._largest_write.compare_exchange_weak(seen, bytes);) {}
       _writes.emplace(_next, std::move(w));
       return _next++;
+    }
+
+    std::size_t max_write_bytes(rank_t peer) const override
+    {
+      return _hub._opts.max_write_bytes.value_or(fabric::max_write_bytes(peer));
     }
 
     write_status status(std::uint64_t id) override
     {
       auto it = _writes.find(id);
+      if (it == _writes.end()) {
+        throw sirius::invalid_input_exception("loopback: unknown write {}", id);
+      }
       if (it->second.failed) {
         _writes.erase(it);
         return write_status::failed;
@@ -172,6 +198,7 @@ class loopback_hub {
   }
 
   options _opts;
+  std::atomic<std::size_t> _largest_write{0};
   std::mutex _mutex;
   std::vector<std::vector<fabric_notification>> _inboxes;
   std::vector<frame_ring*> _recv;

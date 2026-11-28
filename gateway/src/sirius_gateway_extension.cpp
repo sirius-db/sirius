@@ -24,6 +24,66 @@ struct gateway_info : TableFunctionInfo {
   std::shared_ptr<gateway_state> state;
 };
 
+void refuse_null(Value const& parameter)
+{
+  if (parameter.IsNull()) {
+    throw InvalidInputException("a sirius_gateway_exchange setting cannot be NULL: RESET it");
+  }
+}
+
+/// Refuses a value no rank takes, at SET rather than when the ranks start.
+void check_host_staging(ClientContext&, SetScope, Value& parameter)
+{
+  refuse_null(parameter);
+  auto const value = StringValue::Get(parameter);
+  if (value != "auto" && value != "always" && value != "never" && value != "remote") {
+    throw InvalidInputException(
+      "sirius_gateway_exchange_host_staging must be auto, always, never or remote, not '%s'",
+      value);
+  }
+}
+
+void check_tcp_lanes(ClientContext&, SetScope, Value& parameter)
+{
+  refuse_null(parameter);
+  auto const lanes = UBigIntValue::Get(parameter);
+  if (lanes > 64) {
+    throw InvalidInputException(
+      "sirius_gateway_exchange_tcp_lanes must be 0 (automatic) to 64, not %llu", lanes);
+  }
+}
+
+void check_mnnvl(ClientContext&, SetScope, Value& parameter)
+{
+  refuse_null(parameter);
+  auto const value = StringValue::Get(parameter);
+  if (value != "auto" && value != "require" && value != "off") {
+    throw InvalidInputException(
+      "sirius_gateway_exchange_mnnvl must be auto, require or off, not '%s'", value);
+  }
+}
+
+void check_frame_bytes(ClientContext&, SetScope, Value& parameter)
+{
+  refuse_null(parameter);
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0 || bytes % 256 != 0 || bytes > (1ull << 30)) {
+    throw InvalidInputException(
+      "sirius_gateway_exchange_frame_bytes must be a positive multiple of 256 up to 1 GiB, not "
+      "%llu",
+      bytes);
+  }
+}
+
+void check_frames(ClientContext&, SetScope, Value& parameter)
+{
+  refuse_null(parameter);
+  auto const frames = UBigIntValue::Get(parameter);
+  if (frames == 0 || frames > 1024) {
+    throw InvalidInputException("exchange frame counts must be 1 to 1024, not %llu", frames);
+  }
+}
+
 gateway_state& gateway_of(TableFunctionBindInput& input)
 {
   return *input.info->Cast<gateway_info>().state;
@@ -278,6 +338,26 @@ unique_ptr<FunctionData> test_signal_bind(ClientContext&,
   return status_rows(gateway_of(input), types, names);
 }
 
+/// Test hook: sirius_gateway_test_rank_setup(peers, rank) returns the session setup SQL that
+/// sirius_gateway_start would give that rank under the current settings. Starts nothing.
+unique_ptr<FunctionData> test_rank_setup_bind(ClientContext& context,
+                                              TableFunctionBindInput& input,
+                                              vector<LogicalType>& types,
+                                              vector<Identifier>& names)
+{
+  sirius_gateway::start_options options;
+  sirius_gateway::read_settings(context, options);
+  names          = {"step", "sql"};
+  types          = {LogicalType::UBIGINT, LogicalType::VARCHAR};
+  auto data      = make_uniq<rows_data>();
+  auto const sql = sirius_gateway::rank_setup_sql(
+    options, input.inputs[0].ToString(), input.inputs[1].GetValue<uint32_t>());
+  for (idx_t i = 0; i < sql.size(); ++i) {
+    data->rows.push_back({Value::UBIGINT(i + 1), Value(sql[i])});
+  }
+  return std::move(data);
+}
+
 unique_ptr<FunctionData> log_bind(ClientContext&,
                                   TableFunctionBindInput& input,
                                   vector<LogicalType>& types,
@@ -385,6 +465,10 @@ void LoadInternal(ExtensionLoader& loader)
                               {LogicalType::INTEGER, LogicalType::INTEGER},
                               scan_rows,
                               test_signal_bind));
+  loader.RegisterFunction(add("sirius_gateway_test_rank_setup",
+                              {LogicalType::VARCHAR, LogicalType::INTEGER},
+                              scan_rows,
+                              test_rank_setup_bind));
   loader.RegisterFunction(add("sirius_gateway_run", {LogicalType::VARCHAR}, scan_run, run_bind));
 
   // The Quack callback that routes each client statement:
@@ -400,9 +484,13 @@ void LoadInternal(ExtensionLoader& loader)
   // Global, as Quack's own options are: the router and each statement read them in the client's
   // session, which a plain SET on the console would otherwise not reach.
   auto& config = DBConfig::GetConfig(db);
-  auto option  = [&](char const* name, char const* description, LogicalType type, Value fallback) {
+  auto option  = [&](char const* name,
+                    char const* description,
+                    LogicalType type,
+                    Value fallback,
+                    set_option_callback_t check = nullptr) {
     config.AddExtensionOption(
-      name, description, std::move(type), fallback, nullptr, SetScope::GLOBAL);
+      name, description, std::move(type), fallback, check, SetScope::GLOBAL);
   };
   option("sirius_gateway_duckdb_binary",
          "DuckDB binary that runs each rank",
@@ -416,6 +504,41 @@ void LoadInternal(ExtensionLoader& loader)
          "SQL each rank's session runs after the exchange settings",
          LogicalType::VARCHAR,
          Value(""));
+  option("sirius_gateway_exchange_host_staging",
+         "sirius_exchange_host_staging for every rank: auto (the NVLink fabric where it "
+         "reaches, else TCP lanes to other hosts), always, never (the fabric, else NIXL "
+         "to every peer) or remote",
+         LogicalType::VARCHAR,
+         Value("auto"),
+         check_host_staging);
+  option("sirius_gateway_exchange_tcp_lanes",
+         "sirius_exchange_tcp_lanes for every rank: TCP lanes per rank to "
+         "other hosts; 0 shares 16 among the ranks of a host",
+         LogicalType::UBIGINT,
+         Value::UBIGINT(0),
+         check_tcp_lanes);
+  option("sirius_gateway_exchange_mnnvl",
+         "sirius_exchange_mnnvl for every rank: auto, require or off put the "
+         "exchange's rings in fabric memory, for NVLink between nodes",
+         LogicalType::VARCHAR,
+         Value("auto"),
+         check_mnnvl);
+  option("sirius_gateway_exchange_frame_bytes",
+         "sirius_exchange_frame_bytes for every rank",
+         LogicalType::UBIGINT,
+         Value::UBIGINT(8ull << 20),
+         check_frame_bytes);
+  option("sirius_gateway_exchange_send_frames",
+         "sirius_exchange_send_frames for every rank",
+         LogicalType::UBIGINT,
+         Value::UBIGINT(16),
+         check_frames);
+  option("sirius_gateway_exchange_recv_frames_per_peer",
+         "sirius_exchange_recv_frames_per_peer for every rank; over TCP lanes, "
+         "one frame in flight per lane",
+         LogicalType::UBIGINT,
+         Value::UBIGINT(8),
+         check_frames);
   option("sirius_gateway_log_dir",
          "Directory for rank init files and logs; empty uses a temporary one",
          LogicalType::VARCHAR,

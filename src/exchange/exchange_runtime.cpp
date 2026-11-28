@@ -18,24 +18,93 @@
 
 #include "exchange/exchange_service.hpp"
 #include "exchange/nixl_fabric.hpp"
+#include "log/logging.hpp"
 #include "sirius/exception.hpp"
 
 #include <rmm/cuda_device.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 
+#include <algorithm>
+#include <format>
+#include <optional>
+#include <string>
 #include <utility>
 
 namespace sirius::exchange {
 
-host_staging parse_host_staging(std::string_view value)
+namespace {
+
+/// The probe's bar: writes over the network rails top out near 100 GB/s.
+constexpr double nvlink_probe_min_gbps = 150;
+/// A smaller write is over before its bandwidth shows.
+constexpr std::size_t nvlink_probe_min_bytes = std::size_t{32} << 20;
+/// Timed writes to one peer, at most.
+constexpr int nvlink_probe_tries = 8;
+
+/**
+ * @brief Times writes, as large as the transport's largest, to each peer on the NVLink fabric
+ * path, until one reaches the bar. UCX takes another transport without a word when `cuda_ipc`
+ * cannot map the peer's memory; this says so at connect instead of in a slow query.
+ *
+ * Runs before the transport starts: each write lands in this rank's own credit frames on the
+ * peer, which no other rank writes, and carries no notification. Does nothing when the
+ * transport's largest write is under 32 MiB.
+ * @throws sirius::internal_exception on a slow peer when opts.mnnvl is require, or when a write
+ *         fails.
+ */
+void probe_nvlink_peers(nixl_fabric& fab, nixl_exchange_options const& opts)
 {
-  if (value == "auto") { return host_staging::automatic; }
-  if (value == "always") { return host_staging::always; }
-  if (value == "never") { return host_staging::never; }
-  throw sirius::invalid_input_exception(
-    "sirius_exchange_host_staging must be auto, always or never, not '{}'", value);
+  auto const frames =
+    std::max<std::uint32_t>(1, std::min(opts.recv_frames_per_peer, opts.send_frames) / 2);
+  auto const bytes = std::size_t{frames} * opts.frame_bytes;
+  if (bytes < nvlink_probe_min_bytes) { return; }
+  auto const gbps_of = [bytes](std::optional<double> seconds) {
+    return seconds ? static_cast<double>(bytes) / *seconds / 1e9 : 0.0;
+  };
+  // Each rank starts at its next neighbour, so the ranks do not all write rank 0 first.
+  for (rank_t step = 1; step < fab.world_size(); ++step) {
+    auto const peer = (fab.rank() + step) % fab.world_size();
+    if (fab.path_to(peer) != path::nvlink_fabric) { continue; }
+    auto const slot = fab.rank() < peer ? fab.rank() : fab.rank() - 1;
+    auto const dst  = std::size_t{slot} * opts.recv_frames_per_peer * opts.frame_bytes;
+    double gbps     = 0;
+    // The first write also maps the peer's memory.
+    if (fab.timed_write(peer, dst, bytes)) {
+      // Every rank connects to its peers and maps their rings at the same time, and a write
+      // timed meanwhile can read 2 to 60 ms in place of 0.2. That only makes it read slow: no
+      // other path reaches the bar, so the first write at it settles the peer.
+      for (int t = 0; t < nvlink_probe_tries && gbps < nvlink_probe_min_gbps; ++t) {
+        auto const seconds = fab.timed_write(peer, dst, bytes);
+        if (!seconds) {
+          gbps = 0;
+          break;
+        }
+        gbps = std::max(gbps, gbps_of(seconds));
+      }
+    }
+    if (gbps >= nvlink_probe_min_gbps) {
+      SIRIUS_LOG_INFO("exchange: probe to rank {}: {} MiB at {:.0f} GB/s", peer, bytes >> 20, gbps);
+      continue;
+    }
+    auto const speed =
+      gbps > 0 ? std::format("ran at {:.0f} GB/s", gbps) : std::string{"took over ten seconds"};
+    if (opts.mnnvl == mnnvl_mode::require) {
+      throw sirius::internal_exception(
+        "exchange: a write to rank {} over the NVLink fabric {}; UCX did not take cuda_ipc "
+        "(check UCX_TLS and UCX_CUDA_IPC_ENABLE_MNNVL)",
+        peer,
+        speed);
+    }
+    SIRIUS_LOG_WARN(
+      "exchange: a write to rank {} over the NVLink fabric {}; UCX did not take cuda_ipc (check "
+      "UCX_TLS and UCX_CUDA_IPC_ENABLE_MNNVL)",
+      peer,
+      speed);
+  }
 }
+
+}  // namespace
 
 std::shared_ptr<exchange_service> make_nixl_exchange(rank_t rank,
                                                      std::vector<std::string> peers,
@@ -61,12 +130,24 @@ std::shared_ptr<exchange_service> make_nixl_exchange(rank_t rank,
   // A one-rank world has no peers; still give the receive ring frames, since frame_ring needs one.
   auto const peer_count = static_cast<std::uint32_t>(peers.size() > 1 ? peers.size() - 1 : 1);
   auto b                = std::make_shared<bundle>();
-  b->send               = std::make_unique<frame_ring>(opts.send_frames, opts.frame_bytes);
-  b->recv = std::make_unique<frame_ring>(opts.recv_frames_per_peer * peer_count, opts.frame_bytes);
+  auto const memory     = ring_memory_for(opts.mnnvl);
+  b->send               = std::make_unique<frame_ring>(opts.send_frames, opts.frame_bytes, memory);
+  b->recv =
+    std::make_unique<frame_ring>(opts.recv_frames_per_peer * peer_count, opts.frame_bytes, memory);
+  if (opts.mnnvl != mnnvl_mode::off && !b->recv->in_fabric_memory()) {
+    SIRIUS_LOG_WARN(
+      "exchange: rank {} has no fabric memory ({}); its rings use cudaMalloc, and peers on other "
+      "nodes reach it over the network",
+      rank,
+      b->recv->why_not_fabric());
+  }
   nixl_fabric::config cfg{rank, std::move(peers)};
   cfg.staging = opts.staging;
+  cfg.mnnvl   = opts.mnnvl;
+  cfg.lanes   = opts.tcp_lanes;
   b->fabric   = std::make_unique<nixl_fabric>(std::move(cfg), *b->send, *b->recv);
-  b->service  = std::make_unique<exchange_service>(
+  probe_nvlink_peers(*b->fabric, opts);
+  b->service = std::make_unique<exchange_service>(
     *b->fabric, *b->send, *b->recv, gpu, host, std::move(opts.transport_options));
   return std::shared_ptr<exchange_service>(b, b->service.get());
 }

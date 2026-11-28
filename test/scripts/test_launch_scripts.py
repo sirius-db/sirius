@@ -1,14 +1,19 @@
-"""Tests of scripts/compare_answers.py and scripts/sirius_distributed_config.py. No GPU."""
+"""Tests of scripts/compare_answers.py, sirius_distributed_config.py, launcher_env.sh and
+sirius_net.sh. No GPU."""
 
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import compare_answers  # noqa: E402
+import sirius_rank_cpus  # noqa: E402
 
 TIME = "Run Time (s): real 0.5 user 0.1 sys 0.1"
 
@@ -107,6 +112,12 @@ class DistributedConfig(unittest.TestCase):
             done.stdout.splitlines(), ["export SIRIUS_CLUSTER=${SIRIUS_CLUSTER:-x}"]
         )
 
+    def test_rails(self):
+        done = self.read("sirius:\n  distributed:\n    ucx: { rails: true }\n")
+        self.assertEqual(
+            done.stdout, "export SIRIUS_UCX_RAILS=${SIRIUS_UCX_RAILS:-true}\n"
+        )
+
     def test_no_file(self):
         done = self.read()
         self.assertEqual((done.returncode, done.stdout), (0, ""))
@@ -127,6 +138,179 @@ class DistributedConfig(unittest.TestCase):
         done = self.read(fallback, {"SIRIUS_CONFIG_FILE": "/nonexistent/sirius.yaml"})
         self.assertNotEqual(done.returncode, 0)
         self.assertEqual(done.stdout, "")
+
+
+class LauncherEnv(unittest.TestCase):
+    def source(self, rails, env):
+        """Sources launcher_env.sh on a host whose rail NICs are `rails` ("" is none)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy(SCRIPTS / "launcher_env.sh", tmp)
+            found = f"echo {rails}" if rails else "return 1"
+            Path(tmp, "sirius_net.sh").write_text(
+                f"sirius_rail_devices() {{ {found}; }}\n"
+            )
+            # Every variable has a fallback: bash -u would end a case that left one unset, and
+            # the cases that expect a failure would pass on that.
+            show = (
+                "$UCX_TLS ${UCX_NET_DEVICES:-unset} "
+                "${SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING:-unset}"
+            )
+            return subprocess.run(
+                [
+                    "bash",
+                    "-euc",
+                    f'source "$1/launcher_env.sh" && echo "{show}"',
+                    "-",
+                    tmp,
+                ],
+                env={"PATH": "/usr/bin:/bin", **env},
+                capture_output=True,
+                text=True,
+            )
+
+    def test_rails_write_over_nixl(self):
+        done = self.source("mlx5_0:1,mlx5_1:1", {"SIRIUS_UCX_RAILS": "1"})
+        self.assertEqual(done.stdout, "all mlx5_0:1,mlx5_1:1 never\n", done.stderr)
+
+    def test_rails_keep_a_set_host_staging(self):
+        env = {
+            "SIRIUS_UCX_RAILS": "true",
+            "SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING": "auto",
+        }
+        done = self.source("mlx5_0:1,mlx5_1:1", env)
+        self.assertEqual(done.stdout, "all mlx5_0:1,mlx5_1:1 auto\n", done.stderr)
+
+    def test_tcp_leaves_host_staging_to_the_gateway(self):
+        done = self.source("mlx5_0:1,mlx5_1:1", {"UCX_NET_DEVICES": "bond0"})
+        self.assertEqual(
+            done.stdout, "cuda_copy,cuda_ipc,tcp,self bond0 unset\n", done.stderr
+        )
+
+    def test_rails_keep_set_ucx_values(self):
+        env = {"SIRIUS_UCX_RAILS": "1", "UCX_TLS": "rc", "UCX_NET_DEVICES": "mlx5_0:1"}
+        done = self.source("mlx5_0:1,mlx5_1:1", env)
+        self.assertEqual(done.stdout, "rc mlx5_0:1 never\n", done.stderr)
+
+    def test_rails_takes_0_or_1(self):
+        done = self.source("mlx5_0:1,mlx5_1:1", {"SIRIUS_UCX_RAILS": "rails"})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("SIRIUS_UCX_RAILS takes 0 or 1", done.stderr)
+
+    def test_rails_without_rail_nics_fail(self):
+        done = self.source("", {"SIRIUS_UCX_RAILS": "1"})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("needs GPU rail NICs", done.stderr)
+
+
+class RailDevices(unittest.TestCase):
+    def rails(self, ports):
+        """sirius_rail_devices on a host with these (device, port, interface, state, speed, bonded)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for dev, port, net, state, speed, bonded in ports:
+                ib = Path(tmp, "class/infiniband", dev)
+                (ib / "ports" / str(port)).mkdir(parents=True)
+                (ib / "ports" / str(port) / "state").write_text(f"{state}\n")
+                (ib / "device/net" / net).mkdir(parents=True)
+                (ib / "device/net" / net / "dev_port").write_text(f"{port - 1}\n")
+                Path(tmp, "class/net", net).mkdir(parents=True)
+                Path(tmp, "class/net", net, "speed").write_text(f"{speed}\n")
+                if bonded:
+                    Path(tmp, "class/net", net, "master").touch()
+            return subprocess.run(
+                [
+                    "bash",
+                    "-euc",
+                    'source "$1" && sirius_rail_devices "$2"',
+                    "-",
+                    SCRIPTS / "sirius_net.sh",
+                    tmp,
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+    def test_one_port_per_device(self):
+        done = self.rails(
+            [
+                ("mlx5_0", 1, "eth0", "4: ACTIVE", 200000, False),
+                ("mlx5_1", 1, "rail1", "4: ACTIVE", 400000, False),
+                ("mlx5_2", 1, "rail2", "4: ACTIVE", 400000, False),
+                ("mlx5_3", 1, "eth3", "4: ACTIVE", 400000, True),
+                ("mlx5_4", 1, "rail4", "1: DOWN", 400000, False),
+                ("mlx5_5", 1, "eth5", "4: ACTIVE", 200000, False),
+            ]
+        )
+        self.assertEqual(done.stdout, "mlx5_1:1,mlx5_2:1\n", done.stderr)
+
+    def test_a_port_other_than_1(self):
+        done = self.rails(
+            [
+                ("mlx4_0", 1, "ib0", "1: DOWN", 400000, False),
+                ("mlx4_0", 2, "ib1", "4: ACTIVE", 400000, False),
+                ("mlx4_1", 1, "ib2", "4: ACTIVE", 400000, False),
+                ("mlx4_1", 2, "ib3", "4: ACTIVE", 400000, True),
+            ]
+        )
+        self.assertEqual(done.stdout, "mlx4_0:2,mlx4_1:1\n", done.stderr)
+
+    def test_fewer_than_two_rails_is_none(self):
+        done = self.rails([("mlx5_0", 1, "rail0", "4: ACTIVE", 400000, False)])
+        self.assertEqual((done.returncode, done.stdout), (1, ""))
+
+
+class RankCpus(unittest.TestCase):
+    # Socket 0: cores 0-3 with hyperthreads 8-11, two GPUs. Socket 1: cores 4-7 and 12-15, one.
+    GPUS = {
+        "0000:03:00.0": "0-3,8-11",
+        "0000:73:00.0": "0-3,8-11",
+        "0000:83:00.0": "4-7,12-15",
+    }
+
+    def share(self, bus_id):
+        def read(path):
+            cpu = re.fullmatch(r"/sys/devices/system/cpu/cpu(\d+)/topology/.*", path)
+            if cpu:
+                return f"{int(cpu[1]) % 8},{int(cpu[1]) % 8 + 8}"
+            device, name = path.rsplit("/", 1)
+            local = self.GPUS[device.rsplit("/", 1)[1]]
+            return {"vendor": "0x10de", "class": "0x030200", "local_cpulist": local}[
+                name
+            ]
+
+        smi = subprocess.CompletedProcess([], 0, f"0000{bus_id.upper()}\n", "")
+        devices = ["/sys/bus/pci/devices/" + gpu for gpu in self.GPUS]
+        with mock.patch.object(sirius_rank_cpus, "read", read), mock.patch.object(
+            sirius_rank_cpus.glob, "glob", return_value=devices
+        ), mock.patch.object(sirius_rank_cpus.subprocess, "run", return_value=smi):
+            return sirius_rank_cpus.gpu_share("0", set(range(16)))
+
+    def test_gpus_on_one_socket_split_its_cores(self):
+        self.assertEqual(self.share("0000:03:00.0"), [0, 8, 1, 9])
+        self.assertEqual(self.share("0000:73:00.0"), [2, 10, 3, 11])
+
+    def test_a_gpu_alone_on_its_socket_takes_it(self):
+        self.assertEqual(
+            sorted(self.share("0000:83:00.0")), [4, 5, 6, 7, 12, 13, 14, 15]
+        )
+
+    def test_a_rank_started_with_fewer_cpus_keeps_them(self):
+        with mock.patch.object(
+            sirius_rank_cpus.os, "sched_getaffinity", return_value={2, 3, 8}
+        ), mock.patch.object(
+            sirius_rank_cpus.os, "cpu_count", return_value=16
+        ), mock.patch.object(
+            sirius_rank_cpus.sys, "argv", ["sirius_rank_cpus.py", "auto", "0"]
+        ), mock.patch(
+            "builtins.print"
+        ) as printed:
+            sirius_rank_cpus.main()
+        printed.assert_called_once_with(3, "2-3,8")
+
+    def test_ranges(self):
+        self.assertEqual(sirius_rank_cpus.ranges({0, 1, 8, 9, 12}), "0-1,8-9,12")
+        self.assertEqual(sirius_rank_cpus.cpulist("0-1,8-9,12\n"), [0, 1, 8, 9, 12])
 
 
 if __name__ == "__main__":

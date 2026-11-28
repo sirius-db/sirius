@@ -77,10 +77,17 @@ fixed-width or `STRING`.
 
 ### Transport (`src/exchange/transport.*`, `messages.*`, `fabric.hpp`)
 
-Each rank has a send ring and a receive ring. Both are fixed-size frames in one plain `cudaMalloc`
-region, and they are the only memory NIXL registers. They are not pool memory: UCX `cuda_ipc`
-cannot export stream-ordered allocations, and a pool block could be reused while a peer's write
-into it is still landing.
+Each rank has a send ring and a receive ring. Both are fixed-size frames in one device region,
+and they are the only memory NIXL registers. The region comes from `cuMemCreate` with a fabric
+handle where the GPU and driver allow it (see [NVLink between nodes](#nvlink-between-nodes-mnnvl)),
+else from `cudaMalloc`. It is never pool memory: UCX `cuda_ipc` cannot export stream-ordered
+allocations, and a pool block could be reused while a peer's write into it is still landing.
+
+- **Writes.** One write covers as many consecutive frames as the sender holds consecutive send
+  frames and credits for, up to half of the smaller of a peer's credits and the send frames, so
+  two writes to a peer can be in flight.
+  NVLink between nodes needs large writes: one write at a time moves about 450 GB/s at 16 MB,
+  700 at 128 MB and 770 at 1 GB, because each write costs about 15 µs.
 
 - **Credits.** The receive ring is split evenly among the peers at start. A sender writes only
   into the frames it holds, and gets each one back once the receiver has copied it out. There is
@@ -126,11 +133,96 @@ write access, a write is one device-to-host copy into that peer's mirror, then a
 naming the offset and size; the peer copies the bytes host-to-device into its receive ring and
 only then passes the write's own notification to the transport. Credits are unchanged: a mirror
 frame is reused only after the transport has copied its receive frame out.
+`auto` also stages a same-host peer on another GPU when more than two ranks share the host (ranks
+listed under one host name in `sirius_exchange_peers`), its own GPU has no NVLink (NVML's link
+states) and the peer keeps a mirror, as a rank on such a host and GPU does. Direct writes among
+many GPUs share the host's PCIe links (8 RTX PRO 6000 on one host, every rank to every other: 6.3
+GB/s per GPU direct, 24.2 through the mirrors), and among four they stopped GPFS reads on a host
+whose storage NICs sit on the GPUs' PCIe switches. The bound is set by that stall: the four GPUs
+of one socket there move 32 GB/s per GPU direct and 24 staged. Two ranks on a host write each
+other directly (48 GB/s each way there), and so, where the two GPUs have peer access, does a rank
+whose peer has no mirror or whose mirror it cannot map.
 `SET sirius_exchange_host_staging = 'always'` (or `'never'`) overrides the choice (default `auto`). Each rank logs
 its path to every peer at start. Staging maps the peer's mirror from this host's `/dev/shm`, so it
-works only between ranks on one host that share `/dev/shm`; ranks on several hosts, or in separate
-IPC namespaces, need `never` until #2372. A rank that crashes leaves its mirror in `/dev/shm`;
-the launchers in `scripts/` remove mirrors whose process is gone before they start.
+works only between ranks on one host that share `/dev/shm`; ranks in separate IPC namespaces on one
+host need `never`. A rank that crashes or is killed leaves its mirror in `/dev/shm`, as the ranks
+of a `sirius_slurm.sbatch` job do when it ends; the launchers in `scripts/` remove mirrors whose
+process is gone before they start.
+
+**TCP lanes.** Between hosts, UCX's TCP transport moves host memory directly but emulates a put of
+GPU memory, at about 0.2 GB/s, and one TCP connection is bound by the core that copies its socket.
+The hello therefore also carries the host's kernel boot id, and with `auto` a rank reaches a peer
+with another boot id, which the NVLink fabric does not reach (below), over *lanes*: extra NIXL agents, each with its own UCX worker, connection and
+thread, pinned to the CPUs NVML places next to the GPU. A lane's metadata travels in a notification
+of the main agent, so lanes need no listener ports. A lane initiates its own writes, into the
+peer's lane of the same number, not through the writer agent. Each lane owns pinned send slots of
+one frame, so the transport sends such a peer one frame per write instead of a run of frames.
+A write copies the frame device-to-host into a free slot (the send frame is then free), and the
+lane thread writes the slot into the peer's receive mirror; the peer lands it as a host-staged
+write. A rank makes its mirror, if it has none yet, when it first chooses this path for a peer.
+`sirius_exchange_tcp_lanes` sets the lanes per rank (default 16 shared by the ranks on the host,
+at least 2), and `sirius_exchange_recv_frames_per_peer` the frames a peer may have in flight (a
+lane carries one). Every rank must use the same `sirius_exchange_host_staging` and
+`sirius_exchange_mnnvl`; a rank offered
+lanes by a peer it reaches another way fails to connect, saying so. On two GB200 nodes over one
+200 Gb/s port (`[nixl_bandwidth]`, 16 receive frames per peer), 1+1 ranks with 16 lanes moved
+19.0 GB/s each way instead of 0.19, and 4+4 ranks with 4 lanes about 10 GB/s per rank, 23 GB/s
+across the link each way; raw TCP reaches 24.75 there. These figures are from the branch the
+lanes were ported from, with UCX `tcp` on bond0. On this code, two GB200 nodes with 4 ranks each
+and 4 lanes per rank moved 8.9 GB/s per rank over `tcp` on bond0 (8 receive frames per peer, 20
+GB/s across the link each way), and 33 to 38 GB/s per rank with the lanes on the rail NICs
+(`SIRIUS_UCX_RAILS=1`), where UCX carries them over RDMA.
+
+On a cluster with RDMA between hosts and no fabric memory, set
+`sirius_exchange_host_staging = 'never'`: direct NIXL writes over the RDMA NICs are faster than
+lanes there, and `auto` does not yet tell such a cluster from one with TCP only. The launch
+scripts set `never` for the gateway's ranks when `SIRIUS_UCX_RAILS=1` puts UCX on the rail
+NICs, unless `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING` is set. A lane is a UCX connection, so on
+the rails it is RDMA of the host copy, not TCP. On two GB200 nodes with 4 ranks each, the fabric
+off (`[nixl_bandwidth]`, every rank to every other), `never` moved 64.8 GB/s per rank and `auto`
+33.0; with all traffic across the link both ways (`[nixl_pairs]`, 4 pairs) 380 GB/s against 277.
+One way only, `never` was 2 to 27% slower, and TPC-H at SF3000 ran the same with both (73.0
+and 73.7 s warm).
+
+### NVLink between nodes (MNNVL)
+
+On GB200 NVL systems, GPUs on different nodes of one NVLink domain reach each other's memory over
+NVLink, at up to about 780 GB/s each way per GPU pair, against about 98 GB/s over the RDMA rails.
+UCX `cuda_ipc` does this through the IMEX daemon, but only for memory with a fabric handle
+(`CU_MEM_HANDLE_TYPE_FABRIC`). Plain `cudaMalloc` memory has only a legacy IPC handle, and UCX then
+moves it over the network without a word. So with `sirius_exchange_mnnvl` at `auto` (the default)
+or `require`, a rank allocates both rings with `cuMemCreate` and a fabric handle
+(`src/exchange/fabric_memory.*`), rounded up to the allocation granularity. Without fabric
+handles (no support, or no IMEX channel open), `auto` logs why and uses `cudaMalloc`; `require`
+fails.
+
+The hello also carries whether the receive ring is in fabric memory and the GPU's NVLink domain:
+the cluster UUID and clique id from NVML's fabric info (`nvidia-smi -q`, section Fabric). A peer
+whose GPU is in this GPU's domain, both rings in fabric memory, gets the path "NIXL over the
+NVLink fabric" (`choose_path()` in `src/exchange/path_choice.*`), on this host or another; every
+other peer gets the path described above (TCP lanes to another host). `require` fails at connect for a peer that cannot be reached that way.
+
+UCX picks its transport per endpoint and says nothing when `cuda_ipc` cannot map a peer's memory.
+So after connecting, a rank times up to 8 writes, as large as the transport's largest, to each
+peer on the fabric path, into its own credit frames there, and logs the best rate: other ranks
+still connecting can stall a write. Below 150 GB/s it warns
+(`require`: fails) that UCX did not take `cuda_ipc`. `UCX_PROTO_INFO=y` prints the transport of
+each UCX protocol, for example `cuda_ipc/cuda` for a put from `cuda/GPU0` to `cuda/dev[0]`.
+
+The ring sizes are settings, the same on every rank: `sirius_exchange_frame_bytes` (8 MiB),
+`sirius_exchange_send_frames` (16, shared by the peers) and `sirius_exchange_recv_frames_per_peer`
+(8). A rank's ring memory is `frame × (send frames + receive frames × peers)`, outside the GPU
+memory budget: 576 MiB with 8 ranks by default. For NVLink between nodes, set 16 MiB frames, 32
+send frames and 16 receive frames per peer, which keep two 128 MiB writes to a peer in flight,
+and `SIRIUS_UCX_RAILS=1`: 2.25 GiB with 8 ranks, 18.3 GiB with 72 (credits on demand, #2371,
+would bound it). With that sizing one GPU pair moved 670 to 687 GB/s, and 606 with 8 receive
+frames per peer; with `tcp` on bond0 for the notifications, 623 to 652 and 471 to 488. With the
+default sizes it moved 312.
+
+`scripts/distributed_test_nixl_pairs.sh <node1>,<node2>` runs the hidden `[nixl_pairs]` test on
+two nodes of a Slurm partition, one rank per GPU paired with the same GPU on the other node: one
+and four pairs, one and both directions, 1 GB and 128 MB batches, then smaller batches, then a
+check of every value. It writes `summary.md` with GB/s per phase next to raw NIXL's.
 
 ### Operators (`src/op/sirius_physical_exchange_{sink,source}.*`)
 
@@ -168,7 +260,9 @@ before the stream's source is planned, and replays it when the source attaches.
 ### Collectives (`src/exchange/all_gather.*`)
 
 `all_gather()` sends one small table from every rank to every rank and blocks until all have
-arrived. It is used three ways:
+arrived. Its tables are queued without waiting for room in the send queue (`max_queued_bytes`),
+where exchange sinks' smaller batches can otherwise hold a join's filter back until the scan it is
+for has sent everything. It is used three ways:
 
 - **`SORT_SAMPLE` in distributed mode.** Each rank shares up to 1024 evenly spaced rows of its
   sorted sample, and every rank merges them all in rank order. From the same global sample each
@@ -322,7 +416,7 @@ pixi run build-distributed
 
 | Variable | Default | Why |
 |---|---|---|
-| `UCX_TLS` | `cuda_copy,cuda_ipc,tcp,self` | The transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout"). |
+| `UCX_TLS`, `UCX_NET_DEVICES` | `cuda_copy,cuda_ipc,tcp,self` on the interface of the rank's address | The transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout"). `SIRIUS_UCX_RAILS=1` takes every UCX transport on the GPU rail NICs (`sirius_rail_devices` in `scripts/sirius_net.sh`: active RDMA ports in no bond, at the highest link speed). They carry UCX's notifications over RC, which the exchange over NVLink needs at full speed: 4 GPU pairs both ways moved 5.8 TB/s, against 4.9 to 5.2 with tcp on bond0 |
 | `DUCKDB_AGENT_MODE` | 0 | DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse that output |
 
 ## Running TPC-H Q12 on 4 GPUs
@@ -373,8 +467,9 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 - **Unspillable buffers:** an unordered `EXCHANGE_SOURCE` queues arrivals in its port's
   repository, where they spill like any port's batches. Arrivals before the port is wired, an
   ordered gather's batches, and batches held for a stream not yet attached stay outside any
-  repository and cannot spill. Sends block once a rank's queued sends exceed 1 GiB
-  (`transport::options::max_queued_bytes`; #2376).
+  repository and cannot spill. Exchange sinks' sends block once a rank's queued sends exceed
+  1 GiB (`transport::options::max_queued_bytes`; #2376); an all-gather's tables are queued over
+  it.
 - **Blocking collectives:** `SORT_SAMPLE` and Bloom merges block a GPU worker thread until every
   rank's contribution arrives (#2375).
 - **Failures:** a query that fails on one rank (an error, an exhausted retry) is aborted on every
@@ -393,14 +488,20 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   [gateway](distributed-gateway.md) does this restart.
 - **Hosts:** two hosts, one GPU each, ran TPC-H Q12 at SF100 through the gateway, with UCX on
   TCP (`UCX_TLS` with `tcp`, `UCX_NET_DEVICES` set to the hosts' shared interface). The launch
-  scripts set both by default: `UCX_TLS` in `launcher_env.sh`, and `UCX_NET_DEVICES` from the
-  rank's address ([quick start](distributed-quickstart.md)).
-  More than two hosts, and RDMA between hosts, are untested (#2372).
-- **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by default).
+  scripts set both by default (`launcher_env.sh`, [quick start](distributed-quickstart.md)):
+  `tcp` on the interface of the rank's address, or with `SIRIUS_UCX_RAILS=1` the GPU rail NICs
+  with every UCX transport.
+  Between nodes of one NVLink domain the data goes over the
+  [NVLink fabric](#nvlink-between-nodes-mnnvl), which two and four GB200 nodes with 4 GPUs each
+  ran for all of TPC-H at SF30000, and between other hosts over TCP lanes (#2372).
+- **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by
+  default: `sirius_exchange_recv_frames_per_peer`, `sirius_exchange_frame_bytes`).
   Clusters much larger than 8 ranks would need credits granted on demand (#2371).
-- **Ring memory:** the rings take (16 + 8 x (ranks - 1)) x 8 MiB per GPU (192 MiB at 2 ranks,
-  576 MiB at 8), allocated outside the GPU memory space's budget, which does not shrink for
-  them. Reserving them from the space instead stalls any task whose request is clamped to the
+- **Ring memory:** by default the rings take (16 + 8 x (ranks - 1)) x 8 MiB per GPU (192 MiB
+  at 2 ranks, 576 MiB at 8; 2.25 GiB at 8 with the sizing for NVLink between nodes), allocated
+  outside the GPU memory space's budget, which does not
+  shrink for them. A rank on the TCP lanes path also pins, in host memory, a mirror the size of
+  its receive ring and two send slots of one frame per lane. Reserving them from the space instead stalls any task whose request is clamped to the
   space's whole budget, so charging them waits for the budget to shrink with them (#2371).
 - **CI:** the one-rank-per-process tests (`[nixl_multiprocess]`) need several GPUs and run only on
   developer machines (#2480).
@@ -410,7 +511,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | Tag | Covers |
 |---|---|
 | `[exchange][wire]`, `[exchange][batch_io]` | Headers and refusals; batches through 64 KiB to 1 MiB frames to the GPU and host |
-| `[exchange][transport]` | All-to-all on 3 and 4 ranks over the loopback fabric; one credit per peer; shuffled notifications; no room; failed writes |
+| `[exchange][transport]` | All-to-all on 3 and 4 ranks over the loopback fabric; one credit per peer; writes of several frames; shuffled notifications; no room; failed writes |
 | `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather, early arrivals, hints, failure; NULL keys to every rank; `VALUES` on rank 0 |
 | `[exchange][byte_range]` | Byte spans tile every file exactly once across ranks; one file split in two; balance by bytes |
 | `[exchange][collectives]` | All-gather; distributed `SORT_SAMPLE` on skewed and empty inputs; `SORT_SAMPLE` feeding a range exchange |
@@ -420,6 +521,9 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `[pipeline][finalize_listener]` | The callbacks run when an operator's pipeline ends |
 | `[exchange][nixl]` | Two ranks in one process over NIXL |
 | `[nixl_multiprocess]` (hidden) | One rank per process and GPU: `pixi run scripts/distributed_test_nixl.sh 4` |
+| `[exchange][path]` | The path rule (NVLink domain, fabric rings, staging, `require`); a frame ring in fabric memory |
+| `[nixl_bandwidth]` (hidden) | All-to-all bandwidth, one rank per process: `TEST='[nixl_bandwidth]' scripts/distributed_test_nixl.sh 4` |
+| `[nixl_pairs]` (hidden) | GPU pairs on two nodes, 1 GB to 64 KB batches, both directions, every value checked: `scripts/distributed_test_nixl_pairs.sh <node1>,<node2>` |
 | `[dynamic_filter][probe]` | Merging two Blooms of one capacity |
 
 ## Files

@@ -16,6 +16,7 @@
 
 #include "exchange/exchange_service.hpp"
 
+#include "log/logging.hpp"
 #include "sirius/exception.hpp"
 
 #include <cucascade/data/data_batch.hpp>
@@ -41,6 +42,11 @@ std::string what_of(std::exception_ptr const& error)
   }
 }
 
+std::uint64_t bytes_of(cucascade::data_batch& batch)
+{
+  return batch.to_read_only().get_data()->get_size_in_bytes();
+}
+
 }  // namespace
 
 exchange_service::exchange_service(fabric& fabric,
@@ -49,11 +55,23 @@ exchange_service::exchange_service(fabric& fabric,
                                    cucascade::memory::memory_space& gpu,
                                    cucascade::memory::memory_space* host,
                                    transport::options opts)
+  : _rank{fabric.rank()}, _world_size{fabric.world_size()}
 {
   transport::callbacks cb{[this](stream_id stream,
                                  rank_t from,
                                  std::uint64_t batch,
                                  std::shared_ptr<cucascade::data_batch> data) {
+                            if (from != _rank && data) {
+                              auto const bytes = bytes_of(*data);
+                              std::lock_guard lock{_mutex};
+                              // A batch that arrives after its query retired would start a
+                              // traffic entry that nothing drops.
+                              if (!retired(query_of(stream))) {
+                                auto& t = _traffic[query_of(stream)];
+                                t.received_bytes += bytes;
+                                ++t.received_batches;
+                              }
+                            }
                             if (auto r = receiver_of(stream, {from, batch, data})) {
                               r->on_batch(from, batch, std::move(data));
                             }
@@ -85,8 +103,6 @@ exchange_service::exchange_service(fabric& fabric,
                                 "exchange: query {} failed on rank {}: {}", query, from, what)));
                           }};
   auto started = std::make_unique<transport>(fabric, send, recv, gpu, host, std::move(cb), opts);
-  _rank        = started->rank();
-  _world_size  = started->world_size();
   // Under the lock: the engine thread may already be in a callback that reads _transport.
   std::lock_guard lock{_mutex};
   _transport = std::move(started);
@@ -193,8 +209,10 @@ void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receive
 
 void exchange_service::send(stream_id stream,
                             rank_t to,
-                            std::shared_ptr<cucascade::data_batch> batch)
+                            std::shared_ptr<cucascade::data_batch> batch,
+                            bool wait_for_room)
 {
+  auto const bytes = to != _rank && batch ? bytes_of(*batch) : 0;
   std::shared_ptr<transport> running;
   {
     std::lock_guard lock{_mutex};
@@ -206,13 +224,19 @@ void exchange_service::send(stream_id stream,
     }
     running = _transport;
   }
-  running->send(stream, to, std::move(batch));
+  running->send(stream, to, std::move(batch), wait_for_room);
   // An abort that arrived meanwhile may have woken this sender without queueing its batch: it
   // fails like one that started after the abort.
   std::lock_guard lock{_mutex};
   if (_error) { std::rethrow_exception(_error); }
   if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
     std::rethrow_exception(it->second);
+  }
+  // Counted once the send was not refused; not for a query that retired while it waited.
+  if (bytes > 0 && !retired(query_of(stream))) {
+    auto& t = _traffic[query_of(stream)];
+    t.sent_bytes += bytes;
+    ++t.sent_batches;
   }
 }
 
@@ -286,6 +310,18 @@ void exchange_service::forget_range(distributed_query_id first, distributed_quer
   std::erase_if(_detached, [&](stream_id stream) { return in_range(query_of(stream)); });
   std::erase_if(_held, [&](auto const& h) { return in_range(query_of(h.first)); });
   _aborted.erase(_aborted.lower_bound(first), _aborted.upper_bound(last));
+  for (auto t = _traffic.lower_bound(first); t != _traffic.end() && t->first <= last;) {
+    SIRIUS_LOG_INFO(
+      "exchange: query {} on rank {}: sent {:.3f} GB in {} batches, received {:.3f} GB in {} "
+      "batches",
+      t->first,
+      _rank,
+      static_cast<double>(t->second.sent_bytes) / 1e9,
+      t->second.sent_batches,
+      static_cast<double>(t->second.received_bytes) / 1e9,
+      t->second.received_batches);
+    t = _traffic.erase(t);
+  }
   if (_transport) { _transport->forget(first, last); }
 }
 

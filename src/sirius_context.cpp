@@ -1430,10 +1430,24 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
                                               params.exchange_peers.size());
       }
       auto& memory = get_memory_manager();
-      auto* gpu    = memory.get_memory_space(cucascade::memory::Tier::GPU, 0);
-      auto* host   = memory.get_memory_space(cucascade::memory::Tier::HOST, 0);
+      // The exchange's rings and fabric are on the first GPU only, and a rank that runs tasks
+      // on several GPUs has not been validated.
+      if (auto const gpus = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size();
+          gpus != 1) {
+        throw sirius::invalid_input_exception(
+          "a distributed rank runs on one GPU, but this process has {}: start one rank per GPU "
+          "(CUDA_VISIBLE_DEVICES)",
+          gpus);
+      }
+      auto* gpu  = memory.get_memory_space(cucascade::memory::Tier::GPU, 0);
+      auto* host = memory.get_memory_space(cucascade::memory::Tier::HOST, 0);
       sirius::exchange::nixl_exchange_options opts;
-      opts.staging = params.exchange_host_staging;
+      opts.staging              = params.exchange_host_staging;
+      opts.mnnvl                = params.exchange_mnnvl;
+      opts.frame_bytes          = params.exchange_frame_bytes;
+      opts.send_frames          = params.exchange_send_frames;
+      opts.tcp_lanes            = params.exchange_tcp_lanes;
+      opts.recv_frames_per_peer = params.exchange_recv_frames_per_peer;
       // A batch with no room asks the GPU's downgrade executor for it, as a task would.
       // terminate() shuts the exchange down before the executors go.
       opts.transport_options.request_room = [&downgrade = get_downgrade_executor(gpu->get_id()),
