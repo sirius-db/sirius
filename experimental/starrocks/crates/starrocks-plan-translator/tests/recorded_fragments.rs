@@ -6,13 +6,16 @@
 
 use starrocks_plan_translator::{ExchangeInput, PlanTranslator, TranslateError, TranslatedPlan};
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
-use starrocks_thrift::plan_nodes::TPlanNodeType;
+use starrocks_thrift::plan_nodes::{TJoinOp, TPlanNodeType};
+use substrait::proto::join_rel::JoinType;
 use thrift::protocol::{TBinaryInputProtocol, TSerializable};
 
 /// `SELECT region, SUM(amount) FROM FILES(...) GROUP BY region` on 2 CNs: a leaf fragment
 /// (file scan, partial SUM, HASH_PARTITIONED sink on `region`), a merge fragment (EXCHANGE 2,
 /// merge SUM, UNPARTITIONED sink) and a gather fragment (EXCHANGE 4, result sink).
 const TWO_CN_GROUP_BY: &str = "2cn-files-group-by";
+/// Fragments with RIGHT SEMI joins, which used to fail with "hash join type is unsupported".
+const SEMI_ANTI_JOIN: &str = "tpch-sf1000-semi-anti-join";
 
 /// Reads a recorded fragment from a fixture directory.
 fn load(dir: &str, name: &str) -> TExecPlanFragmentParams {
@@ -110,4 +113,91 @@ fn group_by_gather_reads_the_exchange() {
     assert!(function_names(&plan).is_empty());
     assert_eq!(stream_types(&plan, 4), ["VARCHAR", "BIGINT"]);
     assert_eq!(plan.output_partition_columns, None);
+}
+
+/// Join ops of the recorded fragment's hash joins, in plan order.
+fn join_ops(dir: &str, name: &str) -> Vec<TJoinOp> {
+    load(dir, name)
+        .fragment
+        .and_then(|fragment| fragment.plan)
+        .unwrap()
+        .nodes
+        .iter()
+        .filter_map(|node| node.hash_join_node.as_ref().map(|join| join.join_op))
+        .collect()
+}
+
+/// Every Substrait join in the plan, outermost first, with the functions its condition calls.
+fn joins(plan: &TranslatedPlan) -> Vec<(JoinType, Vec<String>)> {
+    use substrait::proto::extensions::simple_extension_declaration::MappingType;
+    use substrait::proto::{Expression, Rel, expression, function_argument, plan_rel, rel};
+
+    fn called(expr: &Expression, out: &mut Vec<u32>) {
+        if let Some(expression::RexType::ScalarFunction(function)) = &expr.rex_type {
+            out.push(function.function_reference);
+            for argument in &function.arguments {
+                if let Some(function_argument::ArgType::Value(value)) = &argument.arg_type {
+                    called(value, out);
+                }
+            }
+        }
+    }
+    fn walk(rel: &Rel, out: &mut Vec<(JoinType, Vec<u32>)>) {
+        let inputs: Vec<&Rel> = match rel.rel_type.as_ref().unwrap() {
+            rel::RelType::Join(join) => {
+                let mut anchors = Vec::new();
+                called(join.expression.as_ref().unwrap(), &mut anchors);
+                out.push((JoinType::try_from(join.r#type).unwrap(), anchors));
+                vec![
+                    join.left.as_deref().unwrap(),
+                    join.right.as_deref().unwrap(),
+                ]
+            }
+            rel::RelType::Project(project) => vec![project.input.as_deref().unwrap()],
+            rel::RelType::Filter(filter) => vec![filter.input.as_deref().unwrap()],
+            rel::RelType::Aggregate(aggregate) => vec![aggregate.input.as_deref().unwrap()],
+            rel::RelType::Sort(sort) => vec![sort.input.as_deref().unwrap()],
+            rel::RelType::Fetch(fetch) => vec![fetch.input.as_deref().unwrap()],
+            _ => Vec::new(),
+        };
+        for input in inputs {
+            walk(input, out);
+        }
+    }
+
+    let names: std::collections::HashMap<u32, String> = plan
+        .plan
+        .extensions
+        .iter()
+        .filter_map(|declaration| match declaration.mapping_type.as_ref() {
+            Some(MappingType::ExtensionFunction(function)) => {
+                Some((function.function_anchor, function.name.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let Some(plan_rel::RelType::Root(root)) = plan.plan.relations[0].rel_type.as_ref() else {
+        panic!("expected a root relation");
+    };
+    let mut found = Vec::new();
+    walk(root.input.as_ref().unwrap(), &mut found);
+    found
+        .into_iter()
+        .map(|(kind, anchors)| {
+            let called = anchors.iter().map(|anchor| names[anchor].clone()).collect();
+            (kind, called)
+        })
+        .collect()
+}
+
+/// q20's root fragment: `s_suppkey IN (...)` is a RIGHT SEMI join keeping the supplier side.
+#[test]
+fn q20_right_semi_join_translates() {
+    assert_eq!(
+        join_ops(SEMI_ANTI_JOIN, "q20-root"),
+        [TJoinOp::RIGHT_SEMI_JOIN]
+    );
+    let plan = translate(SEMI_ANTI_JOIN, "q20-root").unwrap();
+    let kinds: Vec<_> = joins(&plan).into_iter().map(|(kind, _)| kind).collect();
+    assert_eq!(kinds, [JoinType::RightSemi]);
 }
