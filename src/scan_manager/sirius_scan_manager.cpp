@@ -4646,19 +4646,23 @@ void reserve_cufile_arenas(scan_manager_config const& config,
   for (std::size_t i = 0; i < gpu_ids.size(); ++i) {
     int const gpu = gpu_ids[i];
     try {
-      // Native scans want no arena: the spills' own one is only worth taking while the GPU's
-      // pool, primed with its whole capacity once the arenas are taken, still fits beside it.
-      if (config.backend != io_backend::cufile && i < pool_bytes.size()) {
+      // The spills' arena is only worth taking while the GPU's pool, primed with its whole
+      // capacity once the arenas are taken, still fits beside what taking it allocates: nothing
+      // when the GPU's arena (the scan's) covers the spills, else an arena covering both, which
+      // is allocated while the GPU still holds the scan's.
+      auto const needed = i < pool_bytes.size() ? cufile::arena_bytes_to_reserve(gpu, spill) : 0;
+      if (needed != 0) {
         rmm::cuda_set_device_raii const device{rmm::cuda_device_id{gpu}};
         auto const free = rmm::available_device_memory().first;
-        if (free < pool_bytes[i] || free - pool_bytes[i] < spill.arena_bytes()) {
+        if (free < pool_bytes[i] || free - pool_bytes[i] < needed) {
           SIRIUS_LOG_WARN(
-            "[sirius_scan_manager] no cuFile arena is reserved for spills on GPU {}: its {} MiB "
-            "would leave {} MiB free, less than its memory pool's {} MiB (the first spill through "
-            "cuFile tries again, and spills through io_uring if that fails)",
+            "[sirius_scan_manager] no cuFile arena is reserved for spills on GPU {}: the {} MiB "
+            "it takes would leave {} MiB free, less than its memory pool's {} MiB (the GPU keeps "
+            "the arena it has; the first spill through cuFile tries again, and spills through "
+            "io_uring if that fails)",
             gpu,
-            spill.arena_bytes() >> 20,
-            (free > spill.arena_bytes() ? free - spill.arena_bytes() : 0) >> 20,
+            needed >> 20,
+            (free > needed ? free - needed : 0) >> 20,
             pool_bytes[i] >> 20);
           continue;
         }
