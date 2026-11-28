@@ -32,6 +32,7 @@
 namespace duckdb {
 class ClientContext;
 class NodeStatistics;
+class SiriusContext;
 }  // namespace duckdb
 
 namespace sirius::op {
@@ -245,6 +246,14 @@ inline int gpu_count_for_bytes(uint64_t total_bytes, uint64_t bytes_per_gpu, int
   return static_cast<int>(std::min<uint64_t>(required, static_cast<uint64_t>(n_gpus)));
 }
 
+/// @brief Every GPU of @p runtime: one id per GPU memory space, ascending.
+[[nodiscard]] std::vector<int> runtime_gpu_ids(duckdb::SiriusContext& runtime);
+
+/// @brief The GPUs a query can be admitted to: runtime_gpu_ids capped by
+/// `topology.gpus_per_query` (apply_gpu_cap). The engine admits from this list and the plan
+/// generator decides from its size whether to collect admission hints, so the two agree.
+[[nodiscard]] std::vector<int> admission_candidate_gpu_ids(duckdb::SiriusContext& runtime);
+
 /**
  * @brief Whether admission sizes a query at all, and so whether the per-scan facts it sizes from
  * are worth collecting at plan time.
@@ -288,7 +297,8 @@ std::optional<uint64_t> table_function_max_string_bytes(duckdb::ClientContext& c
  * (`transparent::parquet_scan_row_count`, present when the footer statistics pass covered the
  * scan); otherwise the table function's `cardinality` callback (`TableScanCardinality` for
  * DuckDB tables, and DuckDB's own estimate for a Parquet scan the footer pass did not cover). A
- * count of zero is read as unknown.
+ * count of zero from the callback is read as unknown, since a callback can report zero for a
+ * count it does not have. A footer total is exact and is kept, zero included.
  *
  * Widths, for variable-width columns only: for a Parquet scan, the decoded byte-array sizes its
  * footers state (`transparent::parquet_scan_string_sizes`) plus the 4-byte offset word, with

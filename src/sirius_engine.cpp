@@ -67,17 +67,15 @@ void finish_scan_preparation(op::sirius_physical_operator const* plan) noexcept
   });
 }
 
-/// Select the GPU subset this query is admitted with: gpus_per_query caps the fleet, and
-/// within that cap a non-zero admission_bytes_per_gpu narrows further by estimated scan
-/// bytes. With neither set, every active GPU is used.
+/// Select the GPU subset this query is admitted with. @p gpu_ids are its candidates
+/// (planner::admission_candidate_gpu_ids: the fleet capped by gpus_per_query); a non-zero
+/// admission_bytes_per_gpu narrows them further by estimated scan bytes. With neither set, every
+/// active GPU is used.
 std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& plan,
                                            std::vector<int> gpu_ids,
-                                           const sirius_config& config,
                                            const operator_params& op_params)
 {
-  auto const bpg = op_params.admission_bytes_per_gpu;
-
-  gpu_ids           = planner::apply_gpu_cap(std::move(gpu_ids), config.gpus_per_query());
+  auto const bpg    = op_params.admission_bytes_per_gpu;
   auto const n_gpus = static_cast<int>(gpu_ids.size());
   // On a single GPU the estimate cannot change the allocation, so it is computed only when DEBUG
   // logging is on: the `[gpu_alloc] estimated` line is how the estimate is checked against real
@@ -399,21 +397,13 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   sirius_physical_plan = &plan;
 
-  std::vector<int> gpu_ids;
-  for (auto const* space : sirius_ctx_ptr->get_memory_manager().get_memory_spaces_for_tier(
-         cucascade::memory::Tier::GPU)) {
-    if (space != nullptr) { gpu_ids.push_back(space->get_device_id()); }
-  }
-  std::sort(gpu_ids.begin(), gpu_ids.end());
-  gpu_ids.erase(std::unique(gpu_ids.begin(), gpu_ids.end()), gpu_ids.end());
-
   // Admit the query here, before anything downstream is built, so that the build context,
   // partition->GPU routing and the scan round-robin all derive from this one list. Order
   // matters: task_creator holds it, and create_query later reads it back for scan_manager.
   auto query_operator_params      = duckdb::query_operator_options(context);
-  auto const full_gpu_count       = gpu_ids.size();
+  auto const full_gpu_count       = planner::runtime_gpu_ids(*sirius_ctx_ptr).size();
   std::vector<int> active_gpu_ids = compute_admission_gpu_ids(
-    plan, std::move(gpu_ids), sirius_ctx_ptr->get_config(), *query_operator_params);
+    plan, planner::admission_candidate_gpu_ids(*sirius_ctx_ptr), *query_operator_params);
   sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(query_id_, active_gpu_ids, full_gpu_count);
   try {
     std::string gpu_list;

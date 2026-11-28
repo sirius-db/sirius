@@ -240,26 +240,22 @@ op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& 
   return hint;
 }
 
-namespace {
-
-/// `admission_bytes_per_gpu` as `query_operator_options` resolves it, without creating the
-/// session's overrides. Those snapshot the global configuration, and this is asked for every
-/// statement the optimizer sees, so creating them here would stop the session from seeing later
-/// changes to the global configuration.
-uint64_t resolved_admission_bytes_per_gpu(duckdb::ClientContext& context,
-                                          duckdb::SiriusContext& runtime)
+std::vector<int> runtime_gpu_ids(duckdb::SiriusContext& runtime)
 {
-  auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->admission_bytes_per_gpu;
+  std::vector<int> gpu_ids;
+  for (auto const* space :
+       runtime.get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (space != nullptr) { gpu_ids.push_back(space->get_device_id()); }
   }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->admission_bytes_per_gpu;
-  }
-  return runtime.get_config().get_operator_params().admission_bytes_per_gpu;
+  std::ranges::sort(gpu_ids);
+  gpu_ids.erase(std::unique(gpu_ids.begin(), gpu_ids.end()), gpu_ids.end());
+  return gpu_ids;
 }
 
-}  // namespace
+std::vector<int> admission_candidate_gpu_ids(duckdb::SiriusContext& runtime)
+{
+  return apply_gpu_cap(runtime_gpu_ids(runtime), runtime.get_config().gpus_per_query());
+}
 
 bool admission_estimate_needed(duckdb::ClientContext& context)
 {
@@ -267,22 +263,16 @@ bool admission_estimate_needed(duckdb::ClientContext& context)
   auto const sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   // No GPU memory spaces exist before the runtime is initialized, and no query runs on it.
   if (!sirius_ctx || !sirius_ctx->is_initialized()) { return false; }
-  auto const bytes_per_gpu = resolved_admission_bytes_per_gpu(context, *sirius_ctx);
+  // This runs for every statement the optimizer sees, so the setting is read without creating
+  // the session's overrides.
+  auto const bytes_per_gpu =
+    duckdb::current_operator_option(context, &sirius::operator_params::admission_bytes_per_gpu)
+      .value_or(0);
   // Off is the common case: answer it before looking at the GPUs.
   if (bytes_per_gpu == 0) { return false; }
-  // The same candidates sirius_engine admits from: one per GPU memory space, capped by
-  // `topology.gpus_per_query`.
-  std::vector<int> gpu_ids;
-  for (auto const* space :
-       sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-    if (space != nullptr) { gpu_ids.push_back(space->get_device_id()); }
-  }
-  std::ranges::sort(gpu_ids);
-  gpu_ids.erase(std::unique(gpu_ids.begin(), gpu_ids.end()), gpu_ids.end());
-  auto const n_gpus =
-    apply_gpu_cap(std::move(gpu_ids), sirius_ctx->get_config().gpus_per_query()).size();
-  return admission_estimate_needed(
-    bytes_per_gpu, n_gpus, sirius::log::get_sink()->should_log(sirius::log::level::debug));
+  return admission_estimate_needed(bytes_per_gpu,
+                                   admission_candidate_gpu_ids(*sirius_ctx).size(),
+                                   sirius::log::get_sink()->should_log(sirius::log::level::debug));
 }
 
 }  // namespace sirius::planner
