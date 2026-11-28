@@ -351,8 +351,29 @@ TEST_CASE("Downgrade acquisition failure drains live worker captures",
 TEST_CASE("Downgrade monitor acquisition failure releases its request gate",
           "[downgrade_acquisition_failure]")
 {
-  SECTION("repository") { check_acquisition_failure(site::repository, true, true); }
-  SECTION("pipeline queue") { check_acquisition_failure(site::pipeline_queue, true, true); }
+  check_acquisition_failure(site::repository, true, true);
+}
+
+TEST_CASE("Monitor requests leave queued task inputs to demand requests",
+          "[downgrade_acquisition_failure]")
+{
+  fixture f;
+  absl::Cleanup stop = [&] { f.executor->stop(); };
+  auto queued        = f.add_batch(site::pipeline_queue, 1);
+  auto idle          = f.add_batch(site::repository, 2);
+
+  auto monitor = test_access::request_as_monitor(*f.executor, [] { return false; });
+  REQUIRE(monitor.wait_for(5s) == std::future_status::ready);
+  CHECK(monitor.get() == batch_bytes);
+  CHECK(idle->to_read_only().get_memory_space()->get_tier() == Tier::HOST);
+  CHECK(queued->to_read_only().get_memory_space()->get_tier() == Tier::GPU);
+  CHECK_FALSE(test_access::monitor_request_enqueued(*f.executor));
+
+  auto demand = f.executor->request_free_memory(batch_bytes);
+  REQUIRE(demand.wait_for(5s) == std::future_status::ready);
+  CHECK(demand.get() == batch_bytes);
+  CHECK(queued->to_read_only().get_memory_space()->get_tier() == Tier::HOST);
+  f.queue.drain();
 }
 
 TEST_CASE("Downgrade acquisition failure keeps failed worker candidates alive through drain",
