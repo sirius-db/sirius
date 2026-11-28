@@ -29,9 +29,11 @@
 namespace sirius::op::scan {
 
 equality_delete_filter::equality_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data,
+                                               rmm::cuda_device_id device,
                                                size_t group_index,
                                                std::vector<cudf::size_type> data_key_indices)
   : _delete_data(std::move(delete_data)),
+    _device(device),
     _group_index(group_index),
     _data_key_indices(std::move(data_key_indices))
 {
@@ -45,7 +47,7 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
   auto const n_rows = tbl->num_rows();
   if (n_rows == 0) { return tbl; }
 
-  auto const& group = _delete_data->equality_delete_groups.at(_group_index);
+  auto const& group = _delete_data->equality_groups_on(_device).at(_group_index);
   auto const keys   = group.delete_table->view();
   if (_data_key_indices.size() != static_cast<std::size_t>(keys.num_columns())) {
     throw std::invalid_argument("[equality_delete_filter] " +

@@ -171,6 +171,9 @@ class gateway_state {
     std::optional<duckdb::ErrorData> error;
     /// The gateway gave up on the call, so the rank is lost.
     bool abandoned = false;
+    /// The call was still running when the fan-out cancelled its calls, so its error can be the
+    /// cancel's own.
+    bool cancelled = false;
   };
   /// When a fan-out cancels its calls: the client interrupting, and the statement timeout.
   struct fan_out_policy {

@@ -40,7 +40,8 @@ PATH = re.compile(r"PAIRS rank (\d+) peer (\d+): (.*)")
 def main():
     out = pathlib.Path(sys.argv[1])
     phases, order, verify, paths, ucx, failed = {}, [], {}, {}, set(), []
-    for log in sorted(out.glob("rank*.log")):
+    logs = sorted(out.glob("rank*.log"))
+    for log in logs:
         text = log.read_text(errors="replace")
         if "All tests passed" not in text:
             failed.append(log.name)
@@ -89,6 +90,10 @@ def main():
     passed = fast and bad == 0 and not failed and verify
     if failed:
         print(f"\nfailed ranks: {', '.join(failed)}")
+    if not logs:
+        print(
+            f"\nno rank logs in {out}: no rank started, or the nodes do not share this folder"
+        )
     bar = f"bar {share * REFERENCE[tag]:.0f} = {share:.0%} of {REFERENCE[tag]}"
     print(
         f"\nRESULT: {'PASS' if passed else 'FAIL'} ({tag} {got:.1f} GB/s, "

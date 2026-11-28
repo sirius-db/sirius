@@ -67,11 +67,24 @@ struct backing_allocation {
   std::byte* data;
   std::shared_ptr<void> owner;
 };
+// One allocation as blocks that need not be adjacent. Every block is block_size bytes long,
+// the last included; the request's remainder lands there.
+struct backing_blocks {
+  std::vector<std::byte*> blocks;
+  uint64_t block_size;
+  std::shared_ptr<void> owner;
+};
 class reservation_backing {
  public:
   virtual ~reservation_backing()                      = default;
   virtual uint64_t charge_size(uint64_t bytes) const  = 0;
   virtual backing_allocation allocate(uint64_t bytes) = 0;
+  // A backing without a block structure hands out its one contiguous allocation.
+  virtual backing_blocks allocate_blocks(uint64_t bytes)
+  {
+    auto allocation = allocate(bytes);
+    return {{allocation.data}, bytes, std::move(allocation.owner)};
+  }
 };
 struct reservation_grant {
   uint64_t bytes;
@@ -147,6 +160,47 @@ class charged_block {
   bool retained_   = false;
   std::shared_ptr<void> owner_;
 };
+// A charged allocation whose blocks need not be adjacent. Each block holds block_size() bytes;
+// the last holds the remainder of size().
+class charged_blocks {
+ public:
+  charged_blocks()                                 = default;
+  charged_blocks(charged_blocks const&)            = delete;
+  charged_blocks& operator=(charged_blocks const&) = delete;
+  charged_blocks(charged_blocks&& other) noexcept { *this = std::move(other); }
+  charged_blocks& operator=(charged_blocks&& other) noexcept
+  {
+    if (this != &other) {
+      release();
+      blocks_     = std::exchange(other.blocks_, {});
+      block_size_ = std::exchange(other.block_size_, 0);
+      size_       = std::exchange(other.size_, 0);
+      retained_   = std::exchange(other.retained_, false);
+      owner_      = std::move(other.owner_);
+    }
+    return *this;
+  }
+  void release() noexcept
+  {
+    owner_.reset();
+    blocks_.clear();
+    block_size_ = 0;
+    size_       = 0;
+    retained_   = false;
+  }
+  std::span<std::byte* const> blocks() const noexcept { return blocks_; }
+  uint64_t block_size() const noexcept { return block_size_; }
+  uint64_t size() const noexcept { return size_; }
+  explicit operator bool() const noexcept { return bool(owner_); }
+  bool retained() const noexcept { return retained_; }
+
+ private:
+  friend class charging_allocator;
+  std::vector<std::byte*> blocks_;
+  uint64_t block_size_ = 0, size_ = 0;
+  bool retained_ = false;
+  std::shared_ptr<void> owner_;
+};
 class w_permit {
  public:
   w_permit()                           = default;
@@ -167,11 +221,18 @@ class charging_allocator {
  public:
   charged_block allocate(uint64_t bytes);
   charged_block allocate_retained(uint64_t bytes);
+  // Same charge as the forms above, without requiring the backing's blocks to be adjacent.
+  charged_blocks allocate_blocks(uint64_t bytes);
+  charged_blocks allocate_retained_blocks(uint64_t bytes);
 
  private:
   friend class preparation_ledger;
   explicit charging_allocator(std::weak_ptr<permit_state> state) : state_(std::move(state)) {}
-  charged_block allocate_impl(uint64_t, bool retained);
+  template <typename Block>
+  Block allocate_impl(uint64_t, bool retained);
+  // Take the memory for one result form; returns its physical owner.
+  static std::shared_ptr<void> acquire(reservation_backing&, uint64_t bytes, charged_block&);
+  static std::shared_ptr<void> acquire(reservation_backing&, uint64_t bytes, charged_blocks&);
   std::weak_ptr<permit_state> state_;
 };
 class preparation_ledger {

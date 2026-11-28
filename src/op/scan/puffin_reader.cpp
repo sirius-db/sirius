@@ -26,12 +26,8 @@
 // objects, so reading the Puffin footer costs no new dependency.
 #include "yyjson.hpp"
 
-// CRoaring: the portable-Roaring reader. The legacy path uses the same two calls as
-// duckdb-iceberg (`roaring_bitmap_portable_deserialize_size` + `Roaring::readSafe`).
-// The charged path shares the size check and expands containers without allocating a bitmap.
-#include <roaring/roaring.h>
-
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -106,15 +102,49 @@ class datasource_puffin_source final : public puffin_byte_source {
   }
   bool read(std::span<std::byte> destination) override
   {
+    return read_at_offset(destination.size(), [&] {
+      return source_->host_read(static_cast<std::size_t>(offset_),
+                                destination.size(),
+                                reinterpret_cast<std::uint8_t*>(destination.data()));
+    });
+  }
+  bool readv(std::span<std::span<std::byte> const> destinations) override
+  {
+    if (destinations.size() == 1) return read(destinations.front());
+    std::size_t total = 0;
+    for (auto destination : destinations)
+      total += destination.size();
+    return read_at_offset(total, [&] {
+      // Submit all destination blocks in one datasource call.
+      std::vector<cucascade::io::slice> slices;
+      slices.reserve(destinations.size());
+      auto offset = static_cast<std::size_t>(offset_);
+      for (auto destination : destinations) {
+        if (destination.empty()) continue;
+        slices.emplace_back(
+          offset, destination.size(), reinterpret_cast<std::uint8_t*>(destination.data()));
+        offset += destination.size();
+      }
+      return slices.empty() ? std::size_t{0} : source_->host_read_ranges_async(slices).get();
+    });
+  }
+  [[nodiscard]] std::streamoff size() const override
+  {
+    return static_cast<std::streamoff>(source_->size());
+  }
+
+ private:
+  // Bounds-check @p bytes at the cursor, run @p io and advance past a complete read.
+  template <typename Io>
+  bool read_at_offset(std::size_t bytes, Io&& io)
+  {
     auto const size = source_->size();
     if (offset_ < 0 || static_cast<std::uint64_t>(offset_) > size ||
-        destination.size() > size - static_cast<std::uint64_t>(offset_))
+        bytes > size - static_cast<std::uint64_t>(offset_))
       return false;
     std::size_t read;
     try {
-      read = source_->host_read(static_cast<std::size_t>(offset_),
-                                destination.size(),
-                                reinterpret_cast<std::uint8_t*>(destination.data()));
+      read = io();
     } catch (transparent::classified_execution_error const&) {
       throw;
     } catch (duckdb::InterruptException const&) {
@@ -133,16 +163,10 @@ class datasource_puffin_source final : public puffin_byte_source {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
     }
-    if (read != destination.size()) return false;
+    if (read != bytes) return false;
     offset_ += static_cast<std::streamoff>(read);
     return true;
   }
-  [[nodiscard]] std::streamoff size() const override
-  {
-    return static_cast<std::streamoff>(source_->size());
-  }
-
- private:
   std::unique_ptr<cucascade::io::datasource> source_;
   std::streamoff offset_ = 0;
 };
@@ -189,14 +213,80 @@ void init_crc32_table()
   }
 }
 
-uint32_t compute_crc32(const uint8_t* data, size_t length)
+// Blob bytes as the reader holds them: one buffer on the eager path, charged blocks that need
+// not be adjacent on the deferred one.
+using byte_blocks = block_span<uint8_t const>;
+
+/// Bytes [offset, offset + size) as one range: in place when a single block holds them, else
+/// copied into @p scratch, which must have room for them.
+uint8_t const* contiguous(byte_blocks bytes, size_t offset, size_t size, std::span<uint8_t> scratch)
+{
+  auto const first = bytes.run(offset);
+  if (first.size() >= size) return first.data();
+  for (size_t copied = 0; copied < size;) {
+    auto const part = bytes.run(offset + copied);
+    auto const n    = std::min(part.size(), size - copied);
+    std::memcpy(scratch.data() + copied, part.data(), n);
+    copied += n;
+  }
+  return scratch.data();
+}
+
+uint32_t compute_crc32(byte_blocks bytes, size_t offset, size_t length)
 {
   std::call_once(crc32_init_flag, init_crc32_table);
   uint32_t crc = 0xFFFFFFFFu;
-  for (size_t i = 0; i < length; ++i) {
-    crc = crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+  for (size_t done = 0; done < length;) {
+    auto run = bytes.run(offset + done);
+    run      = run.first(std::min(run.size(), length - done));
+    for (auto byte : run) {
+      crc = crc32_table[(crc ^ byte) & 0xFF] ^ (crc >> 8);
+    }
+    done += run.size();
   }
   return crc ^ 0xFFFFFFFFu;
+}
+
+/// CRoaring's `roaring_bitmap_portable_deserialize_size`, which needs one buffer, restated over
+/// blocks: the serialized size of the bitmap at @p start, or 0 when @p len bytes do not hold one.
+size_t portable_roaring_size(byte_blocks bytes, size_t start, size_t len)
+{
+  auto u16 = [&](size_t at) {
+    return static_cast<uint16_t>(bytes[start + at] | (bytes[start + at + 1] << 8));
+  };
+  auto u32    = [&](size_t at) { return uint32_t(u16(at)) | (uint32_t(u16(at + 2)) << 16); };
+  size_t size = 4;
+  if (size > len) return 0;
+  auto const cookie = u32(0);
+  bool const runs   = (cookie & 0xffff) == 12347;
+  if (!runs && cookie != 12346) return 0;
+  uint32_t containers = (cookie >> 16) + 1;
+  if (!runs) {
+    size += 4;
+    if (size > len) return 0;
+    containers = u32(4);
+    if (containers > 65536) return 0;
+  }
+  auto const run_bits = size;
+  if (runs) size += (containers + 7) / 8;
+  if (size > len) return 0;
+  auto const headers = size;
+  size += static_cast<size_t>(containers) * 4;
+  if (size > len) return 0;
+  if (!runs || containers >= 4) size += static_cast<size_t>(containers) * 4;
+  if (size > len) return 0;
+  for (uint32_t i = 0; i < containers; ++i) {
+    if (runs && (bytes[start + run_bits + i / 8] & (1u << (i % 8)))) {
+      size += 2;
+      if (size > len) return 0;
+      size += static_cast<size_t>(u16(size - 2)) * 4;
+    } else {
+      auto const cardinality = uint32_t(u16(headers + i * 4 + 2)) + 1;
+      size += cardinality > 4096 ? 8192 : static_cast<size_t>(cardinality) * 2;
+    }
+    if (size > len) return 0;
+  }
+  return size;
 }
 
 class deletion_vector_expansion_limit : public std::runtime_error {
@@ -208,10 +298,9 @@ class deletion_vector_expansion_limit : public std::runtime_error {
 /// materializing values through @p emit. Both eager and charged readers use this
 /// walker so they share the same format and corruption checks.
 template <typename Emit>
-size_t walk_roaring32(const uint8_t* data, size_t len, size_t max_out, Emit&& emit)
+size_t walk_roaring32(byte_blocks bytes, size_t start, size_t len, size_t max_out, Emit&& emit)
 {
-  auto const consumed = roaring::api::roaring_bitmap_portable_deserialize_size(
-    reinterpret_cast<char const*>(data), len);
+  auto const consumed = portable_roaring_size(bytes, start, len);
   if (!consumed)
     throw std::runtime_error("roaring: no valid portable-Roaring bitmap in the remaining " +
                              std::to_string(len) +
@@ -225,37 +314,43 @@ size_t walk_roaring32(const uint8_t* data, size_t len, size_t max_out, Emit&& em
     std::memcpy(&v, p, 2);
     return v;
   };
-  auto const* end = data + consumed;
-  auto const* p   = data;
-  auto take       = [&](size_t bytes) {
-    if (bytes > static_cast<size_t>(end - p)) fail("container exceeds bitmap bounds");
-    auto result = p;
-    p += bytes;
-    return result;
+  auto u16_at = [&](size_t at) { return static_cast<uint16_t>(bytes[at] | (bytes[at + 1] << 8)); };
+  auto const end = start + consumed;
+  auto p         = start;
+  // The run bitmap and the headers are read in place by offset. Everything taken as a range
+  // is at most one container body, so a body that straddles two blocks fits here.
+  std::array<uint8_t, 8192> scratch;
+  auto skip = [&](size_t size) {
+    if (size > end - p) fail("container exceeds bitmap bounds");
+    auto const at = p;
+    p += size;
+    return at;
   };
-  auto cookie          = read_u32_le(take(4));
-  bool runs            = (cookie & 0xffff) == 12347;
-  uint32_t containers  = runs ? (cookie >> 16) + 1 : read_u32_le(take(4));
-  auto const* run_bits = runs ? take((containers + 7) / 8) : nullptr;
-  auto const* headers  = take(static_cast<size_t>(containers) * 4);
-  if (!runs || containers >= 4) take(static_cast<size_t>(containers) * 4);
-  auto const* payload = p;
+  auto take           = [&](size_t size) { return contiguous(bytes, skip(size), size, scratch); };
+  auto cookie         = read_u32_le(take(4));
+  bool runs           = (cookie & 0xffff) == 12347;
+  uint32_t containers = runs ? (cookie >> 16) + 1 : read_u32_le(take(4));
+  auto const run_bits = runs ? skip((containers + 7) / 8) : 0;
+  auto const headers  = skip(static_cast<size_t>(containers) * 4);
+  if (!runs || containers >= 4) skip(static_cast<size_t>(containers) * 4);
+  auto const payload = p;
 
   for (uint32_t i = 1; i < containers; ++i)
-    if (u16(headers + i * 4) <= u16(headers + (i - 1) * 4)) fail("keys not strictly increasing");
+    if (u16_at(headers + i * 4) <= u16_at(headers + (i - 1) * 4))
+      fail("keys not strictly increasing");
 
   auto walk = [&](bool materialize) {
     p            = payload;
     size_t total = 0;
     for (uint32_t i = 0; i < containers; ++i) {
-      auto key         = u16(headers + i * 4);
-      auto cardinality = uint32_t(u16(headers + i * 4 + 2)) + 1;
+      auto key         = u16_at(headers + i * 4);
+      auto cardinality = uint32_t(u16_at(headers + i * 4 + 2)) + 1;
       auto append      = [&](uint32_t low) {
         if (total >= max_out) fail("decoded positions exceed the declared budget");
         emit((uint32_t(key) << 16) | low);
         ++total;
       };
-      if (run_bits && (run_bits[i / 8] & (1u << (i % 8)))) {
+      if (runs && (bytes[run_bits + i / 8] & (1u << (i % 8)))) {
         auto n = u16(take(2));
         if (!n) fail("zero run count");
         uint32_t previous_end = 0;
@@ -310,24 +405,31 @@ size_t walk_roaring32(const uint8_t* data, size_t len, size_t max_out, Emit&& em
   return consumed;
 }
 
-size_t deserialize_roaring32(const uint8_t* data,
-                             size_t data_len,
-                             std::vector<uint32_t>& out,
-                             size_t max_out)
+size_t deserialize_roaring32(
+  byte_blocks bytes, size_t start, size_t len, std::vector<uint32_t>& out, size_t max_out)
 {
   auto const base = out.size();
   if (base > max_out)
     throw std::runtime_error("roaring: decoded positions exceed the declared budget");
-  auto const consumed =
-    walk_roaring32(data, data_len, max_out - base, [&](uint32_t value) { out.push_back(value); });
+  auto const consumed = walk_roaring32(
+    bytes, start, len, max_out - base, [&](uint32_t value) { out.push_back(value); });
   return consumed;
 }
 
-size_t decode_roaring_charged(
-  const uint8_t* data, size_t len, int64_t high, std::span<int64_t> output, size_t& count)
+size_t decode_roaring_charged(byte_blocks bytes,
+                              size_t start,
+                              size_t len,
+                              int64_t high,
+                              block_span<int64_t> output,
+                              size_t& count)
 {
-  auto const consumed = walk_roaring32(
-    data, len, output.size() - count, [&](uint32_t value) { output[count++] = high | value; });
+  auto next = output.begin() + static_cast<std::ptrdiff_t>(count);
+  auto const consumed =
+    walk_roaring32(bytes, start, len, output.size() - count, [&](uint32_t value) {
+      *next = high | value;
+      ++next;
+      ++count;
+    });
   return consumed;
 }
 
@@ -616,12 +718,14 @@ std::streamoff validate_footer_descriptor(puffin_byte_source& source,
 namespace {
 struct decoded_positions {
   std::vector<int64_t> legacy;
-  sirius::scan_manager::charged_block backing;
+  sirius::scan_manager::charged_blocks backing;
   size_t count = 0;
+  // The charged positions decoded so far.
+  block_span<int64_t> charged() const { return {backing.blocks(), backing.block_size(), count}; }
 };
 // Shared DV payload parser. The caller bounds the input span and expansion.
 // Table-specific descriptor and cardinality checks belong to the reader wrapper.
-decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
+decoded_positions parse_deletion_vector_blob(byte_blocks blob,
                                              std::string const& puffin_path,
                                              size_t max_positions,
                                              sirius::scan_manager::charging_allocator* allocator,
@@ -635,17 +739,20 @@ decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
                              " bytes) to be a deletion-vector-v1");
   }
 
-  const uint8_t* p = blob.data();
+  // Fixed-width fields may straddle two blocks.
+  std::array<uint8_t, 8> scratch;
+  auto field = [&](size_t offset, size_t size) { return contiguous(blob, offset, size, scratch); };
+  size_t p   = 0;
 
-  uint32_t combined_length = read_u32_be(p);
+  uint32_t combined_length = read_u32_be(field(p, 4));
   p += 4;
 
   static constexpr uint8_t DV_MAGIC[4] = {0xD1, 0xD3, 0x39, 0x64};
-  if (std::memcmp(p, DV_MAGIC, 4) != 0) {
+  if (std::memcmp(field(p, 4), DV_MAGIC, 4) != 0) {
     throw std::runtime_error("[puffin] Deletion vector magic mismatch in " + puffin_path);
   }
 
-  const uint8_t* checksummed_start = p;
+  size_t const checksummed_start = p;
   p += 4;  // skip magic
 
   // combined_length covers magic + roaring_vector; the CRC follows it.
@@ -666,9 +773,8 @@ decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
   if (exact_payload && 4 + checksummed_len + 4 != blob_size)
     throw std::runtime_error("[puffin] Trailing bytes after deletion-vector-v1 payload");
 
-  const uint8_t* crc_ptr = checksummed_start + checksummed_len;
-  uint32_t stored_crc    = read_u32_be(crc_ptr);
-  uint32_t computed_crc  = compute_crc32(checksummed_start, checksummed_len);
+  uint32_t stored_crc   = read_u32_be(field(checksummed_start + checksummed_len, 4));
+  uint32_t computed_crc = compute_crc32(blob, checksummed_start, checksummed_len);
   if (stored_crc != computed_crc) {
     throw std::runtime_error("[puffin] CRC-32 mismatch in " + puffin_path +
                              ": stored=" + std::to_string(stored_crc) +
@@ -680,7 +786,7 @@ decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
   size_t roaring_len = checksummed_len - 4;  // minus magic
   if (roaring_len < 8) { throw std::runtime_error("[puffin] Roaring vector too small"); }
 
-  int64_t num_bitmaps = read_i64_le(p);
+  int64_t num_bitmaps = read_i64_le(field(p, 8));
   p += 8;
   roaring_len -= 8;
 
@@ -693,12 +799,15 @@ decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
 
   decoded_positions result;
   auto& positions = result.legacy;
-  if (allocator && max_positions)
-    result.backing = allocator->allocate_retained(max_positions * sizeof(int64_t));
+  block_span<int64_t> output;
+  if (allocator && max_positions) {
+    result.backing = allocator->allocate_retained_blocks(max_positions * sizeof(int64_t));
+    output         = {result.backing.blocks(), result.backing.block_size(), max_positions};
+  }
 
   for (int64_t bm = 0; bm < num_bitmaps; ++bm) {
     if (roaring_len < 4) { throw std::runtime_error("[puffin] Truncated bitmap key"); }
-    int32_t key = read_i32_le(p);
+    int32_t key = read_i32_le(field(p, 4));
     p += 4;
     roaring_len -= 4;
 
@@ -718,16 +827,14 @@ decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
     size_t consumed;
     if (count_only) {
       consumed = walk_roaring32(
-        p, roaring_len, max_positions - result.count, [&](uint32_t) { ++result.count; });
+        blob, p, roaring_len, max_positions - result.count, [&](uint32_t) { ++result.count; });
     } else if (allocator) {
-      auto output =
-        std::span<int64_t>(reinterpret_cast<int64_t*>(result.backing.data()), max_positions);
-      consumed = decode_roaring_charged(p, roaring_len, high, output, result.count);
+      consumed = decode_roaring_charged(blob, p, roaring_len, high, output, result.count);
     } else {
       std::vector<uint32_t> low_positions;
       // Shared across bitmaps, so a blob cannot beat the ceiling by splitting across keys.
       size_t const budget = max_positions - positions.size();
-      consumed            = deserialize_roaring32(p, roaring_len, low_positions, budget);
+      consumed            = deserialize_roaring32(blob, p, roaring_len, low_positions, budget);
       for (uint32_t low : low_positions)
         positions.push_back(high | static_cast<int64_t>(low));
     }
@@ -740,8 +847,11 @@ decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
   if (count_only) return result;
 
   if (allocator) {
-    auto* output = reinterpret_cast<int64_t*>(result.backing.data());
-    if (result.count) std::sort(output, output + result.count);
+    // Puffin orders the bitmaps by key and each decodes in order, so only a file that breaks
+    // that order has anything to sort. Such a file pays for it: a sort over blocks costs
+    // several times one over a buffer.
+    auto const decoded = result.charged();
+    if (!std::is_sorted(decoded.begin(), decoded.end())) std::sort(decoded.begin(), decoded.end());
   } else {
     std::sort(positions.begin(), positions.end());
     result.count = positions.size();
@@ -751,6 +861,13 @@ decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
     "[puffin] Read deletion vector from '{}': {} deleted position(s).", puffin_path, result.count);
 
   return result;
+}
+
+// Drop repeated positions from sorted charged output.
+void deduplicate(decoded_positions& decoded)
+{
+  auto const values = decoded.charged();
+  decoded.count = static_cast<size_t>(std::unique(values.begin(), values.end()) - values.begin());
 }
 
 std::streamoff read_puffin_container_magic(puffin_byte_source& source, std::string const& path)
@@ -854,27 +971,28 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
   }
 
   std::vector<uint8_t> legacy_blob;
-  sirius::scan_manager::charged_block charged_blob;
-  std::span<uint8_t> blob;
+  sirius::scan_manager::charged_blocks charged_blob;
+  block_span<uint8_t> blob;
   if (allocator) {
-    charged_blob = allocator->allocate(content_size_in_bytes);
-    blob         = {reinterpret_cast<uint8_t*>(charged_blob.data()),
-                    static_cast<size_t>(content_size_in_bytes)};
+    charged_blob = allocator->allocate_blocks(content_size_in_bytes);
+    blob         = {
+      charged_blob.blocks(), charged_blob.block_size(), static_cast<size_t>(content_size_in_bytes)};
   } else {
     legacy_blob.resize(content_size_in_bytes);
     blob = legacy_blob;
   }
-  if (!source->read(std::as_writable_bytes(blob))) {
+  std::vector<std::span<std::byte>> destinations;
+  for (size_t offset = 0; offset < blob.size(); offset += destinations.back().size())
+    destinations.push_back(std::as_writable_bytes(blob.run(offset)));
+  if (!source->readv(destinations)) {
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
       "[puffin] Failed to read " + std::to_string(content_size_in_bytes) + " bytes from " +
         puffin_path);
   }
 
-  return parse_deletion_vector_blob(std::span<uint8_t const>{blob},
-                                    ref.puffin_path,
-                                    static_cast<size_t>(ref.record_count),
-                                    allocator);
+  return parse_deletion_vector_blob(
+    blob, ref.puffin_path, static_cast<size_t>(ref.record_count), allocator);
 }
 }  // namespace
 
@@ -1058,10 +1176,9 @@ std::shared_ptr<puffin_container_metadata const> read_puffin_metadata(
     new puffin_container_metadata(std::move(data)));
 }
 
-decoded_delete_positions::decoded_delete_positions(scan_manager::charged_block backing,
+decoded_delete_positions::decoded_delete_positions(scan_manager::charged_blocks backing,
                                                    size_t count)
-  : backing_(std::move(backing)),
-    positions_(reinterpret_cast<int64_t const*>(backing_.data()), count)
+  : backing_(std::move(backing)), positions_(backing_.blocks(), backing_.block_size(), count)
 {
 }
 
@@ -1087,8 +1204,7 @@ std::shared_ptr<decoded_delete_positions const> decode_deletion_vector_payload(
     throw scan_manager::preparation_resource_error(error.what(), true);
   }
   auto decoded = parse_deletion_vector_blob(payload, "payload", count, &allocator, false, true);
-  auto* values = reinterpret_cast<int64_t*>(decoded.backing.data());
-  if (decoded.count) decoded.count = std::unique(values, values + decoded.count) - values;
+  deduplicate(decoded);
   return std::shared_ptr<decoded_delete_positions const>(
     new decoded_delete_positions(std::move(decoded.backing), decoded.count));
 }
@@ -1151,11 +1267,10 @@ decoded_positions read_charged_checked(Ref const& ref,
 std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
   DeletionVectorRef const& ref, sirius::scan_manager::charging_allocator& allocator)
 {
-  auto result     = read_charged_checked(ref, allocator, 0);
-  auto* positions = reinterpret_cast<int64_t*>(result.backing.data());
+  auto result = read_charged_checked(ref, allocator, 0);
   // Repeated high keys are permitted by the legacy reader. Deduplicate only after
   // checking the encoded count, so the immutable result has set semantics.
-  if (result.count) result.count = std::unique(positions, positions + result.count) - positions;
+  deduplicate(result);
   return std::make_shared<iceberg_delete_set const>(
     ref.referenced_data_file, std::move(result.backing), result.count, 1);
 }
@@ -1167,9 +1282,8 @@ std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
   std::shared_ptr<void const> path_owner,
   scan_contract_id contract)
 {
-  auto result     = read_charged_checked(ref, allocator, contract);
-  auto* positions = reinterpret_cast<int64_t*>(result.backing.data());
-  if (result.count) result.count = std::unique(positions, positions + result.count) - positions;
+  auto result = read_charged_checked(ref, allocator, contract);
+  deduplicate(result);
   return std::make_shared<iceberg_delete_set const>(
     canonical_path, std::move(result.backing), result.count, 1, std::move(path_owner));
 }
@@ -1182,9 +1296,8 @@ std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
   scan_contract_id contract,
   puffin_byte_source& source)
 {
-  auto result     = read_charged_checked(ref, allocator, contract, &source);
-  auto* positions = reinterpret_cast<int64_t*>(result.backing.data());
-  if (result.count) result.count = std::unique(positions, positions + result.count) - positions;
+  auto result = read_charged_checked(ref, allocator, contract, &source);
+  deduplicate(result);
   return std::make_shared<iceberg_delete_set const>(
     canonical_path, std::move(result.backing), result.count, 1, std::move(path_owner));
 }

@@ -22,6 +22,7 @@
 #include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
@@ -73,7 +74,7 @@ class positional_delete_filter : public iceberg_delete_filter {
   [[nodiscard]] bool affects(batch_layout layout) const;
 
  private:
-  [[nodiscard]] std::span<int64_t const> positions_for(std::string const& path) const;
+  [[nodiscard]] block_span<int64_t const> positions_for(std::string const& path) const;
   iceberg_delete_sets _delete_sets;
 };
 
@@ -81,9 +82,11 @@ class positional_delete_filter : public iceberg_delete_filter {
 /// and applies an anti-join mask. The caller decides which groups apply; the layout is ignored.
 class equality_delete_filter : public iceberg_delete_filter {
  public:
+  /// @param device The device the batch is on. The group's tables built there are probed.
   /// @param data_key_indices Batch column indices of the group's key columns, in the group's
   ///                         key order.
   equality_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data,
+                         rmm::cuda_device_id device,
                          size_t group_index,
                          std::vector<cudf::size_type> data_key_indices);
 
@@ -94,6 +97,7 @@ class equality_delete_filter : public iceberg_delete_filter {
 
  private:
   std::shared_ptr<const IcebergDeleteData> _delete_data;
+  rmm::cuda_device_id _device;
   size_t _group_index;
   std::vector<cudf::size_type> _data_key_indices;
 };

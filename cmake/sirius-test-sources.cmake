@@ -402,6 +402,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_fused_scan_filter_delivery.cpp
     test/cpp/scan/test_iceberg_batch_layout.cpp
     test/cpp/scan/test_iceberg_equality_delete.cpp
+    test/cpp/scan/test_block_span.cpp
     test/cpp/scan/test_puffin_reader.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp

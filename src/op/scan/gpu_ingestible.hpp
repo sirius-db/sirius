@@ -138,6 +138,10 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   /// validate their backend witness: preflight does not authorize a new/reopened backend.
   virtual void preflight_for_query() {}
 
+  /// The GPUs the query is admitted to, given once before any task runs. State held for a
+  /// device outside them can be released.
+  virtual void set_admitted_gpus(std::span<int const> /*gpu_ids*/) {}
+
   /// Complete any metadata preparation deferred out of the constructor. Idempotent; throws on
   /// failure. Called by the scan manager before it builds a disk-reading split_provider.
   virtual void ensure_metadata_prepared() {}

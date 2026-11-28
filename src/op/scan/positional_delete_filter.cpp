@@ -48,10 +48,10 @@ positional_delete_filter::positional_delete_filter(iceberg_delete_sets delete_se
   }
 }
 
-std::span<int64_t const> positional_delete_filter::positions_for(std::string const& path) const
+block_span<int64_t const> positional_delete_filter::positions_for(std::string const& path) const
 {
   auto it = _delete_sets.find(path);
-  return it == _delete_sets.end() ? std::span<int64_t const>{} : it->second->positions;
+  return it == _delete_sets.end() ? block_span<int64_t const>{} : it->second->positions;
 }
 
 bool positional_delete_filter::affects(batch_layout layout) const

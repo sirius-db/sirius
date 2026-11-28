@@ -52,10 +52,12 @@ namespace sirius::exchange {
  * access between the two GPUs. Without it (GPUs under different PCIe switches on many hosts) UCX
  * falls back to a far slower path. A rank therefore also keeps a pinned host mirror of its
  * receive ring in POSIX shared memory, when NVML reports a GPU on its host without peer access to
- * its own (or staging is always). A write to a peer whose GPU this GPU cannot reach directly
- * is a device-to-host copy into that peer's mirror, followed by a notification naming the bytes;
- * the peer copies them host-to-device into its receive ring and only then hands the write's own
- * notification on. One PCIe crossing each way, no copy through the CPU.
+ * its own, when its host is crowded (crowded_host()) and its GPU has no active NVLink link, or
+ * when staging is always. A write to a peer whose GPU this GPU cannot reach directly, or to a
+ * peer with a mirror on another GPU of such a crowded host, is a device-to-host copy into that
+ * peer's mirror, followed by a notification naming the bytes; the peer copies them
+ * host-to-device into its receive ring and only then hands the write's own notification on. One
+ * PCIe crossing each way, no copy through the CPU.
  *
  * **NVLink fabric (MNNVL).** `cuda_ipc` also reaches a GPU on another node of the same NVLink
  * domain, but only for memory with a fabric handle. The hello therefore carries whether the
@@ -84,7 +86,8 @@ class nixl_fabric : public fabric {
     std::vector<std::string> peers;
     std::chrono::milliseconds connect_timeout{std::chrono::minutes{2}};
     /// automatic: TCP lanes to peers on other hosts; on this host, host-stage writes to peers
-    /// whose GPU lacks peer access to this one (NVML). always: host-stage on this host too.
+    /// whose GPU lacks peer access to this one (NVML), and to peers with a mirror when the host
+    /// is crowded (choose_path()). always: host-stage on this host too.
     host_staging staging{host_staging::automatic};
     /// require: fail unless every peer is reached over the NVLink fabric.
     mnnvl_mode mnnvl{mnnvl_mode::automatic};
@@ -258,6 +261,8 @@ class nixl_fabric : public fabric {
   mnnvl_mode _mnnvl{mnnvl_mode::automatic};
   /// CPUs near this GPU (empty when NVML cannot tell): lane threads and pinned memory use them.
   std::vector<int> _near_cpus;
+  /// Ranks whose address names this rank's host, and whether this GPU has NVLink.
+  host_view _host;
   std::uint32_t _lane_count{0};
   std::uint32_t _slots_per_lane{2};
   std::vector<std::unique_ptr<lane>> _lanes;
