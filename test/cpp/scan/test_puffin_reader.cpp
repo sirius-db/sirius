@@ -30,15 +30,28 @@
 #include "utils/puffin_test_utils.hpp"
 
 #include <catch.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/exec/semi_future.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/io_request.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/utils/cleanup_utils.hpp>
 #include <roaring/roaring.hh>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <string>
 #include <vector>
@@ -129,6 +142,130 @@ class cancelling_puffin_source final : public puffin_byte_source {
   std::streamoff offset_ = 0;
 };
 
+/// Serves a Puffin file from memory through a real datasource. A request for several ranges,
+/// which is how a blob held in several blocks is read, is answered as its `vectored` says.
+class memory_ioctx final : public cucascade::io::ioctx {
+ public:
+  enum class vectored {
+    served,           // every range is filled
+    cancelled,        // the first range is filled, then the request is cancelled
+    failed_and_held,  // the first range fails; the others stay in flight until finish_held()
+  };
+  memory_ioctx(std::vector<std::byte> bytes, vectored answer)
+    : bytes_(std::move(bytes)), answer_(answer)
+  {
+  }
+  ~memory_ioctx() override { pre_destroy(); }
+  cucascade::io::io_context_type type() const noexcept override
+  {
+    return cucascade::io::io_context_type::uring;
+  }
+  void shutdown() noexcept override {}
+  bool supports(std::string_view) const noexcept override { return true; }
+  bool supports_device_read() const noexcept override { return false; }
+  bool supports_host_to_device_read() const noexcept override { return false; }
+  bool supports_vector_host_read() const noexcept override { return false; }
+  bool supports_device_range_read() const noexcept override { return false; }
+  std::vector<cucascade::io::byte_range> align_and_coalesce(
+    std::span<cucascade::io::byte_range const> ranges,
+    std::optional<size_t>) const noexcept override
+  {
+    return {ranges.begin(), ranges.end()};
+  }
+  size_t host_read_io(cucascade::io::io_object const&,
+                      size_t offset,
+                      size_t size,
+                      uint8_t* dst) override
+  {
+    std::memcpy(dst, bytes_.data() + offset, size);
+    return size;
+  }
+  cucascade::exec::semi_future<size_t> mixed_readv_async_io(
+    cucascade::io::io_object const&,
+    std::vector<cucascade::io::prepared_io_slice>&& slices) noexcept override
+  {
+    if (slices.size() == 1) return cucascade::exec::make_semi_future<size_t>(fill(slices[0]));
+    size_t bytes = 0;
+    for (auto const& slice : slices) {
+      destinations.push_back(std::get<std::uint8_t*>(slice.h_buffer.buffer));
+      bytes += slice.size();
+    }
+    if (answer_ == vectored::served) {
+      for (auto const& slice : slices)
+        fill(slice);
+      return cucascade::exec::make_semi_future<size_t>(bytes);
+    }
+    if (answer_ == vectored::cancelled) {
+      fill(slices[0]);
+      return cucascade::exec::make_semi_future<size_t>(std::make_exception_ptr(
+        std::system_error(std::make_error_code(std::errc::operation_canceled))));
+    }
+    // cuCascade's own fan-in, one credit per range, as a backend settles them.
+    auto fan_in = std::make_shared<cucascade::io::grouped_coordinator>(bytes, slices.size());
+    auto future = fan_in->get_future();
+    fan_in->report_error(std::make_exception_ptr(std::runtime_error("range read failed")));
+    std::function<void()> finish = [this, fan_in, slices = std::move(slices)] {
+      for (size_t i = 1; i < slices.size(); ++i) {
+        fill(slices[i]);
+        fan_in->on_complete();
+      }
+    };
+    {
+      std::lock_guard lock(mutex_);
+      if (!released_) held_ = std::exchange(finish, {});
+    }
+    if (finish) finish();  // released before it arrived, so nothing would finish it later
+    issued_.set_value();
+    return future;
+  }
+  /// Whether a failed_and_held request arrives within @p limit. Asked once.
+  bool issued_within(std::chrono::seconds limit)
+  {
+    return issued_.get_future().wait_for(limit) == std::future_status::ready;
+  }
+  /// The ranges still in flight write their bytes and complete, and so does a failed_and_held
+  /// request that arrives later.
+  void finish_held()
+  {
+    std::function<void()> held;
+    {
+      std::lock_guard lock(mutex_);
+      released_ = true;
+      held.swap(held_);
+    }
+    if (held) held();
+  }
+  std::vector<std::uint8_t*> destinations;  // of the request for several ranges
+
+ protected:
+  std::shared_ptr<cucascade::io::io_object> create_io_object(std::string path) override
+  {
+    struct object final : cucascade::io::io_object {
+      object(std::string name, size_t bytes) : path(std::move(name)), bytes(bytes) {}
+      std::string const& raw_file_cache_id() const noexcept override { return path; }
+      std::string const& object_path() const noexcept override { return path; }
+      size_t size() const noexcept override { return bytes; }
+      std::string path;
+      size_t bytes;
+    };
+    return std::make_shared<object>(std::move(path), bytes_.size());
+  }
+
+ private:
+  size_t fill(cucascade::io::prepared_io_slice const& slice) const
+  {
+    std::memcpy(
+      std::get<std::uint8_t*>(slice.h_buffer.buffer), bytes_.data() + slice.offset(), slice.size());
+    return slice.size();
+  }
+  std::vector<std::byte> bytes_;
+  vectored answer_;
+  std::promise<void> issued_;
+  std::mutex mutex_;  // guards released_ and held_
+  bool released_ = false;
+  std::function<void()> held_;
+};
+
 class throwing_puffin_source final : public puffin_byte_source {
  public:
   explicit throwing_puffin_source(std::streamoff size) : size_(size) {}
@@ -208,15 +345,22 @@ DeletionVectorRef fixture_ref()
           .record_count          = kCardinality};
 }
 
+/// A nonzero @p block_size hands the charged reader its blob and positions as non-adjacent
+/// blocks of that size, as a fragmented host pool does.
 std::vector<int64_t> read_for_test(DeletionVectorRef ref,
                                    bool charged,
-                                   puffin_byte_source* supplied_source = nullptr)
+                                   puffin_byte_source* supplied_source = nullptr,
+                                   uint64_t block_size                 = 0)
 {
   if (!charged)
     return supplied_source ? read_deletion_vector(ref, *supplied_source)
                            : read_deletion_vector(ref);
   using namespace sirius::scan_manager;
   test::test_reservation_provider provider;
+  if (block_size) {
+    provider.quantum              = block_size;
+    provider.seen->scatter_blocks = true;
+  }
   auto path = ref.puffin_path;
   if (path.starts_with("file://")) path.erase(0, 7);
   std::error_code error;
@@ -227,7 +371,7 @@ std::vector<int64_t> read_for_test(DeletionVectorRef ref,
     8;
   auto blob            = static_cast<uint64_t>(std::max<int64_t>(ref.content_size_in_bytes, 0));
   auto parser          = static_cast<uint64_t>(ref.file_size_in_bytes) * 14 + 512;
-  provider.grant_bytes = positions + blob + parser;
+  provider.grant_bytes = positions + blob + parser + 3 * provider.quantum;
   preparation_ledger ledger(provider);
   std::array scans{scan_envelope{{{{blob, parser, 0}, positions}}, {}, true}};
   REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
@@ -673,6 +817,8 @@ TEST_CASE("Charged Roaring expansion agrees with CRoaring for arrays, bitsets an
           "[scan_preparation][iceberg][charged_reader]")
 {
   auto shape = GENERATE(0, 1, 2, 3);
+  // 8 puts every position in its own block and splits every header field and container body.
+  auto block = GENERATE(uint64_t{0}, uint64_t{8}, uint64_t{4096});
   roaring::Roaring bitmap;
   if (shape == 0)
     for (uint32_t i : {1u, 5u, 65537u, 0xfffffffeu})
@@ -700,7 +846,35 @@ TEST_CASE("Charged Roaring expansion agrees with CRoaring for arrays, bitsets an
   push_u32_be(blob, crc32_of(checksummed));
   auto path = write_puffin(blob, "charged_roaring_" + std::to_string(shape), bitmap.cardinality());
   auto ref  = synthetic_ref(path, blob, bitmap.cardinality());
-  CHECK(read_for_test(ref, true) == read_deletion_vector(ref));
+  CHECK(read_for_test(ref, true, nullptr, block) == read_deletion_vector(ref));
+}
+
+TEST_CASE("Charged Puffin sorts and deduplicates positions held in non-adjacent blocks",
+          "[scan_preparation][iceberg][charged_reader]")
+{
+  // High keys 1, 0, 1 over the same three values: nine encoded positions, out of order and
+  // repeated, one per 8-byte block. A reader that orders or deduplicates only within a block
+  // returns all nine.
+  roaring::Roaring bitmap;
+  for (uint32_t value : {1u, 5u, 65537u})
+    bitmap.add(value);
+  std::vector<uint8_t> serial(bitmap.getSizeInBytes());
+  REQUIRE(bitmap.write(reinterpret_cast<char*>(serial.data())) == serial.size());
+  std::vector<uint8_t> checksummed{0xD1, 0xD3, 0x39, 0x64};
+  for (int i = 0; i < 8; ++i)
+    checksummed.push_back(i == 0 ? 3 : 0);
+  for (uint32_t key : {1u, 0u, 1u}) {
+    push_u32_le(checksummed, key);
+    checksummed.insert(checksummed.end(), serial.begin(), serial.end());
+  }
+  std::vector<uint8_t> blob;
+  push_u32_be(blob, checksummed.size());
+  blob.insert(blob.end(), checksummed.begin(), checksummed.end());
+  push_u32_be(blob, crc32_of(checksummed));
+  auto path = write_puffin(blob, "charged_blocks_order", 9);
+  auto high = int64_t{1} << 32;
+  CHECK(read_for_test(synthetic_ref(path, blob, 9), true, nullptr, 8) ==
+        std::vector<int64_t>{1, 5, 65537, high | 1, high | 5, high | 65537});
 }
 
 TEST_CASE("Charged Puffin failures distinguish corrupt input from missing files",
@@ -829,7 +1003,8 @@ TEST_CASE("Charged Puffin matches legacy Roaring validation and diagnostics",
                            std::string("bitmap_budget"),
                            std::string("late_corruption"),
                            std::string("run_header"));
-  CAPTURE(scenario);
+  auto block    = GENERATE(uint64_t{0}, uint64_t{8});
+  CAPTURE(scenario, block);
   int64_t declared = 1;
   std::vector<uint8_t> blob;
   if (scenario.starts_with("bitset")) {
@@ -881,7 +1056,7 @@ TEST_CASE("Charged Puffin matches legacy Roaring validation and diagnostics",
   auto ref   = synthetic_ref(path, blob, declared);
   auto error = [&](bool charged) {
     try {
-      (void)read_for_test(ref, charged);
+      (void)read_for_test(ref, charged, nullptr, block);
     } catch (std::runtime_error const& e) {
       return std::string(e.what());
     }
@@ -889,7 +1064,7 @@ TEST_CASE("Charged Puffin matches legacy Roaring validation and diagnostics",
   };
   if (scenario == "run_header") {
     CHECK(read_for_test(ref, false) == std::vector<int64_t>{1, 2});
-    CHECK(read_for_test(ref, true) == read_for_test(ref, false));
+    CHECK(read_for_test(ref, true, nullptr, block) == read_for_test(ref, false));
   } else {
     auto legacy = error(false);
     REQUIRE_FALSE(legacy.empty());
@@ -1032,6 +1207,243 @@ TEST_CASE("Neutral DV payload obeys independent limits and retained grant",
   provider.seen->fail_allocation = true;
   CHECK_THROWS_AS(decode_deletion_vector_payload(blob, allocator), preparation_resource_error);
   CHECK(ledger.charged_bytes({1, 1}) == 0);
+}
+
+TEST_CASE("Deletion vector bitmaps held in blocks are sized as CRoaring sizes them",
+          "[scan_preparation][iceberg][charged_reader]")
+{
+  // The reader sizes a serialized bitmap itself, so that it can do so over blocks. Candidates,
+  // read in 8-byte blocks: array, bitset and run containers (five, so the offset header is
+  // present) cut short at each length, cookies that are neither format, and a container count
+  // above 65,536.
+  roaring::Roaring bitmap;
+  for (uint32_t value : {1u, 5u, 3u * 65536 + 7, 4u * 65536 + 9})
+    bitmap.add(value);
+  for (uint32_t value = 65536; value < 2 * 65536; value += 2)
+    bitmap.add(value);
+  bitmap.addRange(2 * 65536, 3 * 65536);
+  REQUIRE(bitmap.runOptimize());
+  std::vector<uint8_t> serial(bitmap.getSizeInBytes());
+  REQUIRE(bitmap.write(reinterpret_cast<char*>(serial.data())) == serial.size());
+  std::vector<std::vector<uint8_t>> candidates;
+  for (size_t length = 0; length <= serial.size(); ++length)
+    if (length < 80 || length + 80 > serial.size() || length % 251 == 0)
+      candidates.emplace_back(serial.begin(), serial.begin() + length);
+  candidates.push_back(serial);
+  candidates.back()[0] ^= 1;
+  // The format without run containers, with a bit set above the cookie's low half.
+  roaring::Roaring arrays;
+  arrays.add(1);
+  candidates.emplace_back(arrays.getSizeInBytes());
+  REQUIRE(arrays.write(reinterpret_cast<char*>(candidates.back().data())) ==
+          candidates.back().size());
+  candidates.back()[2] = 1;
+  candidates.emplace_back();
+  push_u32_le(candidates.back(), 12346);
+  push_u32_le(candidates.back(), 65537);
+  for (uint32_t i = 0; i < 65537; ++i)
+    push_u32_le(candidates.back(), i & 0xffff);
+  candidates.back().resize(candidates.back().size() + 65537 * 6);
+
+  size_t valid = 0;
+  for (auto const& bytes : candidates) {
+    CAPTURE(bytes.size());
+    auto const size = roaring::api::roaring_bitmap_portable_deserialize_size(
+      reinterpret_cast<char const*>(bytes.data()), bytes.size());
+    std::vector<uint8_t> checksummed{0xD1, 0xD3, 0x39, 0x64, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    checksummed.insert(checksummed.end(), bytes.begin(), bytes.end());
+    std::vector<uint8_t> blob;
+    push_u32_be(blob, checksummed.size());
+    blob.insert(blob.end(), checksummed.begin(), checksummed.end());
+    push_u32_be(blob, crc32_of(checksummed));
+    auto path = write_puffin(blob, "sized_as_croaring", bitmap.cardinality());
+    auto ref  = synthetic_ref(path, blob, bitmap.cardinality());
+    if (size) {
+      REQUIRE(size == bytes.size());
+      CHECK(read_for_test(ref, true, nullptr, 8).size() == bitmap.cardinality());
+      ++valid;
+    } else {
+      CHECK_THROWS_WITH(read_for_test(ref, true, nullptr, 8),
+                        Catch::Matchers::ContainsSubstring("no valid portable-Roaring bitmap"));
+    }
+  }
+  CHECK(valid == 1);
+}
+
+TEST_CASE("A blob read that fails or is cancelled partway over blocks keeps its cause",
+          "[scan_preparation][iceberg][charged_reader]")
+{
+  using namespace sirius::scan_manager;
+  auto ref               = fixture_ref();
+  ref.file_size_in_bytes = fs::file_size(ref.puffin_path);
+  std::ifstream input(ref.puffin_path, std::ios::binary);
+  std::vector<std::byte> bytes(static_cast<std::size_t>(ref.file_size_in_bytes));
+  input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  REQUIRE(input);
+  // The 44-byte blob is read into six 8-byte blocks.
+  test::test_reservation_provider provider;
+  provider.grant_bytes          = 1024 * 1024;
+  provider.quantum              = 8;
+  provider.seen->scatter_blocks = true;
+  preparation_ledger ledger(provider);
+  std::array scans{scan_envelope{{{{44, 64 * 1024, 0}, 16}}, {}, true}};
+  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  ledger.register_unit({1, 1}, 16);
+  auto permit    = ledger.acquire_permit({1, 1});
+  auto allocator = ledger.allocator(permit);
+  DeletionVectorRefView view{ref.puffin_path,
+                             ref.content_offset,
+                             ref.content_size_in_bytes,
+                             ref.referenced_data_file,
+                             ref.file_size_in_bytes,
+                             ref.record_count};
+  auto read = [&](puffin_byte_source& source) {
+    (void)read_deletion_vector_charged(
+      view, allocator, ref.referenced_data_file, std::make_shared<int>(0), 1, source);
+    FAIL("the read succeeded");
+  };
+  SECTION("a failed block read is reader I/O")
+  {
+    // The third block read fails. Parsing the half-filled blob instead would report a corrupt
+    // deletion vector.
+    struct failing_source final : puffin_byte_source {
+      explicit failing_source(std::vector<std::byte> bytes) : inner(std::move(bytes)) {}
+      bool seek(std::streamoff offset) override { return inner.seek(offset); }
+      bool read(std::span<std::byte> out) override
+      {
+        return !(out.size() == 8 && ++block_reads == 3) && inner.read(out);
+      }
+      [[nodiscard]] std::streamoff size() const override { return inner.size(); }
+      vector_puffin_source inner;
+      int block_reads = 0;
+    };
+    failing_source source(std::move(bytes));
+    try {
+      read(source);
+    } catch (sirius::transparent::classified_execution_error const& error) {
+      CHECK(error.cause == sirius::transparent::late_failure_cause::reader_io);
+    }
+    CHECK(source.block_reads == 3);
+  }
+  SECTION("a cancelled vectored read stays a cancellation")
+  {
+    // The datasource fetches the six blocks in one request, cancelled after the first is filled.
+    auto io = std::make_shared<memory_ioctx>(std::move(bytes), memory_ioctx::vectored::cancelled);
+    auto source = make_puffin_byte_source(cucascade::io::open_datasource(io, ref.puffin_path));
+    try {
+      read(*source);
+    } catch (std::system_error const& error) {
+      CHECK(error.code() == std::errc::operation_canceled);
+    }
+    CHECK(io->destinations.size() == 6);
+  }
+  CHECK(provider.seen->allocated_bytes == 0);
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
+}
+
+TEST_CASE("A datasource read fills non-adjacent host pool blocks that outlive a held read",
+          "[scan_preparation][iceberg][charged_reader][host]")
+{
+  using namespace sirius::scan_manager;
+  using namespace std::chrono_literals;
+  constexpr uint64_t block = 8192;
+  // One bitset container: an 8,232-byte blob whose last 40 bytes, the highest positions and
+  // the checksum, land in a second block.
+  roaring::Roaring bitmap;
+  std::vector<int64_t> expected;
+  for (uint32_t value = 0; value < 65536; value += 7) {
+    bitmap.add(value);
+    expected.push_back(value);
+  }
+  std::vector<uint8_t> serial(bitmap.getSizeInBytes());
+  REQUIRE(bitmap.write(reinterpret_cast<char*>(serial.data())) == serial.size());
+  std::vector<uint8_t> checksummed{0xD1, 0xD3, 0x39, 0x64, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  checksummed.insert(checksummed.end(), serial.begin(), serial.end());
+  std::vector<uint8_t> blob;
+  push_u32_be(blob, checksummed.size());
+  blob.insert(blob.end(), checksummed.begin(), checksummed.end());
+  push_u32_be(blob, crc32_of(checksummed));
+  auto ref = synthetic_ref(write_puffin(blob, "held_read", expected.size()), blob, expected.size());
+  ref.file_size_in_bytes = fs::file_size(ref.puffin_path);
+  std::ifstream input(ref.puffin_path, std::ios::binary);
+  std::vector<std::byte> bytes(static_cast<std::size_t>(ref.file_size_in_bytes));
+  input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  REQUIRE(input);
+
+  cucascade::memory::host_memory_space_config config;
+  config.numa_id              = 0;
+  config.memory_capacity      = 128 * block;
+  config.block_size           = block;
+  config.pool_size            = 64;
+  config.initial_number_pools = 1;
+  cucascade::memory::memory_reservation_manager manager({config});
+  auto* resource = manager.get_memory_space(cucascade::memory::Tier::HOST, 0)
+                     ->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  // A pool that has been in use: every other block is free, so no two free blocks are
+  // neighbours.
+  std::vector<decltype(resource->allocate_multiple_blocks(block))> in_use;
+  for (auto blocks = resource->get_free_blocks(); blocks > 0; --blocks)
+    in_use.push_back(resource->allocate_multiple_blocks(block));
+  std::sort(in_use.begin(), in_use.end(), [](auto const& a, auto const& b) {
+    return a->get_blocks().front() < b->get_blocks().front();
+  });
+  for (size_t i = 0; i < in_use.size(); i += 2)
+    in_use[i].reset();
+  auto const initial_free = resource->get_free_blocks();
+
+  host_reservation_provider provider(manager);
+  preparation_ledger ledger(provider);
+  auto const positions = expected.size() * sizeof(int64_t);
+  std::array scans{scan_envelope{{{{blob.size(), block, 0}, positions}}, {}, true}};
+  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  ledger.register_unit({1, 1}, positions);
+  auto permit    = ledger.acquire_permit({1, 1});
+  auto allocator = ledger.allocator(permit);
+  DeletionVectorRefView view{ref.puffin_path,
+                             ref.content_offset,
+                             ref.content_size_in_bytes,
+                             ref.referenced_data_file,
+                             ref.file_size_in_bytes,
+                             ref.record_count};
+  auto read = [&](puffin_byte_source& source) {
+    return read_deletion_vector_charged(
+      view, allocator, ref.referenced_data_file, std::make_shared<int>(0), 1, source);
+  };
+  SECTION("positions decoded across the block boundary are the file's")
+  {
+    // A reader that fills both blocks from one file offset fails the checksum.
+    auto io     = std::make_shared<memory_ioctx>(std::move(bytes), memory_ioctx::vectored::served);
+    auto source = make_puffin_byte_source(cucascade::io::open_datasource(io, ref.puffin_path));
+    auto result = read(*source);
+    REQUIRE(io->destinations.size() == 2);
+    CHECK(io->destinations[0] + block != io->destinations[1]);
+    CHECK(io->destinations[1] + block != io->destinations[0]);
+    CHECK(std::vector<int64_t>(result->positions.begin(), result->positions.end()) == expected);
+  }
+  SECTION("the blocks stay out of the pool until a held read finishes")
+  {
+    auto io =
+      std::make_shared<memory_ioctx>(std::move(bytes), memory_ioctx::vectored::failed_and_held);
+    auto source  = make_puffin_byte_source(cucascade::io::open_datasource(io, ref.puffin_path));
+    auto reading = std::async(std::launch::async, [&] { (void)read(*source); });
+    // Destroyed before `reading`, so no exit from this section joins a worker that is still held.
+    cucascade::utils::on_scope_exit release{[&]() noexcept { io->finish_held(); }};
+    REQUIRE(io->issued_within(5s));
+    // One range has failed and the other is in flight. A reader that returned now would hand
+    // that range's block back to the pool while the backend can still write to it.
+    CHECK(reading.wait_for(100ms) == std::future_status::timeout);
+    CHECK(ledger.charged_bytes(permit) >= 2 * block);
+    CHECK(resource->get_free_blocks() <= initial_free - 2);
+    io->finish_held();
+    try {
+      reading.get();
+      FAIL("the read succeeded");
+    } catch (sirius::transparent::classified_execution_error const& error) {
+      CHECK(error.cause == sirius::transparent::late_failure_cause::reader_io);
+    }
+  }
+  CHECK(ledger.charged_bytes(permit) == 0);
+  CHECK(resource->get_free_blocks() == initial_free);
 }
 
 namespace {

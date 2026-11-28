@@ -89,6 +89,8 @@ libnvjitlink-dev = "*"
 [feature.dev-libs.pypi-dependencies]
 # Local TPC-H Iceberg dataset writer; reuses the existing Python and PyArrow.
 pyiceberg = { version = "==0.12.0", extras = ["sql-sqlite"] }
+# Serializes the deletion-vector bitmap of a generated Iceberg test table.
+pyroaring = ">=1.0.0, <2"
 
 [tasks]
 # Differential fuzzer; see test/fuzz/README.md. Drives the DuckDB shell from the build.

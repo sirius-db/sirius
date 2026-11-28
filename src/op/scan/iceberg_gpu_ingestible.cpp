@@ -208,7 +208,7 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
   auto const* dv         = descriptor.dv;
   if (!dv)
     return std::make_shared<iceberg_delete_set const>(
-      descriptor.path, scan_manager::charged_block{}, 0, 0, job.path_owner());
+      descriptor.path, scan_manager::charged_blocks{}, 0, 0, job.path_owner());
 
   std::shared_ptr<iceberg_delete_set const> set;
   auto allocator = job.allocator();
@@ -712,7 +712,7 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
       apply_lineage_visibility(
         base.table,
         lineage,
-        [&](auto const& file) -> std::span<int64_t const> {
+        [&](auto const& file) -> block_span<int64_t const> {
           for (auto const& binding : pending)
             if (binding.file == delete_key_for(file)) return sets.at(binding.file)->positions;
           return {};
@@ -753,9 +753,9 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
         base.table = owning_table_view(apply_positional_visibility(
           base.table.release(stream, mr_ref),
           std::move(base.row_positions),
-          [&](std::string const& path) -> std::span<int64_t const> {
+          [&](std::string const& path) -> block_span<int64_t const> {
             auto it = pending_sets.find(path);
-            return it == pending_sets.end() ? std::span<int64_t const>{} : it->second->positions;
+            return it == pending_sets.end() ? block_span<int64_t const>{} : it->second->positions;
           },
           stream,
           mr_ref));

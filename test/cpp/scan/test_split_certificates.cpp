@@ -1544,7 +1544,7 @@ TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
     REQUIRE(iceberg_set);
     CHECK(iceberg_set->positions.empty() == (path == intact));
     if (path == deleted) {
-      CHECK(iceberg_set->positions.data() == positions);
+      CHECK(&iceberg_set->positions.front() == positions);
       CHECK(std::vector<int64_t>(iceberg_set->positions.begin(), iceberg_set->positions.end()) ==
             std::vector<int64_t>{0, 0, 4});
     }

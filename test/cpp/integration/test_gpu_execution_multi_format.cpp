@@ -4775,6 +4775,37 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "A deletion vector larger than one host block is applied on the GPU",
+                 "[integration][scan_preparation][iceberg][deferred]")
+{
+  // 140,000 deleted positions take 1.12 MB: two blocks of the 1 MiB host pool, which stop being
+  // neighbours once the pool has been used. `scattered` supplies 4 KiB blocks with gaps instead,
+  // so the 21 KB Puffin blob spans several blocks too.
+  auto scattered = GENERATE(false, true);
+  auto table     = inventory_fixture("dv_two_blocks");
+  auto counters  = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  preparation_test_state observed(counters, scattered ? std::optional<bool>(true) : std::nullopt);
+  if (scattered) {
+    observed.provider->grant_bytes          = 8 * 1024 * 1024;
+    observed.provider->quantum              = 4096;
+    observed.provider->seen->scatter_blocks = true;
+  }
+  // Two statements: a fresh pool hands the first one adjacent blocks. The second reads the
+  // deletes through row lineage. Applying only the first block of positions leaves 18,928 rows.
+  for (auto const* column : {"count", "file_row_number"}) {
+    auto const value = std::string(column);
+    expect_iceberg_rows("SELECT count(*), sum(" + value + "), min(" + value + "), max(" + value +
+                          ") FROM " + pinned_scan(table),
+                        gpu_route::gpu,
+                        {{"10000", "749925000", "0", "149985"}});
+  }
+  REQUIRE(observed.routes.size() == 2);
+  CHECK(observed.routes.front().second);
+  CHECK(observed.routes.back().second);
+  CHECK(observed.reads_started.size() == 2);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "Unsuccessful HOST admission selects legacy without rejecting the scan",
                  "[integration][scan_preparation][iceberg][admission]")
 {

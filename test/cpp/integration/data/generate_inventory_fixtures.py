@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2026, Sirius Contributors. Licensed under the Apache License, Version 2.0.
-"""Generate Iceberg inventory edge cases in a supplied scratch directory (requires fastavro and pyarrow)."""
+"""Generate Iceberg inventory edge cases in a supplied scratch directory (requires fastavro, pyarrow and pyroaring)."""
 import copy
 import json
 from pathlib import Path
@@ -290,6 +290,89 @@ for variant, names in (
     if variant == "dv_missing_payload":
         (dest / "data/a.puffin").unlink()
 
+# One deletion vector whose decoded positions, 8 bytes each, outgrow a default 1 MiB host block:
+# count = row number, and every row but each fifteenth is deleted. Hand-built metadata; the
+# bitmap is serialized by CRoaring (pyroaring, installed with pyiceberg).
+import zlib
+
+from pyroaring import BitMap
+
+rows = 150_000
+dest = out / "dv_two_blocks"
+(dest / "metadata").mkdir(parents=True, exist_ok=True)
+(dest / "data").mkdir(parents=True, exist_ok=True)
+data = dest / "data" / "a.parquet"
+pq.write_table(
+    pa.table(
+        [pa.array(["kiwi"] * rows), pa.array(range(rows), pa.int64())],
+        schema=pa.schema(
+            [
+                pa.field("fruit", pa.string(), metadata={"PARQUET:field_id": "1"}),
+                pa.field("count", pa.int64(), metadata={"PARQUET:field_id": "2"}),
+            ]
+        ),
+    ),
+    data,
+    row_group_size=40_000,
+    use_dictionary=["fruit"],
+    column_encoding={"count": "DELTA_BINARY_PACKED"},
+)
+deleted = [row for row in range(rows) if row % 15]
+vector = bytes([0xD1, 0xD3, 0x39, 0x64]) + struct.pack("<qI", 1, 0)
+vector += BitMap(deleted).serialize()
+blob = struct.pack(">I", len(vector)) + vector + struct.pack(">I", zlib.crc32(vector))
+footer = copy.deepcopy(source_footer)
+footer["blobs"][0].update(offset=4, length=len(blob))
+footer["blobs"][0]["properties"].update(
+    {"referenced-data-file": str(data), "cardinality": str(len(deleted))}
+)
+payload = json.dumps(footer, separators=(",", ":")).encode()
+sidecar = dest / "data" / "a.puffin"
+sidecar.write_bytes(
+    b"PFA1"
+    + blob
+    + b"PFA1"
+    + payload
+    + struct.pack("<i", len(payload))
+    + bytes(4)
+    + b"PFA1"
+)
+meta = json.loads((source / "metadata/v1.metadata.json").read_text())
+meta["location"] = str(dest)
+for snapshot in meta["snapshots"]:
+    snapshot["manifest-list"] = str(
+        dest / "metadata" / Path(snapshot["manifest-list"]).name
+    )
+for path in sorted(
+    (source / "metadata").glob("*.avro"), key=lambda p: p.name.startswith("snap-")
+):
+    schema, metadata, entries = read(path)
+    for row in entries:
+        if "manifest_path" in row:
+            row["manifest_path"] = str(
+                dest / "metadata" / Path(row["manifest_path"]).name
+            )
+            row["manifest_length"] = Path(row["manifest_path"]).stat().st_size
+            row["added_rows_count"] = rows if row["content"] == 0 else 0
+        elif row["data_file"]["content"] == 0:
+            row["data_file"].update(
+                file_path=str(data),
+                record_count=rows,
+                file_size_in_bytes=data.stat().st_size,
+                split_offsets=None,
+            )
+        else:
+            row["data_file"].update(
+                file_path=str(sidecar),
+                referenced_data_file=str(data),
+                record_count=len(deleted),
+                content_offset=4,
+                content_size_in_bytes=len(blob),
+                file_size_in_bytes=sidecar.stat().st_size,
+            )
+    write(dest / "metadata" / path.name, schema, metadata, entries)
+(dest / "metadata/v1.metadata.json").write_text(json.dumps(meta, indent=2))
+(dest / "metadata/version-hint.text").write_text("1")
 
 # Optional remote root keeps metadata, manifests, data and Puffin on the same backend.
 if len(sys.argv) > 2:
@@ -335,6 +418,17 @@ if len(sys.argv) > 2:
         if rows and "manifest_path" in rows[0]:
             for row in rows:
                 row["manifest_length"] = Path(row["manifest_path"]).stat().st_size
+        else:
+            # The footer rewrite above changed the length of each relocated Puffin, and the
+            # deferred reader refuses a file longer than the size its manifest records.
+            for row in rows:
+                sidecar = Path(row["data_file"]["file_path"])
+                if (
+                    sidecar.suffix == ".puffin"
+                    and out in sidecar.parents
+                    and sidecar.is_file()
+                ):
+                    row["data_file"]["file_size_in_bytes"] = sidecar.stat().st_size
         write(path, schema, metadata, relocate(rows))
 
 print(out)
