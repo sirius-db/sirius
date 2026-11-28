@@ -21,12 +21,16 @@
 
 #include <cudf/aggregation.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -66,6 +70,39 @@ class gpu_merge_impl {
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});
+
+  /**
+   * @brief Concatenate tables, keeping cudf::concatenate off the strings input it gets wrong.
+   *
+   * cudf::concatenate (libcudf 26.10) copies the characters of a strings column with one
+   * kernel when the inputs are small on average, and that kernel returns wrong characters once
+   * the concatenated characters pass 2^31 bytes: the offsets are right and the characters are
+   * not. TPC-H Q12 at SF300000 hit this with about 10,600 inputs of 330 KB each. Larger inputs
+   * are copied one by one, correctly. A strings column that would pass @p string_chars_limit
+   * from inputs under @p small_input_chars on average is therefore concatenated in groups of at
+   * most @p group_chars characters first, and the groups are concatenated last. Every other
+   * column, and every table without such a column, is one cudf::concatenate.
+   *
+   * @param input The tables to concatenate, all with the same schema.
+   * @param stream CUDA stream used for device memory operations and kernel launches.
+   * @param mr Device memory resource of the output table and of the groups.
+   * @param string_chars_limit Characters of one strings column above which its inputs may be
+   *                           grouped.
+   * @param small_input_chars Average characters per input under which a strings column is
+   *                          grouped. The default leaves a wide margin above the sizes at
+   *                          which libcudf switches to copying input by input.
+   * @param group_chars Most characters in a group; a single input with more is a group of its
+   *                    own.
+   *
+   * @return The concatenated table.
+   */
+  static std::unique_ptr<cudf::table> concat_tables(
+    const std::vector<cudf::table_view>& input,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    std::int64_t string_chars_limit = std::numeric_limits<cudf::size_type>::max(),
+    std::int64_t small_input_chars  = std::int64_t{4} << 20,
+    std::int64_t group_chars        = std::int64_t{1} << 30);
 
   /**
    * @brief Perform ungrouped merge aggregate on multiple data batches.

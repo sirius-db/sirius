@@ -26,6 +26,8 @@
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
@@ -44,7 +46,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <format>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <utility>
@@ -92,6 +96,83 @@ bool order_partials_by_first_key(std::vector<cudf::table_view>& views,
 
 }  // namespace
 
+std::unique_ptr<cudf::table> gpu_merge_impl::concat_tables(
+  const std::vector<cudf::table_view>& input,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr,
+  std::int64_t string_chars_limit,
+  std::int64_t small_input_chars,
+  std::int64_t group_chars)
+{
+  if (input.empty()) { throw std::runtime_error("`input` in `concat_tables()` is empty"); }
+  auto const num_columns = input.front().num_columns();
+  auto const num_inputs  = static_cast<std::int64_t>(input.size());
+
+  // The strings columns to concatenate in groups, each with the characters of every input.
+  std::vector<std::pair<cudf::size_type, std::vector<std::int64_t>>> grouped;
+  for (cudf::size_type c = 0; c < num_columns; ++c) {
+    if (input.front().column(c).type().id() != cudf::type_id::STRING) { continue; }
+    std::vector<std::int64_t> chars(input.size(), 0);
+    std::int64_t total = 0;
+    for (std::size_t i = 0; i < input.size(); ++i) {
+      auto const col = input[i].column(c);
+      // A 0-row strings column may have no offsets child to read.
+      if (col.size() == 0 || col.num_children() == 0) { continue; }
+      chars[i] = cudf::strings_column_view(col).chars_size(stream);
+      total += chars[i];
+    }
+    if (total > string_chars_limit && total / num_inputs < small_input_chars) {
+      grouped.emplace_back(c, std::move(chars));
+    }
+  }
+  if (grouped.empty()) { return cudf::concatenate(input, stream, mr); }
+
+  // Column by column, so that only the grouped columns exist twice while they are built.
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(static_cast<std::size_t>(num_columns));
+  std::vector<cudf::column_view> views(input.size());
+  auto next_grouped = grouped.begin();
+  for (cudf::size_type c = 0; c < num_columns; ++c) {
+    for (std::size_t i = 0; i < input.size(); ++i) {
+      views[i] = input[i].column(c);
+    }
+    if (next_grouped == grouped.end() || next_grouped->first != c) {
+      columns.push_back(cudf::concatenate(views, stream, mr));
+      continue;
+    }
+    auto const& chars = next_grouped->second;
+    ++next_grouped;
+
+    std::vector<std::unique_ptr<cudf::column>> groups;
+    std::vector<cudf::column_view> group_views;
+    std::vector<cudf::column_view> pending;
+    std::int64_t pending_chars = 0;
+    auto close_group           = [&] {
+      if (pending.empty()) { return; }
+      if (pending.size() == 1) {
+        group_views.push_back(pending.front());
+      } else {
+        groups.push_back(cudf::concatenate(pending, stream, mr));
+        group_views.push_back(groups.back()->view());
+      }
+      pending.clear();
+      pending_chars = 0;
+    };
+    for (std::size_t i = 0; i < input.size(); ++i) {
+      if (pending_chars + chars[i] > group_chars) { close_group(); }
+      pending.push_back(views[i]);
+      pending_chars += chars[i];
+    }
+    close_group();
+    SIRIUS_LOG_DEBUG("concat_tables: strings column {} of {} inputs concatenated in {} groups",
+                     c,
+                     input.size(),
+                     group_views.size());
+    columns.push_back(cudf::concatenate(group_views, stream, mr));
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   const std::vector<cucascade::read_only_data_batch>& input,
   ::cuda::stream_ref stream,
@@ -106,11 +187,25 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   // Pull input cudf tables and merge.
   std::vector<cudf::table_view> input_cudf_table_views;
   input_cudf_table_views.reserve(input.size());
+  std::size_t input_bytes = 0;
   for (const auto& batch : input) {
     input_cudf_table_views.push_back(get_cudf_table_view(batch));
+    input_bytes += batch.get_data()->get_size_in_bytes();
   }
-  auto output_cudf_table = concatenate_carriers(
-    std::move(input_cudf_table_views), stream, memory_space.get_default_allocator());
+  // The inputs' bytes bound the characters of every column, so a concat below the limit
+  // reads no offsets.
+  constexpr auto string_chars_limit =
+    static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
+  auto const mr = memory_space.get_default_allocator();
+  auto output_cudf_table =
+    input_bytes > string_chars_limit
+      ? concatenate_carriers(std::move(input_cudf_table_views),
+                             stream,
+                             mr,
+                             [&](std::vector<cudf::table_view> const& tables) {
+                               return concat_tables(tables, stream, mr);
+                             })
+      : concatenate_carriers(std::move(input_cudf_table_views), stream, mr);
 
   // Create output data batch.
   return make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info);

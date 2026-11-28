@@ -299,9 +299,12 @@ std::unique_ptr<cudf::column> decode_dictionary_carrier(cudf::column_view const&
   return cudf::dictionary::decode(cudf::dictionary_column_view(column), stream, mr);
 }
 
-std::unique_ptr<cudf::table> concatenate_carriers(std::vector<cudf::table_view> tables,
-                                                  ::cuda::stream_ref stream,
-                                                  rmm::device_async_resource_ref mr)
+std::unique_ptr<cudf::table> concatenate_carriers(
+  std::vector<cudf::table_view> tables,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr,
+  std::function<std::unique_ptr<cudf::table>(std::vector<cudf::table_view> const&)> const&
+    concatenate)
 {
   // An empty carrier may lack the keys child, so its type cannot match a populated one.
   if (tables.size() > 1) {
@@ -329,7 +332,8 @@ std::unique_ptr<cudf::table> concatenate_carriers(std::vector<cudf::table_view> 
     }
   }
   // Merging keys can take a carrier past the cap that each input kept to.
-  auto columns = cudf::concatenate(tables, stream, mr)->release();
+  auto columns =
+    (concatenate ? concatenate(tables) : cudf::concatenate(tables, stream, mr))->release();
   for (auto& column : columns) {
     if (column->type().id() == cudf::type_id::DICTIONARY32 &&
         dictionary_keys_bytes(*column) > dictionary_carrier_max_keys_bytes) {
