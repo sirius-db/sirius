@@ -183,6 +183,7 @@ sirius:
     enable_partial_aggregate_below_join: false
     enable_subquery_key_carry: true
     enable_exists_from_aggregate: true
+    enable_late_dimension_join: true
     parquet_footer_statistics_max_remote_reads: 64
     parquet_footer_statistics_max_local_reads: -1
     admission_bytes_per_gpu: 4GiB
