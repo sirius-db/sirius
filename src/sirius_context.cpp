@@ -30,6 +30,7 @@
 #include "exchange/distributed_session.hpp"
 #include "exchange/exchange_runtime.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/rank_control.hpp"
 #include "exec/stream_bind_catalog.hpp"
 #include "exec/thread_util.hpp"
 #include "helper/transaction_utils.hpp"
@@ -50,6 +51,7 @@
 #include "transparent/read_view_registry.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "util/duckdb_error_message.hpp"
+#include "util/scoped_process_affinity.hpp"
 #include "vss/cuvs_index_cache.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
@@ -1299,7 +1301,7 @@ void SiriusContext::release_resources() noexcept
   // The exchange's engine thread lands batches in memory_manager_'s spaces and calls into sources
   // and the components above: stop it while they all still exist. Plans can hold the service past
   // terminate() (a prepared statement), so dropping this reference alone would not stop it.
-  if (auto* session = distributed()) { session->shutdown(); }
+  shutdown_exchange();
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
   // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.
@@ -1365,10 +1367,10 @@ sirius::exchange::distributed_session& SiriusContext::distributed_session_for_us
   return *distributed_owner_;
 }
 
-uint64_t SiriusContext::next_distributed_query(ClientContext& context)
+uint64_t SiriusContext::next_distributed_query(ClientContext& context, uint64_t assigned)
 {
   // The connection state is read outside the session's lock, which never nests DuckDB's.
-  auto const query = distributed_session_for_use().next_query(context.GetConnectionId());
+  auto const query = distributed_session_for_use().next_query(context.GetConnectionId(), assigned);
   if (auto state = get_sirius_connection_state(context)) {
     if (state->active_window != 0) {
       distributed()->tie(state->active_window, query);
@@ -1382,6 +1384,11 @@ uint64_t SiriusContext::next_distributed_query(ClientContext& context)
 void SiriusContext::release_distributed_connection(ClientContext& context)
 {
   if (auto* session = distributed()) { session->release_connection(context.GetConnectionId()); }
+}
+
+void SiriusContext::shutdown_exchange()
+{
+  if (auto* session = distributed()) { session->shutdown(); }
 }
 
 void SiriusContext::set_exchange_service_for_testing(
@@ -1434,10 +1441,16 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
         static_cast<void>(downgrade.request_downgrade(
           [gpu, bytes] { return gpu->get_available_memory() >= bytes; }));
       };
+      // SET sirius_exchange_rank can run on a DuckDB worker pinned to one CPU, and the threads
+      // made here inherit its CPU set. The transport's engine thread and NIXL's listener
+      // busy-poll: pinned there, they starve the DuckDB workers pinned to that CPU, and a query
+      // waits forever on a task one of those workers holds.
       cucascade::exec::thread_util::scoped_thread_affinity startup_affinity(
         config_.get_worker_startup_cpus());
-      return sirius::exchange::make_nixl_exchange(
+      auto exchange = sirius::exchange::make_nixl_exchange(
         params.exchange_rank, params.exchange_peers, *gpu, host, opts);
+      sirius::exchange::note_exchange_joined();
+      return exchange;
     });
 }
 
@@ -2584,6 +2597,13 @@ void SiriusContextExtensionCallback::initialize_context()
   if (disabled_ || context_) { return; }
 
   auto context = duckdb::make_shared_ptr<SiriusContext>();
+  // Every pool Sirius owns is started in here, on whatever thread runs the LOAD.
+  sirius::util::scoped_process_affinity const affinity;
+  if (affinity.widened()) {
+    SIRIUS_LOG_INFO(
+      "SiriusContext: initializing on a thread pinned to fewer CPUs than the "
+      "process; its threads get the process's CPU set");
+  }
   context->initialize(config_);
   write_effective_config_file(context->get_config(), config_.get_user_config());
   context_ = std::move(context);

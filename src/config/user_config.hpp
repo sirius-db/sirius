@@ -43,6 +43,17 @@ struct user_config : block_base<user_config> {
   space_options space;
   operator_options operator_params;
   output_options output;
+  /// The launch scripts read sirius.distributed (scripts/sirius_distributed_config.py); Sirius
+  /// keeps it as written.
+  config_option<node> distributed = option<node>("distributed")
+                                      .parser([](const node& n, node& out) -> parse_status {
+                                        out = n;
+                                        return {};
+                                      })
+                                      .writer([](const node& n) { return n; })
+                                      .mark_production()
+                                      .describe("settings of the launch scripts")
+                                      .build();
 
   auto fields()
   {
@@ -54,7 +65,8 @@ struct user_config : block_base<user_config> {
                       sub("compression", compression),
                       sub("space", space),
                       sub("operator_params", operator_params),
-                      sub("output", output));
+                      sub("output", output),
+                      distributed);
   }
 
   /// sirius.memory and non-empty sirius.space lists are two ways to describe the same spaces.

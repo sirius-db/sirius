@@ -19,6 +19,7 @@
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/main/database.hpp"
 #include "exchange/exchange_runtime.hpp"
+#include "exchange/rank_control.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -2641,6 +2642,9 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo set_session_label_info(set_session_label);
   catalog.CreateTableFunction(transaction, set_session_label_info);
 
+  // Lets a distributed gateway restart this rank to join a new set of peers.
+  sirius::exchange::register_rank_control_functions(instance);
+
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(
     "profiler_start", {}, ProfilerStartFunction, ProfilerBind, ProfilerInit);
@@ -2881,8 +2885,17 @@ static void SetExchangeRank(ClientContext& context, SetScope scope, Value& param
     if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
       static_cast<void>(sirius_ctx->get_exchange_service(next));
     }
+  } else if (next.exchange_peers.size() == 1) {
+    // A gateway's only rank connects to no peer, but it has served that gateway: it restarts
+    // before it serves another set of ranks, so that their DDL log replays into an empty catalog.
+    sirius::exchange::note_exchange_joined();
   }
   params->exchange_rank = next.exchange_rank;
+}
+
+static void SetDistributedQueryId(ClientContext& context, SetScope scope, Value& parameter)
+{
+  get_operator_params(context, scope)->distributed_query_id = UBigIntValue::Get(parameter);
 }
 
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -3994,6 +4007,12 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::VARCHAR,
     Value("auto"),
     SetExchangeHostStaging);
+  config.AddExtensionOption("sirius_distributed_query_id",
+                            "Distributed execution: number of the next distributed query, set by "
+                            "a gateway; must increase. 0 numbers queries per process",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(0),
+                            SetDistributedQueryId);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",

@@ -743,6 +743,47 @@ TEST_CASE("queries retiring out of order are each forgotten", "[exchange][operat
   CHECK(flat(drain(source)).size() == rows_per_batch);
 }
 
+TEST_CASE("a retired range of queries drops their late arrivals, the next query's still kept",
+          "[exchange][operators]")
+{
+  ranks c(2);
+  auto& service = *c.all[1].service;
+  // A gateway skipped queries 2 to 2^40 on this rank; 1 retired alone, out of order.
+  service.forget_range(2, std::uint64_t{1} << 40);
+  service.forget(1);
+  // A range overlapping one already retired, and an empty one, change nothing.
+  service.forget_range(5, 10);
+  service.forget_range(10, 5);
+  auto& sender = *c.all[0].service;
+  for (std::uint64_t query : {std::uint64_t{1}, std::uint64_t{3}, std::uint64_t{1} << 40}) {
+    sender.send(sirius::exchange::make_stream_id(query, 1), 1, key_value_batch(0, 0));
+    sender.close(sirius::exchange::make_stream_id(query, 1), 1);
+  }
+  stream_id const next = sirius::exchange::make_stream_id((std::uint64_t{1} << 40) + 1, 1);
+  sender.send(next, 1, key_value_batch(0, 1));
+  sender.close(next, 1);
+  // One sender's batches land in order: once the next query's has, the retired ones' had.
+  sirius_physical_exchange_source kept(key_value_types(), 0, c.all[1].service, next, {0}, false);
+  CHECK(flat(drain(kept)).size() == rows_per_batch);
+  for (std::uint64_t query : {std::uint64_t{1}, std::uint64_t{3}, std::uint64_t{1} << 40}) {
+    sirius_physical_exchange_source fresh(key_value_types(),
+                                          0,
+                                          c.all[1].service,
+                                          sirius::exchange::make_stream_id(query, 1),
+                                          {0},
+                                          false);
+    CHECK(fresh.get_next_task_hint().value().hint != sirius::op::TaskCreationHint::READY);
+    CHECK_FALSE(fresh.all_ports_empty());
+  }
+}
+
+TEST_CASE("a stream id keeps every bit of its query's number", "[exchange][operators]")
+{
+  auto const last = sirius::exchange::distributed_query_limit - 1;
+  CHECK(sirius::exchange::query_of(sirius::exchange::make_stream_id(last, 7)) == last);
+  CHECK_THROWS_AS(sirius::exchange::make_stream_id(last + 1, 7), sirius::invalid_input_exception);
+}
+
 TEST_CASE("a shut-down exchange service stops its transport and refuses later sends",
           "[exchange][operators]")
 {

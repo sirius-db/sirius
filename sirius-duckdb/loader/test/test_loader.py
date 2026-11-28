@@ -8,7 +8,9 @@ import json
 import os
 from pathlib import Path
 import shutil
+import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -26,10 +28,33 @@ args.duckdb = args.duckdb.resolve()
 args.build_dir = args.build_dir.resolve()
 
 
-class Repository(ThreadingHTTPServer):
-    """Serves an extension repository over HTTP with a settable ETag."""
+def httpfs_loaded():
+    result = subprocess.run(
+        [
+            str(args.duckdb),
+            "-csv",
+            "-noheader",
+            "-c",
+            "SELECT count(*) FROM duckdb_extensions() WHERE extension_name = 'httpfs' AND loaded",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return result.stdout.strip() == "1"
 
-    def __init__(self, root):
+
+# With httpfs loaded, DuckDB installs from an http:// repository over https.
+HTTPS_INSTALLS = httpfs_loaded()
+
+
+class Repository(ThreadingHTTPServer):
+    """Serves an extension repository over HTTP with a settable ETag.
+
+    With a certificate (a PEM file holding the certificate and its key), it serves TLS.
+    """
+
+    def __init__(self, root, certificate=None):
         self.root = root
         self.etag = '"1"'
         # ETags of files other than the current builds, by path relative to the root.
@@ -68,8 +93,17 @@ class Repository(ThreadingHTTPServer):
                 pass
 
         super().__init__(("127.0.0.1", 0), Handler)
+        if certificate:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certificate)
+            self.socket = context.wrap_socket(self.socket, server_side=True)
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
+
+    def handle_error(self, request, client_address):
+        # The update check hangs up once it has the response headers.
+        if not isinstance(sys.exc_info()[1], ConnectionError):
+            super().handle_error(request, client_address)
 
     @property
     def url(self):
@@ -87,6 +121,26 @@ class LoaderTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.loader = args.build_dir / "extension/sirius/sirius.duckdb_extension"
         self.fixtures = args.build_dir / "extension/sirius/test"
+        self.certificate = self.root / "repository.pem"
+
+    def serve(self, repository):
+        """Serves a repository at an http:// URL, over the protocol DuckDB installs from it with."""
+        if HTTPS_INSTALLS:
+            key = self.root / "repository.key"
+            command = (
+                "openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=127.0.0.1"
+                " -addext subjectAltName=IP:127.0.0.1"
+            )
+            subprocess.run(
+                command.split() + ["-keyout", str(key), "-out", str(self.certificate)],
+                check=True,
+                capture_output=True,
+            )
+            with open(self.certificate, "a") as pem:
+                pem.write(key.read_text())
+        server = Repository(repository, self.certificate if HTTPS_INSTALLS else None)
+        self.addCleanup(server.stop)
+        return server
 
     def backend(self, version):
         name = f"sirius_cuda{version}"
@@ -108,6 +162,8 @@ class LoaderTests(unittest.TestCase):
             f"SET extension_directories=[{quote(self.root / 'installed')}];"
             f"SET autoinstall_known_extensions={'true' if autoinstall else 'false'};"
         )
+        if self.certificate.exists():
+            prelude += f"SET GLOBAL ca_cert_file={quote(self.certificate)};"
         return subprocess.run(
             [str(args.duckdb), "-unsigned", "-json", "-c", prelude + sql],
             env=environment,
@@ -425,8 +481,7 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
 
     def test_reports_backend_update(self):
-        server = Repository(self.repository_with_backend(13))
-        self.addCleanup(server.stop)
+        server = self.serve(self.repository_with_backend(13))
         load = (
             f"SET autoinstall_extension_repository={quote(server.url)};"
             f"LOAD {quote(self.loader)}; SELECT sirius_test_backend() AS backend;"
@@ -468,8 +523,7 @@ class LoaderTests(unittest.TestCase):
         pinned = Path("sirius_cuda13/v0") / self.revision / self.platform / name
         (repository / pinned).parent.mkdir(parents=True)
         shutil.copyfile(self.backend(13), repository / pinned)
-        server = Repository(repository)
-        self.addCleanup(server.stop)
+        server = self.serve(repository)
         server.etags[str(pinned)] = '"v0"'
         result = self.query(
             f"FORCE INSTALL sirius_cuda13 FROM {quote(server.url)} VERSION 'v0';"

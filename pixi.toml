@@ -121,6 +121,34 @@ run-clang-tidy -p build/clang-tidy -warnings-as-errors='-*' \
 description = "Start the local DuckDB shell with Sirius loaded."
 cmd = '''sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"'''
 
+# Distributed Sirius: docs/super-sirius/distributed-gateway.md.
+[tasks.build-distributed]
+description = "Build Sirius and the gateway."
+cmd = """
+make -C "$PIXI_PROJECT_ROOT" &&
+make -C "$PIXI_PROJECT_ROOT/gateway" release
+"""
+
+[tasks.test-gateway]
+description = "Run the gateway's SQL tests on CPU ranks; needs the gateway build."
+cmd = 'cd "$PIXI_PROJECT_ROOT/gateway" && ./build/release/test/unittest "test/*"'
+
+[tasks.test-scripts]
+description = "Run the unit tests of the launch and answer-check scripts."
+cmd = 'python -m unittest discover -s "$PIXI_PROJECT_ROOT/test/scripts" -p "test_*.py" -v'
+
+[tasks.sirius-gateway]
+description = "Start the distributed gateway (scripts/sirius_gateway.sh; --help for options)."
+cmd = '"$PIXI_PROJECT_ROOT/scripts/sirius_gateway.sh"'
+
+[tasks.sirius-node]
+description = "Start one rank per GPU on this host and register them with the gateway (scripts/sirius_node.sh)."
+cmd = '"$PIXI_PROJECT_ROOT/scripts/sirius_node.sh"'
+
+[tasks.sirius-client]
+description = "Open a DuckDB shell connected to the gateway (scripts/sirius_client.sh)."
+cmd = '"$PIXI_PROJECT_ROOT/scripts/sirius_client.sh"'
+
 [tasks.clion-env]
 description = "Generate the Pixi environment file used by CLion."
 cmd = "mkdir -p build && pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh"
