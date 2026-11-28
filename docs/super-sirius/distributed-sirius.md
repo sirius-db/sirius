@@ -17,7 +17,8 @@ SELECT ...;                               -- the same statement on every rank
 Without `sirius_exchange_peers`, nothing here applies and queries run in one process as before.
 
 To set up the ranks, the [gateway](distributed-gateway.md) and a client on several machines, see
-the [distributed quick start](distributed-quickstart.md).
+the [distributed quick start](distributed-quickstart.md). To have the ranks read Parquet through
+GPUDirect Storage, see the [GDS runbook](gds-runbook.md).
 
 ## Contents
 
@@ -417,6 +418,7 @@ pixi run build-distributed
 | Variable | Default | Why |
 |---|---|---|
 | `UCX_TLS`, `UCX_NET_DEVICES` | `cuda_copy,cuda_ipc,tcp,self` on the interface of the rank's address | The transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout"). `SIRIUS_UCX_RAILS=1` takes every UCX transport on the GPU rail NICs (`sirius_rail_devices` in `scripts/sirius_net.sh`: active RDMA ports in no bond, at the highest link speed). They carry UCX's notifications over RC, which the exchange over NVLink needs at full speed: 4 GPU pairs both ways moved 5.8 TB/s, against 4.9 to 5.2 with tcp on bond0 |
+| `UCX_RCACHE_ENABLE` | `n` unless `UCX_TLS` is `all` | Without the InfiniBand transports nothing drains the list where UCX 1.21's registration cache queues every freed GPU buffer, and each free walks that list under one lock: the join after TPC-H Q14's exchange took 12 s instead of under 1 s. With a `UCX_TLS` list of your own that has `rc`, `dc` or `ud` in it, export `UCX_RCACHE_ENABLE=y` |
 | `DUCKDB_AGENT_MODE` | 0 | DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse that output |
 
 ## Running TPC-H Q12 on 4 GPUs

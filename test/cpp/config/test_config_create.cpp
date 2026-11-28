@@ -160,6 +160,10 @@ std::string describe(const sirius::sirius_config& c, bool in_effect = false)
   if (!in_effect) { d("uring.explicit", u.n_max_concurrent_scans_explicit); }
   d("uring.odirect", u.use_odirect)("uring.slices", u.slices_per_pass)(
     "uring.batch", u.range_batch_slices)("uring.service", u.low_service_interval);
+  auto const& g = sm.gds;
+  d("gds.threads", g.num_threads)("gds.task", g.task_size)("gds.require", g.require)(
+    "gds.timeout", g.read_timeout.count())("gds.slow", g.slow_read_ms_per_mib)("gds.cap",
+                                                                               g.max_gb_per_s);
   auto const& r = sm.rest;
   d("rest.scans", r.n_max_concurrent_scans);
   if (!in_effect) { d("rest.explicit", r.n_max_concurrent_scans_explicit); }
@@ -475,6 +479,12 @@ TEST_CASE("every key of a configuration reaches its runtime field", "[config][co
   CHECK(sm.uring.n_max_concurrent_scans_explicit);
   CHECK(sm.uring.slices_per_pass == 8);
   CHECK(sm.uring.range_batch_slices == 4);
+  CHECK(sm.gds.num_threads == 8);
+  CHECK(sm.gds.task_size == 4 * MiB);
+  CHECK_FALSE(sm.gds.require);
+  CHECK(sm.gds.read_timeout == std::chrono::seconds{45});
+  CHECK(sm.gds.slow_read_ms_per_mib == 2.5);
+  CHECK(sm.gds.max_gb_per_s == 12.5);
 
   auto const& r = sm.rest;
   CHECK(r.n_max_concurrent_scans == 12);

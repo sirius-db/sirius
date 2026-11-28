@@ -41,6 +41,13 @@ sirius:
         n_max_concurrent_scans: 7
         slices_per_pass: 8
         range_batch_slices: 4
+      gds:
+        num_threads: 8
+        task_size: 4MiB
+        require: false
+        read_timeout_s: 45
+        slow_read_ms_per_mib: 2.5
+        max_gb_per_s: 12.5
       rest:
         n_max_concurrent_scans: 12
         request_timeout_s: 45

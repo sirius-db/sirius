@@ -559,6 +559,14 @@ try {
   uring.slices_per_pass    = sm.uring.slices_per_pass.get();
   uring.range_batch_slices = sm.uring.range_batch_slices.get();
 
+  auto& gds                = sm_cfg.gds;
+  gds.num_threads          = sm.gds.num_threads.get();
+  gds.task_size            = sm.gds.task_size.get().count();
+  gds.require              = sm.gds.require.get();
+  gds.read_timeout         = sm.gds.read_timeout.get();
+  gds.slow_read_ms_per_mib = sm.gds.slow_read_ms_per_mib.get();
+  gds.max_gb_per_s         = sm.gds.max_gb_per_s.get();
+
   auto const& r = sm.rest;
   auto& rest    = sm_cfg.rest;
   if (auto const* scans = r.n_max_concurrent_scans.get_if()) {
@@ -1316,6 +1324,13 @@ void sirius_config::enforce_native_backend_for_multi_gpu()
   size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
     return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
   });
+  // Rewriting gds to native would read through io_uring without saying so.
+  if (num_gpus > 1 && _scan_manager_config.backend == scan_manager::io_backend::gds) {
+    throw std::runtime_error(
+      "sirius_config: scan_manager.backend 'gds' supports one GPU per "
+      "process, but " +
+      std::to_string(num_gpus) + " GPUs are configured");
+  }
   if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::native) {
     SIRIUS_LOG_WARN(
       "sirius_config: backend was not 'native' but {} GPUs are configured; "

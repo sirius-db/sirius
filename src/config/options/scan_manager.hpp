@@ -710,6 +710,59 @@ struct preparation_options : block_base<preparation_options> {
   }
 };
 
+/// `sirius.executor.scan_manager.gds`: GPUDirect Storage reads (`backend: gds`).
+struct gds_options : block_base<gds_options> {
+  static const sirius::io::gds::gds_config& defaults()
+  {
+    return detail::scan_manager_defaults().gds;
+  }
+
+  /// Measured on GPFS: 32 and 64 reads in flight per GPU are fastest, 128 is slower, and at 256 a
+  /// cuFile read stopped returning.
+  config_option<std::size_t> num_threads =
+    option<std::size_t>("num_threads")
+      .validate(between<std::size_t>{1, sirius::io::gds::k_max_num_threads})
+      .fallback(defaults().num_threads)
+      .describe("threads that issue cuFile reads")
+      .build();
+  config_option<ubytes> task_size = option<ubytes>("task_size")
+                                      .validate(positive<ubytes>{})
+                                      .fallback(ubytes(defaults().task_size))
+                                      .describe("bytes per cuFile read")
+                                      .build();
+  config_option<bool> require =
+    option<bool>("require")
+      .fallback(defaults().require)
+      .describe("refuse to start, and fail reads, when cuFile would read through POSIX")
+      .build();
+  config_option<std::chrono::seconds> read_timeout =
+    option<std::chrono::seconds>("read_timeout_s")
+      .validate(positive<std::chrono::seconds>{})
+      .fallback(defaults().read_timeout)
+      .describe("seconds a cuFile read may be in flight before the process ends")
+      .build();
+  /// 0 turns the check off.
+  config_option<double> slow_read_ms_per_mib =
+    option<double>("slow_read_ms_per_mib")
+      .validate(non_negative_finite{})
+      .fallback(defaults().slow_read_ms_per_mib)
+      .describe("milliseconds per MiB above which reads fail")
+      .build();
+  /// 0 = no cap.
+  config_option<double> max_gb_per_s =
+    option<double>("max_gb_per_s")
+      .validate(non_negative_finite{})
+      .fallback(defaults().max_gb_per_s)
+      .describe("most gigabytes per second a process starts reading through cuFile")
+      .build();
+
+  auto fields()
+  {
+    return field_list(
+      num_threads, task_size, require, read_timeout, slow_read_ms_per_mib, max_gb_per_s);
+  }
+};
+
 /// `sirius.executor.scan_manager`: the scan workers and the IO backends behind them.
 struct scan_manager_options : block_base<scan_manager_options> {
   /// Unset: the fixed scan-worker default, derived when the configuration is resolved.
@@ -777,6 +830,7 @@ struct scan_manager_options : block_base<scan_manager_options> {
   cache_options cache;
   memory_prefetcher_options memory_prefetcher;
   preparation_options preparation;
+  gds_options gds;
 
   auto fields()
   {
@@ -798,7 +852,8 @@ struct scan_manager_options : block_base<scan_manager_options> {
       sub("rest", rest),
       sub("cache", cache),
       sub("memory_prefetcher", memory_prefetcher),
-      sub("preparation", preparation));
+      sub("preparation", preparation),
+      sub("gds", gds));
   }
 
   void validate(std::string_view path) const
