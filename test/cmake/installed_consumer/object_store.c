@@ -1,6 +1,7 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include <sirius-c/object_store/config.h>
 #include <sirius-c/object_store/config_builder.h>
+#include <sirius-c/object_store/registry.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -28,6 +29,9 @@ int main(void)
   sirius_object_store_config_builder* builder = NULL;
   sirius_object_store_config_builder* next    = NULL;
   sirius_object_store_config* config          = NULL;
+  sirius_object_store_registry* empty         = NULL;
+  sirius_object_store_registry* fallback      = NULL;
+  sirius_object_store_registry* scoped        = NULL;
   sirius_error* error                         = NULL;
 
   CHECK(sirius_object_store_config_builder_create(&builder, &error) == SIRIUS_SUCCESS);
@@ -64,9 +68,24 @@ int main(void)
   builder = NULL;
   sirius_object_store_config_retain(config);
   sirius_object_store_config_release(config);
+  CHECK(sirius_object_store_registry_create(&empty, &error) == SIRIUS_SUCCESS);
+  CHECK(empty != NULL && error == NULL);
+  CHECK(sirius_object_store_registry_with_store(empty, NULL, 0, config, &fallback, &error) ==
+        SIRIUS_SUCCESS);
+  CHECK(fallback != NULL && error == NULL);
+  CHECK(
+    sirius_object_store_registry_with_store(
+      fallback, "s3://bucket/data/", sizeof("s3://bucket/data/") - 1, config, &scoped, &error) ==
+    SIRIUS_SUCCESS);
+  CHECK(scoped != NULL && error == NULL);
+  sirius_object_store_registry_retain(scoped);
+  sirius_object_store_registry_release(scoped);
   result = 0;
 
 cleanup:
+  sirius_object_store_registry_release(scoped);
+  sirius_object_store_registry_release(fallback);
+  sirius_object_store_registry_release(empty);
   sirius_error_destroy(error);
   sirius_object_store_config_builder_release(next);
   sirius_object_store_config_builder_release(builder);

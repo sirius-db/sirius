@@ -19,9 +19,11 @@
  * @brief GPU round() on FLOAT and DOUBLE matches DuckDB bit for bit.
  *
  * Covers ties written as decimals (2.675), values next to a tie, signed zeros, infinities, NaN,
- * NULL, values whose scaled form overflows, and precisions from -400 to 400. Results are compared
- * as DuckDB's shortest round-trip strings, so a one-ulp difference fails. DECIMAL and integer
- * inputs and a non-constant precision fall back during planning.
+ * NULL, values whose scaled form overflows, and precisions from -400 to 400, including 22, the
+ * last precision at which a product rounded onto a midpoint is corrected, and 23, the first at
+ * which the plain tie rule applies.
+ * Results are compared as DuckDB's shortest round-trip strings, so a one-ulp difference fails.
+ * DECIMAL and integer inputs and a non-constant precision fall back during planning.
  */
 
 #include <catch.hpp>
@@ -36,12 +38,19 @@ namespace {
 
 void create_round_table(RoundFixture& fx)
 {
+  // 1.25e-22 and 2.5e-23 scale by 10^23 onto 12.5 and 2.5 while their exact products lie below:
+  // the first when std::pow(10, 23) returns the double above 10^23, the second when it returns
+  // the double below. Precision 23 is not corrected, so they round away from zero to 1.3e-22 and
+  // 3e-23, where the sign of the product error would give 1.2e-22 and 2.0000000000000002e-23.
+  // '-0.0'::DOUBLE keeps the sign that a bare -0.0 literal loses as a DECIMAL.
   fx.run_ok(
     "CREATE TABLE round_t AS SELECT id, d, TRY_CAST(d AS FLOAT) AS f, CAST(id AS BIGINT) AS b,"
     " TRY_CAST(d AS DECIMAL(18, 4)) AS dec FROM ("
     " SELECT row_number() OVER () AS id, d FROM (VALUES"
     " (2.675::DOUBLE), (-2.675), (1.005), (0.285), (0.125), (-0.125), (0.5), (-0.5), (1.5), (2.5),"
-    " (0.49999999999999994), (-0.49999999999999994), (0.0), (-0.0), (123456.789), (-98765.4321),"
+    " (4.025), (1.115), (0.45), (1.0005), (-1.0005), (123.456785), (1.5e-22), (2.5e-22),"
+    " (1.25e-22), (2.5e-23), (0.49999999999999994), (-0.49999999999999994), (0.0),"
+    " ('-0.0'::DOUBLE), (123456.789), (-98765.4321),"
     " (4503599627370497.0), (1e300), (-1e300), (1.7976931348623157e308), (5e-324),"
     " ('inf'::DOUBLE), ('-inf'::DOUBLE), ('nan'::DOUBLE), (NULL)) v(d)"
     " UNION ALL SELECT 100 + i, (i * 7919 % 100003) / ((i % 977) + 3.0) FROM range(5000) t(i));");
@@ -58,7 +67,8 @@ TEST_CASE_METHOD(RoundFixture,
   for (auto const* column : {"d", "f"}) {
     CAPTURE(column);
     compare_gpu_vs_cpu(std::string("SELECT id, round(") + column + ") AS r FROM round_t");
-    for (auto const* precision : {"0", "2", "15", "300", "400", "-1", "-300", "-400"}) {
+    for (auto const* precision :
+         {"0", "1", "2", "3", "5", "15", "22", "23", "300", "400", "-1", "-300", "-400"}) {
       CAPTURE(precision);
       compare_gpu_vs_cpu(std::string("SELECT id, round(") + column + ", " + precision +
                          ") AS r FROM round_t");

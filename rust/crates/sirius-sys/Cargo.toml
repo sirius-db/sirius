@@ -17,7 +17,10 @@ name = "sirius_sys"
 static = []
 
 # Maintainer-only: ordinary builds use the checked-in declarations.
-generate-bindings = ["dep:bindgen"]
+generate-bindings = ["dep:bindgen", "dep:prettyplease", "dep:syn"]
 
 [build-dependencies]
-bindgen = { version = "=0.73.2", optional = true, default-features = false, features = ["runtime", "prettyplease"] }
+bindgen = { version = "=0.73.2", optional = true, default-features = false, features = ["runtime"] }
+# Keep these major versions aligned: prettyplease 0.3 formats syn 3 syntax trees.
+prettyplease = { version = "0.3", features = ["verbatim"], optional = true }
+syn = { version = "3", features = ["full"], optional = true }

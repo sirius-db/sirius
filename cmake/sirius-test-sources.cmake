@@ -37,6 +37,16 @@ set(TEST_SOURCES
     test/cpp/config/test_c_api_config.cpp
     test/cpp/plan/test_c_api_plan.cpp
     test/cpp/config/test_config.cpp
+    test/cpp/config/test_config_block.cpp
+    test/cpp/config/test_config_create.cpp
+    test/cpp/config/test_config_executor_options.cpp
+    test/cpp/config/test_config_memory_options.cpp
+    test/cpp/config/test_config_operator_options.cpp
+    test/cpp/config/test_config_option.cpp
+    test/cpp/config/test_config_scan_manager_options.cpp
+    test/cpp/config/test_config_user_config.cpp
+    test/cpp/config/test_config_values.cpp
+    test/cpp/config/test_config_yaml.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
     test/cpp/config/test_scan_manager_config.cpp
@@ -88,6 +98,7 @@ set(TEST_SOURCES
     test/cpp/object_store_scope/test_scope.cpp
     test/cpp/object_store_scope/test_validation.cpp
     test/cpp/object_store_scope/test_c_object_store_config.cpp
+    test/cpp/object_store_scope/test_c_object_store_registry.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_cuda_event_completion_poll.cpp
     test/cpp/exec/test_stream_session.cpp
@@ -111,11 +122,13 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_decimal_integer_cast.cpp
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
+    test/cpp/helper/test_dictionary_carrier.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_numeric_narrowing.cpp
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_compressed_materialization_gate.cpp
     test/cpp/integration/test_compressed_materialization_partition.cpp
+    test/cpp/integration/test_dictionary_carrier_sources.cpp
     test/cpp/integration/test_gpu_execution_aggregate_filter.cpp
     test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
@@ -265,6 +278,7 @@ set(TEST_SOURCES
     test/cpp/operator/window/test_whole_partition.cpp
     test/cpp/operator/aggregate/test_average_as_double.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
+    test/cpp/operator/aggregate/test_dictionary_carrier_groupby.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_sorted_keys.cpp
     test/cpp/operator/aggregate/test_group_key_labels.cpp

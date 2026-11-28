@@ -269,6 +269,9 @@ struct scan_manager_config {
   /// interrupts and the reactors.  No effect when the reactors run unpinned.
   bool reserve_rest_reactor_cpus{true};
 
+  /// Allow DuckDB byte caching through sirius_httpfs; a startup policy captured per handle.
+  bool httpfs_external_file_cache{false};
+
   /// Engine-owned rank CPU boundary, sampled from the main-thread affinity and cgroup
   /// allowance at configuration resolution. Used by metadata and lazy I/O/control startup.
   std::vector<int> startup_cpus;

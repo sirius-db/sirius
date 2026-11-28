@@ -24,8 +24,8 @@ function(sirius_add_duckdb_source)
   set(BUILD_UNITTESTS OFF)
   if(NOT DEFINED DUCKDB_EXPLICIT_VERSION
      AND SIRIUS_DUCKDB_SOURCE_REVISION STREQUAL
-         "d54cbbe3df17e8e5ce68312f483b4155836112aa")
-    set(DUCKDB_EXPLICIT_VERSION "v2.0.0")
+         "8d78114e90a53823803660bf821f6073ac87da8c")
+    set(DUCKDB_EXPLICIT_VERSION "v2.0.1")
   endif()
   # Root sanitizer presets supply flags to both the library and its dependency.
   set(ENABLE_SANITIZER OFF)

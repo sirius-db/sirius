@@ -17,8 +17,11 @@
 #pragma once
 
 #include "duckdb/common/enums/order_type.hpp"
+#include "expression/ast/order_modifier.hpp"
 
 #include <cudf/types.hpp>
+
+#include <utility>
 
 namespace sirius {
 namespace op {
@@ -49,6 +52,20 @@ inline cudf::null_order to_cudf_null_order(duckdb::OrderType order_type,
       (result == cudf::null_order::BEFORE) ? cudf::null_order::AFTER : cudf::null_order::BEFORE;
   }
   return result;
+}
+
+/// Map a Sirius ORDER BY key modifier to its cuDF sort order and null order, through the two
+/// mappings above.
+inline std::pair<cudf::order, cudf::null_order> to_cudf_sort_order(
+  sirius::ast::order_modifier modifier)
+{
+  auto const order_type = modifier.direction == sirius::ast::sort_direction::descending
+                            ? duckdb::OrderType::DESCENDING
+                            : duckdb::OrderType::ASCENDING;
+  auto const null_type  = modifier.nulls == sirius::ast::null_placement::first
+                            ? duckdb::OrderByNullType::NULLS_FIRST
+                            : duckdb::OrderByNullType::NULLS_LAST;
+  return {to_cudf_order(order_type), to_cudf_null_order(order_type, null_type)};
 }
 
 }  // namespace op

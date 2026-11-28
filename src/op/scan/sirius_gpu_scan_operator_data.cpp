@@ -354,11 +354,19 @@ void scan_operator_input::prepare_for_processing(
         // Hand the scan's restore types to the decode, so a compacted decode can write a
         // narrow-stored column directly in the type the scan would otherwise cast it to.
         if (!decode_restore_types.empty()) {
+          // A dictionary carrier changes even a plain decode, so it gets a request of its own;
+          // widening targets only matter to a compacted decode.
+          bool const any_dictionary = std::ranges::any_of(
+            decode_restore_types, [](auto t) { return t.id() == cudf::type_id::DICTIONARY32; });
           auto attach_output_types = [&](auto* rep) {
-            if (!rep->pushdown_scan()) { return; }
+            auto const current = rep->pushdown_scan();
+            if (!current && !any_dictionary) { return; }
             std::vector<std::optional<cudf::data_type>> types(decode_restore_types.begin(),
                                                               decode_restore_types.end());
-            rep->set_pushdown_scan(rep->pushdown_scan()->with_output_types(std::move(types)));
+            rep->set_pushdown_scan(
+              current ? current->with_output_types(std::move(types))
+                      : std::make_shared<const sirius::decompression_pushdown_scan>(
+                          sirius::pushdown_request{.output_types = std::move(types)}));
           };
           if (auto* device_rep =
                 dynamic_cast<::sirius::compressed_device_representation*>(mut.get_data())) {
