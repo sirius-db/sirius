@@ -227,6 +227,21 @@ FROM sirius_gateway_start(2, quack_base_port := 19820);
 ----
 this process has 2
 
+# Nor does a rank that the statement timeout cancelled hide it: rank 0 runs until the cancel.
+statement ok
+SET sirius_gateway_statement_timeout = 1;
+
+statement ok
+SET GLOBAL sirius_gateway_rank_init = 'SELECT sum(CASE WHEN getenv(''CUDA_VISIBLE_DEVICES'') = ''0'' THEN i ELSE error(''a distributed rank runs on one GPU, but this process has 2'') END) FROM range(1000000000000) r(i)';
+
+statement error
+FROM sirius_gateway_start(2, quack_base_port := 19820);
+----
+this process has 2
+
+statement ok
+SET sirius_gateway_statement_timeout = 3600;
+
 statement ok
 SET GLOBAL sirius_gateway_rank_init = '';
 
