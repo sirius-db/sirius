@@ -16,6 +16,7 @@
 
 #include "op/scan/arrow/arrow_batch_producer.hpp"
 
+#include "op/scan/arrow/arrow_input_copy.hpp"
 #include "op/scan/arrow/arrow_staging_resource.hpp"
 #include "op/scan/arrow/arrow_string_offsets.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
@@ -53,22 +54,24 @@ struct copied_column {
   ArrowArray array{};
   void const* buffers[3]{};
 };
-uint64_t copy_size(offered_arrow_input const& input, std::vector<cudf::data_type> const& types)
+uint64_t copy_size(ArrowSchema const& schema,
+                   ArrowArray const& array,
+                   std::vector<cudf::data_type> const& types)
 {
-  auto rows      = static_cast<uint64_t>(input.array->length);
+  auto rows      = static_cast<uint64_t>(array.length);
   uint64_t bytes = 0;
   auto reserve   = [&](uint64_t n) { bytes = add(bytes, aligned(n)); };
   reserve(types.size() * sizeof(ArrowSchema*));
   reserve(types.size() * sizeof(ArrowArray*));
   reserve(sizeof(void*));
   for (size_t i = 0; i < types.size(); ++i) {
-    auto const& source = *input.array->children[i];
-    auto begin         = source.offset + input.array->offset;
+    auto const& source = *array.children[i];
+    auto begin         = source.offset + array.offset;
     reserve(sizeof(copied_column));
-    reserve(std::strlen(input.schema->children[i]->format) + 1);
+    reserve(std::strlen(schema.children[i]->format) + 1);
     if (rows && source.null_count != 0 && source.buffers[0]) reserve((rows + 7) / 8);
     if (types[i].id() == cudf::type_id::STRING) {
-      detail::arrow_string_offsets offsets(input.schema->children[i]->format, source.buffers[1]);
+      detail::arrow_string_offsets offsets(schema.children[i]->format, source.buffers[1]);
       reserve((rows + 1) * offsets.width());
       reserve(rows ? detail::arrow_string_window_size(offsets[begin], offsets[begin + rows]) : 0);
     } else if (types[i].id() == cudf::type_id::BOOL8) {
@@ -89,12 +92,12 @@ struct copy_owner {
   }
 };
 // Allocate all arrays, format strings and selected payload through one charged block.
-std::shared_ptr<owned_arrow_batch> copy_input(offered_arrow_input const& input,
+std::shared_ptr<owned_arrow_batch> copy_input(ArrowSchema const& source_schema,
+                                              ArrowArray const& root,
                                               materialization_program const& program,
-                                              arrow_push_limits const& limits,
+                                              arrow_copy_limits const& limits,
                                               admitted_arrow_input admitted)
 {
-  auto const& root  = *input.array;
   auto const& types = *program.input_types;
   auto copy_bytes   = aligned(limits.max_copy_bytes);
   auto storage =
@@ -117,7 +120,7 @@ std::shared_ptr<owned_arrow_batch> copy_input(offered_arrow_input const& input,
   for (size_t i = 0; i < types.size(); ++i) {
     auto* column       = new (alloc(sizeof(copied_column))) copied_column{};
     auto const& source = *root.children[i];
-    auto const& schema = *input.schema->children[i];
+    auto const& schema = *source_schema.children[i];
     auto& out          = column->array;
     schemas[i]         = &column->schema;
     arrays[i]          = &out;
@@ -192,6 +195,42 @@ std::shared_ptr<owned_arrow_batch> copy_input(offered_arrow_input const& input,
   return std::make_shared<owned_arrow_batch>(schema, array, storage, storage->staging);
 }
 }  // namespace
+void detail::validate_arrow_copy_input(ArrowSchema const& schema,
+                                       ArrowArray const& array,
+                                       materialization_program const& program,
+                                       arrow_copy_limits const& bounds,
+                                       arrow_metadata_lengths const& metadata_lengths)
+{
+  if (array.length > bounds.max_rows)
+    throw sm::preparation_resource_error("Arrow offered input exceeds its declared bounds", true);
+  auto types = validate_arrow_host_flat(schema, array, metadata_lengths);
+  if (types.size() != program.input_types->size())
+    throw transparent::arrow_schema_drift_error("Arrow offered input exceeds its declared bounds");
+  if (types != *program.input_types)
+    throw transparent::arrow_schema_drift_error("Arrow offered schema drift");
+  if (copy_size(schema, array, types) > aligned(bounds.max_copy_bytes) ||
+      arrow_import_staging_bytes(array, types) > bounds.staging_bytes)
+    throw sm::preparation_resource_error("Arrow offered input exceeds copy or normalization bounds",
+                                         true);
+  for (size_t i = 0; i < types.size(); ++i) {
+    if (types[i].id() != cudf::type_id::DECIMAL128) continue;
+    int precision = 0;
+    std::string_view format(schema.children[i]->format);
+    (void)std::from_chars(format.data() + 2, format.data() + format.size(), precision);
+    if (program.decimal_precisions.size() != types.size() ||
+        program.decimal_precisions[i] != precision)
+      throw transparent::arrow_schema_drift_error("Arrow offered decimal precision drift");
+  }
+}
+std::shared_ptr<owned_arrow_batch> detail::copy_admitted_arrow_input(
+  ArrowSchema const& schema,
+  ArrowArray const& array,
+  materialization_program const& program,
+  arrow_copy_limits const& bounds,
+  admitted_arrow_input admitted)
+{
+  return copy_input(schema, array, program, bounds, std::move(admitted));
+}
 struct arrow_push_queue::impl {
   materialization_program program;
   arrow_push_limits bounds;
@@ -274,25 +313,18 @@ struct arrow_push_queue::impl {
   void validate(offered_arrow_input const& value) const
   {
     if (!value.schema || !value.array || !value.owner || !value.retained_bytes ||
-        value.retained_bytes > bounds.max_offered_bytes || value.array->length > bounds.max_rows)
+        value.retained_bytes > bounds.max_offered_bytes)
       throw std::invalid_argument("Arrow offered input exceeds its declared bounds");
-    auto types = validate_arrow_host_flat(*value.schema, *value.array, value.metadata_lengths);
-    if (types.size() != program.input_types->size())
-      throw transparent::arrow_schema_drift_error(
-        "Arrow offered input exceeds its declared bounds");
-    if (types != *program.input_types)
-      throw transparent::arrow_schema_drift_error("Arrow offered schema drift");
-    if (copy_size(value, types) > aligned(bounds.max_copy_bytes) ||
-        arrow_import_staging_bytes(*value.array, types) > bounds.staging_bytes)
-      throw std::invalid_argument("Arrow offered input exceeds copy or normalization bounds");
-    for (size_t i = 0; i < types.size(); ++i) {
-      if (types[i].id() != cudf::type_id::DECIMAL128) continue;
-      int precision = 0;
-      std::string_view format(value.schema->children[i]->format);
-      (void)std::from_chars(format.data() + 2, format.data() + format.size(), precision);
-      if (program.decimal_precisions.size() != types.size() ||
-          program.decimal_precisions[i] != precision)
-        throw transparent::arrow_schema_drift_error("Arrow offered decimal precision drift");
+    try {
+      detail::validate_arrow_copy_input(
+        *value.schema,
+        *value.array,
+        program,
+        {bounds.max_rows, bounds.max_copy_bytes, bounds.staging_bytes},
+        value.metadata_lengths);
+    } catch (sm::preparation_resource_error const& error) {
+      // Keep the offered-input contract of Arrow push sources.
+      throw std::invalid_argument(error.what());
     }
   }
 };
@@ -681,7 +713,12 @@ arrow_production arrow_push_queue::next(admitted_arrow_input admitted,
     impl_->input.reset();
   }
   try {
-    auto batch = copy_input(input, impl_->program, impl_->bounds, admitted);
+    auto batch = detail::copy_admitted_arrow_input(
+      *input.schema,
+      *input.array,
+      impl_->program,
+      {impl_->bounds.max_rows, impl_->bounds.max_copy_bytes, impl_->bounds.staging_bytes},
+      admitted);
     {
       std::lock_guard lock(impl_->mutex);
       if (impl_->error) std::rethrow_exception(impl_->error);

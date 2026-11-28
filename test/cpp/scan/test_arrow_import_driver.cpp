@@ -16,6 +16,12 @@
 
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
+#ifdef SIRIUS_PAIMON_LOCAL_MODULE
+#include "op/scan/paimon/paimon_arrow_producer.hpp"
+#include "scan/paimon_native_test_fixture.hpp"
+
+#include <paimon/reader/batch_reader.h>
+#endif
 #include "data/data_batch_utils.hpp"
 #include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
@@ -2466,7 +2472,9 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   auto reason = GENERATE(
     sm::stop_reason::normal_eos, sm::stop_reason::user_cancel, sm::stop_reason::failure_induced);
   auto read_fails = GENERATE(false, true);
+  CAPTURE(kind, static_cast<int>(reason), read_fails);
   sirius::test::preparation::hold reading;
+  std::atomic<bool> read_wait_failed{false};
   std::atomic<int> failures{0};
   auto pull     = std::make_shared<pull_producer>();
   pull->rows    = {3, 3};
@@ -2478,10 +2486,16 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
     push ? std::static_pointer_cast<arrow_batch_producer>(q)
          : std::static_pointer_cast<arrow_batch_producer>(pull);
   harness h(counters, producer, program);
-  int allocations = 0;
-  auto pause      = [&] {
-    reading.wait();
-    if (read_fails) throw std::runtime_error("read failed after stop");
+  int allocations                = 0;
+  constexpr auto late_read_error = "read failed after stop";
+  auto pause                     = [&] {
+    try {
+      reading.wait();
+    } catch (...) {
+      read_wait_failed = true;
+      throw;
+    }
+    if (read_fails) throw std::runtime_error(late_read_error);
   };
   pull->before_next = [&] {
     if (pull->calls == 2) pause();
@@ -2536,8 +2550,13 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
       std::lock_guard lock(reading.mutex);
       entered = reading.entered;
     }
-    if (entered || completion.has_error()) break;
+    // The second read can enter while the first batch is still queued for publication.
+    // Make the first commit part of the fixture before stopping the in-flight read.
+    if ((entered && publications.load() != 0) || completion.has_error()) break;
   }
+  auto const publications_before_stop = publications.load();
+  auto const error_before_stop        = completion.has_error();
+  CAPTURE(entered, publications_before_stop, error_before_stop);
   if (reason == sm::stop_reason::failure_induced)
     completion.report_error(std::make_exception_ptr(std::runtime_error("original failure")));
   coordinator.request_stop(reason);
@@ -2546,6 +2565,10 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   q->cancel();
   if (submitting.valid()) submitting.get();
   REQUIRE(entered);
+  // Only the release after request_stop may end the held read.
+  CHECK_FALSE(read_wait_failed.load());
+  CHECK_FALSE(error_before_stop);
+  CHECK(publications_before_stop == 1);
   CHECK(publications == 1);
   CHECK(completion.has_error() == (read_fails || reason != sm::stop_reason::normal_eos));
   if (reason == sm::stop_reason::user_cancel)
@@ -2558,6 +2581,20 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   CHECK(h.ledger->permits_in_flight() == 0);
   CHECK(h.ledger->tracked_units() == 0);
   CHECK(h.backing.seen->allocated_bytes == 0);
+  if (reason == sm::stop_reason::normal_eos && read_fails) {
+    auto terminal = completion.terminal_error();
+    REQUIRE(terminal);
+    if (push) {
+      try {
+        std::rethrow_exception(terminal);
+      } catch (sm::preparation_resource_error const& error) {
+        CHECK_FALSE(error.bound_exceeded);
+        terminal = error.original;
+      }
+      REQUIRE(terminal);
+    }
+    CHECK_THROWS_WITH(std::rethrow_exception(terminal), late_read_error);
+  }
 }
 
 TEST_CASE("Arrow independent cancellation survives a later coordinator normal stop",
@@ -2803,3 +2840,644 @@ TEST_CASE("Arrow children share preparation identities with retained slots",
   a->finish_preparation();
   b->finish_preparation();
 }
+
+#ifdef SIRIUS_PAIMON_LOCAL_MODULE
+namespace {
+struct native_kind_tree {
+  integer_tree values;
+  ArrowSchema kind_schema{}, dictionary_schema{};
+  ArrowArray kind{}, dictionary{};
+  ArrowSchema* schemas[2]{&kind_schema, &values.field};
+  ArrowArray* arrays[2]{&kind, &values.column};
+  int8_t kinds[3]{0, 0, 0}, deleted = 3;
+  void const* kind_buffers[2]{nullptr, kinds};
+  void const* dictionary_buffers[2]{nullptr, &deleted};
+  std::array<std::thread::id, 2> release_threads{};
+  unsigned releases = 0;
+  explicit native_kind_tree(int fault, int rows = 3) : values(rows)
+  {
+    values.schema.n_children = values.array.n_children = 2;
+    values.schema.children                             = schemas;
+    values.array.children                              = arrays;
+    kind_schema.name                                   = "_VALUE_KIND";
+    kind_schema.format                                 = "c";
+    kind_schema.release = [](ArrowSchema* p) { p->release = nullptr; };
+    kind.length         = rows;
+    kind.n_buffers      = 2;
+    kind.buffers        = kind_buffers;
+    kind.release        = [](ArrowArray* p) { p->release = nullptr; };
+    dictionary_schema   = kind_schema;
+    dictionary          = kind;
+    dictionary.length   = 1;
+    dictionary.buffers  = dictionary_buffers;
+    if (fault == 0) {
+      kind_schema.dictionary = &dictionary_schema;
+      kind.dictionary        = &dictionary;
+    }
+    if (fault == 1) {
+      kind_schema.n_children = kind.n_children = 1;
+      kind_schema.children                     = &schemas[1];
+      kind.children                            = &arrays[1];
+    }
+    if (fault == 2) kind.release = nullptr;
+    if (fault == 3) kind_schema.release = nullptr;
+    if (fault == 4) kinds[0] = deleted;
+  }
+};
+struct native_read_script {
+  std::vector<std::shared_ptr<native_kind_tree>> batches;
+  std::function<void()> before_next;
+  sm::preparation_stop_token stop;
+  std::thread::id owner, close_owner;
+  std::atomic<unsigned> reads{0}, closes{0};
+  bool reads_on_owner              = true;
+  unsigned roots_released_at_close = 0;
+};
+class native_kind_reader final : public ::paimon::BatchReader {
+ public:
+  explicit native_kind_reader(std::shared_ptr<native_read_script> script)
+    : script_(std::move(script))
+  {
+    script_->owner = std::this_thread::get_id();
+  }
+  ::paimon::Result<ReadBatch> NextBatch() override
+  {
+    script_->reads_on_owner &= script_->owner == std::this_thread::get_id();
+    auto index = script_->reads++;
+    if (script_->before_next) script_->before_next();
+    if (index >= script_->batches.size()) return MakeEofBatch();
+    auto const& value    = script_->batches[index];
+    auto array           = std::make_unique<ArrowArray>(value->values.array);
+    auto schema          = std::make_unique<ArrowSchema>(value->values.schema);
+    array->private_data  = value.get();
+    schema->private_data = value.get();
+    array->release       = [](ArrowArray* p) {
+      auto& value              = *static_cast<native_kind_tree*>(p->private_data);
+      value.release_threads[0] = std::this_thread::get_id();
+      ++value.releases;
+      p->release = nullptr;
+    };
+    schema->release = [](ArrowSchema* p) {
+      auto& value              = *static_cast<native_kind_tree*>(p->private_data);
+      value.release_threads[1] = std::this_thread::get_id();
+      ++value.releases;
+      p->release = nullptr;
+    };
+    return ReadBatch{std::move(array), std::move(schema)};
+  }
+  void Close() override
+  {
+    script_->close_owner = std::this_thread::get_id();
+    for (auto const& batch : script_->batches)
+      script_->roots_released_at_close += batch->releases;
+    ++script_->closes;
+  }
+  std::shared_ptr<::paimon::Metrics> GetReaderMetrics() const override { return {}; }
+
+ private:
+  // The cursor releases every root before Close or reader destruction.
+  std::shared_ptr<native_read_script> script_;
+};
+
+auto scripted_paimon(std::shared_ptr<native_read_script> script,
+                     arrow_copy_limits limits = {3, 8192, 8192})
+{
+  return std::make_shared<paimon_arrow_producer>(
+    integer_program(),
+    limits,
+    [script = std::move(script)](int64_t, sm::preparation_stop_token stop) {
+      script->stop = stop;
+      return std::make_unique<paimon_batch_cursor>(std::make_unique<native_kind_reader>(script),
+                                                   script);
+    });
+}
+
+struct native_worker_run {
+  sirius::exec::static_thread_pool pool{2};
+  sirius::exec::scoped_dispatcher dispatcher{pool};
+  sirius::pipeline::completion_handler completion;
+  sm::native_reader_executor readers;
+  std::shared_ptr<sm::split_connector> connector = std::make_shared<sm::split_connector>();
+  sm::preparation_coordinator coordinator;
+
+  explicit native_worker_run(size_t workers = 1)
+    : readers(workers, workers), coordinator(completion, dispatcher, {2, 2, 4, 1}, &readers)
+  {
+  }
+  sm::preparation_coordinator::source source(arrow_import_ingestible& driver)
+  {
+    driver.preflight_for_query();
+    auto lane = driver.make_preparation_source({});
+    REQUIRE(lane.execution == sm::preparation_execution_domain::native_reader);
+    sm::preparation_coordinator::source result;
+    result.execution   = lane.execution;
+    result.try_claim   = std::move(lane.try_claim);
+    result.close       = std::move(lane.close);
+    result.bind_wakeup = std::move(lane.bind_wakeup);
+    result.coalescer   = std::move(lane.coalescer);
+    result.destination = connector;
+    result.construct   = [](auto input) {
+      auto bytes = input->preparation_bytes();
+      return sirius::test::preparation::make_publication(std::move(input), bytes);
+    };
+    return result;
+  }
+  void start()
+  {
+    coordinator.arm();
+    coordinator.start();
+  }
+  void advance()
+  {
+    coordinator.advance(1ms);
+    while (connector->has_more_splits())
+      (void)connector->get_next_split();
+  }
+  template <class Predicate>
+  bool until(Predicate done)
+  {
+    auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (!done() && std::chrono::steady_clock::now() < deadline)
+      advance();
+    return done();
+  }
+  bool quiescent() const
+  {
+    return coordinator.snapshot().phase == sm::preparation_coordinator::lifecycle::quiescent;
+  }
+};
+
+void check_native_retirement(native_read_script const& script,
+                             unsigned reads,
+                             unsigned released_roots)
+{
+  CHECK(script.reads == reads);
+  CHECK(script.closes == 1);
+  CHECK(script.reads_on_owner);
+  CHECK(script.owner != std::this_thread::get_id());
+  CHECK(script.close_owner == script.owner);
+  CHECK(script.roots_released_at_close == released_roots);
+  for (auto const& batch : script.batches) {
+    CHECK(batch->releases == 2);
+    CHECK(batch->release_threads[0] == script.owner);
+    CHECK(batch->release_threads[1] == script.owner);
+  }
+}
+
+void check_native_ledger(harness const& h)
+{
+  CHECK_FALSE(h.gate->active);
+  CHECK(h.ledger->tracked_units() == 0);
+  CHECK(h.ledger->permits_in_flight() == 0);
+  CHECK(h.backing.seen->allocated_bytes == 0);
+}
+
+void check_native_bound(std::exception_ptr error, std::string_view message)
+{
+  REQUIRE(error);
+  try {
+    std::rethrow_exception(error);
+  } catch (sm::preparation_resource_error const& refusal) {
+    CHECK(refusal.bound_exceeded);
+    CHECK(refusal.what() == message);
+  }
+}
+}  // namespace
+TEST_CASE("Paimon producer refuses an Arrow source profile before opening a cursor",
+          "[paimon_kind_profile]")
+{
+  bool opened = false;
+  auto open   = [&](int64_t, sm::preparation_stop_token) {
+    opened = true;
+    return std::unique_ptr<paimon_batch_cursor>{};
+  };
+  CHECK_THROWS_AS(
+    paimon_arrow_producer(qualified_integer_program(), arrow_copy_limits{3, 8192, 8192}, open),
+    std::invalid_argument);
+  CHECK_FALSE(opened);
+}
+
+TEST_CASE("Paimon row-kind must be a live plain leaf before any copy", "[paimon_kind_profile]")
+{
+  auto fault      = GENERATE(0, 1, 2, 3, 4);
+  auto input      = std::make_shared<native_kind_tree>(fault);
+  auto script     = std::make_shared<native_read_script>();
+  script->batches = {input};
+  auto producer   = scripted_paimon(script);
+  harness h(producer, integer_program(), false);
+  auto message = fault == 4 ? "Paimon batch contains non-insert row kinds"
+                            : "Paimon batch has no valid row-kind column";
+  CHECK_THROWS_WITH(h.next(), message);
+  CHECK(input->releases == 2);
+  CHECK(h.backing.seen->allocations == 0);
+  CHECK_THROWS(h.next());
+  CHECK(script->reads == 1);
+  producer->close();
+  CHECK(h.ledger->tracked_units() == 0);
+}
+
+TEST_CASE("Paimon worker drains a stopped initial native open without reading",
+          "[paimon_worker_open_stop]")
+{
+  auto script = std::make_shared<native_read_script>();
+  sirius::test::preparation::hold opening;
+  int64_t requested_rows = 0;
+  auto open              = [&](int64_t max_rows, sm::preparation_stop_token stop) {
+    requested_rows = max_rows;
+    script->stop   = stop;
+    opening.wait();
+    return std::make_unique<paimon_batch_cursor>(std::make_unique<native_kind_reader>(script),
+                                                 script);
+  };
+  auto producer = std::make_shared<paimon_arrow_producer>(
+    integer_program(), arrow_copy_limits{3, 8192, 8192}, open);
+  harness h(producer, integer_program(), false);
+  unsigned publications = 0;
+  native_worker_run run;
+  struct release_hold {
+    sirius::test::preparation::hold& opening;
+    ~release_hold() { opening.release(); }
+  } release_on_failure{opening};
+  run.coordinator.add_source(run.source(*h.driver));
+  run.coordinator.after_publication_for_testing([&](auto, auto const&, auto) { ++publications; });
+  run.start();
+  REQUIRE(run.until([&] {
+    std::lock_guard lock(opening.mutex);
+    return opening.entered;
+  }));
+  CHECK(requested_rows == 3);
+  run.coordinator.request_stop(sm::stop_reason::user_cancel);
+  REQUIRE(run.until([&] { return script->stop.stop_requested(); }));
+  CHECK_FALSE(run.quiescent());
+  CHECK(script->reads == 0);
+  CHECK(publications == 0);
+  opening.release();
+  REQUIRE(run.until([&] { return run.quiescent(); }));
+  run.coordinator.drain();
+  auto const error = run.completion.terminal_error();
+  REQUIRE(error);
+  CHECK_THROWS_AS(std::rethrow_exception(error), duckdb::InterruptException);
+  CHECK(publications == 0);
+  CHECK(h.backing.seen->allocations == 0);
+  check_native_retirement(*script, 0, 0);
+  check_native_ledger(h);
+}
+
+TEST_CASE("Paimon producer checks its row budget before inspecting row kinds",
+          "[paimon_kind_profile]")
+{
+  auto input      = std::make_shared<native_kind_tree>(-1);
+  input->kinds[0] = 3;
+  auto script     = std::make_shared<native_read_script>();
+  script->batches = {input};
+  harness h(scripted_paimon(script, {1, 8192, 8192}), integer_program(), false);
+  check_native_bound(capture_rejection([&] { (void)h.next(); }),
+                     "Paimon batch exceeds its declared row bound");
+  CHECK(script->reads == 1);
+  CHECK(input->releases == 2);
+  CHECK(h.backing.seen->allocations == 0);
+  CHECK(h.ledger->tracked_units() == 0);
+}
+
+TEST_CASE("Paimon worker distinguishes a live zero-row batch from EOF", "[paimon_worker_eof]")
+{
+  auto empty  = GENERATE(false, true);
+  auto script = std::make_shared<native_read_script>();
+  if (!empty) {
+    script->batches.push_back(std::make_shared<native_kind_tree>(-1, 0));
+    script->batches.push_back(std::make_shared<native_kind_tree>(-1, 1));
+  }
+  harness h(scripted_paimon(script), integer_program(), false);
+  std::vector<int64_t> published;
+  native_worker_run run;
+  run.coordinator.add_source(run.source(*h.driver));
+  run.coordinator.after_publication_for_testing([&](auto, auto const& metadata, auto) {
+    auto const& input = dynamic_cast<owned_arrow_scan_info const&>(*metadata);
+    published.push_back(input.rootless() ? -1 : input.batch()->row_count());
+  });
+  run.start();
+  REQUIRE(run.until([&] { return run.quiescent(); }));
+  run.coordinator.drain();
+  REQUIRE_FALSE(run.completion.has_error());
+  if (empty) {
+    CHECK(published.empty());
+    CHECK(h.backing.seen->allocations == 0);
+  } else {
+    CHECK(published == std::vector<int64_t>{0, 1});
+    CHECK(h.backing.seen->allocations == 2);
+  }
+  CHECK(run.connector->is_closed());
+  CHECK(std::holds_alternative<sm::preparation_exhausted>(h.driver->try_claim_split({})));
+  check_native_retirement(*script, empty ? 1 : 3, empty ? 0 : 4);
+  check_native_ledger(h);
+}
+
+TEST_CASE("Paimon worker waits for capacity and rejects oversized copies",
+          "[paimon_worker_backpressure]")
+{
+  auto script     = std::make_shared<native_read_script>();
+  auto batch      = std::make_shared<native_kind_tree>(-1);
+  script->batches = {batch};
+  SECTION("An occupied statement permit blocks the first native call")
+  {
+    harness h(scripted_paimon(script), integer_program(), false);
+    std::atomic<bool> pending{false};
+    native_worker_run run;
+    auto source      = run.source(*h.driver);
+    source.try_claim = [claim = std::move(source.try_claim), &pending]() mutable {
+      auto result = claim();
+      if (std::holds_alternative<sm::preparation_pending>(result)) pending = true;
+      return result;
+    };
+    run.coordinator.add_source(std::move(source));
+    auto permit = h.ledger->try_acquire_unit({999, 0}, 0);
+    REQUIRE(permit);
+    run.start();
+    CHECK(run.until([&] { return pending.load(); }));
+    CHECK(script->reads == 0);
+    CHECK(h.ledger->tracked_units() == 1);
+    h.ledger->retire_unit({999, 0});
+    permit.release();
+    REQUIRE(run.until([&] { return run.quiescent(); }));
+    REQUIRE_FALSE(run.completion.has_error());
+    CHECK(h.backing.seen->allocations == 1);
+    check_native_retirement(*script, 2, 2);
+    check_native_ledger(h);
+  }
+  SECTION("A full alignment quantum below the required copy bound rejects before allocating")
+  {
+    harness h(scripted_paimon(script, {3, 16, 8192}), integer_program(), false);
+    unsigned publications = 0;
+    native_worker_run run;
+    run.coordinator.add_source(run.source(*h.driver));
+    run.coordinator.after_publication_for_testing([&](auto, auto const&, auto) { ++publications; });
+    run.start();
+    REQUIRE(run.until([&] { return run.quiescent(); }));
+    check_native_bound(run.completion.terminal_error(),
+                       "Arrow offered input exceeds copy or normalization bounds");
+    CHECK(publications == 0);
+    CHECK(h.backing.seen->allocations == 0);
+    check_native_retirement(*script, 1, 2);
+    check_native_ledger(h);
+  }
+}
+
+TEST_CASE("Paimon worker drains an accepted sibling and retains the first error",
+          "[paimon_worker_failure_drain]")
+{
+  sm::test::test_reservation_provider backing;
+  backing.grant_bytes = 2 * (8192 + 8192);
+  std::atomic<unsigned> publications{0};
+  {
+    auto blocked = std::make_shared<native_read_script>();
+    blocked->batches.push_back(std::make_shared<native_kind_tree>(-1));
+    auto failing = std::make_shared<native_read_script>();
+    auto first_error =
+      std::make_exception_ptr(std::runtime_error("native sibling rejected the read"));
+    failing->before_next = [first_error] { std::rethrow_exception(first_error); };
+    auto a               = scripted_paimon(blocked);
+    auto b               = scripted_paimon(failing);
+    arrow_import_binding sibling_binding;
+    auto configure = [&](arrow_import_binding& binding) {
+      auto next                      = std::make_shared<uint64_t>(0);
+      binding.next_unit_id           = [next] { return (*next)++; };
+      sibling_binding                = binding;
+      sibling_binding.owns_admission = false;
+      sibling_binding.gate           = std::make_shared<arrow_input_gate>();
+    };
+    harness h(a, integer_program(), false, &backing, b, 1, {}, configure);
+    auto sibling_gate = sibling_binding.gate;
+    arrow_import_ingestible sibling(std::move(sibling_binding), b);
+    sibling.attach_preparation_ledger(h.ledger);
+    sirius::test::preparation::hold reading;
+    blocked->before_next = [&] { reading.wait(); };
+    std::atomic<bool> allow_sibling{false};
+    native_worker_run run(2);
+    struct release_hold {
+      sirius::test::preparation::hold& reading;
+      ~release_hold() { reading.release(); }
+    } release_on_failure{reading};
+    auto second      = run.source(sibling);
+    second.try_claim = [claim = std::move(second.try_claim),
+                        &allow_sibling]() mutable -> sm::preparation_coordinator::claim_result {
+      if (!allow_sibling) return sm::preparation_pending{};
+      return claim();
+    };
+    std::vector<sm::preparation_coordinator::source> lanes;
+    lanes.push_back(run.source(*h.driver));
+    lanes.push_back(std::move(second));
+    run.coordinator.add_sources(std::move(lanes));
+    run.coordinator.after_publication_for_testing([&](auto, auto const&, auto) { ++publications; });
+    run.start();
+    REQUIRE(run.until([&] {
+      std::lock_guard lock(reading.mutex);
+      return reading.entered;
+    }));
+    REQUIRE(blocked->reads == 1);
+    REQUIRE(h.ledger->permits_in_flight() == 1);
+    allow_sibling = true;
+    run.coordinator.wake_for_testing();
+    REQUIRE(run.until([&] { return blocked->stop.stop_requested(); }));
+    CHECK(blocked->stop.reason() == sm::stop_reason::failure_induced);
+    CHECK(run.completion.terminal_error() == first_error);
+    CHECK_FALSE(run.quiescent());
+    CHECK(failing->reads == 1);
+    CHECK(blocked->closes == 0);
+    CHECK(h.ledger->permits_in_flight() >= 1);
+    CHECK(publications == 0);
+    reading.release();
+    REQUIRE(run.until([&] { return run.quiescent(); }));
+    run.coordinator.drain();
+    CHECK(run.completion.terminal_error() == first_error);
+    CHECK(publications == 0);
+    CHECK(backing.seen->allocations == 0);
+    CHECK(backing.seen->allocated_bytes == 0);
+    CHECK_FALSE(sibling_gate->active);
+    check_native_retirement(*blocked, 1, 2);
+    check_native_retirement(*failing, 1, 0);
+    CHECK(blocked->owner != failing->owner);
+    check_native_ledger(h);
+  }
+  CHECK(backing.outstanding() == 0);
+
+  auto healthy = std::make_shared<native_read_script>();
+  healthy->batches.push_back(std::make_shared<native_kind_tree>(-1, 1));
+  harness retry(scripted_paimon(healthy), integer_program(), false, &backing);
+  native_worker_run recovery;
+  recovery.coordinator.add_source(recovery.source(*retry.driver));
+  recovery.coordinator.after_publication_for_testing(
+    [&](auto, auto const&, auto) { ++publications; });
+  recovery.start();
+  REQUIRE(recovery.until([&] { return recovery.quiescent(); }));
+  CHECK_FALSE(recovery.completion.has_error());
+  CHECK(publications == 1);
+  CHECK(backing.seen->allocated_bytes == 0);
+  check_native_retirement(*healthy, 2, 2);
+  check_native_ledger(retry);
+}
+
+TEST_CASE("Paimon worker holds its next claim until detached data retires on another lane",
+          "[paimon_worker_handoff]")
+{
+  auto script     = std::make_shared<native_read_script>();
+  auto batch      = std::make_shared<native_kind_tree>(-1, 1);
+  script->batches = {batch};
+  auto producer   = scripted_paimon(script);
+  // Leave room for a second permit so the local reader gate is the constraint.
+  harness h(producer, integer_program(), false, nullptr, producer);
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  std::atomic<unsigned> pending{0}, publications{0};
+  std::promise<std::unique_ptr<owned_arrow_scan_info>> published;
+  auto first = published.get_future();
+  native_worker_run run;
+  auto source      = run.source(*h.driver);
+  source.try_claim = [claim = std::move(source.try_claim), &pending]() mutable {
+    auto result = claim();
+    if (std::holds_alternative<sm::preparation_pending>(result)) ++pending;
+    return result;
+  };
+  run.coordinator.add_source(std::move(source));
+  run.coordinator.after_publication_for_testing([&](auto, auto const& metadata, auto) {
+    auto const& input = dynamic_cast<owned_arrow_scan_info const&>(*metadata);
+    if (++publications == 1) published.set_value(input.coalesced_copy());
+  });
+  run.start();
+  REQUIRE(run.until([&] { return first.wait_for(0ms) == std::future_status::ready; }));
+  run.advance();
+  auto alias = first.get();
+  REQUIRE_FALSE(alias->rootless());
+  CHECK_FALSE(alias->required_device_id());
+  CHECK(alias->read_identity() == h.identity);
+  REQUIRE(batch->releases == 2);
+  REQUIRE(script->reads == 1);
+  CHECK(h.backing.seen->allocated_bytes > 0);
+  CHECK(h.ledger->permits_in_flight() == 1);
+  auto free_permit = h.ledger->try_acquire_unit({999, 0}, 0);
+  REQUIRE(free_permit);
+  h.ledger->retire_unit({999, 0});
+  free_permit.release();
+  auto previous_pending = pending.load();
+  run.coordinator.wake_for_testing();
+  REQUIRE(run.until([&] { return pending > previous_pending; }));
+  CHECK(script->reads == 1);
+  CHECK(h.gate->active);
+  batch->values.values[0] = 99;
+  auto consumed = std::async(std::launch::async, [&, input = alias->coalesced_copy()]() mutable {
+    if (cudaSetDevice(0) != cudaSuccess) throw std::runtime_error("cannot bind transform device");
+    rmm::cuda_stream stream;
+    auto result = h.driver->materialize_metadata_to_table(*input, *space, stream);
+    if (result.table.num_rows() != 1) throw std::runtime_error("wrong detached batch size");
+    int32_t observed = 0;
+    if (cudaMemcpyAsync(&observed,
+                        result.table.view().column(0).template data<int32_t>(),
+                        sizeof(observed),
+                        cudaMemcpyDeviceToHost,
+                        stream.value()) != cudaSuccess)
+      throw std::runtime_error("cannot read detached batch value");
+    stream.synchronize();
+    input.reset();
+    return std::pair{std::this_thread::get_id(), observed};
+  });
+  auto [consumer, value] = consumed.get();
+  CHECK(value == 11);
+  CHECK(consumer != script->owner);
+  CHECK(script->reads == 1);
+  CHECK(h.ledger->permits_in_flight() == 1);
+  alias.reset();
+  REQUIRE(run.until([&] { return run.quiescent(); }));
+  CHECK_FALSE(run.completion.has_error());
+  CHECK(publications == 1);
+  check_native_retirement(*script, 2, 2);
+  check_native_ledger(h);
+}
+
+TEST_CASE("Paimon native lane detaches roots before GPU import and cancellation drain",
+          "[arrow_driver][paimon_native_gpu]")
+{
+  bool stopped     = GENERATE(false, true);
+  auto owners      = std::make_shared<sirius::test::paimon::native_fixture>();
+  auto metadata    = sirius::test::paimon::fixture_metadata();
+  auto native_pool = owners->pool;
+  materialization_program program{701, 4, {cudf::data_type{cudf::type_id::INT64}}, 0, false};
+  program.input_types = program.output_types;
+  auto open           = [metadata, owners](int64_t max_rows, sm::preparation_stop_token stop) {
+    return open_paimon_read(metadata, {0}, owners->pool, owners, max_rows, stop);
+  };
+  auto producer = std::make_shared<paimon_arrow_producer>(
+    program, arrow_copy_limits{1, 8192, 8192}, std::move(open));
+  harness h(producer, program, false);
+  CHECK_FALSE(h.driver->can_serve_cached_view());
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+  sirius::exec::static_thread_pool pool(2);
+  sirius::exec::scoped_dispatcher dispatcher(pool);
+  sirius::pipeline::completion_handler completion;
+  sm::native_reader_executor readers(1, 1);
+  std::vector<int64_t> actual;
+  std::atomic<unsigned> stop_requests{0};
+  sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1}, &readers);
+  auto lane = h.driver->make_preparation_source({});
+  REQUIRE(lane.execution == sm::preparation_execution_domain::native_reader);
+  auto connector = std::make_shared<sm::split_connector>();
+  sm::preparation_coordinator::source source;
+  source.execution   = lane.execution;
+  source.try_claim   = std::move(lane.try_claim);
+  source.close       = std::move(lane.close);
+  source.bind_wakeup = std::move(lane.bind_wakeup);
+  source.coalescer   = std::move(lane.coalescer);
+  source.destination = connector;
+  source.construct   = [](auto input) {
+    auto bytes = input->preparation_bytes();
+    return sirius::test::preparation::make_publication(std::move(input), bytes);
+  };
+  coordinator.after_publication_for_testing([&](auto, auto const& input, auto) {
+    auto result = h.driver->materialize_metadata_to_table(*input, *space, stream);
+    auto n      = result.table.num_rows();
+    auto begin  = actual.size();
+    actual.resize(begin + n);
+    REQUIRE(cudaMemcpyAsync(actual.data() + begin,
+                            result.table.view().column(0).template data<int64_t>(),
+                            n * sizeof(int64_t),
+                            cudaMemcpyDeviceToHost,
+                            stream.value()) == cudaSuccess);
+    stream.synchronize();
+  });
+  if (stopped) {
+    coordinator.before_publication_for_testing([&] {
+      ++stop_requests;
+      coordinator.request_stop(sm::stop_reason::user_cancel);
+    });
+  }
+  coordinator.add_source(std::move(source));
+  h.driver->preflight_for_query();
+  coordinator.arm();
+  coordinator.start();
+  auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (coordinator.snapshot().phase != sm::preparation_coordinator::lifecycle::quiescent &&
+         std::chrono::steady_clock::now() < deadline) {
+    coordinator.advance(1ms);
+    if (connector->has_more_splits()) (void)connector->get_next_split();
+  }
+  auto finished = coordinator.snapshot().phase == sm::preparation_coordinator::lifecycle::quiescent;
+  if (!finished) coordinator.request_stop(sm::stop_reason::failure_induced);
+  coordinator.drain();
+  REQUIRE(finished);
+  if (!stopped && completion.terminal_error()) std::rethrow_exception(completion.terminal_error());
+  std::sort(actual.begin(), actual.end());
+  if (stopped) {
+    CHECK(stop_requests == 1);
+    auto error = completion.terminal_error();
+    REQUIRE(error);
+    CHECK_THROWS_AS(std::rethrow_exception(error), duckdb::InterruptException);
+    REQUIRE(actual.empty());
+  } else {
+    REQUIRE(actual == std::vector<int64_t>{1, 1, 2});
+  }
+  REQUIRE(h.profiles->counters->arrow_batches_imported == (stopped ? 0 : 3));
+  REQUIRE(native_pool->CurrentUsage() == 0);
+  REQUIRE(h.backing.seen->allocated_bytes == 0);
+  REQUIRE(h.ledger->tracked_units() == 0);
+}
+#endif

@@ -464,3 +464,8 @@ set(TEST_SOURCES
 # caught by the check-orphan-tests pre-commit hook
 # (scripts/check_orphan_tests.py) rather than a configure-time glob — see
 # test/cpp/orphan_test_allowlist.txt.
+
+if(SIRIUS_ENABLE_PAIMON_SDK)
+  list(APPEND TEST_SOURCES test/cpp/scan/test_paimon_batch_cursor.cpp
+       test/cpp/scan/test_paimon_batch_cursor_native.cpp)
+endif()

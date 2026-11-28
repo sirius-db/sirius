@@ -60,6 +60,12 @@ include(cmake/sirius-substrait.cmake)
 
 include(cmake/sirius-targets.cmake)
 
+option(SIRIUS_ENABLE_PAIMON_SDK
+       "Build Paimon SDK components (does not enable SQL routing)" OFF)
+if(SIRIUS_ENABLE_PAIMON_SDK)
+  include(cmake/sirius-paimon.cmake)
+endif()
+
 include(cmake/sirius-install.cmake)
 
 if(ENABLE_STREAM_CHECK)
