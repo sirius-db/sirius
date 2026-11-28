@@ -657,6 +657,15 @@ gateway_state::rank_plan gateway_state::plan_ranks(start_options const& options)
     throw InvalidInputException("the base ports of %d ranks must stay within 1 to 65535",
                                 options.ranks);
   }
+  // Sirius ranks refuse this pair when they connect to a peer, after the running ranks stopped.
+  if (!options.sirius_extension.empty() && options.ranks + registered.size() > 1 &&
+      options.mnnvl == "require" &&
+      (options.host_staging == "always" || options.host_staging == "remote")) {
+    throw InvalidInputException(
+      "sirius_gateway_exchange_mnnvl is require, but sirius_gateway_exchange_host_staging = %s "
+      "stages every peer",
+      options.host_staging);
+  }
 
   // With no gpus argument, Sirius ranks stay inside the gateway's own CUDA_VISIBLE_DEVICES.
   std::vector<std::string> visible;
