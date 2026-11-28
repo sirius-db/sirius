@@ -32,6 +32,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -270,11 +271,16 @@ inline constexpr std::size_t dictionary_carrier_max_keys_bytes = std::size_t{512
  * `cudf::concatenate` rejects such a mix, so a column that mixes the two forms is decoded to
  * STRING in every table; a column every table carries as a dictionary stays one unless its merged
  * keys exceed `dictionary_carrier_max_keys_bytes`.
+ *
+ * @p concatenate, when set, replaces `cudf::concatenate` for the tables once their columns agree
+ * (gpu_merge_impl::concat_tables for inputs past 2^31 bytes).
  */
 [[nodiscard]] std::unique_ptr<cudf::table> concatenate_carriers(
   std::vector<cudf::table_view> tables,
   ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref(),
+  std::function<std::unique_ptr<cudf::table>(std::vector<cudf::table_view> const&)> const&
+    concatenate = {});
 
 /**
  * @brief Checks whether exact bounds are representable by a numeric carrier
