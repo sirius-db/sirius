@@ -215,11 +215,6 @@ void exchange_service::send(stream_id stream,
   std::shared_ptr<transport> running;
   {
     std::lock_guard lock{_mutex};
-    if (bytes > 0) {
-      auto& t = _traffic[query_of(stream)];
-      t.sent_bytes += bytes;
-      ++t.sent_batches;
-    }
     if (_error) { std::rethrow_exception(_error); }
     // A peer failed this query: stop producing for it. close() still goes through, since sinks
     // and all-gathers close their streams on the way out.
@@ -235,6 +230,12 @@ void exchange_service::send(stream_id stream,
   if (_error) { std::rethrow_exception(_error); }
   if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
     std::rethrow_exception(it->second);
+  }
+  // Counted once the send was not refused; not for a query that retired while it waited.
+  if (bytes > 0 && !retired(query_of(stream))) {
+    auto& t = _traffic[query_of(stream)];
+    t.sent_bytes += bytes;
+    ++t.sent_batches;
   }
 }
 

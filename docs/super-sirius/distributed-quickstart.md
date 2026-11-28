@@ -141,7 +141,7 @@ with the gateway. Ranks started before the gateway wait for its `gateway.conf`. 
 `/tmp/sirius_node_<user>_<cluster>/rank_<port>/rank.log` and `register.log`. Sirius's own log
 of every rank goes to `log/` under the directory the node was started in; export
 `SIRIUS_RANK_LOG_ROOT=<dir>` to give each rank `<dir>/<short hostname>-<quack port>/`, which
-nodes that share a file system need. Ctrl-C stops the
+nodes that share a file system need (the Slurm launcher sets it). Ctrl-C stops the
 node's ranks. If one rank's script exits on an error it cannot retry, the node stops all its
 ranks.
 
@@ -231,7 +231,9 @@ exchange port 27000 + `SLURM_LOCALID`. The script asks for 4 tasks per node;
 `sbatch -N2 --ntasks-per-node=2 scripts/sirius_slurm.sbatch` uses 2 GPUs per node. The gateway
 serves until the job ends. If either the gateway's step or the ranks' step exits, the job stops
 the other and ends with exit code 1. At exit the script removes `~/.sirius/gateways/<job id>/`,
-so the job's token, keys and DDL log go with it. It needs a shared `$HOME`.
+so the job's token, keys and DDL log go with it. It needs a shared `$HOME`. Each rank's
+Sirius log goes to `log/<short hostname>-<quack port>/` under the submit directory; an exported
+`SIRIUS_RANK_LOG_ROOT` names another root.
 
 Tested on two GB200 nodes with 2 GPUs each (`sbatch -N2 --ntasks-per-node=2`): a count at SF100
 and TPC-H Q12 were correct, and cancelling the gateway's step ended the job with exit code 1.

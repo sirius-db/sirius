@@ -11,7 +11,8 @@
 #   PARTITION        Slurm partition, default nvidia-part
 #   SECONDS_PER_PHASE  default 1.5
 #   SIRIUS_EXCHANGE_MNNVL, SIRIUS_EXCHANGE_FRAME_BYTES, SIRIUS_EXCHANGE_SEND_FRAMES,
-#   SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER   passed to every rank (defaults: require, 16 MiB, 32, 16)
+#   SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER   passed to every rank (defaults: require, 16 MiB, 32, 16;
+#                    with [nixl_bandwidth]: require, 8 MiB, 16, 8)
 #   SIRIUS_EXCHANGE_HOST_STAGING (auto), SIRIUS_EXCHANGE_PAIRS_GPU_GIB (40)   likewise; with
 #                    [nixl_bandwidth] also SIRIUS_EXCHANGE_TCP_LANES and SIRIUS_EXCHANGE_BW_BATCHES
 #   RANK_TIMEOUT     seconds before a rank is killed, default 900

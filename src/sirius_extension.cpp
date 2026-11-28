@@ -2863,20 +2863,30 @@ static void SetExchangePeers(ClientContext& context, SetScope scope, Value& para
   get_operator_params(context, scope)->exchange_peers = std::move(peers);
 }
 
+/// StringValue::Get of a NULL is an INTERNAL error, which invalidates the database, and
+/// UBigIntValue::Get of one reads a number that was never set.
+static void refuse_null(char const* name, Value const& parameter)
+{
+  if (parameter.IsNull()) { throw InvalidInputException("%s cannot be NULL: RESET it", name); }
+}
+
 static void SetExchangeHostStaging(ClientContext& context, SetScope scope, Value& parameter)
 {
+  refuse_null("sirius_exchange_host_staging", parameter);
   get_operator_params(context, scope)->exchange_host_staging =
     sirius::exchange::parse_host_staging(StringValue::Get(parameter));
 }
 
 static void SetExchangeMnnvl(ClientContext& context, SetScope scope, Value& parameter)
 {
+  refuse_null("sirius_exchange_mnnvl", parameter);
   get_operator_params(context, scope)->exchange_mnnvl =
     sirius::exchange::parse_mnnvl(StringValue::Get(parameter));
 }
 
 static void SetExchangeFrameBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
+  refuse_null("sirius_exchange_frame_bytes", parameter);
   auto const bytes = UBigIntValue::Get(parameter);
   if (bytes == 0 || bytes % 256 != 0 || bytes > sirius::exchange::max_frame_bytes) {
     throw InvalidInputException(
@@ -2890,6 +2900,7 @@ static void SetExchangeFrameBytes(ClientContext& context, SetScope scope, Value&
 /// Parses a frame count setting @p name: 1 to max_ring_frames.
 static uint32_t ring_frames(char const* name, Value& parameter)
 {
+  refuse_null(name, parameter);
   auto const frames = UBigIntValue::Get(parameter);
   if (frames == 0 || frames > sirius::exchange::max_ring_frames) {
     throw InvalidInputException(
@@ -2906,6 +2917,7 @@ static void SetExchangeSendFrames(ClientContext& context, SetScope scope, Value&
 
 static void SetExchangeTcpLanes(ClientContext& context, SetScope scope, Value& parameter)
 {
+  refuse_null("sirius_exchange_tcp_lanes", parameter);
   auto const lanes = UBigIntValue::Get(parameter);
   if (lanes > sirius::exchange::max_tcp_lanes) {
     throw InvalidInputException("sirius_exchange_tcp_lanes must be 0 (automatic) to %u, not %llu",
