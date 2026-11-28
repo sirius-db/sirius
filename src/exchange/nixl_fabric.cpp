@@ -232,7 +232,9 @@ std::string lane_name(rank_t rank, std::uint32_t lane)
   return "sirius-exchange-" + std::to_string(rank) + "-lane-" + std::to_string(lane);
 }
 
-/// The CPUs NVML places next to the GPU at @p bus_id; empty when it cannot tell.
+/// The CPUs NVML places next to the GPU at @p bus_id, of those the calling thread may run on;
+/// empty when it cannot tell or there are none. taskset gives a rank its share of a host's CPUs,
+/// and a thread that sets its affinity leaves that share: the kernel holds it only to the cgroup.
 std::vector<int> cpus_near(std::string const& bus_id)
 {
   nvmlDevice_t device{};
@@ -242,12 +244,14 @@ std::vector<int> cpus_near(std::string const& bus_id)
   constexpr unsigned words  = CPU_SETSIZE / (8 * sizeof(unsigned long));
   unsigned long mask[words] = {};
   if (nvmlDeviceGetCpuAffinity(device, words, mask) != NVML_SUCCESS) { return {}; }
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed) != 0) { return {}; }
   std::vector<int> cpus;
   for (unsigned w = 0; w < words; ++w) {
     for (unsigned b = 0; b < 8 * sizeof(unsigned long); ++b) {
-      if ((mask[w] >> b) & 1UL) {
-        cpus.push_back(static_cast<int>(w * 8 * sizeof(unsigned long) + b));
-      }
+      auto const cpu = static_cast<int>(w * 8 * sizeof(unsigned long) + b);
+      if (((mask[w] >> b) & 1UL) && CPU_ISSET(cpu, &allowed)) { cpus.push_back(cpu); }
     }
   }
   return cpus;
