@@ -4,6 +4,7 @@
 # pairs with rank (r + N) % 2N, N ranks per node. Writes each rank's log, the UCX transport
 # choices and summary.md (GB/s per phase next to raw NIXL's) to OUT.
 #   SLURM_CONF=... scripts/distributed_test_nixl_pairs.sh <node1>,<node2> [out dir]
+# OUT (default: nixl-pairs-<time> in this folder) must be on a file system both nodes share.
 # Environment:
 #   RANKS_PER_NODE   ranks (GPUs) per node, default 4
 #   TEST             the Catch2 tag, default [nixl_pairs]; [nixl_bandwidth] runs an all-to-all
@@ -15,8 +16,8 @@
 #                    [nixl_bandwidth] also SIRIUS_EXCHANGE_TCP_LANES and SIRIUS_EXCHANGE_BW_BATCHES
 #   RANK_TIMEOUT     seconds before a rank is killed, default 900
 #   UCX_TLS, UCX_NET_DEVICES  default: scripts/launcher_env.sh's, as a gateway's ranks: tcp for
-#                    notifications on bond0. SIRIUS_UCX_RAILS=1: UCX_TLS=all on the node's GPU
-#                    rail NICs.
+#                    notifications on the interface of the node's address (bond0 on GB200
+#                    nodes). SIRIUS_UCX_RAILS=1: UCX_TLS=all on the node's GPU rail NICs.
 # Never run it on nodes you use outside Slurm.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -37,7 +38,9 @@ if [[ ${1:-} == --rank ]]; then
   # Sirius writes its log to ./log: one folder per rank.
   mkdir -p "$out/rank$rank" && cd "$out/rank$rank"
   source "$here/launcher_env.sh"
-  export UCX_NET_DEVICES=${UCX_NET_DEVICES:-bond0}
+  # As sirius_rank_node.sh: the interface that holds this rank's address.
+  picked=$(sirius_pick_address "${mine%:*}/32")
+  export UCX_NET_DEVICES=${UCX_NET_DEVICES:-${picked% *}}
   echo "rank $rank on $(hostname): UCX_TLS=$UCX_TLS UCX_NET_DEVICES=$UCX_NET_DEVICES" >> "$out/ucx.txt"
   exec timeout -s KILL "${RANK_TIMEOUT:-900}" "$root/build/release/test/cpp/sirius_unittest" \
     "${TEST:-[nixl_pairs]}" > "$out/rank$rank.log" 2>&1
@@ -58,6 +61,8 @@ done
 mkdir -p "$out"
 # Each rank changes into its own folder before it writes here.
 out=$(cd "$out" && pwd)
+# A folder used before: its rank logs would be summarized as this run's.
+rm -f "$out"/rank*.log "$out/ucx.txt"
 export SIRIUS_EXCHANGE_PEERS=$peers
 export SIRIUS_EXCHANGE_PAIRS_SECONDS=${SECONDS_PER_PHASE:-1.5}
 export SIRIUS_EXCHANGE_MNNVL=${SIRIUS_EXCHANGE_MNNVL:-require}
