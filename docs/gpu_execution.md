@@ -1,26 +1,20 @@
 # `gpu_execution`
 
-`gpu_execution` is the recommended execution path — out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. It currently works with **Parquet** data format.
+`gpu_execution` is the recommended execution path — out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. It works with both **Parquet** and **DuckDB-native** storage.
 
 ## Building
 
-Clone the Sirius repository:
-```
-git clone --recurse-submodules https://github.com/sirius-db/sirius.git
-cd sirius
-```
-
-Follow the [build instructions](building.md) to build Sirius and the separate
-DuckDB wrapper using Pixi.
+Follow the [source quick start](README.md#quick-start) to build Sirius and the
+DuckDB extension using Pixi.
 
 ## Configuration
 
-`gpu_execution` requires a config file in YAML format. See the [Configuration documentation](super-sirius/configuration.md) for the full reference, including [config file resolution order](super-sirius/configuration.md#config-file-resolution), all available options, and [byte suffixes](super-sirius/configuration.md#byte-suffixes). An example config file is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
+`gpu_execution` reads an optional YAML config file; without one, built-in defaults apply. See the [Configuration documentation](super-sirius/configuration.md) for the full reference, including [config file resolution order](super-sirius/configuration.md#config-file-resolution), all available options, and [value formats](super-sirius/configuration.md#value-formats). An example config file is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
 ## Running
 
 ```bash
-export SIRIUS_CONFIG_FILE=/path/to/sirius.yaml
+export SIRIUS_CONFIG_FILE=/path/to/sirius.yaml  # optional
 pixi run sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"
 ```
 
@@ -72,7 +66,7 @@ GROUP BY l_returnflag, l_linestatus
 ORDER BY l_returnflag, l_linestatus;
 ```
 
-Queries with unsupported operators fall back silently to DuckDB CPU execution. `gpu_execution` is a session-scoped setting: an unqualified `SET` changes it for the current connection only. To change it for every connection of the database instance, including connections that other extensions open for their own SQL, use `SET GLOBAL`; a connection with its own `SET SESSION` value keeps that value.
+Queries with unsupported operators fall back silently to DuckDB CPU execution, unless `enable_duckdb_fallback` is `false`. `gpu_execution` is a session-scoped setting: an unqualified `SET` changes it for the current connection only. To change it for every connection of the database instance, including connections that other extensions open for their own SQL, use `SET GLOBAL`; a connection with its own `SET SESSION` value keeps that value. `RESET gpu_execution` removes the connection's own value, so the connection follows the global value again; `RESET GLOBAL gpu_execution` removes the global value, so connections without their own value return to the default, `true`.
 
 ```sql
 SET gpu_execution = false;          -- this connection only
@@ -89,7 +83,7 @@ SET gpu_execution = true;
 
 Sirius plans a correlated subquery only in the form DuckDB's default `delim_join_as_cte = true` gives it, a CTE. With `false`, which DuckDB has deprecated, a correlated subquery that DuckDB cannot flatten stays a delim join, and Sirius has no operators for one. A query whose plan has a delim join is left to the CPU like any other plan Sirius cannot run, on the transparent path and in `gpu_execution(...)`: Sirius logs a warning that names the setting, and with `enable_duckdb_fallback = false` the query fails with that message. Every other query runs on the GPU under either value.
 
-**How it works:** Sirius registers two optimizer hooks at extension load time, and disables the DuckDB optimizers it cannot plan after (such as `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, and `LATE_MATERIALIZATION`). The pre-optimizer hook decides whether the statement stays on DuckDB and, for a query headed to the GPU, rewrites correlated subqueries before DuckDB orders the joins (see [Optimizations](super-sirius/optimizations.md#subquery-keys-carried-across-an-equality)). The post-optimizer hook captures the optimized logical plan, and GPU plan generation runs on it via `sirius_physical_plan_generator`. If plan generation succeeds, a `PhysicalSiriusExecution` node replaces the DuckDB physical plan and the query runs on GPU; if it throws, DuckDB's CPU plan runs. When the pre-optimizer hook had rewritten the query, DuckDB first plans the statement again without the rewrite, so the CPU runs the plan DuckDB makes alone.
+**How it works:** Sirius registers two optimizer hooks at extension load time, and disables the DuckDB optimizers it cannot plan after (such as `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, and `LATE_MATERIALIZATION`). The pre-optimizer hook decides whether the statement stays on DuckDB and, for a query headed to the GPU, rewrites correlated subqueries before DuckDB orders the joins (see [Optimizations](super-sirius/optimizations.md#subquery-keys-carried-across-an-equality)). The post-optimizer hook captures the optimized logical plan, and GPU plan generation runs on it via `sirius_physical_plan_generator`. If plan generation succeeds, a `PhysicalSiriusExecution` node replaces the DuckDB physical plan and the query runs on GPU; if it throws, DuckDB's CPU plan runs, or the error is raised when `enable_duckdb_fallback` is `false`. When the pre-optimizer hook had rewritten the query, DuckDB first plans the statement again without the rewrite, so the CPU runs the plan DuckDB makes alone.
 
 ## Generating Test Datasets
 

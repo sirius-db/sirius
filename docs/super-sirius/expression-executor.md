@@ -364,8 +364,9 @@ The helper uses a libcudf JIT transform with public CCCL overflow helpers and er
 collection; DATE inputs are bitcast to day counts without copying. Scalar operands
 use one-row columns broadcast by `cudf::scalar_column_view`, with the output row
 count passed explicitly so scalar-only and empty inputs retain the input shape.
-Offsets preserve NULLs and infinity and reject finite overflow or infinity-sentinel
-collisions. Date differences widen both day counts before subtraction and return
+Offsets preserve NULLs and infinity and reject finite overflow, infinity-sentinel
+collisions, and day counts below -infinity (`INT32_MIN`) as input or result, like
+DuckDB. Date differences widen both day counts before subtraction and return
 BIGINT. These operations materialize under every evaluator strategy; standalone
 cuDF AST translation declines them because it cannot implement the checks.
 The existing reference evaluator restores compressed operands before execution.
@@ -379,10 +380,12 @@ Tests are tagged `[decimal_integer_cast]`.
 
 ### Division and modulo
 
-`//` and `%` check valid operand pairs for zero divisors and signed-minimum/-1 overflow before
-calling cuDF. Both operators raise for the latter pair in the pinned DuckDB version. NULLs in
-either operand suppress the check for that row. A detected exceptional pair triggers CPU replay,
-which preserves DuckDB's `error_on_division_by_zero` setting. A guarded
+`//` and `%` check valid operand pairs for zero divisors and signed-minimum/-1 pairs before
+calling cuDF. NULLs in either operand suppress the check for that row. A zero divisor triggers CPU
+replay, which preserves DuckDB's `error_on_division_by_zero` setting. So does a signed-minimum/-1
+pair under `//`, whose quotient overflows and raises in DuckDB. Its remainder is 0, so `%` stays on
+the GPU and matches DuckDB: when such a pair occurs without a zero divisor, the kernel divides by 1
+wherever the divisor is -1, which leaves every remainder unchanged. A guarded
 `CASE WHEN b = 0 THEN NULL ELSE a // b END` stays on the GPU: the division is retried on the rows
 that ELSE selects (see [Conditional evaluation](#conditional-evaluation-and-row-dependent-errors)).
 With fallback disabled, the GPU reports the unsupported exceptional pair without executing it.
@@ -417,8 +420,13 @@ from the operand's, stay on the CPU. `negate` is an AST breaker. Tests are tagge
 `round_floating_point` (`src/cuda/sirius_round_floating_point.cu`), one elementwise kernel that
 reproduces DuckDB's `RoundOperatorPrecision`: the value is rounded in double precision as
 `round(x * 10^n) / 10^n`, or `round(x / 10^-n) * 10^-n` for negative `n`, with ties away from
-zero. A non-finite result yields the input for `n >= 0` and 0 for `n < 0`. The output is bit
-identical to DuckDB. The precision must be a constant INTEGER.
+zero. For `n` from 1 to 22 the product `x * 10^n` can round onto a midpoint that `x` itself is not
+on: `2.675 * 100` is `267.5` while the stored `2.675` is just below it. The kernel then takes the
+product's rounding error from `fma(x, 10^n, -product)` and rounds to the side the exact product
+lies on, so `round(2.675::DOUBLE, 2)` is `2.67`; a zero error is a true tie and rounds away from
+zero. The product is computed with `__dmul_rn` so that nvcc cannot contract it into a fused
+multiply-add. A non-finite result yields the input; a negative `n` whose `10^-n` overflows rounds
+finite values to 0. The output is bit identical to DuckDB. The precision must be a constant INTEGER.
 DECIMAL and integer inputs and a column precision fall back to the CPU at plan time.
 
 ### Absolute value

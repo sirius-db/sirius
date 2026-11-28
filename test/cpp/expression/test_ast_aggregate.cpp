@@ -20,8 +20,8 @@
 // Covers the id mapper round-trips + unsupported-name nullopt, direct
 // aggregate-node construction, and translation of a directly-constructed
 // duckdb::BoundAggregateExpression (sum, count/count_star with no children,
-// COUNT(DISTINCT struct_pack(a, b)) recursion + distinct flag, and the
-// unsupported-name -> nullptr fallback).
+// COUNT(DISTINCT struct_pack(a, b)) recursion + distinct flag, ORDER BY keys,
+// and the unsupported-name -> nullptr fallback).
 
 #include "catch.hpp"
 #include "expression/ast/from_duckdb.hpp"
@@ -34,11 +34,14 @@
 #include "expression/ast/reference.hpp"
 #include "expression/function_id.hpp"
 #include "helper/logical_type.hpp"
+#include "sirius/exception.hpp"
 
 // duckdb — direct-ctor construction surface
+#include <duckdb/common/enums/order_type.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/function/aggregate_function.hpp>
 #include <duckdb/function/scalar_function.hpp>
+#include <duckdb/planner/bound_result_modifier.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -68,7 +71,10 @@ using sirius::to_duckdb_aggregate_name;
 using sirius::ast::aggregate;
 using sirius::ast::function_call;
 using sirius::ast::node;
+using sirius::ast::null_placement;
+using sirius::ast::order_modifier;
 using sirius::ast::reference;
+using sirius::ast::sort_direction;
 
 namespace {
 
@@ -149,7 +155,8 @@ TEST_CASE("ast_aggregate - direct node construction reads back fields", "[ast_ag
     std::make_unique<node>(aggregate{aggregate_id::sum,
                                      std::move(args),
                                      sirius::logical_type::make(sirius::type_id::BIGINT),
-                                     /*distinct=*/true});
+                                     /*distinct=*/true,
+                                     /*order=*/{}});
 
   REQUIRE(agg_node->holds<aggregate>());
   auto const& agg = agg_node->get<aggregate>();
@@ -157,6 +164,29 @@ TEST_CASE("ast_aggregate - direct node construction reads back fields", "[ast_ag
   REQUIRE(agg.arguments().size() == 1);
   REQUIRE(agg.return_type().id() == sirius::type_id::BIGINT);
   REQUIRE(agg.distinct() == true);
+  REQUIRE(agg.order().empty());
+}
+
+TEST_CASE("ast_aggregate - ORDER BY keys are trailing arguments", "[ast_aggregate][distinct]")
+{
+  auto const integer  = sirius::logical_type::make(sirius::type_id::INTEGER);
+  auto make_arguments = [&](std::size_t count) {
+    std::vector<std::unique_ptr<node>> args;
+    for (std::size_t i = 0; i < count; ++i) {
+      args.push_back(std::make_unique<node>(reference{static_cast<std::uint32_t>(i), integer}));
+    }
+    return args;
+  };
+  std::vector<order_modifier> const order{{sort_direction::descending, null_placement::first},
+                                          {sort_direction::ascending, null_placement::last}};
+
+  aggregate const agg{aggregate_id::first, make_arguments(3), integer, false, order};
+  REQUIRE(agg.arguments().size() == 3);
+  REQUIRE(agg.order() == order);
+
+  // Two keys need a value argument ahead of them.
+  REQUIRE_THROWS_AS((aggregate{aggregate_id::first, make_arguments(2), integer, false, order}),
+                    sirius::internal_exception);
 }
 
 // ============================================================================
@@ -307,4 +337,63 @@ TEST_CASE("ast_aggregate - unsupported aggregate name yields nullptr fallback (n
   std::unique_ptr<node> out;
   REQUIRE_NOTHROW(out = sirius::ast::from_duckdb(*expr));
   REQUIRE(out == nullptr);
+}
+
+TEST_CASE("ast_aggregate - an aggregate ORDER BY translates to trailing key arguments",
+          "[ast_aggregate][distinct]")
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+  children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+  auto fn        = make_dummy_aggregate("first", {LogicalType::INTEGER}, LogicalType::INTEGER);
+  auto expr      = duckdb::make_uniq<BoundAggregateExpression>(duckdb::BoundAggregateFunction(fn),
+                                                          std::move(children),
+                                                          nullptr,
+                                                          nullptr,
+                                                          AggregateType::NON_DISTINCT);
+  auto order_bys = duckdb::make_uniq<duckdb::BoundOrderModifier>();
+  order_bys->orders.emplace_back(
+    duckdb::OrderType::DESCENDING,
+    duckdb::OrderByNullType::NULLS_FIRST,
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DOUBLE, 2));
+  order_bys->orders.emplace_back(
+    duckdb::OrderType::ASCENDING,
+    duckdb::OrderByNullType::NULLS_LAST,
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 1));
+  expr->GetOrderBysMutable() = std::move(order_bys);
+
+  auto out = sirius::ast::from_duckdb(*expr);
+  REQUIRE(out);
+  auto const& agg = out->get<aggregate>();
+  REQUIRE(agg.function() == aggregate_id::first);
+  REQUIRE(agg.arguments().size() == 3);
+  CHECK(agg.arguments()[0]->get<reference>().column_index == 0);
+  CHECK(agg.arguments()[1]->get<reference>().column_index == 2);
+  CHECK(agg.arguments()[2]->get<reference>().column_index == 1);
+  CHECK(agg.order() ==
+        std::vector<order_modifier>{{sort_direction::descending, null_placement::first},
+                                    {sort_direction::ascending, null_placement::last}});
+}
+
+TEST_CASE("ast_aggregate - an unresolved ORDER BY modifier yields nullptr",
+          "[ast_aggregate][distinct]")
+{
+  bool const default_direction = GENERATE(false, true);
+  CAPTURE(default_direction);
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+  children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+  auto fn        = make_dummy_aggregate("first", {LogicalType::INTEGER}, LogicalType::INTEGER);
+  auto expr      = duckdb::make_uniq<BoundAggregateExpression>(duckdb::BoundAggregateFunction(fn),
+                                                          std::move(children),
+                                                          nullptr,
+                                                          nullptr,
+                                                          AggregateType::NON_DISTINCT);
+  auto order_bys = duckdb::make_uniq<duckdb::BoundOrderModifier>();
+  order_bys->orders.emplace_back(
+    default_direction ? duckdb::OrderType::ORDER_DEFAULT : duckdb::OrderType::ASCENDING,
+    default_direction ? duckdb::OrderByNullType::NULLS_LAST
+                      : duckdb::OrderByNullType::ORDER_DEFAULT,
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 1));
+  expr->GetOrderBysMutable() = std::move(order_bys);
+
+  REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
 }

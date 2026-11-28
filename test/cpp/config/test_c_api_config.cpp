@@ -117,9 +117,29 @@ TEST_CASE("C configuration returns categorized diagnostics", "[c_api_config][con
     file.write("sirius: [");
     expected = SIRIUS_MALFORMED_YAML;
   }
+  SECTION("a second document")
+  {
+    file.write("sirius: {}\n---\nsirius: {max_concurrent_queries: 2}\n");
+    expected = SIRIUS_MALFORMED_YAML;
+  }
+  SECTION("an alias inside the value it names")
+  {
+    file.write("sirius: &a [*a]");
+    expected = SIRIUS_MALFORMED_YAML;
+  }
+  SECTION("nesting deeper than any configuration")
+  {
+    file.write("sirius: " + std::string(100, '[') + std::string(100, ']'));
+    expected = SIRIUS_MALFORMED_YAML;
+  }
   SECTION("settings")
   {
     file.write("sirius: {unknown: 1}");
+    expected = SIRIUS_INVALID_CONFIGURATION;
+  }
+  SECTION("duplicate key")
+  {
+    file.write("sirius: {max_concurrent_queries: 1, max_concurrent_queries: 2}");
     expected = SIRIUS_INVALID_CONFIGURATION;
   }
   SECTION("malformed time")

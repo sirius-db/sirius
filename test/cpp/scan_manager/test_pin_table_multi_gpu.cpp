@@ -775,6 +775,109 @@ TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)
 }
 
 //===----------------------------------------------------------------------===//
+// Host-tier cached serve — DISPATCH ON AN ADMITTED SUBSET.
+//
+// Three GPUs, two of them admitted. Pin a 4-file surface to host with a 1 MB batch (multiple
+// chunks), run a cached column read, and count the tasks each GPU executed: both admitted GPUs
+// run tasks and the excluded one runs none.
+//===----------------------------------------------------------------------===//
+TEST_CASE("pin_table - host-tier cached scan runs only on admitted GPUs under gpus_per_query",
+          "[pin_mgpu][scan_manager][host_tier][multi_gpu][admission]")
+{
+  if (!sirius::test::has_gpus(3)) return;
+
+  auto tmp = make_tmp("host-dispatch-admission");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  generate_4file_surface(tmp);
+
+  // 1 MB batch so the host pin splits into multiple chunks; gpus_per_query: 2 admits every
+  // query onto the first two of the three GPUs.
+  mgpu_env_params params;
+  params.num_gpus             = 3;
+  params.gpus_per_query       = 2;
+  params.scan_task_batch_size = 1'000'000;
+  auto yaml_path              = tmp / "pin_mgpu_host_dispatch_admission.yaml";
+  write_mgpu_yaml(yaml_path, params);
+
+  auto env = std::make_unique<scoped_mgpu_env>(yaml_path);
+  {
+    auto con          = env->make_connection();
+    auto const run_ok = [&con](std::string const& sql) {
+      auto result = con.Query(sql);
+      REQUIRE(result);
+      if (result->HasError()) { UNSCOPED_INFO(sql << " failed: " << result->GetError()); }
+      REQUIRE_FALSE(result->HasError());
+      return result;
+    };
+
+    run_ok("SET enable_duckdb_fallback = false;");
+    auto const glob = parquet_glob(tmp);
+    run_ok("CALL pin_table('" + glob + "', tier='host', name='host_dispatch_admission');");
+
+    auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx != nullptr);
+
+    // More chunks than admitted GPUs, so the scan has work for both of them.
+    std::size_t chunks = 0;
+    sirius_ctx->get_scan_manager().visit_pinned_entries(
+      [&](std::string_view name, const auto& entry) {
+        if (name != "host_dispatch_admission") { return true; }  // keep looking
+        chunks = entry.host_chunks.size();
+        return false;  // found
+      });
+    INFO("host_chunks=" << chunks);
+    REQUIRE(chunks >= 3u);
+
+    auto const tasks_per_gpu = [&] {
+      std::map<int, std::size_t> out;
+      env->get_task_scheduler(con).visit_executors(
+        [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+          out[device_id] = exec.get_metrics().tasks_executed;
+        });
+      return out;
+    };
+
+    // Admission keeps the first two of the process's GPUs.
+    auto const executors = tasks_per_gpu();
+    REQUIRE(executors.size() == 3u);
+    std::set<int> admitted;
+    for (auto const& [device, executed] : executors) {
+      if (admitted.size() < 2u) { admitted.insert(device); }
+    }
+
+    auto const query = "SELECT max(k) FROM read_parquet('" + glob + "');";
+    // Repeated, since the round-robin cursors carry over from one query to the next.
+    for (int iteration = 0; iteration < 3; ++iteration) {
+      auto before       = tasks_per_gpu();
+      auto const result = run_ok(query);
+      auto after        = tasks_per_gpu();
+
+      REQUIRE(result->RowCount() == 1);
+      CHECK(result->Collection().GetValue(0, 0).GetValue<int64_t>() == 99999);
+
+      // Both admitted GPUs ran tasks and the excluded one ran none.
+      INFO("iteration=" << iteration);
+      for (auto const& [device, executed] : after) {
+        INFO("gpu=" << device << " tasks before=" << before[device] << " after=" << executed);
+        if (admitted.contains(device)) {
+          CHECK(executed > before[device]);
+        } else {
+          CHECK(executed == before[device]);
+        }
+      }
+    }
+
+    run_ok("CALL unpin_table('host_dispatch_admission');");
+  }
+
+  env.reset();
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
 // Host-tier cached serve — MULTI-GPU (distributed chunks), SUM(v).
 //
 // Companion to the MAX(k) gate above, with a non-trivial aggregate: SUM(v)
