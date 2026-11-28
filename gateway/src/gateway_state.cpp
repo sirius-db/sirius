@@ -806,6 +806,7 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
     auto const setup_done = fan_out(context, setup, client_policy(context));
     // A rank refused at connect (several GPUs, no fabric memory under 'require') answers at once
     // and never listens, so every other rank waits out its connect timeout: report the refusal.
+    // A rank whose call the gateway cancelled (timeout, interrupt) is not the cause either.
     std::string earliest;
     std::string cause;
     for (uint32_t i = 0; i < setup_done.outcomes.size(); ++i) {
@@ -815,7 +816,9 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
       std::lock_guard lock{state_mutex_};
       last_errors_[ranks_[i].name] = what;
       if (earliest.empty()) { earliest = what; }
-      if (cause.empty() && !waited_for_peers(message)) { cause = what; }
+      if (cause.empty() && !setup_done.outcomes[i].cancelled && !waited_for_peers(message)) {
+        cause = what;
+      }
     }
     if (!earliest.empty()) { throw IOException(cause.empty() ? earliest : cause); }
     std::lock_guard lock{state_mutex_};
@@ -1388,6 +1391,7 @@ gateway_state::fan_out_result gateway_state::fan_out(
 
   fan_out_result out;
   std::vector<std::shared_ptr<canceller>> cancelling;
+  std::vector<bool> running_at_cancel(ranks_.size(), false);
   auto const started = steady_clock::now();
   std::optional<steady_clock::time_point> cancelled_at;
   std::optional<steady_clock::time_point> killed_at;
@@ -1407,6 +1411,12 @@ gateway_state::fan_out_result gateway_state::fan_out(
       }
       cancelled_at   = now;
       shared->cancel = true;
+      {
+        std::lock_guard lock{shared->mutex};
+        for (std::size_t i = 0; i < ranks_.size(); ++i) {
+          running_at_cancel[i] = !shared->calls[i].done;
+        }
+      }
       for (auto const& r : ranks_) {
         auto one     = std::make_shared<canceller>();
         one->shared  = shared;
@@ -1443,7 +1453,8 @@ gateway_state::fan_out_result gateway_state::fan_out(
   std::lock_guard lock{shared->mutex};
   out.outcomes.resize(ranks_.size());
   for (std::size_t i = 0; i < ranks_.size(); ++i) {
-    auto& call = shared->calls[i];
+    auto& call                = shared->calls[i];
+    out.outcomes[i].cancelled = running_at_cancel[i];
     if (call.done) {
       threads[i].join();
       out.outcomes[i].result = std::move(call.result);
