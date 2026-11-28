@@ -268,6 +268,11 @@ jobs:
           pixi run --locked cargo clippy --locked --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --package sirius-ffi --all-targets -- -D warnings
           RUSTFLAGS="--cfg miri" pixi run --locked cargo clippy --locked --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --test miri -- -D warnings
           pixi run --locked cargo test --locked --no-run --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --package sirius-ffi
+          pixi run --locked cmake --build build/release --target sirius_rust_plan_test_library
+          export SIRIUS_BUILD_DIR="$PWD/build/release/test/rust-plan"
+          export LD_LIBRARY_PATH="$SIRIUS_BUILD_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          pixi run --locked cargo test --locked --manifest-path rust/Cargo.toml -p sirius --test plan
+          pixi run --locked cargo run --locked --manifest-path rust/Cargo.toml -p sirius --example plan
 
       - name: Build (vcpkg)
         if: matrix.build.environment == 'vcpkg'

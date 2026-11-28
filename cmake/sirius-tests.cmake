@@ -599,6 +599,20 @@ set_target_properties(
              CXX_SCAN_FOR_MODULES OFF
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 
+# Cargo links by library name. Isolate the host-only plan ABI from the engine.
+add_library(sirius_rust_plan_test_library SHARED EXCLUDE_FROM_ALL
+            src/c_api/plan.cpp src/c_api/error.cpp)
+target_compile_features(sirius_rust_plan_test_library PRIVATE cxx_std_20)
+target_include_directories(sirius_rust_plan_test_library PRIVATE include src)
+target_link_libraries(sirius_rust_plan_test_library PRIVATE absl::strings
+                                                            utf8proc::utf8proc)
+set_target_properties(
+  sirius_rust_plan_test_library
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF
+             OUTPUT_NAME sirius
+             LIBRARY_OUTPUT_DIRECTORY
+             "${CMAKE_CURRENT_BINARY_DIR}/test/rust-plan")
+
 # Export cleanup/ordering tests need neither a CUDA driver nor a DuckDB runtime.
 add_executable(
   sirius_parquet_session_test src/output/parquet_session.cpp

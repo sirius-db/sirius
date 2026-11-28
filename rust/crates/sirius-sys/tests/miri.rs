@@ -1,7 +1,12 @@
 //! Check raw pointer usage against Rust-owned C ABI stand-ins under Miri.
 #![cfg(miri)]
+#[cfg(not(feature = "miri-test-backend"))]
 #[path = "support/backend.rs"]
 mod backend;
+#[cfg(not(feature = "miri-test-backend"))]
+use sirius_sys::c_api;
+#[cfg(feature = "miri-test-backend")]
+use sirius_sys::miri_test_backend as backend;
 
 use sirius_sys::c_api::*;
 use std::ptr;
@@ -58,4 +63,16 @@ fn raw_handles_and_diagnostics() {
         sirius_context_config_release(ptr::null_mut());
         sirius_context_config_builder_release(ptr::null_mut());
     }
+}
+
+#[test]
+fn owning_builder_passes_empty_path_and_keeps_native_error() {
+    use sirius_sys::handles::ConfigBuilderHandle;
+    backend::fail_next(SIRIUS_CONFIGURATION_IO, Some(b"empty configuration path"));
+    let Err(error) = ConfigBuilderHandle::from_yaml(Vec::new().as_slice()) else {
+        panic!("injected read failure");
+    };
+    assert!(backend::last_path().is_empty());
+    assert_eq!(error.status, SIRIUS_CONFIGURATION_IO);
+    assert_eq!(error.message, "empty configuration path");
 }

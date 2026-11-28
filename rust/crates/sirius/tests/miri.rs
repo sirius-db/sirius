@@ -1,7 +1,6 @@
 //! Exercise safe wrappers against Rust-owned C ABI stand-ins under Miri.
 #![cfg(miri)]
-#[path = "../../sirius-sys/tests/support/backend.rs"]
-mod backend;
+use sirius_sys::miri_test_backend as backend;
 
 use sirius::{ConfigError, ContextConfigBuilder};
 use sirius_sys::c_api::*;
@@ -121,4 +120,38 @@ fn configuration_handles_can_move_and_be_shared_between_threads() {
             });
         }
     });
+}
+
+#[test]
+fn expression_final_release_on_another_thread() {
+    let original = sirius::Expression::literal_int64(42).unwrap();
+    let shared = original.clone();
+    drop(original);
+    std::thread::spawn(move || drop(shared)).join().unwrap();
+}
+
+#[test]
+fn field_view_borrows_from_retained_schema() {
+    use sirius::{DataType, Field, Schema};
+    let name = String::from("field");
+    let schema = Schema::new(&[Field {
+        name: &name,
+        data_type: DataType::Int64,
+        nullable: true,
+    }])
+    .unwrap();
+    drop(name);
+    let retained = schema.clone();
+    let view = retained.field(0).unwrap();
+    drop(schema);
+    assert_eq!(view.name, "field");
+}
+
+#[test]
+fn allocation_error_preserves_available_diagnostic() {
+    backend::fail_next(SIRIUS_ALLOCATION_FAILURE, Some(b"\xffout of memory\0"));
+    let result = sirius::Expression::literal_int64(10);
+    assert!(
+        matches!(result, Err(sirius::PlanError::AllocationFailure(message)) if message == "\u{fffd}out of memory\0")
+    );
 }

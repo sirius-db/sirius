@@ -16,8 +16,17 @@ name = "sirius_sys"
 # linked separately. Point SIRIUS_BUILD_DIR at the build tree with that archive.
 static = []
 
+# Provide C ABI stand-ins to integration tests only when interpreted by Miri.
+miri-test-backend = []
+
 # Maintainer-only: ordinary builds use the checked-in declarations.
 generate-bindings = ["dep:bindgen", "dep:prettyplease", "dep:syn"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
 
 [build-dependencies]
 bindgen = { version = "=0.73.2", optional = true, default-features = false, features = ["runtime"] }
